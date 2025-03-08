@@ -1,0 +1,23 @@
+{
+	"name": "@partly/permissions",
+	"version": "0.1.0",
+	"description": "A flexible authorization system for Rust",
+	"license": "Partly Group Proprietary",
+	"private": true,
+	"author": "Partly Group",
+	"scripts": {
+		"build": "cargo build --color=always",
+		"build:release": "cargo build --release --color=always",
+		"cargo": "cargo",
+		"format": "cargo fmt",
+		"lint": "cargo clippy --color=always --all-targets",
+		"lint:ci": "cargo clippy --color=always --all-targets -- -D warnings",
+		"start": "cargo run",
+		"start:release": "cargo run --release",
+		"test": "cargo test",
+		"test:release": "cargo test --release",
+		"where": "pwd"
+	},
+	"dependencies": {},
+	"devDependencies": {}
+}
