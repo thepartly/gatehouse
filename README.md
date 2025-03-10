@@ -1,4 +1,6 @@
-# Permissions Library
+# @partly/permissions
+
+> Permissions library
 
 A flexible authorization library that combines role-based (RBAC), attribute-based (ABAC), and relationship-based (ReBAC) access control policies.
 
