@@ -91,7 +91,7 @@ async fn main() {
         let counter = Arc::new(AtomicUsize::new(0));
 
         // Create an AND policy with a deny policy first
-        let and_policy = AndPolicy::new(vec![
+        let and_policy = AndPolicy::try_new(vec![
             Arc::new(CountingPolicy {
                 allow: false,
                 name: "DenyFirst".to_string(),
@@ -102,7 +102,8 @@ async fn main() {
                 name: "AllowSecond".to_string(),
                 counter: counter.clone(),
             }),
-        ]);
+        ])
+        .expect("Unable to create and-policy policy");
 
         println!("Evaluating AND(DenyFirst, AllowSecond):");
         let result = and_policy
@@ -110,7 +111,7 @@ async fn main() {
             .await;
         println!(
             "Result: {}",
-            if result.outcome() {
+            if result.is_granted() {
                 "Access granted"
             } else {
                 "Access denied"
@@ -128,7 +129,7 @@ async fn main() {
         let counter = Arc::new(AtomicUsize::new(0));
 
         // Create an OR policy with an allow policy first
-        let or_policy = OrPolicy::new(vec![
+        let or_policy = OrPolicy::try_new(vec![
             Arc::new(CountingPolicy {
                 allow: true,
                 name: "AllowFirst".to_string(),
@@ -139,7 +140,8 @@ async fn main() {
                 name: "DenySecond".to_string(),
                 counter: counter.clone(),
             }),
-        ]);
+        ])
+        .expect("Unable to create or-policy policy");
 
         println!("Evaluating OR(AllowFirst, DenySecond):");
         let result = or_policy
@@ -147,7 +149,7 @@ async fn main() {
             .await;
         println!(
             "Result: {}",
-            if result.outcome() {
+            if result.is_granted() {
                 "Access granted"
             } else {
                 "Access denied"
@@ -165,7 +167,7 @@ async fn main() {
         let counter = Arc::new(AtomicUsize::new(0));
 
         // Create a complex nested policy: OR(AND(Deny, Allow), Allow)
-        let inner_and = AndPolicy::new(vec![
+        let inner_and = AndPolicy::try_new(vec![
             Arc::new(CountingPolicy {
                 allow: false,
                 name: "DenyInner".to_string(),
@@ -176,16 +178,18 @@ async fn main() {
                 name: "AllowInner".to_string(),
                 counter: counter.clone(),
             }),
-        ]);
+        ])
+        .expect("Unable to create and-policy policy");
 
-        let complex_policy = OrPolicy::new(vec![
+        let complex_policy = OrPolicy::try_new(vec![
             Arc::new(inner_and),
             Arc::new(CountingPolicy {
                 allow: true,
                 name: "AllowOuter".to_string(),
                 counter: counter.clone(),
             }),
-        ]);
+        ])
+        .expect("Unable to create or-policy policy");
 
         println!("Evaluating OR(AND(DenyInner, AllowInner), AllowOuter):");
         let result = complex_policy
@@ -193,7 +197,7 @@ async fn main() {
             .await;
         println!(
             "Result: {} for document with ID {} for user with ID {}",
-            if result.outcome() {
+            if result.is_granted() {
                 "Access granted"
             } else {
                 "Access denied"

@@ -1,6 +1,8 @@
 //! A flexible authorization library that combines role‐based (RBAC),
 //! attribute‐based (ABAC), and relationship‐based (ReBAC) policies.
-//! It also provides combinators (AndPolicy, OrPolicy, NotPolicy) for
+//! The library provides a generic `Policy` trait for defining custom policies,
+//! a builder pattern for creating custom policies as well as several built-in
+//! policies for common use cases, and combinators (AndPolicy, OrPolicy, NotPolicy) for
 //! composing complex authorization logic.
 //!
 //! # Overview
@@ -64,6 +66,7 @@
 //!             }
 //!         }
 //!     }
+//!     fn policy_type(&self) -> String { "AdminPolicy".to_string() }
 //! }
 //!
 //! // An ABAC policy: grant access if the user is the owner of the document.
@@ -89,6 +92,9 @@
 //!                reason: "User is not the owner".to_string(),
 //!            }
 //!         }
+//!     }
+//!     fn policy_type(&self) -> String {
+//!         "OwnerPolicy".to_string()
 //!     }
 //! }
 //!
@@ -162,29 +168,55 @@ use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
 
-/// Internal result of evaluating a single policy or a combination of policies
+/// The type of boolean combining operation a policy might represent.
+#[derive(Debug, PartialEq, Clone)]
+pub enum CombineOp {
+    And,
+    Or,
+    Not,
+}
+
+impl fmt::Display for CombineOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CombineOp::And => write!(f, "AND"),
+            CombineOp::Or => write!(f, "OR"),
+            CombineOp::Not => write!(f, "NOT"),
+        }
+    }
+}
+
+/// The result of evaluating a single policy (or a combination).
+///
+/// This enum is used both by individual policies and by combinators to represent the
+/// outcome of access evaluation.
+///
+/// - [`Granted`]: Indicates that access is granted, with an optional reason.
+/// - [`Denied`]: Indicates that access is denied, along with an explanatory reason.
+/// - [`Combined`]: Represents the aggregate result of combining multiple policies.
+
 #[derive(Debug, Clone)]
 pub enum PolicyEvalResult {
+    /// Access granted. Contains the policy type and an optional reason.
     Granted {
         policy_type: String,
         reason: Option<String>,
     },
-    Denied {
-        policy_type: String,
-        reason: String,
-    },
+    /// Access denied. Contains the policy type and a reason.
+    Denied { policy_type: String, reason: String },
+    /// Combined result from multiple policy evaluations.
+    /// Contains the policy type, the combining operation (e.g. "AND", "OR", "NOT"),
+    /// a list of child evaluation results, and the overall outcome.
     Combined {
         policy_type: String,
-        operation: String, // "AND", "OR", "NOT"
+        operation: CombineOp,
         children: Vec<PolicyEvalResult>,
         outcome: bool,
     },
 }
 
-/// Access evaluation result
-///
-/// Complete result of a permission evaluation that includes
-/// both success and failure cases with detailed tracing.
+/// The complete result of a permission evaluation.
+/// Contains both the final decision and a detailed trace for debugging.
 ///
 /// ### Evaluation Tracing
 ///
@@ -227,6 +259,7 @@ pub enum PolicyEvalResult {
 /// ```
 #[derive(Debug, Clone)]
 pub enum AccessEvaluation {
+    /// Access was granted.
     Granted {
         /// The policy that granted access
         policy_type: String,
@@ -235,6 +268,7 @@ pub enum AccessEvaluation {
         /// Full evaluation trace including any rejected policies
         trace: EvalTrace,
     },
+    /// Access was denied.
     Denied {
         /// The complete evaluation trace showing all policy decisions
         trace: EvalTrace,
@@ -249,14 +283,56 @@ impl AccessEvaluation {
         matches!(self, Self::Granted { .. })
     }
 
-    /// Helper method to convert to Result type
+    /// Converts the evaluation into a `Result`, mapping a denial into an error.
     pub fn to_result<E>(&self, error_fn: impl FnOnce(&str) -> E) -> Result<(), E> {
         match self {
             Self::Granted { .. } => Ok(()),
             Self::Denied { reason, .. } => Err(error_fn(reason)),
         }
     }
+
+    pub fn display_trace(&self) -> String {
+        let trace = match self {
+            AccessEvaluation::Granted {
+                policy_type: _,
+                reason: _,
+                trace,
+            } => trace,
+            AccessEvaluation::Denied { reason: _, trace } => trace,
+        };
+
+        // If there's an actual tree to show, add it. Otherwise, fallback.
+        let trace_str = trace.format();
+        if trace_str == "No evaluation trace available" {
+            format!("{}\n(No evaluation trace available)", self)
+        } else {
+            format!("{}\nEvaluation Trace:\n{}", self, trace_str)
+        }
+    }
 }
+
+/// A concise line about the final decision.
+impl fmt::Display for AccessEvaluation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Granted {
+                policy_type,
+                reason,
+                trace: _,
+            } => {
+                // Headline
+                match reason {
+                    Some(r) => write!(f, "[GRANTED] by {} - {}", policy_type, r),
+                    None => write!(f, "[GRANTED] by {}", policy_type),
+                }
+            }
+            Self::Denied { reason, trace: _ } => {
+                write!(f, "[Denied] - {}", reason)
+            }
+        }
+    }
+}
+
 /// Container for the evaluation tree
 /// Detailed trace of all policy evaluations
 #[derive(Debug, Clone, Default)]
@@ -292,7 +368,7 @@ impl EvalTrace {
 
 impl PolicyEvalResult {
     /// Returns whether this evaluation resulted in access being granted
-    pub fn outcome(&self) -> bool {
+    pub fn is_granted(&self) -> bool {
         match self {
             Self::Granted { .. } => true,
             Self::Denied { .. } => false,
@@ -312,6 +388,7 @@ impl PolicyEvalResult {
     /// Formats the evaluation tree with indentation for readability
     pub fn format(&self, indent: usize) -> String {
         let indent_str = " ".repeat(indent);
+
         match self {
             Self::Granted {
                 policy_type,
@@ -320,13 +397,13 @@ impl PolicyEvalResult {
                 let reason_text = reason
                     .as_ref()
                     .map_or("".to_string(), |r| format!(": {}", r));
-                format!("{}✓ {} GRANTED{}", indent_str, policy_type, reason_text)
+                format!("{}✔ {} GRANTED{}", indent_str, policy_type, reason_text)
             }
             Self::Denied {
                 policy_type,
                 reason,
             } => {
-                format!("{}✗ {} DENIED: {}", indent_str, policy_type, reason)
+                format!("{}✘ {} DENIED: {}", indent_str, policy_type, reason)
             }
             Self::Combined {
                 policy_type,
@@ -334,7 +411,7 @@ impl PolicyEvalResult {
                 children,
                 outcome,
             } => {
-                let outcome_char = if *outcome { "✓" } else { "✗" };
+                let outcome_char = if *outcome { "✔" } else { "✘" };
                 let mut result = format!(
                     "{}{} {} ({})",
                     indent_str, outcome_char, policy_type, operation
@@ -349,15 +426,30 @@ impl PolicyEvalResult {
     }
 }
 
-/// A generic async Policy trait representing a single authorization policy.
-///
-/// Each `Policy` must implement the `evaluate_access` method, which returns an
-/// `PolicyEvalResult`.
+impl fmt::Display for PolicyEvalResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tree = self.format(0);
+        write!(f, "{}", tree)
+    }
+}
+
+/// A generic async trait representing a single authorization policy.
+/// A policy determines if a subject is allowed to perform an action on
+/// a resource within a given context.
 #[async_trait]
 pub trait Policy<Subject, Resource, Action, Context>: Send + Sync {
-    /// Check whether access is allowed, with detailed evaluation results
-    /// Determines if `subject` is allowed to perform `action` on `resource`,
-    /// potentially taking additional context into account.
+    /// Evaluates whether access should be granted.
+    ///
+    /// # Arguments
+    ///
+    /// * `subject` - The entity requesting access.
+    /// * `action` - The action being performed.
+    /// * `resource` - The target resource.
+    /// * `context` - Additional context that may affect the decision.
+    ///
+    /// # Returns
+    ///
+    /// A [`PolicyEvalResult`] indicating whether access is granted or denied.
     async fn evaluate_access(
         &self,
         subject: &Subject,
@@ -366,31 +458,17 @@ pub trait Policy<Subject, Resource, Action, Context>: Send + Sync {
         context: &Context,
     ) -> PolicyEvalResult;
 
-    /// Policy type name for debugging
-    fn policy_type(&self) -> String {
-        std::any::type_name::<Self>()
-            .split("::")
-            .last()
-            .unwrap_or("Unknown")
-            .to_string()
-    }
+    /// Policy name for debugging
+    fn policy_type(&self) -> String;
 }
-
-/// A unified interface for context used during permissions checks.
-pub trait PermissionContext: fmt::Debug + Send + Sync {}
-
-/// A trait for resources in a permission check.
-pub trait PermissionResource: fmt::Debug + Send + Sync {}
-
-/// A trait for actions in a permission check.
-pub trait PermissionAction: fmt::Debug + Send + Sync {}
 
 /// A container for multiple policies, applied in an "OR" fashion.
 /// (If any policy returns Ok, access is granted)
 /// **Important**:
 /// If no policies are added, access is always denied.
+#[derive(Clone)]
 pub struct PermissionChecker<S, R, A, C> {
-    policies: Vec<std::sync::Arc<dyn Policy<S, R, A, C>>>,
+    policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
 }
 
 impl<S, R, A, C> Default for PermissionChecker<S, R, A, C> {
@@ -400,19 +478,26 @@ impl<S, R, A, C> Default for PermissionChecker<S, R, A, C> {
 }
 
 impl<S, R, A, C> PermissionChecker<S, R, A, C> {
+    /// Creates a new `PermissionChecker` with no policies.
     pub fn new() -> Self {
         Self {
             policies: Vec::new(),
         }
     }
 
+    /// Adds a policy to the checker.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - A type implementing [`Policy`]. It is stored as an `Arc` for shared ownership.
     pub fn add_policy<P: Policy<S, R, A, C> + 'static>(&mut self, policy: P) {
-        self.policies.push(std::sync::Arc::new(policy));
+        self.policies.push(Arc::new(policy));
     }
 
-    /// Evaluates the subject/resource/action/context against all policies.
+    /// Evaluates all policies against the given parameters.
     ///
-    /// Returns full trace of evaluation.
+    /// Policies are evaluated sequentially with OR semantics (short-circuiting on first success).
+    /// Returns an [`AccessEvaluation`] with detailed tracing.
     #[tracing::instrument(skip_all)]
     pub async fn evaluate_access(
         &self,
@@ -442,14 +527,14 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
             let result = policy
                 .evaluate_access(subject, action, resource, context)
                 .await;
-            let result_passes = result.outcome();
+            let result_passes = result.is_granted();
             policy_results.push(result.clone());
 
             // If any policy allows access, return immediately
             if result_passes {
                 let combined = PolicyEvalResult::Combined {
                     policy_type: "PermissionChecker".to_string(),
-                    operation: "OR".to_string(),
+                    operation: CombineOp::Or,
                     children: policy_results,
                     outcome: true,
                 };
@@ -466,7 +551,7 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
         tracing::trace!("No policies allowed access, returning Forbidden");
         let combined = PolicyEvalResult::Combined {
             policy_type: "PermissionChecker".to_string(),
-            operation: "OR".to_string(),
+            operation: CombineOp::Or,
             children: policy_results,
             outcome: false,
         };
@@ -475,6 +560,208 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
             trace: EvalTrace::with_root(combined),
             reason: "All policies denied access".to_string(),
         }
+    }
+}
+
+/// Represents the intended effect of a policy.
+///
+/// `Allow` means the policy grants access; `Deny` means it denies access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    Allow,
+    Deny,
+}
+
+/// An internal policy type (not exposed to API users) that is constructed via the builder.
+struct InternalPolicy<S, R, A, C> {
+    name: String,
+    effect: Effect,
+    // The predicate returns true if all conditions pass.
+    predicate: Box<dyn Fn(&S, &A, &R, &C) -> bool + Send + Sync>,
+}
+
+#[async_trait]
+impl<S, R, A, C> Policy<S, R, A, C> for InternalPolicy<S, R, A, C>
+where
+    S: Send + Sync,
+    R: Send + Sync,
+    A: Send + Sync,
+    C: Send + Sync,
+{
+    async fn evaluate_access(
+        &self,
+        subject: &S,
+        action: &A,
+        resource: &R,
+        context: &C,
+    ) -> PolicyEvalResult {
+        if (self.predicate)(subject, action, resource, context) {
+            match self.effect {
+                Effect::Allow => PolicyEvalResult::Granted {
+                    policy_type: self.name.clone(),
+                    reason: Some("Policy allowed access".into()),
+                },
+                Effect::Deny => PolicyEvalResult::Denied {
+                    policy_type: self.name.clone(),
+                    reason: "Policy denied access".into(),
+                },
+            }
+        } else {
+            // Predicate didn't match – treat as non-applicable (denied).
+            PolicyEvalResult::Denied {
+                policy_type: self.name.clone(),
+                reason: "Policy predicate did not match".into(),
+            }
+        }
+    }
+    fn policy_type(&self) -> String {
+        self.name.clone()
+    }
+}
+
+// Tell the compiler that a Box<dyn Policy> implements the Policy trait so we can keep
+// our internal policy type private.
+#[async_trait]
+impl<S, R, A, C> Policy<S, R, A, C> for Box<dyn Policy<S, R, A, C>>
+where
+    S: Send + Sync,
+    R: Send + Sync,
+    A: Send + Sync,
+    C: Send + Sync,
+{
+    async fn evaluate_access(
+        &self,
+        subject: &S,
+        action: &A,
+        resource: &R,
+        context: &C,
+    ) -> PolicyEvalResult {
+        (**self)
+            .evaluate_access(subject, action, resource, context)
+            .await
+    }
+
+    fn policy_type(&self) -> String {
+        (**self).policy_type()
+    }
+}
+
+/// A builder API for creating custom policies.
+///
+/// The [`PolicyBuilder`] offers a fluent interface to combine predicate functions
+/// on the subject, action, resource, and context. Use it to construct a policy that
+/// can be added to a [`PermissionChecker`].
+pub struct PolicyBuilder<S, R, A, C>
+where
+    S: Send + Sync + 'static,
+    R: Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    C: Send + Sync + 'static,
+{
+    name: String,
+    effect: Effect,
+    subject_pred: Option<Box<dyn Fn(&S) -> bool + Send + Sync>>,
+    action_pred: Option<Box<dyn Fn(&A) -> bool + Send + Sync>>,
+    resource_pred: Option<Box<dyn Fn(&R) -> bool + Send + Sync>>,
+    context_pred: Option<Box<dyn Fn(&C) -> bool + Send + Sync>>,
+    // Note the order here matches the evaluate_access signature
+    extra_condition: Option<Box<dyn Fn(&S, &A, &R, &C) -> bool + Send + Sync>>,
+}
+
+impl<Subject, Resource, Action, Context> PolicyBuilder<Subject, Resource, Action, Context>
+where
+    Subject: Send + Sync + 'static,
+    Resource: Send + Sync + 'static,
+    Action: Send + Sync + 'static,
+    Context: Send + Sync + 'static,
+{
+    /// Creates a new policy builder with the given name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            effect: Effect::Allow,
+            subject_pred: None,
+            action_pred: None,
+            resource_pred: None,
+            context_pred: None,
+            extra_condition: None,
+        }
+    }
+
+    /// Sets the effect (Allow or Deny) for the policy.
+    /// Defaults to Allow
+    pub fn effect(mut self, effect: Effect) -> Self {
+        self.effect = effect;
+        self
+    }
+
+    /// Adds a predicate that tests the subject.
+    pub fn subjects<F>(mut self, pred: F) -> Self
+    where
+        F: Fn(&Subject) -> bool + Send + Sync + 'static,
+    {
+        self.subject_pred = Some(Box::new(pred));
+        self
+    }
+
+    /// Adds a predicate that tests the action.
+    pub fn actions<F>(mut self, pred: F) -> Self
+    where
+        F: Fn(&Action) -> bool + Send + Sync + 'static,
+    {
+        self.action_pred = Some(Box::new(pred));
+        self
+    }
+
+    /// Adds a predicate that tests the resource.
+    pub fn resources<F>(mut self, pred: F) -> Self
+    where
+        F: Fn(&Resource) -> bool + Send + Sync + 'static,
+    {
+        self.resource_pred = Some(Box::new(pred));
+        self
+    }
+
+    /// Add a predicate that validates the context.
+    pub fn context<F>(mut self, pred: F) -> Self
+    where
+        F: Fn(&Context) -> bool + Send + Sync + 'static,
+    {
+        self.context_pred = Some(Box::new(pred));
+        self
+    }
+
+    /// Add a condition that considers all four inputs.
+    pub fn when<F>(mut self, pred: F) -> Self
+    where
+        F: Fn(&Subject, &Action, &Resource, &Context) -> bool + Send + Sync + 'static,
+    {
+        self.extra_condition = Some(Box::new(pred));
+        self
+    }
+
+    /// Build the policy. Returns a boxed policy that can be added to a PermissionChecker.
+    pub fn build(self) -> Box<dyn Policy<Subject, Resource, Action, Context>> {
+        let effect = self.effect;
+        let subject_pred = self.subject_pred;
+        let action_pred = self.action_pred;
+        let resource_pred = self.resource_pred;
+        let context_pred = self.context_pred;
+        let extra_condition = self.extra_condition;
+
+        let predicate = Box::new(move |s: &Subject, a: &Action, r: &Resource, c: &Context| {
+            subject_pred.as_ref().map_or(true, |f| f(s))
+                && action_pred.as_ref().map_or(true, |f| f(a))
+                && resource_pred.as_ref().map_or(true, |f| f(r))
+                && context_pred.as_ref().map_or(true, |f| f(c))
+                && extra_condition.as_ref().map_or(true, |f| f(s, a, r, c))
+        });
+
+        Box::new(InternalPolicy {
+            name: self.name,
+            effect,
+            predicate,
+        })
     }
 }
 
@@ -530,6 +817,10 @@ where
                 reason: "User doesn't have required role".to_string(),
             }
         }
+    }
+
+    fn policy_type(&self) -> String {
+        "RbacPolicy".to_string()
     }
 }
 
@@ -641,6 +932,10 @@ where
                 reason: "Condition evaluated to false".to_string(),
             }
         }
+    }
+
+    fn policy_type(&self) -> String {
+        "AbacPolicy".to_string()
     }
 }
 
@@ -779,6 +1074,10 @@ where
             }
         }
     }
+
+    fn policy_type(&self) -> String {
+        "RebacPolicy".to_string()
+    }
 }
 
 /// ---
@@ -793,9 +1092,19 @@ pub struct AndPolicy<S, R, A, C> {
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
 }
 
+/// Error returned when no policies are provided to a combinator policy.
+#[derive(Debug, Copy, Clone)]
+pub struct EmptyPoliciesError(pub &'static str);
+
 impl<S, R, A, C> AndPolicy<S, R, A, C> {
-    pub fn new(policies: Vec<Arc<dyn Policy<S, R, A, C>>>) -> Self {
-        Self { policies }
+    pub fn try_new(policies: Vec<Arc<dyn Policy<S, R, A, C>>>) -> Result<Self, EmptyPoliciesError> {
+        if policies.is_empty() {
+            Err(EmptyPoliciesError(
+                "AndPolicy must have at least one policy",
+            ))
+        } else {
+            Ok(Self { policies })
+        }
     }
 }
 
@@ -828,10 +1137,10 @@ where
             children_results.push(result.clone());
 
             // Short-circuit on first denial
-            if !result.outcome() {
+            if !result.is_granted() {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
-                    operation: "AND".to_string(),
+                    operation: CombineOp::And,
                     children: children_results,
                     outcome: false,
                 };
@@ -841,7 +1150,7 @@ where
         // All policies granted access
         PolicyEvalResult::Combined {
             policy_type: self.policy_type(),
-            operation: "AND".to_string(),
+            operation: CombineOp::And,
             children: children_results,
             outcome: true,
         }
@@ -857,8 +1166,12 @@ pub struct OrPolicy<S, R, A, C> {
 }
 
 impl<S, R, A, C> OrPolicy<S, R, A, C> {
-    pub fn new(policies: Vec<Arc<dyn Policy<S, R, A, C>>>) -> Self {
-        Self { policies }
+    pub fn try_new(policies: Vec<Arc<dyn Policy<S, R, A, C>>>) -> Result<Self, EmptyPoliciesError> {
+        if policies.is_empty() {
+            Err(EmptyPoliciesError("OrPolicy must have at least one policy"))
+        } else {
+            Ok(Self { policies })
+        }
     }
 }
 
@@ -890,10 +1203,10 @@ where
             children_results.push(result.clone());
 
             // Short-circuit on first success
-            if result.outcome() {
+            if result.is_granted() {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
-                    operation: "OR".to_string(),
+                    operation: CombineOp::Or,
                     children: children_results,
                     outcome: true,
                 };
@@ -903,7 +1216,7 @@ where
         // All policies denied access
         PolicyEvalResult::Combined {
             policy_type: self.policy_type(),
-            operation: "OR".to_string(),
+            operation: CombineOp::Or,
             children: children_results,
             outcome: false,
         }
@@ -953,9 +1266,9 @@ where
 
         PolicyEvalResult::Combined {
             policy_type: Policy::<S, R, A, C>::policy_type(self),
-            operation: "NOT".to_string(),
+            operation: CombineOp::Not,
             children: vec![inner_result.clone()],
-            outcome: !inner_result.outcome(),
+            outcome: !inner_result.is_granted(),
         }
     }
 }
@@ -963,6 +1276,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_test::assert_err;
 
     // Dummy resource/action/context types for testing
     #[derive(Debug, Clone)]
@@ -998,6 +1312,10 @@ mod tests {
                 reason: Some("Always allow policy".to_string()),
             }
         }
+
+        fn policy_type(&self) -> String {
+            "AlwaysAllowPolicy".to_string()
+        }
     }
 
     // A policy that always denies, with a custom reason
@@ -1016,6 +1334,10 @@ mod tests {
                 policy_type: self.policy_type(),
                 reason: self.0.to_string(),
             }
+        }
+
+        fn policy_type(&self) -> String {
+            "AlwaysDenyPolicy".to_string()
         }
     }
 
@@ -1213,7 +1535,7 @@ mod tests {
             .await;
 
         assert!(
-            result.outcome(),
+            result.is_granted(),
             "Access should be allowed if relationship exists"
         );
     }
@@ -1240,7 +1562,7 @@ mod tests {
             .await;
         // Check access is denied
         assert!(
-            !result.outcome(),
+            !result.is_granted(),
             "Access should be denied if relationship does not exist"
         );
     }
@@ -1248,10 +1570,11 @@ mod tests {
     // Combinator tests.
     #[tokio::test]
     async fn test_and_policy_allows_when_all_allow() {
-        let policy = AndPolicy::new(vec![
+        let policy = AndPolicy::try_new(vec![
             Arc::new(AlwaysAllowPolicy),
             Arc::new(AlwaysAllowPolicy),
-        ]);
+        ])
+        .expect("Unable to create and-policy policy");
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
         };
@@ -1262,16 +1585,17 @@ mod tests {
             .evaluate_access(&subject, &TestAction, &resource, &TestContext)
             .await;
         assert!(
-            result.outcome(),
+            result.is_granted(),
             "AndPolicy should allow access when all inner policies allow"
         );
     }
     #[tokio::test]
     async fn test_and_policy_denies_when_one_denies() {
-        let policy = AndPolicy::new(vec![
+        let policy = AndPolicy::try_new(vec![
             Arc::new(AlwaysAllowPolicy),
             Arc::new(AlwaysDenyPolicy("DenyInAnd")),
-        ]);
+        ])
+        .expect("Unable to create and-policy policy");
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
         };
@@ -1288,7 +1612,7 @@ mod tests {
                 children,
                 outcome,
             } => {
-                assert_eq!(operation, "AND");
+                assert_eq!(operation, CombineOp::And);
                 assert!(!outcome);
                 assert_eq!(children.len(), 2);
                 assert!(children[1].format(0).contains("DenyInAnd"));
@@ -1299,10 +1623,11 @@ mod tests {
     }
     #[tokio::test]
     async fn test_or_policy_allows_when_one_allows() {
-        let policy = OrPolicy::new(vec![
+        let policy = OrPolicy::try_new(vec![
             Arc::new(AlwaysDenyPolicy("Deny1")),
             Arc::new(AlwaysAllowPolicy),
-        ]);
+        ])
+        .expect("Unable to create or-policy policy");
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
         };
@@ -1313,16 +1638,17 @@ mod tests {
             .evaluate_access(&subject, &TestAction, &resource, &TestContext)
             .await;
         assert!(
-            result.outcome(),
+            result.is_granted(),
             "OrPolicy should allow access when at least one inner policy allows"
         );
     }
     #[tokio::test]
     async fn test_or_policy_denies_when_all_deny() {
-        let policy = OrPolicy::new(vec![
+        let policy = OrPolicy::try_new(vec![
             Arc::new(AlwaysDenyPolicy("Deny1")),
             Arc::new(AlwaysDenyPolicy("Deny2")),
-        ]);
+        ])
+        .expect("Unable to create or-policy policy");
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
         };
@@ -1339,7 +1665,7 @@ mod tests {
                 children,
                 outcome,
             } => {
-                assert_eq!(operation, "OR");
+                assert_eq!(operation, CombineOp::Or);
                 assert!(!outcome);
                 assert_eq!(children.len(), 2);
                 assert!(children[0].format(0).contains("Deny1"));
@@ -1362,7 +1688,7 @@ mod tests {
             .evaluate_access(&subject, &TestAction, &resource, &TestContext)
             .await;
         assert!(
-            result.outcome(),
+            result.is_granted(),
             "NotPolicy should allow access when inner policy denies"
         );
     }
@@ -1385,7 +1711,7 @@ mod tests {
                 children,
                 outcome,
             } => {
-                assert_eq!(operation, "NOT");
+                assert_eq!(operation, CombineOp::Not);
                 assert!(!outcome);
                 assert_eq!(children.len(), 1);
                 assert!(children[0].format(0).contains("AlwaysAllowPolicy"));
@@ -1398,8 +1724,11 @@ mod tests {
     #[tokio::test]
     async fn test_empty_policies_in_combinators() {
         // Test AndPolicy with no policies
-        let and_policy =
-            AndPolicy::<TestSubject, TestResource, TestAction, TestContext>::new(vec![]);
+        let and_policy_result =
+            AndPolicy::<TestSubject, TestResource, TestAction, TestContext>::try_new(vec![]);
+
+        assert!(and_policy_result.is_err());
+
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
         };
@@ -1407,43 +1736,10 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result = and_policy
-            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
-            .await;
-
-        // By logical identity, AND with no operands should be true (vacuously satisfied)
-        match result {
-            PolicyEvalResult::Combined {
-                outcome, children, ..
-            } => {
-                assert!(
-                    outcome,
-                    "Empty AndPolicy should allow access (vacuous truth)"
-                );
-                assert_eq!(children.len(), 0);
-            }
-            _ => panic!("Expected Combined result"),
-        }
-
         // Test OrPolicy with no policies
-        let or_policy = OrPolicy::<TestSubject, TestResource, TestAction, TestContext>::new(vec![]);
-        let result = or_policy
-            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
-            .await;
-
-        // By logical identity, OR with no operands should be false
-        match result {
-            PolicyEvalResult::Combined {
-                outcome, children, ..
-            } => {
-                assert!(
-                    !outcome,
-                    "Empty OrPolicy should deny access (vacuous falsehood)"
-                );
-                assert_eq!(children.len(), 0);
-            }
-            _ => panic!("Expected Combined result"),
-        }
+        let or_policy_result =
+            OrPolicy::<TestSubject, TestResource, TestAction, TestContext>::try_new(vec![]);
+        assert!(or_policy_result.is_err());
     }
 
     #[tokio::test]
@@ -1451,12 +1747,14 @@ mod tests {
         // Create a complex policy structure: NOT(AND(Allow, OR(Deny, NOT(Deny))))
         let inner_not = NotPolicy::new(AlwaysDenyPolicy("InnerDeny"));
 
-        let inner_or = OrPolicy::new(vec![
+        let inner_or = OrPolicy::try_new(vec![
             Arc::new(AlwaysDenyPolicy("MidDeny")),
             Arc::new(inner_not),
-        ]);
+        ])
+        .expect("Unable to create or-policy policy");
 
-        let inner_and = AndPolicy::new(vec![Arc::new(AlwaysAllowPolicy), Arc::new(inner_or)]);
+        let inner_and = AndPolicy::try_new(vec![Arc::new(AlwaysAllowPolicy), Arc::new(inner_or)])
+            .expect("Unable to create and-policy policy");
 
         let outer_not = NotPolicy::new(inner_and);
 
@@ -1472,7 +1770,7 @@ mod tests {
             .await;
 
         // This complex structure should result in a denial
-        assert!(!result.outcome());
+        assert!(!result.is_granted());
 
         // Verify the correct structure of the trace
         let trace_str = result.format(0);
@@ -1510,6 +1808,10 @@ mod tests {
                 }
             }
         }
+
+        fn policy_type(&self) -> String {
+            "FeatureFlagPolicy".to_string()
+        }
     }
 
     #[tokio::test]
@@ -1529,7 +1831,7 @@ mod tests {
         let result = policy
             .evaluate_access(&subject, &TestAction, &resource, &context_enabled)
             .await;
-        assert!(result.outcome());
+        assert!(result.is_granted());
 
         // Test with flag disabled
         let context_disabled = FeatureFlagContext {
@@ -1538,7 +1840,7 @@ mod tests {
         let result = policy
             .evaluate_access(&subject, &TestAction, &resource, &context_disabled)
             .await;
-        assert!(!result.outcome());
+        assert!(!result.is_granted());
     }
 
     #[tokio::test]
@@ -1577,13 +1879,17 @@ mod tests {
                     }
                 }
             }
+
+            fn policy_type(&self) -> String {
+                "CountingPolicy".to_string()
+            }
         }
 
         // Test AND short circuit on first deny
         let count_clone = evaluation_count.clone();
         evaluation_count.store(0, Ordering::SeqCst);
 
-        let and_policy = AndPolicy::new(vec![
+        let and_policy = AndPolicy::try_new(vec![
             Arc::new(CountingPolicy {
                 result: false,
                 counter: count_clone.clone(),
@@ -1592,7 +1898,8 @@ mod tests {
                 result: true,
                 counter: count_clone,
             }),
-        ]);
+        ])
+        .expect("Unable to create 'and' policy");
 
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
@@ -1614,7 +1921,7 @@ mod tests {
         let count_clone = evaluation_count.clone();
         evaluation_count.store(0, Ordering::SeqCst);
 
-        let or_policy = OrPolicy::new(vec![
+        let or_policy = OrPolicy::try_new(vec![
             Arc::new(CountingPolicy {
                 result: true,
                 counter: count_clone.clone(),
@@ -1623,7 +1930,8 @@ mod tests {
                 result: false,
                 counter: count_clone,
             }),
-        ]);
+        ])
+        .unwrap();
 
         or_policy
             .evaluate_access(&subject, &TestAction, &resource, &TestContext)
@@ -1633,6 +1941,182 @@ mod tests {
             evaluation_count.load(Ordering::SeqCst),
             1,
             "OR policy should short-circuit after first allow"
+        );
+    }
+}
+
+#[cfg(test)]
+mod policy_builder_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    // Define simple test types
+    #[derive(Debug, Clone)]
+    struct TestSubject {
+        pub name: String,
+    }
+    #[derive(Debug, Clone)]
+    struct TestAction;
+    #[derive(Debug, Clone)]
+    struct TestResource;
+    #[derive(Debug, Clone)]
+    struct TestContext;
+
+    // Test that with no predicates the builder returns a policy that always "matches"
+    #[tokio::test]
+    async fn test_policy_builder_allows_when_no_predicates() {
+        let policy = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
+            "NoPredicatesPolicy",
+        )
+        .build();
+
+        let result = policy
+            .evaluate_access(
+                &TestSubject { name: "Any".into() },
+                &TestAction,
+                &TestResource,
+                &TestContext,
+            )
+            .await;
+        assert!(
+            result.is_granted(),
+            "Policy built with no predicates should allow access (default true)"
+        );
+    }
+
+    // Test that a subject predicate is applied correctly.
+    #[tokio::test]
+    async fn test_policy_builder_with_subject_predicate() {
+        let policy = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
+            "SubjectPolicy",
+        )
+        .subjects(|s: &TestSubject| s.name == "Alice")
+        .build();
+
+        // Should allow if the subject's name is "Alice"
+        let result1 = policy
+            .evaluate_access(
+                &TestSubject {
+                    name: "Alice".into(),
+                },
+                &TestAction,
+                &TestResource,
+                &TestContext,
+            )
+            .await;
+        assert!(
+            result1.is_granted(),
+            "Policy should allow access for subject 'Alice'"
+        );
+
+        // Otherwise, it should deny
+        let result2 = policy
+            .evaluate_access(
+                &TestSubject { name: "Bob".into() },
+                &TestAction,
+                &TestResource,
+                &TestContext,
+            )
+            .await;
+        assert!(
+            !result2.is_granted(),
+            "Policy should deny access for subject not named 'Alice'"
+        );
+    }
+
+    // Test that setting the effect to Deny overrides an otherwise matching predicate.
+    #[tokio::test]
+    async fn test_policy_builder_effect_deny() {
+        let policy =
+            PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new("DenyPolicy")
+                .effect(Effect::Deny)
+                .build();
+
+        // Even though no predicate fails (so predicate returns true),
+        // the effect should result in a Denied outcome.
+        let result = policy
+            .evaluate_access(
+                &TestSubject {
+                    name: "Anyone".into(),
+                },
+                &TestAction,
+                &TestResource,
+                &TestContext,
+            )
+            .await;
+        assert!(
+            !result.is_granted(),
+            "Policy with effect Deny should result in denial even if the predicate passes"
+        );
+    }
+
+    // Test that extra conditions (combining multiple inputs) work correctly.
+    #[tokio::test]
+    async fn test_policy_builder_with_extra_condition() {
+        #[derive(Debug, Clone)]
+        struct ExtendedSubject {
+            pub id: Uuid,
+            pub name: String,
+        }
+        #[derive(Debug, Clone)]
+        struct ExtendedResource {
+            pub owner_id: Uuid,
+        }
+        #[derive(Debug, Clone)]
+        struct ExtendedAction;
+        #[derive(Debug, Clone)]
+        struct ExtendedContext;
+
+        // Build a policy that checks:
+        //   1. Subject's name is "Alice"
+        //   2. And that subject.id == resource.owner_id (via extra condition)
+        let subject_id = Uuid::new_v4();
+        let policy = PolicyBuilder::<
+            ExtendedSubject,
+            ExtendedResource,
+            ExtendedAction,
+            ExtendedContext,
+        >::new("AliceOwnerPolicy")
+        .subjects(|s: &ExtendedSubject| s.name == "Alice")
+        .when(|s, _a, r, _c| s.id == r.owner_id)
+        .build();
+
+        // Case where both conditions are met.
+        let result1 = policy
+            .evaluate_access(
+                &ExtendedSubject {
+                    id: subject_id,
+                    name: "Alice".into(),
+                },
+                &ExtendedAction,
+                &ExtendedResource {
+                    owner_id: subject_id,
+                },
+                &ExtendedContext,
+            )
+            .await;
+        assert!(
+            result1.is_granted(),
+            "Policy should allow access when conditions are met"
+        );
+
+        // Case where extra condition fails (different id)
+        let result2 = policy
+            .evaluate_access(
+                &ExtendedSubject {
+                    id: subject_id,
+                    name: "Alice".into(),
+                },
+                &ExtendedAction,
+                &ExtendedResource {
+                    owner_id: Uuid::new_v4(),
+                },
+                &ExtendedContext,
+            )
+            .await;
+        assert!(
+            !result2.is_granted(),
+            "Policy should deny access when extra condition fails"
         );
     }
 }

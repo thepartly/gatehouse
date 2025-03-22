@@ -171,13 +171,11 @@ async fn main() {
     let _viewer_policy =
         RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new("viewer", normal_resolver);
 
-    // Create a permission checker with a composite policy
+    // Create a permission checker with multiple policies
     // Only owners and contributors can edit, not viewers
     let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
-    checker.add_policy(OrPolicy::new(vec![
-        Arc::new(owner_policy),
-        Arc::new(contributor_policy),
-    ]));
+    checker.add_policy(owner_policy);
+    checker.add_policy(contributor_policy);
 
     // Test normal access
     println!("Testing normal access patterns:");

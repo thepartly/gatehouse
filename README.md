@@ -5,10 +5,10 @@
 A flexible authorization library that combines role-based (RBAC), attribute-based (ABAC), and relationship-based (ReBAC) access control policies.
 
 ## Features
-- 
 - **Multi-paradigm Authorization**: Support for RBAC, ABAC, and ReBAC patterns
 - **Policy Composition**: Combine policies with logical operators (`AND`, `OR`, `NOT`)
 - **Detailed Evaluation Tracing**: Complete decision trace for debugging and auditing
+- **Fluent Builder API**: Construct custom policies with a PolicyBuilder.
 - **Type Safety**: Strongly typed resources/actions/contexts
 - **Async Ready**: Built with async/await support
 
@@ -47,6 +47,20 @@ if result.is_granted() {
 } else {
     // Access denied
 }
+```
+
+### PolicyBuilder
+The `PolicyBuilder` provides a fluent API to construct custom policies by chaining predicate functions for 
+subjects, actions, resources, and context. Once built, the policy can be added to a [`PermissionChecker`].
+
+```rust
+let custom_policy = PolicyBuilder::<MySubject, MyResource, MyAction, MyContext>::new("CustomPolicy")
+    .subjects(|s| /* ... */)
+    .actions(|a| /* ... */)
+    .resources(|r| /* ... */)
+    .context(|c| /* ... */)
+    .when(|s, a, r, c| /* ... */)
+    .build();
 ```
 
 ### Built-in Policies

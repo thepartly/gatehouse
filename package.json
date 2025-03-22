@@ -14,7 +14,7 @@
 		"lint:ci": "cargo clippy --color=always --all-targets -- -D warnings",
 		"start": "cargo run",
 		"start:release": "cargo run --release",
-		"test": "cargo test",
+		"test": "cargo test --all-targets",
 		"test:release": "cargo test --release",
 		"where": "pwd"
 	},

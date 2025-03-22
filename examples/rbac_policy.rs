@@ -105,7 +105,7 @@ async fn main() {
         |user: &User| user.roles.iter().cloned().collect(),
     );
 
-    // Create permission checker with our RBAC policy
+    // Create a strongly typed permission checker and add our RBAC policy
     let mut checker = PermissionChecker::<User, Document, ReadAction, EmptyContext>::new();
     checker.add_policy(rbac_policy);
 
