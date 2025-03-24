@@ -1,6 +1,6 @@
 [package]
 name = "gatehouse"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/thepartly/gatehouse"
@@ -19,4 +19,8 @@ tower = "0.5"
 hyper = "1"
 
 [package.metadata.docs.rs]
+# Scape examples from the documentation.
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+
+# We want to document all features.
+all-features = true

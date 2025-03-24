@@ -5,6 +5,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  release:
+    types: [ published ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,5 +29,28 @@ jobs:
         run: cargo build --verbose
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build Docs
+        run: cargo doc --verbose
       - name: Test
         run: cargo test --all-targets --all-features
+
+  release:
+    name: Release
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.event.release && github.event.action == 'published'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Cache cargo & target directories
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "v2"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Cargo Login
+        run: cargo login ${{ secrets.CRATES_IO_API_TOKEN }}
+      - name: Publish
+        run: cargo publish

@@ -191,9 +191,9 @@ impl fmt::Display for CombineOp {
 /// This enum is used both by individual policies and by combinators to represent the
 /// outcome of access evaluation.
 ///
-/// - [`Granted`]: Indicates that access is granted, with an optional reason.
-/// - [`Denied`]: Indicates that access is denied, along with an explanatory reason.
-/// - [`Combined`]: Represents the aggregate result of combining multiple policies.
+/// - [`PolicyEvalResult::Granted`]: Indicates that access is granted, with an optional reason.
+/// - [`PolicyEvalResult::Denied`]: Indicates that access is denied, along with an explanatory reason.
+/// - [`PolicyEvalResult::Combined`]: Represents the aggregate result of combining multiple policies.
 
 #[derive(Debug, Clone)]
 pub enum PolicyEvalResult {
