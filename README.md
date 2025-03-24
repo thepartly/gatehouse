@@ -87,5 +87,5 @@ See the `examples` directory for complete demonstration of:
 Run with:
 
 ```shell
-cargo run --package permissions --example rbac_policy
+cargo run --example rbac_policy
 ```

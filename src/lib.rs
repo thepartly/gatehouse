@@ -2,8 +2,8 @@
 //! attribute‐based (ABAC), and relationship‐based (ReBAC) policies.
 //! The library provides a generic `Policy` trait for defining custom policies,
 //! a builder pattern for creating custom policies as well as several built-in
-//! policies for common use cases, and combinators (AndPolicy, OrPolicy, NotPolicy) for
-//! composing complex authorization logic.
+//! policies for common use cases, and combinators for composing complex
+//! authorization logic.
 //!
 //! # Overview
 //!
@@ -13,7 +13,13 @@
 //! logic by default (i.e. if any policy grants access, then access is allowed).
 //! The [`PolicyBuilder`] offers a builder pattern for creating custom policies.
 //!
-//! ## Policies
+//! ## Built in Policies
+//! The library provides a few built-in policies:
+//!  - [`RbacPolicy`]: A role-based access control policy.
+//!  - [`AbacPolicy`]: An attribute-based access control policy.
+//!  - [`RebacPolicy`]: A relationship-based access control policy.
+//!
+//! ## Custom Policies
 //!
 //! Below we define a simple system where a user may read a document if they
 //! are an admin (via a simple role-based policy) or if they are the owner of the document (via
@@ -140,16 +146,17 @@
 //! # });
 //! ```
 //!
-//! # Evaluation Tracing
+//! ## Evaluation Tracing
 //!
-//! The permission system provides detailed tracing of policy decisions, see [`AccessEvaluation`]\
+//! The permission system provides detailed tracing of policy decisions, see [`AccessEvaluation`]
 //! for an example.
 //!
 //!
 //! ## Combinators
 //!
 //! Sometimes you may want to require that several policies pass (AND), require that
-//! at least one passes (OR), or even invert a policy (NOT). `permissions` provides:
+//! at least one passes (OR), or even invert a policy (NOT). `gatehouse` provides
+//! combinators for this purpose:
 //!
 //! - [`AndPolicy`]: Grants access only if all inner policies allow access. Otherwise,
 //!   returns a combined error.
@@ -158,12 +165,7 @@
 //! - [`NotPolicy`]: Inverts the decision of an inner policy.
 //!
 //!
-//! ## Built in Policies
-//! The library provides a few built-in policies:
-//!  - [`RbacPolicy`]: A role-based access control policy.
-//!  - [`AbacPolicy`]: An attribute-based access control policy.
-//!  - [`RebacPolicy`]: A relationship-based access control policy.
-//!
+
 #![allow(clippy::type_complexity)]
 use async_trait::async_trait;
 use std::fmt;
@@ -195,7 +197,6 @@ impl fmt::Display for CombineOp {
 /// - [`PolicyEvalResult::Granted`]: Indicates that access is granted, with an optional reason.
 /// - [`PolicyEvalResult::Denied`]: Indicates that access is denied, along with an explanatory reason.
 /// - [`PolicyEvalResult::Combined`]: Represents the aggregate result of combining multiple policies.
-
 #[derive(Debug, Clone)]
 pub enum PolicyEvalResult {
     /// Access granted. Contains the policy type and an optional reason.
@@ -886,7 +887,7 @@ where
 /// assert!(checker.evaluate_access(&user, &Action, &owned_resource, &context).await.is_granted());
 ///
 /// // This check should fail because the user is not the owner:
-/// assert!(checker.evaluate_access(&user, &Action, &other_resource, &context).await.is_granted() == false);
+/// assert!(!checker.evaluate_access(&user, &Action, &other_resource, &context).await.is_granted());
 /// # });
 /// ```
 ///
