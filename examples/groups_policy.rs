@@ -128,7 +128,10 @@ async fn main() {
         .evaluate_access(&subject, &action, &group, &context)
         .await;
     assert!(result.is_granted());
-    println!("Evaluating subject {} with org id {} and group {}", subject.id, subject.authorization_details.id, group.id);
+    println!(
+        "Evaluating subject {} with org id {} and group {}",
+        subject.id, subject.authorization_details.id, group.id
+    );
     println!("{}", result.display_trace());
 
     // [GRANTED] by StaffPolicy - User has staff permission
