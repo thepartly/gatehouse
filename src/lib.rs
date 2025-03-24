@@ -22,7 +22,7 @@
 //! # use uuid::Uuid;
 //! # use async_trait::async_trait;
 //! # use std::sync::Arc;
-//! # use permissions::*;
+//! # use gatehouse::*;
 //!
 //! // Define our core types.
 //! #[derive(Debug, Clone)]
@@ -222,7 +222,7 @@ pub enum PolicyEvalResult {
 ///
 /// The permission system provides detailed tracing of policy decisions:
 /// ```rust
-/// # use permissions::*;
+/// # use gatehouse::*;
 /// # use uuid::Uuid;
 /// #
 /// # // Define simple types for the example
@@ -839,7 +839,7 @@ where
 /// # use async_trait::async_trait;
 /// # use std::sync::Arc;
 /// # use uuid::Uuid;
-/// # use permissions::*;
+/// # use gatehouse::*;
 ///
 /// // Define our core types.
 /// #[derive(Debug, Clone)]
@@ -956,7 +956,7 @@ pub trait RelationshipResolver<S, R>: Send + Sync {
 /// use async_trait::async_trait;
 /// use std::sync::Arc;
 /// use uuid::Uuid;
-/// use permissions::*;
+/// use gatehouse::*;
 ///
 /// #[derive(Debug, Clone)]
 /// pub struct Employee {
