@@ -17,3 +17,6 @@ tokio-test = "0.4"
 axum = "0.8"
 tower = "0.5"
 hyper = "1"
+
+[package.metadata.docs.rs]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
