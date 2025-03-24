@@ -1,21 +1,18 @@
 [package]
-name = "permissions"
+name = "gatehouse"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+license = "Apache-2.0"
+repository = "https://github.com/thepartly/gatehouse"
 
 [dependencies]
-tracing.workspace = true
-uuid = {workspace = true, features = ["serde", "v4"]}
-async-trait = "0.1.85"
-chrono = { version = "0.4.39", features = ["serde"]}
+tracing = "0.1"
+uuid = {version="1", features = ["serde", "v4"]}
+async-trait = "0.1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full", "test-util"] }
-tokio-test = {workspace = true}
-axum = {workspace = true}
-tower = {workspace = true}
-hyper = {workspace = true}
-[lints]
-workspace = true
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-test = "0.4"
+axum = "0.8"
+tower = "0.5"
+hyper = "1"

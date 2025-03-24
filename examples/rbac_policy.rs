@@ -1,16 +1,15 @@
 //! # Role-Based Access Control Policy Example
 //!
 //! This example demonstrates how to use the built-in RBAC policy
-//! for role-based permissions management.
+//! for role-based permission management.
 //!
 //! To run this example:
 //! ```
-//! cargo run --package permissions --example rbac_policy
+//! cargo run --example rbac_policy
 //! ```
 
-use permissions::*;
+use gatehouse::*;
 use std::collections::HashSet;
-use tokio;
 use uuid::Uuid;
 
 // Define types for our permission system

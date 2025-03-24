@@ -5,11 +5,11 @@
 //!
 //! To run this example:
 //! ```
-//! cargo run --package permissions --example combinator_policy
+//! cargo run --example combinator_policy
 //! ```
 
 use async_trait::async_trait;
-use permissions::*;
+use gatehouse::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;

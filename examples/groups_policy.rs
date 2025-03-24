@@ -1,14 +1,11 @@
 use async_trait::async_trait;
-use permissions::*;
-use std::sync::Arc;
+use gatehouse::*;
 use uuid::Uuid;
 
-// Our domain types for this example:
 #[derive(Debug, Clone)]
 struct OrganizationAuthorizationDetails {
     id: Uuid,
     is_org_admin: bool,
-    // For simplicity, assume permissions is a list of scopes:
     permissions: Vec<Permission>,
 }
 
@@ -26,7 +23,6 @@ struct SubjectV2 {
 #[derive(Debug, Clone)]
 struct Group {
     id: Uuid,
-    // additional group fields here...
 }
 
 #[derive(Debug, Clone)]
@@ -65,11 +61,11 @@ impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for OrgAdminP
     }
 }
 
-// Policy that grants access if the user has the `partly_staff` permission.
-struct PartlyStaffPolicy;
+// Policy that grants access if the user has the `staff` permission.
+struct StaffPolicy;
 
 #[async_trait]
-impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for PartlyStaffPolicy {
+impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for StaffPolicy {
     async fn evaluate_access(
         &self,
         subject: &SubjectV2,
@@ -81,22 +77,22 @@ impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for PartlySta
             .authorization_details
             .permissions
             .iter()
-            .any(|p| p.scope == "partly_staff")
+            .any(|p| p.scope == "staff")
         {
             PolicyEvalResult::Granted {
                 policy_type: self.policy_type(),
-                reason: Some("User has partly_staff permission".to_string()),
+                reason: Some("User has staff permission".to_string()),
             }
         } else {
             PolicyEvalResult::Denied {
                 policy_type: self.policy_type(),
-                reason: "User lacks partly_staff permission".to_string(),
+                reason: "User lacks staff permission".to_string(),
             }
         }
     }
 
     fn policy_type(&self) -> String {
-        "PartlyStaffPolicy".to_string()
+        "StaffPolicy".to_string()
     }
 }
 
@@ -105,20 +101,20 @@ fn create_group_management_checker(
 ) -> PermissionChecker<SubjectV2, Group, GroupManagementAction, EmptyContext> {
     let mut checker = PermissionChecker::new();
     checker.add_policy(OrgAdminPolicy);
-    checker.add_policy(PartlyStaffPolicy);
+    checker.add_policy(StaffPolicy);
     checker
 }
 
 #[tokio::main]
 async fn main() {
-    // Example subject with partly_staff but not org admin:
+    // Example subject with staff but not org admin:
     let subject = SubjectV2 {
         id: Uuid::new_v4(),
         authorization_details: OrganizationAuthorizationDetails {
             id: Uuid::new_v4(),
             is_org_admin: false,
             permissions: vec![Permission {
-                scope: "partly_staff".to_string(),
+                scope: "staff".to_string(),
             }],
         },
     };
@@ -132,11 +128,12 @@ async fn main() {
         .evaluate_access(&subject, &action, &group, &context)
         .await;
     assert!(result.is_granted());
+    println!("Evaluating subject {} with org id {} and group {}", subject.id, subject.authorization_details.id, group.id);
     println!("{}", result.display_trace());
 
-    // [GRANTED] by PartlyStaffPolicy - User has partly_staff permission
+    // [GRANTED] by StaffPolicy - User has staff permission
     // Evaluation Trace:
     // ✔ PermissionChecker (OR)
     //   ✘ OrgAdminPolicy DENIED: User is not organization admin
-    //   ✔ PartlyStaffPolicy GRANTED: User has partly_staff permission
+    //   ✔ PartlyStaffPolicy GRANTED: User has staff permission
 }

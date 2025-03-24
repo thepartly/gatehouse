@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use permissions::*;
+use gatehouse::*;
 use std::sync::Arc;
 
 use axum::extract::Request;
@@ -96,7 +96,7 @@ pub struct RequestContext {
 /// --------------------------
 /// We'll create multiple policies that each handle a slice of the logic.
 /// Then we combine them with OR or AND as needed.
-
+///
 /// (A) `AdminOverridePolicy`
 ///     Allows any action on any resource if user has the "admin" role.
 fn admin_override_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
@@ -234,7 +234,7 @@ fn build_permission_checker() -> PermissionChecker<User, Resource, Action, Reque
 // ---------------------------------
 
 async fn view_invoice_handler(
-    Path(invoice_id): Path<String>,
+    Path(_invoice_id): Path<String>,
     Extension(checker): Extension<PermissionChecker<User, Resource, Action, RequestContext>>,
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> impl IntoResponse {
@@ -366,7 +366,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use permissions::AccessEvaluation;
+    use gatehouse::AccessEvaluation;
     use std::time::{Duration, SystemTime};
 
     // Helper to quickly build an invoice with desired properties
@@ -657,8 +657,7 @@ mod integration_tests {
         http::{Request, StatusCode},
         Router,
     };
-    use std::net::SocketAddr;
-    use tower::ServiceExt; // for `oneshot` method
+    use tower::ServiceExt;
 
     fn test_app() -> Router {
         let checker = build_permission_checker();

@@ -163,7 +163,7 @@
 //!  - [`AbacPolicy`]: An attribute-based access control policy.
 //!  - [`RebacPolicy`]: A relationship-based access control policy.
 //!
-
+#![allow(clippy::type_complexity)]
 use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
@@ -1083,7 +1083,7 @@ where
 /// ---
 /// Policy Combinators
 /// ---
-
+///
 /// AndPolicy
 ///
 /// Combines multiple policies with a logical AND. Access is granted only if every
@@ -1276,7 +1276,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_test::assert_err;
 
     // Dummy resource/action/context types for testing
     #[derive(Debug, Clone)]
@@ -1728,13 +1727,6 @@ mod tests {
             AndPolicy::<TestSubject, TestResource, TestAction, TestContext>::try_new(vec![]);
 
         assert!(and_policy_result.is_err());
-
-        let subject = TestSubject {
-            id: uuid::Uuid::new_v4(),
-        };
-        let resource = TestResource {
-            id: uuid::Uuid::new_v4(),
-        };
 
         // Test OrPolicy with no policies
         let or_policy_result =

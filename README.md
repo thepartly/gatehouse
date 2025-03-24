@@ -1,6 +1,9 @@
-# @partly/permissions
+# Gatehouse
 
-> Permissions library
+[![Build status](https://github.com/thepartly/gatehouse/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/thepartly/gatehouse/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/gatehouse)](https://crates.io/crates/gatehouse)
+[![Documentation](https://docs.rs/gatehouse/badge.svg)](https://docs.rs/gatehouse)
+
 
 A flexible authorization library that combines role-based (RBAC), attribute-based (ABAC), and relationship-based (ReBAC) access control policies.
 

@@ -6,14 +6,12 @@
 //!
 //! To run this example:
 //! ```
-//! cargo run --package permissions --example rebac_policy
+//! cargo run --example rebac_policy
 //! ```
 
 use async_trait::async_trait;
-use permissions::*;
-use std::sync::Arc;
+use gatehouse::*;
 use std::time::Duration;
-use tokio;
 use uuid::Uuid;
 
 // Define types for our permission system

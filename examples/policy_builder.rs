@@ -6,9 +6,9 @@
 //!
 //! To run this example:
 //! ```sh
-//! cargo run --package permissions --example policy_builder
+//! cargo run --example policy_builder
 //! ```
-use permissions::*;
+use gatehouse::*;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -97,33 +97,33 @@ async fn main() {
         .evaluate_access(&org1, &(), &(), &"org1".to_string())
         .await;
     println!("Org1 on 'org1': {}", result1);
-    assert_eq!(result1.is_granted(), true);
+    assert!(result1.is_granted());
 
     // 2. org2 should be denied access when the target is "org1".
     let result2 = checker
         .evaluate_access(&org2, &(), &(), &"org1".to_string())
         .await;
     println!("Org2 on 'org1': {}", result2);
-    assert_eq!(result2.is_granted(), false);
+    assert!(!result2.is_granted());
 
     // 3. org2 should be granted access when the target is "org2".
     let result3 = checker
         .evaluate_access(&org2, &(), &(), &"org2".to_string())
         .await;
     println!("Org2 on 'org2': {}", result3);
-    assert_eq!(result3.is_granted(), true);
+    assert!(result3.is_granted());
 
     // 4. org3 should be denied access regardless of the target since it doesn't have the correct permission.
     let result4 = checker
         .evaluate_access(&org3, &(), &(), &"org1".to_string())
         .await;
     println!("Org3 on 'org1': {}", result4);
-    assert_eq!(result4.is_granted(), false);
+    assert!(!result4.is_granted());
 
     // 5. org4 should be granted access since it has global admin permissions
     let result5 = checker
         .evaluate_access(&org4, &(), &(), &"org1".to_string())
         .await;
     println!("Org4 on 'org1': {}", result5);
-    assert_eq!(result5.is_granted(), true);
+    assert!(result5.is_granted());
 }
