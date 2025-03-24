@@ -1,6 +1,6 @@
 [package]
 name = "gatehouse"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/thepartly/gatehouse"
@@ -17,6 +17,10 @@ tokio-test = "0.4"
 axum = "0.8"
 tower = "0.5"
 hyper = "1"
+
+[[example]]
+name = "axum"
+doc-scrape-examples = true
 
 [package.metadata.docs.rs]
 # Scape examples from the documentation.

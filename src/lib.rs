@@ -11,6 +11,7 @@
 //! perform an action on a resource within a given context. Policies implement the
 //! [`Policy`] trait. A [`PermissionChecker`] aggregates multiple policies and uses OR
 //! logic by default (i.e. if any policy grants access, then access is allowed).
+//! The [`PolicyBuilder`] offers a builder pattern for creating custom policies.
 //!
 //! ## Policies
 //!
@@ -205,7 +206,7 @@ pub enum PolicyEvalResult {
     /// Access denied. Contains the policy type and a reason.
     Denied { policy_type: String, reason: String },
     /// Combined result from multiple policy evaluations.
-    /// Contains the policy type, the combining operation (e.g. "AND", "OR", "NOT"),
+    /// Contains the policy type, the combining operation ([`CombineOp`]),
     /// a list of child evaluation results, and the overall outcome.
     Combined {
         policy_type: String,
@@ -648,9 +649,9 @@ where
 
 /// A builder API for creating custom policies.
 ///
-/// The [`PolicyBuilder`] offers a fluent interface to combine predicate functions
-/// on the subject, action, resource, and context. Use it to construct a policy that
-/// can be added to a [`PermissionChecker`].
+/// A fluent interface to combine predicate functions on the subject, action, resource,
+/// and context. Use it to construct a policy that can be added to a [`PermissionChecker`].
+///
 pub struct PolicyBuilder<S, R, A, C>
 where
     S: Send + Sync + 'static,
