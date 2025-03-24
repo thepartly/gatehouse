@@ -750,11 +750,11 @@ where
         let extra_condition = self.extra_condition;
 
         let predicate = Box::new(move |s: &Subject, a: &Action, r: &Resource, c: &Context| {
-            subject_pred.as_ref().map_or(true, |f| f(s))
-                && action_pred.as_ref().map_or(true, |f| f(a))
-                && resource_pred.as_ref().map_or(true, |f| f(r))
-                && context_pred.as_ref().map_or(true, |f| f(c))
-                && extra_condition.as_ref().map_or(true, |f| f(s, a, r, c))
+            subject_pred.as_ref().is_none_or(|f| f(s))
+                && action_pred.as_ref().is_none_or(|f| f(a))
+                && resource_pred.as_ref().is_none_or(|f| f(r))
+                && context_pred.as_ref().is_none_or(|f| f(c))
+                && extra_condition.as_ref().is_none_or(|f| f(s, a, r, c))
         });
 
         Box::new(InternalPolicy {
