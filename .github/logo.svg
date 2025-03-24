@@ -1,0 +1,25 @@
+<!-- gatehouse_logo.svg -->
+<svg
+        version="1.1"
+        width="160"
+        height="160"
+        viewBox="0 0 160 160"
+        xmlns="http://www.w3.org/2000/svg"
+>
+
+    <!-- Castle towers (left + right) -->
+    <rect x="20" y="40" width="30" height="60" fill="#6D4C41" rx="4"/>
+    <rect x="110" y="40" width="30" height="60" fill="#6D4C41" rx="4"/>
+
+    <!-- Main gate body -->
+    <rect x="50" y="30" width="60" height="70" fill="#8D6E63" rx="4" />
+
+    <!-- Arched gate entry: a simple path with an arch cutout -->
+    <path
+            d="M60,100
+       v-10
+       a20,20 0 0 1 40,0
+       v10
+       z"
+    />
+</svg>
