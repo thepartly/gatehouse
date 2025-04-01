@@ -90,3 +90,34 @@ Run with:
 ```shell
 cargo run --example rbac_policy
 ```
+
+Below is an updated section you can add to your README (e.g., at the bottom) to document the Docker build and run process. It also notes that a screenshot of a successful build is available in the `image/screenshots` folder.
+
+---
+
+## Docker
+
+You can build and run the Axum example using Docker. Make sure the Dockerfile is placed in the root of the repository (alongside `Cargo.toml`, `Cargo.lock`, `src/`, and `examples/`).
+
+### Build the Docker Image
+
+Open a terminal in your project root and run:
+
+```bash
+docker build -t gatehouse-axum .
+```
+
+### Run the Docker Container
+
+After building the image, run the container with:
+
+```bash
+docker run -p 8000:8000 gatehouse-axum 
+```
+
+This command maps port 8000 of your container to port 8000 on your host, allowing you to access the Axum service at [http://localhost:8000](http://localhost:8000).
+
+> **Note:** A screenshot showing a successful build and container run is available at `image/screenshots`.
+
+---
+
