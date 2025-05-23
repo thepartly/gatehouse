@@ -23,7 +23,7 @@ name = "axum"
 doc-scrape-examples = true
 
 [package.metadata.docs.rs]
-# Scape examples from the documentation.
+# Scrape examples from the documentation.
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 
 # We want to document all features.
