@@ -153,6 +153,23 @@ async fn approve_payment_allows_finance_manager() {
 }
 
 #[tokio::test]
+async fn approve_payment_allows_reapproving() {
+    let payment_id = Uuid::new_v4();
+    let app = axum_app();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/payments/{payment_id}/approve"))
+        .header("x-roles", "finance_manager")
+        .header("x-payment-approved", "true")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn approve_payment_denies_regular_user() {
     let payment_id = Uuid::new_v4();
     let app = axum_app();

@@ -283,6 +283,7 @@ fn invoice_editing_policy() -> Box<dyn Policy<User, Resource, Action, RequestCon
 ///       - It's a `Payment` resource
 ///       - Action is `Action::ApprovePayment`
 ///       - The user has "finance_manager" (or "admin", but we have AdminOverride separately)
+///       - The payment has not been refunded (already-approved payments can be re-approved)
 fn payment_approve_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
     PolicyBuilder::<User, Resource, Action, RequestContext>::new("PaymentApprovePolicy")
         .when(|user, action, resource, _ctx| match resource {
@@ -290,7 +291,6 @@ fn payment_approve_policy() -> Box<dyn Policy<User, Resource, Action, RequestCon
                 matches!(action, Action::ApprovePayment)
                     && user.roles.contains(&"finance_manager".to_string())
                     && !payment.is_refunded
-                    && !payment.approved
             }
             _ => false,
         })
@@ -663,6 +663,31 @@ mod tests {
         assert!(
             result.is_granted(),
             "PaymentApprovePolicy should allow finance_manager to approve"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_payment_approve_finance_manager_idempotent() {
+        let checker = build_permission_checker();
+
+        let user = User {
+            id: Uuid::new_v4(),
+            roles: vec!["finance_manager".to_string()],
+        };
+        let payment = make_payment(
+            Uuid::new_v4(),
+            /*is_refunded=*/ false,
+            /*approved=*/ true,
+        );
+        let resource = Resource::Payment(payment);
+
+        let result = checker
+            .evaluate_access(&user, &Action::ApprovePayment, &resource, &context_now())
+            .await;
+
+        assert!(
+            result.is_granted(),
+            "PaymentApprovePolicy should allow finance_manager to re-approve",
         );
     }
 
