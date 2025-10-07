@@ -1,38 +1,38 @@
-//! Actix Web example showcasing how to plug Gatehouse policies into
-//! request handlers. The server exposes three routes:
-//!
-//! - `PUT /posts/{id}` edits a blog post if the author is allowed.
-//! - `POST /posts/{id}/publish` publishes a post for editors.
-//! - `GET /posts/{id}` reads a post when it is public or the caller is privileged.
-//!
-//! Try it with curl:
-//!
-//! ```bash
-//! # Author editing their own draft succeeds
-//! curl -i -X PUT http://127.0.0.1:8080/posts/11111111-1111-1111-1111-111111111111 \
-//!   -H "x-user-id: 11111111-1111-1111-1111-111111111111" \
-//!   -H "x-roles: author"
-//!
-//! # Publishing requires the `editor` role
-//! curl -i -X POST http://127.0.0.1:8080/posts/11111111-1111-1111-1111-111111111111 \
-//!   -H "x-user-id: 22222222-2222-2222-2222-222222222222" \
-//!   -H "x-roles: editor"
-//!
-//! # Viewing a published post works for anonymous users as well
-//! curl -i http://127.0.0.1:8080/posts/00000000-0000-0000-0000-000000000000
-//! ```
-//!
-//! The example uses the [`PolicyBuilder`] to compose a few policies and
-//! stores them inside a shared [`PermissionChecker`]. Each handler pulls the
-//! checker from Actix Web's `Data` extractor and evaluates the request before
-//! continuing.
+// Actix Web example showcasing how to plug Gatehouse policies into
+// request handlers. The server exposes three routes:
+//
+// - `PUT /posts/{id}` edits a blog post if the author is allowed.
+// - `POST /posts/{id}/publish` publishes a post for editors.
+// - `GET /posts/{id}` reads a post when it is public or the caller is privileged.
+//
+// Try it with curl:
+//
+// ```bash
+// # Author editing their own draft succeeds
+// curl -i -X PUT http://127.0.0.1:8080/posts/11111111-1111-1111-1111-111111111111 \
+//   -H "x-user-id: 11111111-1111-1111-1111-111111111111" \
+//   -H "x-roles: author"
+//
+// # Publishing requires the `editor` role
+// curl -i -X POST http://127.0.0.1:8080/posts/11111111-1111-1111-1111-111111111111 \
+//   -H "x-user-id: 22222222-2222-2222-2222-222222222222" \
+//   -H "x-roles: editor"
+//
+// # Viewing a published post works for anonymous users as well
+// curl -i http://127.0.0.1:8080/posts/00000000-0000-0000-0000-000000000000
+// ```
+//
+// The example uses the [`PolicyBuilder`] to compose a few policies and
+// stores them inside a shared [`PermissionChecker`]. Each handler pulls the
+// checker from Actix Web's `Data` extractor and evaluates the request before
+// continuing.
 
 use actix_web::{
-    dev::Payload,
-    web, App, FromRequest, HttpRequest, HttpResponse, HttpServer, Responder,
+    dev::Payload, web, App, FromRequest, HttpRequest, HttpResponse, HttpServer, Responder,
 };
-use gatehouse::{AccessEvaluation, PermissionChecker, Policy, PolicyBuilder};
+use gatehouse::{AccessEvaluation, AndPolicy, PermissionChecker, Policy, PolicyBuilder};
 use std::future::{ready, Ready};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
@@ -76,6 +76,61 @@ impl FromRequest for AuthenticatedUser {
 
         let user = User { id, roles };
         ready(Ok(AuthenticatedUser(user)))
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PostOverrides {
+    locked: Option<bool>,
+    published: Option<bool>,
+    age_days: Option<u64>,
+}
+
+impl PostOverrides {
+    pub fn from_request(req: &HttpRequest) -> Self {
+        let locked = req
+            .headers()
+            .get("x-post-locked")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_bool);
+
+        let published = req
+            .headers()
+            .get("x-post-published")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_bool);
+
+        let age_days = req
+            .headers()
+            .get("x-post-age-days")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.parse::<u64>().ok());
+
+        Self {
+            locked,
+            published,
+            age_days,
+        }
+    }
+
+    fn locked_or(&self, default: bool) -> bool {
+        self.locked.unwrap_or(default)
+    }
+
+    fn published_or(&self, default: bool) -> bool {
+        self.published.unwrap_or(default)
+    }
+
+    fn age_days_or(&self, default: u64) -> u64 {
+        self.age_days.unwrap_or(default)
     }
 }
 
@@ -129,20 +184,22 @@ fn author_can_edit_policy() -> Box<dyn Policy<User, Resource, Action, RequestCon
 fn draft_recency_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
     const MAX_AGE: u64 = 30 * 24 * 60 * 60; // 30 days
     PolicyBuilder::<User, Resource, Action, RequestContext>::new("DraftRecencyWindow")
-        .when(move |_user, action, resource, ctx| match (action, resource) {
-            (Action::Edit, Resource::Post(post)) => {
-                if post.published_at.is_some() {
-                    return false;
-                }
+        .when(
+            move |_user, action, resource, ctx| match (action, resource) {
+                (Action::Edit, Resource::Post(post)) => {
+                    if post.published_at.is_some() {
+                        return false;
+                    }
 
-                ctx.current_time
-                    .duration_since(post.created_at)
-                    .unwrap_or_default()
-                    .as_secs()
-                    <= MAX_AGE
-            }
-            _ => false,
-        })
+                    ctx.current_time
+                        .duration_since(post.created_at)
+                        .unwrap_or_default()
+                        .as_secs()
+                        <= MAX_AGE
+                }
+                _ => false,
+            },
+        )
         .build()
 }
 
@@ -172,11 +229,17 @@ fn published_posts_are_public() -> Box<dyn Policy<User, Resource, Action, Reques
         .build()
 }
 
-fn build_permission_checker() -> PermissionChecker<User, Resource, Action, RequestContext> {
+pub fn build_permission_checker() -> PermissionChecker<User, Resource, Action, RequestContext> {
     let mut checker = PermissionChecker::new();
     checker.add_policy(admin_override_policy());
-    checker.add_policy(author_can_edit_policy());
-    checker.add_policy(draft_recency_policy());
+
+    let combined_edit_policy = AndPolicy::try_new(vec![
+        Arc::from(author_can_edit_policy()),
+        Arc::from(draft_recency_policy()),
+    ])
+    .expect("Edit policy should contain at least one rule");
+    checker.add_policy(combined_edit_policy);
+
     checker.add_policy(editors_can_publish());
     checker.add_policy(published_posts_are_public());
     checker
@@ -186,34 +249,42 @@ fn build_permission_checker() -> PermissionChecker<User, Resource, Action, Reque
 // 3) Helpers for Mocked Resources
 // -------------------------------
 
-fn load_post(post_id: Uuid) -> BlogPost {
-    let created_at = SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
+pub fn load_post(post_id: Uuid, overrides: &PostOverrides) -> BlogPost {
+    let created_at =
+        SystemTime::now() - Duration::from_secs(overrides.age_days_or(7) * 24 * 60 * 60);
     BlogPost {
         id: post_id,
         author_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
-        locked: false,
-        published_at: None,
+        locked: overrides.locked_or(false),
+        published_at: if overrides.published_or(false) {
+            Some(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
+        } else {
+            None
+        },
         created_at,
     }
 }
 
-fn load_published_post(post_id: Uuid) -> BlogPost {
-    BlogPost {
-        published_at: Some(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60)),
-        ..load_post(post_id)
+pub fn load_published_post(post_id: Uuid, overrides: &PostOverrides) -> BlogPost {
+    let mut overrides = overrides.clone();
+    if overrides.published.is_none() {
+        overrides.published = Some(true);
     }
+    load_post(post_id, &overrides)
 }
 
 // -------------------------
 // 4) Actix Web Handlers
 // -------------------------
 
-async fn edit_post(
+pub async fn edit_post(
     path: web::Path<Uuid>,
+    req: HttpRequest,
     AuthenticatedUser(user): AuthenticatedUser,
     checker: web::Data<PermissionChecker<User, Resource, Action, RequestContext>>,
 ) -> impl Responder {
-    let post = load_post(*path);
+    let overrides = PostOverrides::from_request(&req);
+    let post = load_post(*path, &overrides);
     let ctx = RequestContext {
         current_time: SystemTime::now(),
     };
@@ -223,17 +294,20 @@ async fn edit_post(
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post updated"),
-        AccessEvaluation::Denied { reason, trace } => HttpResponse::Forbidden()
-            .body(format!("Denied: {}\n{}", reason, trace.format())),
+        AccessEvaluation::Denied { reason, trace } => {
+            HttpResponse::Forbidden().body(format!("Denied: {}\n{}", reason, trace.format()))
+        }
     }
 }
 
-async fn publish_post(
+pub async fn publish_post(
     path: web::Path<Uuid>,
+    req: HttpRequest,
     AuthenticatedUser(user): AuthenticatedUser,
     checker: web::Data<PermissionChecker<User, Resource, Action, RequestContext>>,
 ) -> impl Responder {
-    let post = load_post(*path);
+    let overrides = PostOverrides::from_request(&req);
+    let post = load_post(*path, &overrides);
     let ctx = RequestContext {
         current_time: SystemTime::now(),
     };
@@ -243,13 +317,15 @@ async fn publish_post(
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post published"),
-        AccessEvaluation::Denied { reason, trace } => HttpResponse::Forbidden()
-            .body(format!("Denied: {}\n{}", reason, trace.format())),
+        AccessEvaluation::Denied { reason, trace } => {
+            HttpResponse::Forbidden().body(format!("Denied: {}\n{}", reason, trace.format()))
+        }
     }
 }
 
-async fn view_post(
+pub async fn view_post(
     path: web::Path<Uuid>,
+    req: HttpRequest,
     maybe_user: Option<AuthenticatedUser>,
     checker: web::Data<PermissionChecker<User, Resource, Action, RequestContext>>,
 ) -> impl Responder {
@@ -260,7 +336,8 @@ async fn view_post(
             roles: vec![],
         });
 
-    let post = load_published_post(*path);
+    let overrides = PostOverrides::from_request(&req);
+    let post = load_published_post(*path, &overrides);
     let ctx = RequestContext {
         current_time: SystemTime::now(),
     };
@@ -270,8 +347,9 @@ async fn view_post(
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Here is your post"),
-        AccessEvaluation::Denied { reason, trace } => HttpResponse::Forbidden()
-            .body(format!("Denied: {}\n{}", reason, trace.format())),
+        AccessEvaluation::Denied { reason, trace } => {
+            HttpResponse::Forbidden().body(format!("Denied: {}\n{}", reason, trace.format()))
+        }
     }
 }
 
