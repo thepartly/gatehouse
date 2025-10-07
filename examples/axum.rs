@@ -1,17 +1,15 @@
-//! Axum service that authorizes multiple resource types (Invoices, Payments)
-//! using a single PermissionChecker. Demonstrates multiple policies and actions.
+// Axum service that authorizes multiple resource types (Invoices, Payments)
+// using a single PermissionChecker. Demonstrates multiple policies and actions.
 
 use axum::{
-    extract::{Extension, Path},
-    http::StatusCode,
+    extract::{Extension, FromRequestParts, Path},
+    http::{request::Parts, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
 use gatehouse::*;
 use std::sync::Arc;
-
-use axum::extract::Request;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
@@ -28,19 +26,126 @@ pub struct User {
 #[derive(Debug, Clone)]
 pub struct AuthenticatedUser(pub User);
 
-impl<S> axum::extract::FromRequest<S> for AuthenticatedUser
+impl<S> FromRequestParts<S> for AuthenticatedUser
 where
     S: Send + Sync,
 {
     type Rejection = (StatusCode, String);
 
-    async fn from_request(_req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        // logic for extracting a user (e.g. decode a token, etc.)
-        let user = User {
-            id: Uuid::new_v4(),
-            roles: vec!["admin".to_string()],
-        };
-        Ok(AuthenticatedUser(user))
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let id = parts
+            .headers
+            .get("x-user-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap_or_else(Uuid::nil);
+
+        let roles = parts
+            .headers
+            .get("x-roles")
+            .and_then(|value| value.to_str().ok())
+            .map(|raw| {
+                raw.split(',')
+                    .map(|role| role.trim().to_ascii_lowercase())
+                    .filter(|role| !role.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec!["viewer".to_string()]);
+
+        Ok(AuthenticatedUser(User { id, roles }))
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct InvoiceOverrides {
+    locked: Option<bool>,
+    age_days: Option<u64>,
+}
+
+impl InvoiceOverrides {
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        let locked = headers
+            .get("x-invoice-locked")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_bool);
+
+        let age_days = headers
+            .get("x-invoice-age-days")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.parse::<u64>().ok());
+
+        Self { locked, age_days }
+    }
+
+    fn build_invoice(&self, invoice_id: Uuid) -> Invoice {
+        Invoice {
+            id: invoice_id,
+            owner_id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            locked: self.locked.unwrap_or(false),
+            created_at: SystemTime::now()
+                - Duration::from_secs(self.age_days.unwrap_or(10) * 24 * 60 * 60),
+        }
+    }
+}
+
+impl<S> FromRequestParts<S> for InvoiceOverrides
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self::from_headers(&parts.headers))
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PaymentOverrides {
+    refunded: Option<bool>,
+    approved: Option<bool>,
+}
+
+impl PaymentOverrides {
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        let refunded = headers
+            .get("x-payment-refunded")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_bool);
+
+        let approved = headers
+            .get("x-payment-approved")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_bool);
+
+        Self { refunded, approved }
+    }
+
+    fn build_payment(&self, payment_id: Uuid) -> Payment {
+        Payment {
+            id: payment_id,
+            invoice_id: Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+            is_refunded: self.refunded.unwrap_or(false),
+            approved: self.approved.unwrap_or(false),
+        }
+    }
+}
+
+impl<S> FromRequestParts<S> for PaymentOverrides
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self::from_headers(&parts.headers))
     }
 }
 
@@ -178,12 +283,14 @@ fn invoice_editing_policy() -> Box<dyn Policy<User, Resource, Action, RequestCon
 ///       - It's a `Payment` resource
 ///       - Action is `Action::ApprovePayment`
 ///       - The user has "finance_manager" (or "admin", but we have AdminOverride separately)
+///       - The payment has not been refunded (already-approved payments can be re-approved)
 fn payment_approve_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
     PolicyBuilder::<User, Resource, Action, RequestContext>::new("PaymentApprovePolicy")
         .when(|user, action, resource, _ctx| match resource {
-            Resource::Payment(_payment) => {
+            Resource::Payment(payment) => {
                 matches!(action, Action::ApprovePayment)
                     && user.roles.contains(&"finance_manager".to_string())
+                    && !payment.is_refunded
             }
             _ => false,
         })
@@ -215,7 +322,7 @@ fn payment_refund_policy() -> Box<dyn Policy<User, Resource, Action, RequestCont
 /// (E) Combine all relevant policies into a single `PermissionChecker`.
 ///     The checker uses OR semantics by default: if ANY policy returns Granted,
 ///     the request is allowed.
-fn build_permission_checker() -> PermissionChecker<User, Resource, Action, RequestContext> {
+pub fn build_permission_checker() -> PermissionChecker<User, Resource, Action, RequestContext> {
     let mut checker = PermissionChecker::new();
 
     // We add them in the order we want them to be evaluated,
@@ -233,18 +340,14 @@ fn build_permission_checker() -> PermissionChecker<User, Resource, Action, Reque
 // 3) Using in Axum Route Handlers
 // ---------------------------------
 
-async fn view_invoice_handler(
-    Path(_invoice_id): Path<String>,
+pub async fn view_invoice_handler(
+    Path(invoice_id): Path<Uuid>,
     Extension(checker): Extension<PermissionChecker<User, Resource, Action, RequestContext>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    overrides: InvoiceOverrides,
 ) -> impl IntoResponse {
     // Simulate DB fetch
-    let invoice = Invoice {
-        id: Uuid::new_v4(),
-        owner_id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(), // Example
-        locked: false,
-        created_at: SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60), // 10 days old
-    };
+    let invoice = overrides.build_invoice(invoice_id);
 
     if checker
         .evaluate_access(
@@ -268,18 +371,14 @@ async fn view_invoice_handler(
     }
 }
 
-async fn edit_invoice_handler(
+pub async fn edit_invoice_handler(
     Path(invoice_id): Path<Uuid>,
     Extension(checker): Extension<PermissionChecker<User, Resource, Action, RequestContext>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    overrides: InvoiceOverrides,
 ) -> impl IntoResponse {
     // Simulate DB fetch
-    let invoice = Invoice {
-        id: invoice_id,
-        owner_id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(), // Example
-        locked: false,
-        created_at: SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60), // 10 days old
-    };
+    let invoice = overrides.build_invoice(invoice_id);
 
     let resource = Resource::Invoice(invoice);
     let action = Action::Edit;
@@ -303,18 +402,15 @@ async fn edit_invoice_handler(
     }
 }
 
-async fn approve_payment_handler(
+pub async fn approve_payment_handler(
     Path(payment_id): Path<Uuid>,
     Extension(checker): Extension<PermissionChecker<User, Resource, Action, RequestContext>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     // Simulate DB fetch
-    let payment = Payment {
-        id: payment_id,
-        invoice_id: Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(), // Example
-        is_refunded: false,
-        approved: false,
-    };
+    let overrides = PaymentOverrides::from_headers(&headers);
+    let payment = overrides.build_payment(payment_id);
 
     let resource = Resource::Payment(payment);
     let action = Action::ApprovePayment;
@@ -571,6 +667,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_payment_approve_finance_manager_idempotent() {
+        let checker = build_permission_checker();
+
+        let user = User {
+            id: Uuid::new_v4(),
+            roles: vec!["finance_manager".to_string()],
+        };
+        let payment = make_payment(
+            Uuid::new_v4(),
+            /*is_refunded=*/ false,
+            /*approved=*/ true,
+        );
+        let resource = Resource::Payment(payment);
+
+        let result = checker
+            .evaluate_access(&user, &Action::ApprovePayment, &resource, &context_now())
+            .await;
+
+        assert!(
+            result.is_granted(),
+            "PaymentApprovePolicy should allow finance_manager to re-approve",
+        );
+    }
+
+    #[tokio::test]
     async fn test_payment_approve_denied_for_regular_user() {
         let checker = build_permission_checker();
 
@@ -674,40 +795,30 @@ mod integration_tests {
         let req = Request::builder()
             .method("POST")
             .uri("/invoices/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/edit")
+            .header("x-roles", "admin")
             .body(Body::empty())
             .unwrap();
 
         let response = app.clone().oneshot(req).await.unwrap();
-        // Because from_request always sets user as admin in this example, we expect 200 OK
+        // With the admin role header set we expect 200 OK
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_edit_invoice_handler_denies_regular_user_if_locked() {
-        // Suppose we want to forcibly pretend the user is not admin.
-        // For demonstration, we can modify the `from_request` extraction or create
-        // a separate test route. But with the current code, user is always admin.
-        // In a real app, you'd have a token with roles, etc.
-        //
-        // As a workaround, let's show how you'd do it if from_request used a shared state or override.
-
-        // For simplicity, we'll just test the normal route with the default "admin user".
-        // That means it's always allowed. So, let's just demonstrate the structure here:
-
         let app = test_app();
 
         let req = Request::builder()
             .method("POST")
             .uri("/invoices/cccccccc-cccc-cccc-cccc-cccccccccccc/edit")
+            .header("x-user-id", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+            .header("x-roles", "author")
+            .header("x-invoice-locked", "true")
             .body(Body::empty())
             .unwrap();
 
         let response = app.clone().oneshot(req).await.unwrap();
 
-        // Because in our sample extraction we always set the user as admin,
-        // the invoice editing would be allowed. So we'd see 200 OK again.
-        // In a real test environment, you'd mock or override the user roles.
-
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
