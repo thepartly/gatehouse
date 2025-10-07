@@ -17,9 +17,14 @@ tokio-test = "0.4"
 axum = "0.8"
 tower = "0.5"
 hyper = "1"
+actix-web = "4"
 
 [[example]]
 name = "axum"
+doc-scrape-examples = true
+
+[[example]]
+name = "actix_web"
 doc-scrape-examples = true
 
 [package.metadata.docs.rs]

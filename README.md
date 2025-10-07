@@ -80,10 +80,12 @@ NotPolicy: Inverts the decision of an inner policy
 
 ## Examples
 
-See the `examples` directory for complete demonstration of:
+See the `examples` directory for complete demonstrations of:
 - Role-based access control (`rbac_policy`)
 - Relationship-based access control (`rebac_policy`)
 - Policy combinators (`combinator_policy`)
+- Axum integration with shared policies (`axum`)
+- Actix Web integration with shared policies (`actix_web`)
 
 Run with:
 
