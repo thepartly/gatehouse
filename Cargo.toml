@@ -18,6 +18,11 @@ axum = "0.8"
 tower = "0.5"
 hyper = "1"
 actix-web = "4"
+criterion = { version = "0.5" }
+
+[[bench]]
+name = "permission_checker"
+harness = false
 
 [[example]]
 name = "axum"
