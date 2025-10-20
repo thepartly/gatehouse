@@ -171,6 +171,120 @@ use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
 
+const DEFAULT_SECURITY_RULE_CATEGORY: &str = "Access Control";
+const PERMISSION_CHECKER_POLICY_TYPE: &str = "PermissionChecker";
+
+/// Metadata describing the security rule associated with a [`Policy`].
+///
+/// These fields follow the OpenTelemetry semantic conventions for security
+/// rules: <https://opentelemetry.io/docs/specs/semconv/registry/attributes/security-rule/>.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecurityRuleMetadata {
+    name: Option<String>,
+    category: Option<String>,
+    description: Option<String>,
+    reference: Option<String>,
+    ruleset_name: Option<String>,
+    uuid: Option<String>,
+    version: Option<String>,
+    license: Option<String>,
+}
+
+impl SecurityRuleMetadata {
+    /// Creates an empty metadata container.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the `security_rule.name` attribute.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the `security_rule.category` attribute.
+    pub fn with_category(mut self, category: impl Into<String>) -> Self {
+        self.category = Some(category.into());
+        self
+    }
+
+    /// Sets the `security_rule.description` attribute.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Sets the `security_rule.reference` attribute.
+    pub fn with_reference(mut self, reference: impl Into<String>) -> Self {
+        self.reference = Some(reference.into());
+        self
+    }
+
+    /// Sets the `security_rule.ruleset.name` attribute.
+    pub fn with_ruleset_name(mut self, ruleset_name: impl Into<String>) -> Self {
+        self.ruleset_name = Some(ruleset_name.into());
+        self
+    }
+
+    /// Sets the `security_rule.uuid` attribute.
+    pub fn with_uuid(mut self, uuid: impl Into<String>) -> Self {
+        self.uuid = Some(uuid.into());
+        self
+    }
+
+    /// Sets the `security_rule.version` attribute.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Sets the `security_rule.license` attribute.
+    pub fn with_license(mut self, license: impl Into<String>) -> Self {
+        self.license = Some(license.into());
+        self
+    }
+
+    /// Returns the configured `security_rule.name` value.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Returns the configured `security_rule.category` value.
+    pub fn category(&self) -> Option<&str> {
+        self.category.as_deref()
+    }
+
+    /// Returns the configured `security_rule.description` value.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Returns the configured `security_rule.reference` value.
+    pub fn reference(&self) -> Option<&str> {
+        self.reference.as_deref()
+    }
+
+    /// Returns the configured `security_rule.ruleset.name` value.
+    pub fn ruleset_name(&self) -> Option<&str> {
+        self.ruleset_name.as_deref()
+    }
+
+    /// Returns the configured `security_rule.uuid` value.
+    pub fn uuid(&self) -> Option<&str> {
+        self.uuid.as_deref()
+    }
+
+    /// Returns the configured `security_rule.version` value.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// Returns the configured `security_rule.license` value.
+    pub fn license(&self) -> Option<&str> {
+        self.license.as_deref()
+    }
+}
+
 /// The type of boolean combining operation a policy might represent.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CombineOp {
@@ -462,6 +576,15 @@ pub trait Policy<Subject, Resource, Action, Context>: Send + Sync {
 
     /// Policy name for debugging
     fn policy_type(&self) -> String;
+
+    /// Metadata describing the security rule that backs this policy.
+    ///
+    /// Implementors can override this method to surface additional semantic
+    /// information. The default implementation returns empty metadata which
+    /// still allows downstream telemetry to fall back to the policy type.
+    fn security_rule(&self) -> SecurityRuleMetadata {
+        SecurityRuleMetadata::default()
+    }
 }
 
 /// A container for multiple policies, applied in an "OR" fashion.
@@ -511,7 +634,7 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
         if self.policies.is_empty() {
             tracing::debug!("No policies configured");
             let result = PolicyEvalResult::Denied {
-                policy_type: "PermissionChecker".to_string(),
+                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
                 reason: "No policies configured".to_string(),
             };
 
@@ -526,24 +649,56 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
 
         // Evaluate each policy
         for policy in &self.policies {
+            let policy_type = policy.policy_type();
+            let policy_type_str = policy_type.as_str();
+            let metadata = policy.security_rule();
             let result = policy
                 .evaluate_access(subject, action, resource, context)
                 .await;
             let result_passes = result.is_granted();
+            let reason = result.reason();
+            let reason_str = reason.as_deref();
+            let rule_name = metadata.name().unwrap_or(policy_type_str);
+            let category = metadata
+                .category()
+                .unwrap_or(DEFAULT_SECURITY_RULE_CATEGORY);
+            let ruleset_name = metadata
+                .ruleset_name()
+                .unwrap_or(PERMISSION_CHECKER_POLICY_TYPE);
+            let event_outcome = if result_passes { "success" } else { "failure" };
+
+            tracing::trace!(
+                target: "gatehouse::security",
+                {
+                    security_rule.name = rule_name,
+                    security_rule.category = category,
+                    security_rule.description = metadata.description(),
+                    security_rule.reference = metadata.reference(),
+                    security_rule.ruleset.name = ruleset_name,
+                    security_rule.uuid = metadata.uuid(),
+                    security_rule.version = metadata.version(),
+                    security_rule.license = metadata.license(),
+                    event.outcome = event_outcome,
+                    policy.type = policy_type_str,
+                    policy.result.reason = reason_str,
+                },
+                "Security rule evaluated"
+            );
+
             policy_results.push(result.clone());
 
             // If any policy allows access, return immediately
             if result_passes {
                 let combined = PolicyEvalResult::Combined {
-                    policy_type: "PermissionChecker".to_string(),
+                    policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
                     operation: CombineOp::Or,
                     children: policy_results,
                     outcome: true,
                 };
 
                 return AccessEvaluation::Granted {
-                    policy_type: policy.policy_type(),
-                    reason: result.reason(),
+                    policy_type,
+                    reason,
                     trace: EvalTrace::with_root(combined),
                 };
             }
@@ -552,7 +707,7 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
         // If all policies denied access
         tracing::trace!("No policies allowed access, returning Forbidden");
         let combined = PolicyEvalResult::Combined {
-            policy_type: "PermissionChecker".to_string(),
+            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
             operation: CombineOp::Or,
             children: policy_results,
             outcome: false,
@@ -645,6 +800,10 @@ where
 
     fn policy_type(&self) -> String {
         (**self).policy_type()
+    }
+
+    fn security_rule(&self) -> SecurityRuleMetadata {
+        (**self).security_rule()
     }
 }
 
@@ -1295,6 +1454,28 @@ mod tests {
 
     #[derive(Debug, Clone)]
     pub struct TestContext;
+
+    #[test]
+    fn security_rule_metadata_builder_sets_fields() {
+        let metadata = SecurityRuleMetadata::new()
+            .with_name("Example")
+            .with_category("Access Control")
+            .with_description("Example description")
+            .with_reference("https://example.com/rule")
+            .with_ruleset_name("ExampleRuleset")
+            .with_uuid("1234")
+            .with_version("1.0.0")
+            .with_license("Apache-2.0");
+
+        assert_eq!(metadata.name(), Some("Example"));
+        assert_eq!(metadata.category(), Some("Access Control"));
+        assert_eq!(metadata.description(), Some("Example description"));
+        assert_eq!(metadata.reference(), Some("https://example.com/rule"));
+        assert_eq!(metadata.ruleset_name(), Some("ExampleRuleset"));
+        assert_eq!(metadata.uuid(), Some("1234"));
+        assert_eq!(metadata.version(), Some("1.0.0"));
+        assert_eq!(metadata.license(), Some("Apache-2.0"));
+    }
 
     // A policy that always allows
     struct AlwaysAllowPolicy;

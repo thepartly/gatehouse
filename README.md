@@ -92,3 +92,9 @@ Run with:
 ```shell
 cargo run --example rbac_policy
 ```
+
+## Performance
+
+Criterion benchmarks in `benches/permission_checker.rs` exercise `PermissionChecker::evaluate_access` across
+several policy stack sizes. Run them with `cargo bench` to track changes in evaluation latency as you evolve
+your policy definitions.
