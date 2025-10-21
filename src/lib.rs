@@ -654,12 +654,43 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
                 .await;
             let result_passes = result.is_granted();
 
+            // Extract metadata for tracing (always needed for security audit)
+            let policy_type = policy.policy_type();
+            let policy_type_str = policy_type.as_str();
+            let metadata = policy.security_rule();
+            let reason = result.reason();
+            let reason_str = reason.as_deref();
+            let rule_name = metadata.name().unwrap_or(policy_type_str);
+            let category = metadata
+                .category()
+                .unwrap_or(DEFAULT_SECURITY_RULE_CATEGORY);
+            let ruleset_name = metadata
+                .ruleset_name()
+                .unwrap_or(PERMISSION_CHECKER_POLICY_TYPE);
+            let event_outcome = if result_passes { "success" } else { "failure" };
+
+            tracing::trace!(
+                target: "gatehouse::security",
+                {
+                    security_rule.name = rule_name,
+                    security_rule.category = category,
+                    security_rule.description = metadata.description(),
+                    security_rule.reference = metadata.reference(),
+                    security_rule.ruleset.name = ruleset_name,
+                    security_rule.uuid = metadata.uuid(),
+                    security_rule.version = metadata.version(),
+                    security_rule.license = metadata.license(),
+                    event.outcome = event_outcome,
+                    policy.type = policy_type_str,
+                    policy.result.reason = reason_str,
+                },
+                "Security rule evaluated"
+            );
+
+            policy_results.push(result);
+
             // If any policy allows access, return immediately
             if result_passes {
-                let policy_type = policy.policy_type();
-                let reason = result.reason();
-                policy_results.push(result);
-
                 let combined = PolicyEvalResult::Combined {
                     policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
                     operation: CombineOp::Or,
@@ -673,40 +704,6 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
                     trace: EvalTrace::with_root(combined),
                 };
             }
-
-            // Policy denied - extract metadata for tracing
-            let policy_type = policy.policy_type();
-            let policy_type_str = policy_type.as_str();
-            let metadata = policy.security_rule();
-            let reason = result.reason();
-            let reason_str = reason.as_deref();
-            let rule_name = metadata.name().unwrap_or(policy_type_str);
-            let category = metadata
-                .category()
-                .unwrap_or(DEFAULT_SECURITY_RULE_CATEGORY);
-            let ruleset_name = metadata
-                .ruleset_name()
-                .unwrap_or(PERMISSION_CHECKER_POLICY_TYPE);
-
-            tracing::trace!(
-                target: "gatehouse::security",
-                {
-                    security_rule.name = rule_name,
-                    security_rule.category = category,
-                    security_rule.description = metadata.description(),
-                    security_rule.reference = metadata.reference(),
-                    security_rule.ruleset.name = ruleset_name,
-                    security_rule.uuid = metadata.uuid(),
-                    security_rule.version = metadata.version(),
-                    security_rule.license = metadata.license(),
-                    event.outcome = "failure",
-                    policy.type = policy_type_str,
-                    policy.result.reason = reason_str,
-                },
-                "Security rule evaluated"
-            );
-
-            policy_results.push(result);
         }
 
         // If all policies denied access
