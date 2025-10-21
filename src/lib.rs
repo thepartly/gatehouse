@@ -645,17 +645,19 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
         }
         tracing::trace!(num_policies = self.policies.len(), "Checking access");
 
-        let mut policy_results = Vec::new();
+        let mut policy_results = Vec::with_capacity(self.policies.len());
 
         // Evaluate each policy
         for policy in &self.policies {
-            let policy_type = policy.policy_type();
-            let policy_type_str = policy_type.as_str();
-            let metadata = policy.security_rule();
             let result = policy
                 .evaluate_access(subject, action, resource, context)
                 .await;
             let result_passes = result.is_granted();
+
+            // Extract metadata for tracing (always needed for security audit)
+            let policy_type = policy.policy_type();
+            let policy_type_str = policy_type.as_str();
+            let metadata = policy.security_rule();
             let reason = result.reason();
             let reason_str = reason.as_deref();
             let rule_name = metadata.name().unwrap_or(policy_type_str);
@@ -685,7 +687,7 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
                 "Security rule evaluated"
             );
 
-            policy_results.push(result.clone());
+            policy_results.push(result);
 
             // If any policy allows access, return immediately
             if result_passes {
@@ -1289,16 +1291,17 @@ where
         resource: &R,
         context: &C,
     ) -> PolicyEvalResult {
-        let mut children_results = Vec::new();
+        let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
             let result = policy
                 .evaluate_access(subject, action, resource, context)
                 .await;
-            children_results.push(result.clone());
+            let is_granted = result.is_granted();
+            children_results.push(result);
 
             // Short-circuit on first denial
-            if !result.is_granted() {
+            if !is_granted {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
                     operation: CombineOp::And,
@@ -1355,16 +1358,17 @@ where
         resource: &R,
         context: &C,
     ) -> PolicyEvalResult {
-        let mut children_results = Vec::new();
+        let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
             let result = policy
                 .evaluate_access(subject, action, resource, context)
                 .await;
-            children_results.push(result.clone());
+            let is_granted = result.is_granted();
+            children_results.push(result);
 
             // Short-circuit on first success
-            if result.is_granted() {
+            if is_granted {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
                     operation: CombineOp::Or,
@@ -1424,12 +1428,13 @@ where
             .policy
             .evaluate_access(subject, action, resource, context)
             .await;
+        let is_granted = inner_result.is_granted();
 
         PolicyEvalResult::Combined {
             policy_type: Policy::<S, R, A, C>::policy_type(self),
             operation: CombineOp::Not,
-            children: vec![inner_result.clone()],
-            outcome: !inner_result.is_granted(),
+            children: vec![inner_result],
+            outcome: !is_granted,
         }
     }
 }
