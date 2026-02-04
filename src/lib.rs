@@ -1188,7 +1188,7 @@ pub struct RebacPolicy<S, R, A, C, Re, RG> {
 }
 
 impl<S, R, A, C, Re, RG> RebacPolicy<S, R, A, C, Re, RG> {
-    /// Create a new RebacPolicy for a given relationship string.
+    /// Create a new `RebacPolicy` for a given relationship.
     pub fn new(relationship: Re, resolver: RG) -> Self {
         Self {
             relationship,
