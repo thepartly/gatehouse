@@ -1143,20 +1143,20 @@ pub trait RelationshipResolver<S, R, Re>: Send + Sync {
 /// struct DummyRelationshipResolver;
 ///
 /// #[async_trait]
-/// impl RelationshipResolver<Employee, Project> for DummyRelationshipResolver {
+/// impl RelationshipResolver<Employee, Project, String> for DummyRelationshipResolver {
 ///     async fn has_relationship(
 ///         &self,
 ///         employee: &Employee,
 ///         project: &Project,
-///         relationship: &str,
+///         relationship: &String,
 ///     ) -> bool {
 ///         relationship == "manager" && employee.id == project.manager_id
 ///     }
 /// }
 ///
 /// // Create a ReBAC policy that checks for the "manager" relationship.
-/// let rebac_policy = RebacPolicy::<Employee, Project, AccessAction, EmptyContext, _>::new(
-///     "manager",
+/// let rebac_policy = RebacPolicy::<Employee, Project, AccessAction, EmptyContext, _, _>::new(
+///     "manager".to_string(),
 ///     DummyRelationshipResolver,
 /// );
 ///
