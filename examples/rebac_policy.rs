@@ -159,6 +159,7 @@ async fn main() {
 
     // Create resolver with normal operation
     let normal_resolver = ProjectRelationshipResolver::new(relationships.clone());
+
     // Create ReBAC policies for different relationships
     let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
         "owner".to_string(),
