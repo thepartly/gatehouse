@@ -168,7 +168,7 @@
 
 #![allow(clippy::type_complexity)]
 use async_trait::async_trait;
-use std::fmt;
+use std::fmt::{self, Display};
 use std::sync::Arc;
 
 const DEFAULT_SECURITY_RULE_CATEGORY: &str = "Access Control";
@@ -1106,8 +1106,8 @@ where
 /// Given a subject and a resource, the resolver answers whether the
 /// specified relationship e.g. "creator", "manager" exists between them.
 #[async_trait]
-pub trait RelationshipResolver<S, R>: Send + Sync {
-    async fn has_relationship(&self, subject: &S, resource: &R, relationship: &str) -> bool;
+pub trait RelationshipResolver<S, R, Re>: Send + Sync {
+    async fn has_relationship(&self, subject: &S, resource: &R, relationship: &Re) -> bool;
 }
 
 /// ### ReBAC Policy
@@ -1181,17 +1181,17 @@ pub trait RelationshipResolver<S, R>: Send + Sync {
 /// assert!(!checker.evaluate_access(&other_employee, &AccessAction, &project, &context).await.is_granted());
 /// # });
 /// ```
-pub struct RebacPolicy<S, R, A, C, RG> {
-    pub relationship: String,
+pub struct RebacPolicy<S, R, A, C, Re, RG> {
+    pub relationship: Re,
     pub resolver: RG,
     _marker: std::marker::PhantomData<(S, R, A, C)>,
 }
 
-impl<S, R, A, C, RG> RebacPolicy<S, R, A, C, RG> {
+impl<S, R, A, C, Re, RG> RebacPolicy<S, R, A, C, Re, RG> {
     /// Create a new RebacPolicy for a given relationship string.
-    pub fn new(relationship: impl Into<String>, resolver: RG) -> Self {
+    pub fn new(relationship: Re, resolver: RG) -> Self {
         Self {
-            relationship: relationship.into(),
+            relationship,
             resolver,
             _marker: std::marker::PhantomData,
         }
@@ -1199,13 +1199,14 @@ impl<S, R, A, C, RG> RebacPolicy<S, R, A, C, RG> {
 }
 
 #[async_trait]
-impl<S, R, A, C, RG> Policy<S, R, A, C> for RebacPolicy<S, R, A, C, RG>
+impl<S, R, A, C, Re, RG> Policy<S, R, A, C> for RebacPolicy<S, R, A, C, Re, RG>
 where
     S: Sync + Send,
     R: Sync + Send,
     A: Sync + Send,
     C: Sync + Send,
-    RG: RelationshipResolver<S, R> + Send + Sync,
+    Re: Sync + Send + Display,
+    RG: RelationshipResolver<S, R, Re> + Send + Sync,
 {
     async fn evaluate_access(
         &self,
@@ -1682,12 +1683,12 @@ mod tests {
     }
 
     #[async_trait]
-    impl RelationshipResolver<TestSubject, TestResource> for DummyRelationshipResolver {
+    impl RelationshipResolver<TestSubject, TestResource, String> for DummyRelationshipResolver {
         async fn has_relationship(
             &self,
             subject: &TestSubject,
             resource: &TestResource,
-            relationship: &str,
+            relationship: &String,
         ) -> bool {
             self.relationships
                 .iter()
@@ -1699,7 +1700,7 @@ mod tests {
     async fn test_rebac_policy_allows_when_relationship_exists() {
         let subject_id = uuid::Uuid::new_v4();
         let resource_id = uuid::Uuid::new_v4();
-        let relationship = "manager";
+        let relationship = "manager".to_string();
 
         let subject = TestSubject { id: subject_id };
         let resource = TestResource { id: resource_id };
@@ -1711,7 +1712,7 @@ mod tests {
             relationship.to_string(),
         )]);
 
-        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _>::new(
+        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
             relationship,
             resolver,
         );
@@ -1731,7 +1732,7 @@ mod tests {
     async fn test_rebac_policy_denies_when_relationship_missing() {
         let subject_id = uuid::Uuid::new_v4();
         let resource_id = uuid::Uuid::new_v4();
-        let relationship = "manager";
+        let relationship = "manager".to_string();
 
         let subject = TestSubject { id: subject_id };
         let resource = TestResource { id: resource_id };
@@ -1739,7 +1740,7 @@ mod tests {
         // Create a dummy resolver with no relationships.
         let resolver = DummyRelationshipResolver::new(vec![]);
 
-        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _>::new(
+        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
             relationship,
             resolver,
         );

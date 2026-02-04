@@ -66,8 +66,13 @@ impl ProjectRelationshipResolver {
 }
 
 #[async_trait]
-impl RelationshipResolver<User, Project> for ProjectRelationshipResolver {
-    async fn has_relationship(&self, user: &User, project: &Project, relationship: &str) -> bool {
+impl RelationshipResolver<User, Project, String> for ProjectRelationshipResolver {
+    async fn has_relationship(
+        &self,
+        user: &User,
+        project: &Project,
+        relationship: &String,
+    ) -> bool {
         println!(
             "Checking if user {} has '{}' relationship with project {}",
             user.name, relationship, project.name
@@ -154,20 +159,21 @@ async fn main() {
 
     // Create resolver with normal operation
     let normal_resolver = ProjectRelationshipResolver::new(relationships.clone());
-
     // Create ReBAC policies for different relationships
-    let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new(
-        "owner",
+    let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        "owner".to_string(),
         normal_resolver.clone(),
     );
 
-    let contributor_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new(
-        "contributor",
+    let contributor_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        "contributor".to_string(),
         normal_resolver.clone(),
     );
 
-    let _viewer_policy =
-        RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new("viewer", normal_resolver);
+    let _viewer_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, String, _>::new(
+        "viewer".to_string(),
+        normal_resolver,
+    );
 
     // Create a permission checker with multiple policies
     // Only owners and contributors can edit, not viewers
@@ -186,8 +192,10 @@ async fn main() {
 
     // Create a resolver that simulates a database error
     let error_resolver = ProjectRelationshipResolver::new(relationships.clone()).with_error();
-    let error_policy =
-        RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new("owner", error_resolver);
+    let error_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        "owner".to_string(),
+        error_resolver,
+    );
 
     let mut error_checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
     error_checker.add_policy(error_policy);
@@ -199,8 +207,10 @@ async fn main() {
 
     // Create a resolver that simulates a timeout
     let timeout_resolver = ProjectRelationshipResolver::new(relationships).with_timeout();
-    let timeout_policy =
-        RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new("owner", timeout_resolver);
+    let timeout_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        "owner".to_string(),
+        timeout_resolver,
+    );
 
     let mut timeout_checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
     timeout_checker.add_policy(timeout_policy);
