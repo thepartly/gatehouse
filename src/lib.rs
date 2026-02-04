@@ -168,7 +168,7 @@
 
 #![allow(clippy::type_complexity)]
 use async_trait::async_trait;
-use std::fmt::{self, Display};
+use std::fmt;
 use std::sync::Arc;
 
 const DEFAULT_SECURITY_RULE_CATEGORY: &str = "Access Control";
@@ -1205,7 +1205,7 @@ where
     R: Sync + Send,
     A: Sync + Send,
     C: Sync + Send,
-    Re: Sync + Send + Display,
+    Re: Sync + Send + fmt::Display,
     RG: RelationshipResolver<S, R, Re> + Send + Sync,
 {
     async fn evaluate_access(
