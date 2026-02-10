@@ -19,7 +19,7 @@ CI order: build → clippy → doc → test. Always `fmt` + `clippy` before comm
 
 ## Architecture
 
-Single-crate library, all in `src/lib.rs`. Unit tests co-located under `#[cfg(test)]`; integration tests in `tests/` import examples via `#[path]`.
+Single-crate library, all in `src/lib.rs`. Unit tests co-located under `#[cfg(test)]`; integration tests in `tests/` include examples via `include!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/..."))`.
 
 Core abstraction is `Policy<S, R, A, C>` trait (async `evaluate_access()` → `PolicyEvalResult`). `PermissionChecker` aggregates policies with OR semantics (short-circuits on first allow). `PolicyBuilder` chains predicates with AND logic.
 
