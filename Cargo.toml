@@ -1,6 +1,6 @@
 [package]
 name = "gatehouse"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/thepartly/gatehouse"
@@ -18,7 +18,7 @@ axum = "0.8"
 tower = "0.5"
 hyper = "1"
 actix-web = "4"
-criterion = { version = "0.5" }
+criterion = { version = "0.8" }
 
 [[bench]]
 name = "permission_checker"
