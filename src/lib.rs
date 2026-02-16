@@ -13,17 +13,49 @@
 //! logic by default (i.e. if any policy grants access, then access is allowed).
 //! The [`PolicyBuilder`] offers a builder pattern for creating custom policies.
 //!
-//! ## Built in Policies
-//! The library provides a few built-in policies:
+//! ## Quick Start
+//!
+//! The fastest way to define a policy is with [`PolicyBuilder`]:
+//!
+//! ```rust
+//! # use gatehouse::*;
+//! #[derive(Debug, Clone)]
+//! struct User { roles: Vec<String> }
+//! #[derive(Debug, Clone)]
+//! struct Document;
+//! #[derive(Debug, Clone)]
+//! struct ReadAction;
+//! #[derive(Debug, Clone)]
+//! struct AppContext;
+//!
+//! let policy = PolicyBuilder::<User, Document, ReadAction, AppContext>::new("AdminOnly")
+//!     .subjects(|user: &User| user.roles.iter().any(|r| r == "admin"))
+//!     .build();
+//!
+//! let mut checker = PermissionChecker::new();
+//! checker.add_policy(policy);
+//!
+//! # tokio_test::block_on(async {
+//! let admin = User { roles: vec!["admin".into()] };
+//! assert!(checker.evaluate_access(&admin, &ReadAction, &Document, &AppContext).await.is_granted());
+//!
+//! let guest = User { roles: vec!["guest".into()] };
+//! assert!(!checker.evaluate_access(&guest, &ReadAction, &Document, &AppContext).await.is_granted());
+//! # });
+//! ```
+//!
+//! ## Built-in Policies
+//!
+//! The library provides several built-in policies:
 //!  - [`RbacPolicy`]: A role-based access control policy.
 //!  - [`AbacPolicy`]: An attribute-based access control policy.
 //!  - [`RebacPolicy`]: A relationship-based access control policy.
 //!
 //! ## Custom Policies
 //!
-//! Below we define a simple system where a user may read a document if they
-//! are an admin (via a simple role-based policy) or if they are the owner of the document (via
-//! an attribute-based policy).
+//! For full control, implement the [`Policy`] trait directly. Below we define a simple
+//! system where a user may read a document if they are an admin (via a role-based policy)
+//! or if they are the owner of the document (via an attribute-based policy).
 //!
 //! ```rust
 //! # use uuid::Uuid;
@@ -166,6 +198,7 @@
 //!
 //!
 
+#![warn(missing_docs)]
 #![allow(clippy::type_complexity)]
 use async_trait::async_trait;
 use std::fmt;
@@ -288,8 +321,11 @@ impl SecurityRuleMetadata {
 /// The type of boolean combining operation a policy might represent.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CombineOp {
+    /// All inner policies must grant access.
     And,
+    /// At least one inner policy must grant access.
     Or,
+    /// The inner policy's decision is inverted.
     Not,
 }
 
@@ -315,18 +351,29 @@ impl fmt::Display for CombineOp {
 pub enum PolicyEvalResult {
     /// Access granted. Contains the policy type and an optional reason.
     Granted {
+        /// The name of the policy that granted access.
         policy_type: String,
+        /// An optional human-readable reason for the grant.
         reason: Option<String>,
     },
     /// Access denied. Contains the policy type and a reason.
-    Denied { policy_type: String, reason: String },
+    Denied {
+        /// The name of the policy that denied access.
+        policy_type: String,
+        /// A human-readable reason for the denial.
+        reason: String,
+    },
     /// Combined result from multiple policy evaluations.
     /// Contains the policy type, the combining operation ([`CombineOp`]),
     /// a list of child evaluation results, and the overall outcome.
     Combined {
+        /// The name of the combinator policy (e.g. `"AndPolicy"`).
         policy_type: String,
+        /// The boolean operation used to combine child results.
         operation: CombineOp,
+        /// The individual results from each child policy.
         children: Vec<PolicyEvalResult>,
+        /// The overall outcome after applying the combining operation.
         outcome: bool,
     },
 }
@@ -400,6 +447,30 @@ impl AccessEvaluation {
     }
 
     /// Converts the evaluation into a `Result`, mapping a denial into an error.
+    ///
+    /// `error_fn` receives the denial reason string and should return your
+    /// application's error type.
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # use uuid::Uuid;
+    /// # #[derive(Debug, Clone)]
+    /// # struct User;
+    /// # #[derive(Debug, Clone)]
+    /// # struct Resource;
+    /// # #[derive(Debug, Clone)]
+    /// # struct Action;
+    /// # #[derive(Debug, Clone)]
+    /// # struct Ctx;
+    /// # tokio_test::block_on(async {
+    /// let checker = PermissionChecker::<User, Resource, Action, Ctx>::new();
+    /// let result = checker.evaluate_access(&User, &Action, &Resource, &Ctx).await;
+    ///
+    /// // Map a denial into a standard error:
+    /// let outcome: Result<(), String> = result.to_result(|reason| reason.to_string());
+    /// assert!(outcome.is_err());
+    /// # });
+    /// ```
     pub fn to_result<E>(&self, error_fn: impl FnOnce(&str) -> E) -> Result<(), E> {
         match self {
             Self::Granted { .. } => Ok(()),
@@ -407,6 +478,12 @@ impl AccessEvaluation {
         }
     }
 
+    /// Returns a human-readable string containing both the decision headline
+    /// and the full evaluation trace tree.
+    ///
+    /// Useful for logging or debugging. The output includes the `Display`
+    /// representation (e.g. `[GRANTED] by AdminPolicy - User is admin`)
+    /// followed by the indented trace from [`EvalTrace::format`].
     pub fn display_trace(&self) -> String {
         let trace = match self {
             AccessEvaluation::Granted {
@@ -449,31 +526,53 @@ impl fmt::Display for AccessEvaluation {
     }
 }
 
-/// Container for the evaluation tree
-/// Detailed trace of all policy evaluations
+/// A tree of [`PolicyEvalResult`] nodes capturing every policy decision made
+/// during an access evaluation.
+///
+/// Returned as part of [`AccessEvaluation`]. Use [`EvalTrace::format`] to render
+/// a human-readable tree, useful for debugging and audit logging.
+///
+/// # Example
+///
+/// ```rust
+/// # use gatehouse::*;
+/// // After evaluating access:
+/// # let trace = EvalTrace::new();
+/// let output = trace.format();
+/// // Output looks like:
+/// //   ✔ AdminPolicy GRANTED: User is admin
+/// //   ✘ OwnerPolicy DENIED: User is not the owner
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct EvalTrace {
     root: Option<PolicyEvalResult>,
 }
 
 impl EvalTrace {
+    /// Creates an empty trace with no evaluation results.
     pub fn new() -> Self {
         Self { root: None }
     }
 
+    /// Creates a trace with the given [`PolicyEvalResult`] as the root node.
     pub fn with_root(result: PolicyEvalResult) -> Self {
         Self { root: Some(result) }
     }
 
+    /// Sets (or replaces) the root node of the evaluation tree.
     pub fn set_root(&mut self, result: PolicyEvalResult) {
         self.root = Some(result);
     }
 
+    /// Returns a reference to the root [`PolicyEvalResult`], if present.
     pub fn root(&self) -> Option<&PolicyEvalResult> {
         self.root.as_ref()
     }
 
-    /// Returns a formatted representation of the evaluation tree
+    /// Returns a formatted, indented representation of the evaluation tree.
+    ///
+    /// Each node shows a `✔` or `✘` prefix, the policy name, and the reason.
+    /// Combined nodes indent their children for readability.
     pub fn format(&self) -> String {
         match &self.root {
             Some(root) => root.format(0),
@@ -727,7 +826,9 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
 /// `Allow` means the policy grants access; `Deny` means it denies access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
+    /// The policy grants access when its predicates pass.
     Allow,
+    /// The policy denies access when its predicates pass.
     Deny,
 }
 
@@ -812,8 +913,49 @@ where
 /// A builder API for creating custom policies.
 ///
 /// A fluent interface to combine predicate functions on the subject, action, resource,
-/// and context. Use it to construct a policy that can be added to a [`PermissionChecker`].
+/// and context. All predicates are combined with AND logic — every predicate must pass
+/// for the policy to grant access. Use [`PolicyBuilder::build`] to produce a boxed
+/// [`Policy`] that can be added to a [`PermissionChecker`].
 ///
+/// # Example
+///
+/// ```rust
+/// # use gatehouse::*;
+/// # use uuid::Uuid;
+/// #[derive(Debug, Clone)]
+/// struct User { id: Uuid, roles: Vec<String> }
+/// #[derive(Debug, Clone)]
+/// struct Document { owner_id: Uuid, classification: String }
+/// #[derive(Debug, Clone)]
+/// struct Action(String);
+/// #[derive(Debug, Clone)]
+/// struct Ctx;
+///
+/// let policy = PolicyBuilder::<User, Document, Action, Ctx>::new("OwnerEditors")
+///     .subjects(|user: &User| user.roles.iter().any(|r| r == "editor"))
+///     .actions(|action: &Action| action.0 == "edit")
+///     .resources(|doc: &Document| doc.classification != "top-secret")
+///     // Use `when` when a predicate needs to compare multiple inputs:
+///     .when(|user: &User, _action: &Action, doc: &Document, _ctx: &Ctx| {
+///         user.id == doc.owner_id
+///     })
+///     .build();
+///
+/// let mut checker = PermissionChecker::new();
+/// checker.add_policy(policy);
+///
+/// # tokio_test::block_on(async {
+/// let user_id = Uuid::new_v4();
+/// let user = User { id: user_id, roles: vec!["editor".into()] };
+/// let doc = Document { owner_id: user_id, classification: "internal".into() };
+///
+/// // User is an editor, action is "edit", doc is not top-secret, and user owns it:
+/// assert!(checker.evaluate_access(&user, &Action("edit".into()), &doc, &Ctx).await.is_granted());
+///
+/// // Wrong action — predicate fails:
+/// assert!(!checker.evaluate_access(&user, &Action("delete".into()), &doc, &Ctx).await.is_granted());
+/// # });
+/// ```
 pub struct PolicyBuilder<S, R, A, C>
 where
     S: Send + Sync + 'static,
@@ -932,6 +1074,45 @@ where
 ///
 /// `required_roles_resolver` is a closure that determines which roles are required
 /// for the given (resource, action). `user_roles_resolver` extracts the subject's roles.
+/// Access is granted if the subject holds at least one of the required roles.
+///
+/// Roles are identified by [`Uuid`](uuid::Uuid), allowing integration with external
+/// identity systems without relying on string matching.
+///
+/// # Example
+///
+/// ```rust
+/// # use gatehouse::*;
+/// # use uuid::Uuid;
+/// #[derive(Debug, Clone)]
+/// struct User { role_ids: Vec<Uuid> }
+/// #[derive(Debug, Clone)]
+/// struct Resource;
+/// #[derive(Debug, Clone)]
+/// struct Action;
+/// #[derive(Debug, Clone)]
+/// struct Ctx;
+///
+/// let editor_role = Uuid::new_v4();
+///
+/// let rbac = RbacPolicy::new(
+///     // required_roles_resolver: which roles can access this resource/action?
+///     move |_resource: &Resource, _action: &Action| vec![editor_role],
+///     // user_roles_resolver: which roles does this user have?
+///     |user: &User| user.role_ids.clone(),
+/// );
+///
+/// let mut checker = PermissionChecker::new();
+/// checker.add_policy(rbac);
+///
+/// # tokio_test::block_on(async {
+/// let authorised = User { role_ids: vec![editor_role] };
+/// assert!(checker.evaluate_access(&authorised, &Action, &Resource, &Ctx).await.is_granted());
+///
+/// let unauthorised = User { role_ids: vec![Uuid::new_v4()] };
+/// assert!(!checker.evaluate_access(&unauthorised, &Action, &Resource, &Ctx).await.is_granted());
+/// # });
+/// ```
 pub struct RbacPolicy<S, F1, F2> {
     required_roles_resolver: F1,
     user_roles_resolver: F2,
@@ -939,6 +1120,7 @@ pub struct RbacPolicy<S, F1, F2> {
 }
 
 impl<S, F1, F2> RbacPolicy<S, F1, F2> {
+    /// Creates a new RBAC policy from two resolver closures.
     pub fn new(required_roles_resolver: F1, user_roles_resolver: F2) -> Self {
         Self {
             required_roles_resolver,
@@ -1058,6 +1240,7 @@ pub struct AbacPolicy<S, R, A, C, F> {
 }
 
 impl<S, R, A, C, F> AbacPolicy<S, R, A, C, F> {
+    /// Creates a new ABAC policy from a condition closure.
     pub fn new(condition: F) -> Self {
         Self {
             condition,
@@ -1107,6 +1290,7 @@ where
 /// specified relationship e.g. "creator", "manager" exists between them.
 #[async_trait]
 pub trait RelationshipResolver<S, R>: Send + Sync {
+    /// Returns `true` if `relationship` exists between `subject` and `resource`.
     async fn has_relationship(&self, subject: &S, resource: &R, relationship: &str) -> bool;
 }
 
@@ -1182,7 +1366,9 @@ pub trait RelationshipResolver<S, R>: Send + Sync {
 /// # });
 /// ```
 pub struct RebacPolicy<S, R, A, C, RG> {
+    /// The relationship name to check (e.g. `"manager"`, `"creator"`).
     pub relationship: String,
+    /// The resolver that determines whether the relationship exists.
     pub resolver: RG,
     _marker: std::marker::PhantomData<(S, R, A, C)>,
 }
@@ -1260,6 +1446,9 @@ pub struct AndPolicy<S, R, A, C> {
 pub struct EmptyPoliciesError(pub &'static str);
 
 impl<S, R, A, C> AndPolicy<S, R, A, C> {
+    /// Creates a new `AndPolicy` from a non-empty list of policies.
+    ///
+    /// Returns [`EmptyPoliciesError`] if `policies` is empty.
     pub fn try_new(policies: Vec<Arc<dyn Policy<S, R, A, C>>>) -> Result<Self, EmptyPoliciesError> {
         if policies.is_empty() {
             Err(EmptyPoliciesError(
@@ -1330,6 +1519,9 @@ pub struct OrPolicy<S, R, A, C> {
 }
 
 impl<S, R, A, C> OrPolicy<S, R, A, C> {
+    /// Creates a new `OrPolicy` from a non-empty list of policies.
+    ///
+    /// Returns [`EmptyPoliciesError`] if `policies` is empty.
     pub fn try_new(policies: Vec<Arc<dyn Policy<S, R, A, C>>>) -> Result<Self, EmptyPoliciesError> {
         if policies.is_empty() {
             Err(EmptyPoliciesError("OrPolicy must have at least one policy"))
@@ -1397,6 +1589,7 @@ pub struct NotPolicy<S, R, A, C> {
 }
 
 impl<S, R, A, C> NotPolicy<S, R, A, C> {
+    /// Creates a new `NotPolicy` that inverts the given policy's decision.
     pub fn new(policy: impl Policy<S, R, A, C> + 'static) -> Self {
         Self {
             policy: Arc::new(policy),
