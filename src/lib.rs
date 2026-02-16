@@ -453,7 +453,6 @@ impl AccessEvaluation {
     ///
     /// ```rust
     /// # use gatehouse::*;
-    /// # use uuid::Uuid;
     /// # #[derive(Debug, Clone)]
     /// # struct User;
     /// # #[derive(Debug, Clone)]
@@ -536,12 +535,16 @@ impl fmt::Display for AccessEvaluation {
 ///
 /// ```rust
 /// # use gatehouse::*;
-/// // After evaluating access:
-/// # let trace = EvalTrace::new();
-/// let output = trace.format();
-/// // Output looks like:
-/// //   ✔ AdminPolicy GRANTED: User is admin
-/// //   ✘ OwnerPolicy DENIED: User is not the owner
+/// // An empty trace produces a fallback message:
+/// let empty = EvalTrace::new();
+/// assert_eq!(empty.format(), "No evaluation trace available");
+///
+/// // A trace built from a policy result renders a decision tree:
+/// let trace = EvalTrace::with_root(PolicyEvalResult::Granted {
+///     policy_type: "AdminPolicy".into(),
+///     reason: Some("User is admin".into()),
+/// });
+/// assert!(trace.format().contains("AdminPolicy GRANTED"));
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct EvalTrace {
