@@ -2303,6 +2303,273 @@ mod tests {
         assert!(!result.is_granted());
     }
 
+    // ==================== AbacPolicy Tests ====================
+
+    #[tokio::test]
+    async fn test_abac_policy_grants_when_condition_true() {
+        let policy = AbacPolicy::new(
+            |_subject: &TestSubject, _resource: &TestResource, _action: &TestAction, _context: &TestContext| {
+                true
+            },
+        );
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = policy
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        assert!(result.is_granted(), "AbacPolicy should grant when condition returns true");
+        assert_eq!(policy.policy_type(), "AbacPolicy");
+    }
+
+    #[tokio::test]
+    async fn test_abac_policy_denies_when_condition_false() {
+        let policy = AbacPolicy::new(
+            |_subject: &TestSubject, _resource: &TestResource, _action: &TestAction, _context: &TestContext| {
+                false
+            },
+        );
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = policy
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        assert!(!result.is_granted(), "AbacPolicy should deny when condition returns false");
+        match result {
+            PolicyEvalResult::Denied { policy_type, reason } => {
+                assert_eq!(policy_type, "AbacPolicy");
+                assert!(reason.contains("false"));
+            }
+            _ => panic!("Expected Denied result, got {:?}", result),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_abac_policy_with_attribute_check() {
+        // Policy that checks if the subject owns the resource
+        let policy = AbacPolicy::new(
+            |subject: &TestSubject, resource: &TestResource, _action: &TestAction, _context: &TestContext| {
+                subject.id == resource.id
+            },
+        );
+
+        let owner_id = uuid::Uuid::new_v4();
+        let owner = TestSubject { id: owner_id };
+        let owned_resource = TestResource { id: owner_id };
+        let other_resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        // Owner should have access to owned resource
+        let result = policy
+            .evaluate_access(&owner, &TestAction, &owned_resource, &TestContext)
+            .await;
+        assert!(result.is_granted(), "Owner should have access to owned resource");
+
+        // Owner should not have access to other resource
+        let result = policy
+            .evaluate_access(&owner, &TestAction, &other_resource, &TestContext)
+            .await;
+        assert!(!result.is_granted(), "Owner should not have access to other resource");
+    }
+
+    // ==================== RbacPolicy Tests ====================
+
+    #[tokio::test]
+    async fn test_rbac_policy_grants_when_user_has_required_role() {
+        let admin_role = uuid::Uuid::new_v4();
+        let user_role = uuid::Uuid::new_v4();
+
+        #[derive(Debug, Clone)]
+        struct RbacUser {
+            roles: Vec<uuid::Uuid>,
+        }
+
+        let policy = RbacPolicy::new(
+            |_resource: &TestResource, _action: &TestAction| vec![admin_role],
+            |subject: &RbacUser| subject.roles.clone(),
+        );
+
+        let admin_user = RbacUser {
+            roles: vec![admin_role, user_role],
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+            &policy,
+            &admin_user,
+            &TestAction,
+            &resource,
+            &TestContext,
+        )
+        .await;
+
+        assert!(result.is_granted(), "User with required role should be granted access");
+        assert_eq!(
+            Policy::<RbacUser, TestResource, TestAction, TestContext>::policy_type(&policy),
+            "RbacPolicy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rbac_policy_denies_when_user_lacks_required_role() {
+        let admin_role = uuid::Uuid::new_v4();
+        let user_role = uuid::Uuid::new_v4();
+
+        #[derive(Debug, Clone)]
+        struct RbacUser {
+            roles: Vec<uuid::Uuid>,
+        }
+
+        let policy = RbacPolicy::new(
+            |_resource: &TestResource, _action: &TestAction| vec![admin_role],
+            |subject: &RbacUser| subject.roles.clone(),
+        );
+
+        let regular_user = RbacUser {
+            roles: vec![user_role],
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+            &policy,
+            &regular_user,
+            &TestAction,
+            &resource,
+            &TestContext,
+        )
+        .await;
+
+        assert!(!result.is_granted(), "User without required role should be denied");
+        match result {
+            PolicyEvalResult::Denied { policy_type, reason } => {
+                assert_eq!(policy_type, "RbacPolicy");
+                assert!(reason.contains("doesn't have required role"));
+            }
+            _ => panic!("Expected Denied result, got {:?}", result),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rbac_policy_grants_with_any_matching_role() {
+        let role1 = uuid::Uuid::new_v4();
+        let role2 = uuid::Uuid::new_v4();
+        let role3 = uuid::Uuid::new_v4();
+
+        #[derive(Debug, Clone)]
+        struct RbacUser {
+            roles: Vec<uuid::Uuid>,
+        }
+
+        // Policy requires either role1 or role2
+        let policy = RbacPolicy::new(
+            |_resource: &TestResource, _action: &TestAction| vec![role1, role2],
+            |subject: &RbacUser| subject.roles.clone(),
+        );
+
+        // User has role2 (one of the required roles)
+        let user = RbacUser {
+            roles: vec![role2, role3],
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+            &policy,
+            &user,
+            &TestAction,
+            &resource,
+            &TestContext,
+        )
+        .await;
+
+        assert!(result.is_granted(), "User with any required role should be granted access");
+    }
+
+    #[tokio::test]
+    async fn test_rbac_policy_denies_with_empty_user_roles() {
+        let admin_role = uuid::Uuid::new_v4();
+
+        #[derive(Debug, Clone)]
+        struct RbacUser {
+            roles: Vec<uuid::Uuid>,
+        }
+
+        let policy = RbacPolicy::new(
+            |_resource: &TestResource, _action: &TestAction| vec![admin_role],
+            |subject: &RbacUser| subject.roles.clone(),
+        );
+
+        let user_no_roles = RbacUser { roles: vec![] };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+            &policy,
+            &user_no_roles,
+            &TestAction,
+            &resource,
+            &TestContext,
+        )
+        .await;
+
+        assert!(!result.is_granted(), "User with no roles should be denied");
+    }
+
+    #[tokio::test]
+    async fn test_rbac_policy_denies_with_empty_required_roles() {
+        let user_role = uuid::Uuid::new_v4();
+
+        #[derive(Debug, Clone)]
+        struct RbacUser {
+            roles: Vec<uuid::Uuid>,
+        }
+
+        // No roles are required (empty list)
+        let policy = RbacPolicy::new(
+            |_resource: &TestResource, _action: &TestAction| vec![],
+            |subject: &RbacUser| subject.roles.clone(),
+        );
+
+        let user = RbacUser {
+            roles: vec![user_role],
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+            &policy,
+            &user,
+            &TestAction,
+            &resource,
+            &TestContext,
+        )
+        .await;
+
+        // With empty required roles, no role can match, so access is denied
+        assert!(!result.is_granted(), "Empty required roles means no match is possible");
+    }
+
     #[tokio::test]
     async fn test_short_circuit_evaluation() {
         // Create a counter to track policy evaluation
@@ -2402,6 +2669,328 @@ mod tests {
             1,
             "OR policy should short-circuit after first allow"
         );
+    }
+
+    // ==================== AccessEvaluation Tests ====================
+
+    #[tokio::test]
+    async fn test_access_evaluation_to_result_granted() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysAllowPolicy);
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = checker
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        // to_result should return Ok for granted access
+        let converted: Result<(), String> = result.to_result(|reason| reason.to_string());
+        assert!(converted.is_ok(), "to_result should return Ok for granted access");
+    }
+
+    #[tokio::test]
+    async fn test_access_evaluation_to_result_denied() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("Access denied"));
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = checker
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        // to_result should return Err for denied access
+        let converted: Result<(), String> = result.to_result(|reason| reason.to_string());
+        assert!(converted.is_err(), "to_result should return Err for denied access");
+        assert!(converted.unwrap_err().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn test_access_evaluation_display_trace_granted() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysAllowPolicy);
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = checker
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        let trace_display = result.display_trace();
+        assert!(trace_display.contains("GRANTED"), "Trace should show GRANTED");
+        assert!(trace_display.contains("AlwaysAllowPolicy"), "Trace should show policy name");
+        assert!(trace_display.contains("Evaluation Trace"), "Trace should include trace section");
+    }
+
+    #[tokio::test]
+    async fn test_access_evaluation_display_trace_denied() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("Test denial"));
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = checker
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        let trace_display = result.display_trace();
+        assert!(trace_display.contains("Denied"), "Trace should show Denied");
+        assert!(trace_display.contains("Test denial"), "Trace should show denial reason");
+    }
+
+    #[tokio::test]
+    async fn test_access_evaluation_display_impl() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysAllowPolicy);
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = checker
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        // Test Display trait
+        let display_str = format!("{}", result);
+        assert!(display_str.contains("GRANTED"), "Display should show GRANTED");
+        assert!(display_str.contains("AlwaysAllowPolicy"), "Display should show policy name");
+    }
+
+    // ==================== EvalTrace Tests ====================
+
+    #[test]
+    fn test_eval_trace_new_creates_empty() {
+        let trace = EvalTrace::new();
+        assert!(trace.root().is_none(), "New trace should have no root");
+        assert_eq!(
+            trace.format(),
+            "No evaluation trace available",
+            "Empty trace should format as 'No evaluation trace available'"
+        );
+    }
+
+    #[test]
+    fn test_eval_trace_with_root() {
+        let result = PolicyEvalResult::Granted {
+            policy_type: "TestPolicy".to_string(),
+            reason: Some("Test reason".to_string()),
+        };
+        let trace = EvalTrace::with_root(result);
+
+        assert!(trace.root().is_some(), "Trace with root should have a root");
+        let formatted = trace.format();
+        assert!(formatted.contains("TestPolicy"), "Formatted trace should contain policy name");
+        assert!(formatted.contains("GRANTED"), "Formatted trace should contain GRANTED");
+    }
+
+    #[test]
+    fn test_eval_trace_set_root() {
+        let mut trace = EvalTrace::new();
+        assert!(trace.root().is_none());
+
+        let result = PolicyEvalResult::Denied {
+            policy_type: "DenyPolicy".to_string(),
+            reason: "Denied for testing".to_string(),
+        };
+        trace.set_root(result);
+
+        assert!(trace.root().is_some(), "After set_root, trace should have a root");
+        let formatted = trace.format();
+        assert!(formatted.contains("DenyPolicy"));
+        assert!(formatted.contains("DENIED"));
+    }
+
+    #[test]
+    fn test_eval_trace_default() {
+        let trace = EvalTrace::default();
+        assert!(trace.root().is_none(), "Default trace should have no root");
+    }
+
+    // ==================== PolicyEvalResult Tests ====================
+
+    #[test]
+    fn test_policy_eval_result_reason_granted() {
+        let result = PolicyEvalResult::Granted {
+            policy_type: "TestPolicy".to_string(),
+            reason: Some("Grant reason".to_string()),
+        };
+        assert_eq!(result.reason(), Some("Grant reason".to_string()));
+
+        // Test with None reason
+        let result_no_reason = PolicyEvalResult::Granted {
+            policy_type: "TestPolicy".to_string(),
+            reason: None,
+        };
+        assert_eq!(result_no_reason.reason(), None);
+    }
+
+    #[test]
+    fn test_policy_eval_result_reason_denied() {
+        let result = PolicyEvalResult::Denied {
+            policy_type: "TestPolicy".to_string(),
+            reason: "Deny reason".to_string(),
+        };
+        assert_eq!(result.reason(), Some("Deny reason".to_string()));
+    }
+
+    #[test]
+    fn test_policy_eval_result_reason_combined() {
+        let result = PolicyEvalResult::Combined {
+            policy_type: "CombinedPolicy".to_string(),
+            operation: CombineOp::And,
+            children: vec![],
+            outcome: true,
+        };
+        assert_eq!(result.reason(), None, "Combined result should have no reason");
+    }
+
+    #[test]
+    fn test_policy_eval_result_format_indentation() {
+        let result = PolicyEvalResult::Granted {
+            policy_type: "TestPolicy".to_string(),
+            reason: Some("Test".to_string()),
+        };
+
+        let formatted_0 = result.format(0);
+        let formatted_4 = result.format(4);
+
+        assert!(formatted_0.starts_with("✔"), "Indent 0 should start with checkmark");
+        assert!(formatted_4.starts_with("    ✔"), "Indent 4 should have 4 spaces before checkmark");
+    }
+
+    #[test]
+    fn test_policy_eval_result_display() {
+        let result = PolicyEvalResult::Denied {
+            policy_type: "TestPolicy".to_string(),
+            reason: "Test denial".to_string(),
+        };
+
+        let display_str = format!("{}", result);
+        assert!(display_str.contains("TestPolicy"));
+        assert!(display_str.contains("DENIED"));
+        assert!(display_str.contains("Test denial"));
+    }
+
+    // ==================== CombineOp Display Tests ====================
+
+    #[test]
+    fn test_combine_op_display() {
+        assert_eq!(format!("{}", CombineOp::And), "AND");
+        assert_eq!(format!("{}", CombineOp::Or), "OR");
+        assert_eq!(format!("{}", CombineOp::Not), "NOT");
+    }
+
+    // ==================== PermissionChecker Default Tests ====================
+
+    #[tokio::test]
+    async fn test_permission_checker_default() {
+        let checker =
+            PermissionChecker::<TestSubject, TestResource, TestAction, TestContext>::default();
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = checker
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        // Default checker has no policies, so should deny
+        assert!(!result.is_granted(), "Default checker with no policies should deny");
+    }
+
+    // ==================== SecurityRuleMetadata Tests ====================
+
+    #[test]
+    fn test_security_rule_metadata_default_values() {
+        let metadata = SecurityRuleMetadata::default();
+
+        assert_eq!(metadata.name(), None);
+        assert_eq!(metadata.category(), None);
+        assert_eq!(metadata.description(), None);
+        assert_eq!(metadata.reference(), None);
+        assert_eq!(metadata.ruleset_name(), None);
+        assert_eq!(metadata.uuid(), None);
+        assert_eq!(metadata.version(), None);
+        assert_eq!(metadata.license(), None);
+    }
+
+    #[test]
+    fn test_security_rule_metadata_new_equals_default() {
+        let new_metadata = SecurityRuleMetadata::new();
+        let default_metadata = SecurityRuleMetadata::default();
+
+        assert_eq!(new_metadata, default_metadata);
+    }
+
+    #[test]
+    fn test_security_rule_metadata_partial_builder() {
+        // Test that we can set only some fields
+        let metadata = SecurityRuleMetadata::new()
+            .with_name("TestRule")
+            .with_category("TestCategory");
+
+        assert_eq!(metadata.name(), Some("TestRule"));
+        assert_eq!(metadata.category(), Some("TestCategory"));
+        assert_eq!(metadata.description(), None);
+        assert_eq!(metadata.reference(), None);
+    }
+
+    #[tokio::test]
+    async fn test_policy_default_security_rule() {
+        // Test that the default security_rule implementation returns empty metadata
+        let policy = AlwaysAllowPolicy;
+        let metadata = Policy::<TestSubject, TestResource, TestAction, TestContext>::security_rule(&policy);
+
+        assert_eq!(metadata, SecurityRuleMetadata::default());
+    }
+
+    // ==================== EmptyPoliciesError Tests ====================
+
+    #[test]
+    fn test_empty_policies_error_debug() {
+        let error = EmptyPoliciesError("Test error message");
+        let debug_str = format!("{:?}", error);
+        assert!(debug_str.contains("Test error message"));
+    }
+
+    #[test]
+    #[allow(clippy::clone_on_copy)] // intentionally testing both Copy and Clone
+    fn test_empty_policies_error_copy_clone() {
+        let error = EmptyPoliciesError("Test");
+        let copied = error;
+        let cloned = error.clone();
+
+        assert_eq!(copied.0, "Test");
+        assert_eq!(cloned.0, "Test");
     }
 }
 
@@ -2578,5 +3167,238 @@ mod policy_builder_tests {
             !result2.is_granted(),
             "Policy should deny access when extra condition fails"
         );
+    }
+
+    // Test action predicate
+    #[tokio::test]
+    async fn test_policy_builder_with_action_predicate() {
+        #[derive(Debug, Clone)]
+        struct ActionType {
+            pub name: String,
+        }
+
+        let policy =
+            PolicyBuilder::<TestSubject, TestResource, ActionType, TestContext>::new("ActionPolicy")
+                .actions(|a: &ActionType| a.name == "read")
+                .build();
+
+        // Should allow for "read" action
+        let result = policy
+            .evaluate_access(
+                &TestSubject { name: "Anyone".into() },
+                &ActionType { name: "read".into() },
+                &TestResource,
+                &TestContext,
+            )
+            .await;
+        assert!(result.is_granted(), "Policy should allow 'read' action");
+
+        // Should deny for "write" action
+        let result = policy
+            .evaluate_access(
+                &TestSubject { name: "Anyone".into() },
+                &ActionType { name: "write".into() },
+                &TestResource,
+                &TestContext,
+            )
+            .await;
+        assert!(!result.is_granted(), "Policy should deny 'write' action");
+    }
+
+    // Test resource predicate
+    #[tokio::test]
+    async fn test_policy_builder_with_resource_predicate() {
+        #[derive(Debug, Clone)]
+        struct ResourceType {
+            pub public: bool,
+        }
+
+        let policy = PolicyBuilder::<TestSubject, ResourceType, TestAction, TestContext>::new(
+            "ResourcePolicy",
+        )
+        .resources(|r: &ResourceType| r.public)
+        .build();
+
+        // Should allow access to public resource
+        let result = policy
+            .evaluate_access(
+                &TestSubject { name: "Anyone".into() },
+                &TestAction,
+                &ResourceType { public: true },
+                &TestContext,
+            )
+            .await;
+        assert!(result.is_granted(), "Policy should allow public resource");
+
+        // Should deny access to private resource
+        let result = policy
+            .evaluate_access(
+                &TestSubject { name: "Anyone".into() },
+                &TestAction,
+                &ResourceType { public: false },
+                &TestContext,
+            )
+            .await;
+        assert!(!result.is_granted(), "Policy should deny private resource");
+    }
+
+    // Test context predicate
+    #[tokio::test]
+    async fn test_policy_builder_with_context_predicate() {
+        #[derive(Debug, Clone)]
+        struct RequestContext {
+            pub is_internal: bool,
+        }
+
+        let policy = PolicyBuilder::<TestSubject, TestResource, TestAction, RequestContext>::new(
+            "ContextPolicy",
+        )
+        .context(|c: &RequestContext| c.is_internal)
+        .build();
+
+        // Should allow for internal requests
+        let result = policy
+            .evaluate_access(
+                &TestSubject { name: "Anyone".into() },
+                &TestAction,
+                &TestResource,
+                &RequestContext { is_internal: true },
+            )
+            .await;
+        assert!(result.is_granted(), "Policy should allow internal requests");
+
+        // Should deny for external requests
+        let result = policy
+            .evaluate_access(
+                &TestSubject { name: "Anyone".into() },
+                &TestAction,
+                &TestResource,
+                &RequestContext { is_internal: false },
+            )
+            .await;
+        assert!(
+            !result.is_granted(),
+            "Policy should deny external requests"
+        );
+    }
+
+    // Test combining all predicates
+    #[tokio::test]
+    async fn test_policy_builder_with_all_predicates_combined() {
+        #[derive(Debug, Clone)]
+        struct FullSubject {
+            pub role: String,
+        }
+        #[derive(Debug, Clone)]
+        struct FullAction {
+            pub name: String,
+        }
+        #[derive(Debug, Clone)]
+        struct FullResource {
+            pub category: String,
+        }
+        #[derive(Debug, Clone)]
+        struct FullContext {
+            pub time_of_day: String,
+        }
+
+        // Policy: admin can read documents during business hours
+        let policy =
+            PolicyBuilder::<FullSubject, FullResource, FullAction, FullContext>::new("FullPolicy")
+                .subjects(|s: &FullSubject| s.role == "admin")
+                .actions(|a: &FullAction| a.name == "read")
+                .resources(|r: &FullResource| r.category == "document")
+                .context(|c: &FullContext| c.time_of_day == "business_hours")
+                .build();
+
+        // All conditions met - should allow
+        let result = policy
+            .evaluate_access(
+                &FullSubject {
+                    role: "admin".into(),
+                },
+                &FullAction { name: "read".into() },
+                &FullResource {
+                    category: "document".into(),
+                },
+                &FullContext {
+                    time_of_day: "business_hours".into(),
+                },
+            )
+            .await;
+        assert!(
+            result.is_granted(),
+            "Policy should allow when all conditions are met"
+        );
+
+        // Wrong role - should deny
+        let result = policy
+            .evaluate_access(
+                &FullSubject {
+                    role: "user".into(),
+                },
+                &FullAction { name: "read".into() },
+                &FullResource {
+                    category: "document".into(),
+                },
+                &FullContext {
+                    time_of_day: "business_hours".into(),
+                },
+            )
+            .await;
+        assert!(!result.is_granted(), "Policy should deny wrong role");
+
+        // Wrong action - should deny
+        let result = policy
+            .evaluate_access(
+                &FullSubject {
+                    role: "admin".into(),
+                },
+                &FullAction {
+                    name: "write".into(),
+                },
+                &FullResource {
+                    category: "document".into(),
+                },
+                &FullContext {
+                    time_of_day: "business_hours".into(),
+                },
+            )
+            .await;
+        assert!(!result.is_granted(), "Policy should deny wrong action");
+
+        // Wrong resource - should deny
+        let result = policy
+            .evaluate_access(
+                &FullSubject {
+                    role: "admin".into(),
+                },
+                &FullAction { name: "read".into() },
+                &FullResource {
+                    category: "video".into(),
+                },
+                &FullContext {
+                    time_of_day: "business_hours".into(),
+                },
+            )
+            .await;
+        assert!(!result.is_granted(), "Policy should deny wrong resource");
+
+        // Wrong context - should deny
+        let result = policy
+            .evaluate_access(
+                &FullSubject {
+                    role: "admin".into(),
+                },
+                &FullAction { name: "read".into() },
+                &FullResource {
+                    category: "document".into(),
+                },
+                &FullContext {
+                    time_of_day: "after_hours".into(),
+                },
+            )
+            .await;
+        assert!(!result.is_granted(), "Policy should deny wrong context");
     }
 }
