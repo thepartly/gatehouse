@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use gatehouse::*;
+use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -66,8 +67,13 @@ impl ProjectRelationshipResolver {
 }
 
 #[async_trait]
-impl RelationshipResolver<User, Project> for ProjectRelationshipResolver {
-    async fn has_relationship(&self, user: &User, project: &Project, relationship: &str) -> bool {
+impl RelationshipResolver<User, Project, String> for ProjectRelationshipResolver {
+    async fn has_relationship(
+        &self,
+        user: &User,
+        project: &Project,
+        relationship: &String,
+    ) -> bool {
         println!(
             "Checking if user {} has '{}' relationship with project {}",
             user.name, relationship, project.name
@@ -156,18 +162,20 @@ async fn main() {
     let normal_resolver = ProjectRelationshipResolver::new(relationships.clone());
 
     // Create ReBAC policies for different relationships
-    let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new(
-        "owner",
+    let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        "owner".to_string(),
         normal_resolver.clone(),
     );
 
-    let contributor_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new(
-        "contributor",
+    let contributor_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        "contributor".to_string(),
         normal_resolver.clone(),
     );
 
-    let _viewer_policy =
-        RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new("viewer", normal_resolver);
+    let _viewer_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, String, _>::new(
+        "viewer".to_string(),
+        normal_resolver,
+    );
 
     // Create a permission checker with multiple policies
     // Only owners and contributors can edit, not viewers
@@ -186,8 +194,10 @@ async fn main() {
 
     // Create a resolver that simulates a database error
     let error_resolver = ProjectRelationshipResolver::new(relationships.clone()).with_error();
-    let error_policy =
-        RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new("owner", error_resolver);
+    let error_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        "owner".to_string(),
+        error_resolver,
+    );
 
     let mut error_checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
     error_checker.add_policy(error_policy);
@@ -199,14 +209,19 @@ async fn main() {
 
     // Create a resolver that simulates a timeout
     let timeout_resolver = ProjectRelationshipResolver::new(relationships).with_timeout();
-    let timeout_policy =
-        RebacPolicy::<User, Project, EditAction, EmptyContext, _>::new("owner", timeout_resolver);
+    let timeout_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        "owner".to_string(),
+        timeout_resolver,
+    );
 
     let mut timeout_checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
     timeout_checker.add_policy(timeout_policy);
 
     println!("Testing with database timeout:");
     test_access(&timeout_checker, &owner, &project).await;
+
+    // Demonstrate enum-based relationships (type-safe alternative to strings)
+    enum_relationship_example().await;
 }
 
 async fn test_access(
@@ -237,6 +252,116 @@ async fn test_access(
         match &result {
             AccessEvaluation::Granted { trace, .. } => trace.format(),
             AccessEvaluation::Denied { trace, .. } => trace.format(),
+        }
+    );
+}
+
+// --- Enum-based relationship example ---
+//
+// The relationship type parameter is generic, so you can use enums instead
+// of strings for compile-time safety. A typo like "contibutor" becomes a
+// compile error rather than a silent permission failure.
+
+#[derive(Debug, Clone, PartialEq)]
+enum Relation {
+    Owner,
+    Contributor,
+    Viewer,
+}
+
+impl fmt::Display for Relation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Relation::Owner => write!(f, "owner"),
+            Relation::Contributor => write!(f, "contributor"),
+            Relation::Viewer => write!(f, "viewer"),
+        }
+    }
+}
+
+struct EnumRelationshipResolver {
+    relationships: Vec<(Uuid, Uuid, Relation)>,
+}
+
+#[async_trait]
+impl RelationshipResolver<User, Project, Relation> for EnumRelationshipResolver {
+    async fn has_relationship(
+        &self,
+        user: &User,
+        project: &Project,
+        relationship: &Relation,
+    ) -> bool {
+        self.relationships
+            .iter()
+            .any(|(uid, pid, rel)| *uid == user.id && *pid == project.id && rel == relationship)
+    }
+}
+
+async fn enum_relationship_example() {
+    println!("\n=== Enum-Based Relationship Types ===\n");
+
+    let alice = User {
+        id: Uuid::new_v4(),
+        name: "Alice".to_string(),
+    };
+    let bob = User {
+        id: Uuid::new_v4(),
+        name: "Bob".to_string(),
+    };
+
+    let project = Project {
+        id: Uuid::new_v4(),
+        name: "Typed Project".to_string(),
+    };
+
+    let charlie = User {
+        id: Uuid::new_v4(),
+        name: "Charlie".to_string(),
+    };
+
+    let resolver = EnumRelationshipResolver {
+        relationships: vec![
+            (alice.id, project.id, Relation::Owner),
+            (bob.id, project.id, Relation::Contributor),
+            (charlie.id, project.id, Relation::Viewer),
+        ],
+    };
+
+    // Owners and contributors can edit — using enum variants instead of strings.
+    let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+        Relation::Owner,
+        resolver,
+    );
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(owner_policy);
+
+    let context = EmptyContext;
+    let action = EditAction;
+
+    let result = checker
+        .evaluate_access(&alice, &action, &project, &context)
+        .await;
+    println!(
+        "{} edit access: {} (expected: granted)",
+        alice.name,
+        if result.is_granted() {
+            "GRANTED ✓"
+        } else {
+            "DENIED ✗"
+        }
+    );
+
+    let result = checker
+        .evaluate_access(&bob, &action, &project, &context)
+        .await;
+    println!(
+        "{} edit access: {} (expected: denied — viewer, not owner)",
+        bob.name,
+        if result.is_granted() {
+            "GRANTED ✓"
+        } else {
+            "DENIED ✗"
         }
     );
 }
