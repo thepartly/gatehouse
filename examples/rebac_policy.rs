@@ -327,7 +327,7 @@ async fn enum_relationship_example() {
         ],
     };
 
-    // Owners and contributors can edit — using enum variants instead of strings.
+    // Only owners can edit — using an enum variant instead of a string.
     let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
         Relation::Owner,
         resolver,
@@ -339,29 +339,30 @@ async fn enum_relationship_example() {
     let context = EmptyContext;
     let action = EditAction;
 
-    let result = checker
-        .evaluate_access(&alice, &action, &project, &context)
-        .await;
-    println!(
-        "{} edit access: {} (expected: granted)",
-        alice.name,
-        if result.is_granted() {
+    for (user, expected_granted, role) in [
+        (&alice, true, "owner"),
+        (&bob, false, "contributor"),
+        (&charlie, false, "viewer"),
+    ] {
+        let result = checker
+            .evaluate_access(user, &action, &project, &context)
+            .await;
+        let status = if result.is_granted() {
             "GRANTED ✓"
         } else {
             "DENIED ✗"
-        }
-    );
-
-    let result = checker
-        .evaluate_access(&bob, &action, &project, &context)
-        .await;
-    println!(
-        "{} edit access: {} (expected: denied — contributor, not owner)",
-        bob.name,
-        if result.is_granted() {
-            "GRANTED ✓"
-        } else {
-            "DENIED ✗"
-        }
-    );
+        };
+        println!(
+            "{} ({}) edit access: {} (expected: {})",
+            user.name,
+            role,
+            status,
+            if expected_granted {
+                "granted"
+            } else {
+                "denied"
+            }
+        );
+        assert_eq!(result.is_granted(), expected_granted);
+    }
 }

@@ -1293,9 +1293,7 @@ where
 /// specified relationship e.g. "creator", "manager" exists between them.
 ///
 /// The relationship type `Re` is generic, so you can use strings, enums, or
-/// other domain-specific types. `Re` must implement [`fmt::Display`] so that
-/// policy evaluation reasons can include the relationship in human-readable
-/// messages.
+/// other domain-specific types.
 #[async_trait]
 pub trait RelationshipResolver<S, R, Re>: Send + Sync {
     /// Returns `true` if `relationship` exists between `subject` and `resource`.
@@ -1403,7 +1401,7 @@ where
     A: Sync + Send,
     C: Sync + Send,
     Re: Sync + Send + fmt::Display,
-    RG: RelationshipResolver<S, R, Re> + Send + Sync,
+    RG: RelationshipResolver<S, R, Re>,
 {
     async fn evaluate_access(
         &self,
@@ -1953,6 +1951,86 @@ mod tests {
         assert!(
             !result.is_granted(),
             "Access should be denied if relationship does not exist"
+        );
+    }
+
+    // RebacPolicy test with enum relationship type.
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum TestRelation {
+        Manager,
+        Viewer,
+    }
+
+    impl fmt::Display for TestRelation {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                TestRelation::Manager => write!(f, "manager"),
+                TestRelation::Viewer => write!(f, "viewer"),
+            }
+        }
+    }
+
+    struct EnumRelationshipResolver {
+        relationships: Vec<(uuid::Uuid, uuid::Uuid, TestRelation)>,
+    }
+
+    #[async_trait]
+    impl RelationshipResolver<TestSubject, TestResource, TestRelation> for EnumRelationshipResolver {
+        async fn has_relationship(
+            &self,
+            subject: &TestSubject,
+            resource: &TestResource,
+            relationship: &TestRelation,
+        ) -> bool {
+            self.relationships
+                .iter()
+                .any(|(s, r, rel)| s == &subject.id && r == &resource.id && rel == relationship)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rebac_policy_with_enum_relationship() {
+        let subject_id = uuid::Uuid::new_v4();
+        let resource_id = uuid::Uuid::new_v4();
+
+        let subject = TestSubject { id: subject_id };
+        let resource = TestResource { id: resource_id };
+
+        let resolver = EnumRelationshipResolver {
+            relationships: vec![(subject_id, resource_id, TestRelation::Manager)],
+        };
+
+        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
+            TestRelation::Manager,
+            resolver,
+        );
+
+        // Manager relationship exists — should be granted.
+        let result = policy
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+        assert!(
+            result.is_granted(),
+            "Access should be granted for matching enum relationship"
+        );
+
+        // Viewer policy with same resolver (no viewer relationship) — should be denied.
+        let resolver = EnumRelationshipResolver {
+            relationships: vec![(subject_id, resource_id, TestRelation::Manager)],
+        };
+        let viewer_policy =
+            RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
+                TestRelation::Viewer,
+                resolver,
+            );
+
+        let result = viewer_policy
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+        assert!(
+            !result.is_granted(),
+            "Access should be denied when enum relationship does not match"
         );
     }
 
