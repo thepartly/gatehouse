@@ -1293,7 +1293,9 @@ where
 /// specified relationship e.g. "creator", "manager" exists between them.
 ///
 /// The relationship type `Re` is generic, so you can use strings, enums, or
-/// any other type that makes sense for your domain.
+/// other domain-specific types. `Re` must implement [`fmt::Display`] so that
+/// policy evaluation reasons can include the relationship in human-readable
+/// messages.
 #[async_trait]
 pub trait RelationshipResolver<S, R, Re>: Send + Sync {
     /// Returns `true` if `relationship` exists between `subject` and `resource`.
@@ -1371,6 +1373,9 @@ pub trait RelationshipResolver<S, R, Re>: Send + Sync {
 /// assert!(!checker.evaluate_access(&other_employee, &AccessAction, &project, &context).await.is_granted());
 /// # });
 /// ```
+///
+/// The relationship type `Re` must implement [`fmt::Display`] so that policy
+/// evaluation reasons can include the relationship value in log messages.
 pub struct RebacPolicy<S, R, A, C, Re, RG> {
     /// The relationship to check (e.g. `"manager"`, or an enum variant).
     pub relationship: Re,

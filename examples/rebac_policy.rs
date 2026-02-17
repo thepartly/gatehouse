@@ -356,7 +356,7 @@ async fn enum_relationship_example() {
         .evaluate_access(&bob, &action, &project, &context)
         .await;
     println!(
-        "{} edit access: {} (expected: denied — viewer, not owner)",
+        "{} edit access: {} (expected: denied — contributor, not owner)",
         bob.name,
         if result.is_granted() {
             "GRANTED ✓"
