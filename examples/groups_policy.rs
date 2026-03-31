@@ -138,5 +138,5 @@ async fn main() {
     // Evaluation Trace:
     // ✔ PermissionChecker (OR)
     //   ✘ OrgAdminPolicy DENIED: User is not organization admin
-    //   ✔ PartlyStaffPolicy GRANTED: User has staff permission
+    //   ✔ StaffPolicy GRANTED: User has staff permission
 }
