@@ -1,8 +1,9 @@
 //! # Relationship-Based Access Control Policy Example
 //!
 //! This example demonstrates how to use the built-in ReBAC policy
-//! for relationship-based permissions management, including error handling
-//! during relationship resolution.
+//! for relationship-based permissions management, including how resolver
+//! failures such as database errors or timeouts must be flattened into
+//! denial because `RelationshipResolver` returns `bool`.
 //!
 //! To run this example:
 //! ```
