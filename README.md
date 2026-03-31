@@ -11,7 +11,7 @@ A flexible authorization library that combines role-based (RBAC), attribute-base
 ## Features
 - **Multi-paradigm Authorization**: Support for RBAC, ABAC, and ReBAC patterns
 - **Policy Composition**: Combine policies with logical operators (`AND`, `OR`, `NOT`)
-- **Detailed Evaluation Tracing**: Complete decision trace for debugging and auditing
+- **Detailed Evaluation Tracing**: Decision trace for the policies and branches that were actually evaluated
 - **Fluent Builder API**: Construct custom policies with a PolicyBuilder.
 - **Type Safety**: Strongly typed resources/actions/contexts
 - **Async Ready**: Built with async/await support
@@ -76,7 +76,7 @@ assert!(outcome.is_ok());
 - `AndPolicy` short-circuits on the first denial; `OrPolicy` short-circuits on the first grant.
 - `NotPolicy` inverts the result of its inner policy.
 - `PolicyBuilder` combines all configured predicates with `AND` logic.
-- `PolicyBuilder::effect(Effect::Deny)` only makes that one built policy return `Denied` when its predicates match. It does not create global "deny overrides allow" behavior when used inside `PermissionChecker`.
+- `PolicyBuilder::effect(Effect::Deny)` changes a matching policy result from allow to deny; a non-match is still treated as denied/non-applicable. It does not create global "deny overrides allow" behavior when used inside `PermissionChecker`.
 - `AccessEvaluation::Denied.reason` is a summary string such as `"All policies denied access"`. Inspect the trace tree for individual policy reasons.
 - Evaluation traces only contain policies and branches that were actually evaluated before short-circuiting.
 
@@ -86,7 +86,7 @@ assert!(outcome.is_ok());
 
 The foundation of the authorization system:
 
-```rust
+```rust,ignore
 #[async_trait]
 trait Policy<Subject, Resource, Action, Context>: Send + Sync {
     async fn evaluate_access(
@@ -109,7 +109,7 @@ trait Policy<Subject, Resource, Action, Context>: Send + Sync {
 
 Aggregates multiple policies (e.g. RBAC, ABAC) with `OR` logic by default: if any policy grants access, permission is granted. The returned `AccessEvaluation` contains both the final decision and a trace tree of the evaluated policies.
 
-```rust
+```rust,ignore
 let mut checker = PermissionChecker::new();
 checker.add_policy(rbac_policy);
 checker.add_policy(owner_policy);
@@ -131,7 +131,7 @@ subjects, actions, resources, and context. Every configured predicate must pass 
 
 Use `PolicyBuilder` for synchronous predicate logic. If your policy needs async I/O or external lookups, implement `Policy` directly.
 
-```rust
+```rust,ignore
 let custom_policy = PolicyBuilder::<MySubject, MyResource, MyAction, MyContext>::new("CustomPolicy")
     .subjects(|s| /* ... */)
     .actions(|a| /* ... */)
@@ -156,7 +156,7 @@ let custom_policy = PolicyBuilder::<MySubject, MyResource, MyAction, MyContext>:
 
 ## Tracing And Telemetry
 
-`PermissionChecker::evaluate_access` is instrumented with `tracing`, and every evaluated policy emits a `trace!` event on the `gatehouse::security` target.
+When trace-level events are enabled, `PermissionChecker::evaluate_access` creates an instrumented span and every evaluated policy records a `trace!` event on the `gatehouse::security` target.
 
 Emitted fields:
 

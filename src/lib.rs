@@ -28,8 +28,9 @@
 //! - [`NotPolicy`] inverts the decision of its inner policy.
 //! - [`PolicyBuilder`] combines all configured predicates with AND logic.
 //! - [`PolicyBuilder::effect`] changes the result returned by that specific
-//!   built policy; it does not create global deny-overrides-allow semantics when
-//!   used inside [`PermissionChecker`].
+//!   built policy when its combined predicate matches. A non-match is still
+//!   treated as denied/non-applicable, and the effect does not create global
+//!   deny-overrides-allow semantics when used inside [`PermissionChecker`].
 //!
 //! Denials from [`AccessEvaluation`] are intentionally summary-level. For example,
 //! a failed [`PermissionChecker`] returns the top-level reason
@@ -214,8 +215,9 @@
 //!
 //! ## Tracing And Telemetry
 //!
-//! [`PermissionChecker::evaluate_access`] is instrumented with `tracing`, and each
-//! evaluated policy emits a `trace!` event on the `gatehouse::security` target.
+//! When trace-level events are enabled, [`PermissionChecker::evaluate_access`]
+//! creates an instrumented span and each evaluated policy records a `trace!`
+//! event on the `gatehouse::security` target.
 //!
 //! Emitted fields:
 //!
@@ -987,8 +989,9 @@ where
 ///
 /// [`PolicyBuilder::effect`] controls the result returned when the combined
 /// predicate matches. In particular, `Effect::Deny` means "this built policy
-/// returns [`PolicyEvalResult::Denied`] when it matches"; it does not introduce a
-/// global deny-overrides-allow rule when combined with other policies.
+/// returns [`PolicyEvalResult::Denied`] when it matches". A non-match is still
+/// treated as denied/non-applicable, and this does not introduce a global
+/// deny-overrides-allow rule when combined with other policies.
 ///
 /// # Example
 ///
@@ -1071,8 +1074,9 @@ where
     /// Defaults to [`Effect::Allow`].
     ///
     /// `Effect::Deny` causes the built policy to return
-    /// [`PolicyEvalResult::Denied`] when its combined predicate matches. It does
-    /// not override grants from other policies evaluated by [`PermissionChecker`].
+    /// [`PolicyEvalResult::Denied`] when its combined predicate matches. A
+    /// non-match is still treated as denied/non-applicable, and this does not
+    /// override grants from other policies evaluated by [`PermissionChecker`].
     pub fn effect(mut self, effect: Effect) -> Self {
         self.effect = effect;
         self
@@ -1724,6 +1728,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc as StdArc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::Registry;
 
     // Dummy resource/action/context types for testing
     #[derive(Debug, Clone)]
@@ -1741,6 +1752,83 @@ mod tests {
 
     #[derive(Debug, Clone)]
     pub struct TestContext;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedEvent {
+        target: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldRecorder {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for FieldRecorder {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct EventRecorder {
+        events: StdArc<Mutex<Vec<RecordedEvent>>>,
+    }
+
+    impl<S> Layer<S> for EventRecorder
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldRecorder::default();
+            event.record(&mut visitor);
+
+            self.events
+                .lock()
+                .expect("events mutex poisoned")
+                .push(RecordedEvent {
+                    target: event.metadata().target().to_string(),
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    fn with_recorded_events<T>(f: impl FnOnce() -> T) -> (T, Vec<RecordedEvent>) {
+        let recorder = EventRecorder::default();
+        let events = recorder.events.clone();
+        let subscriber = Registry::default().with(recorder);
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let events = events.lock().expect("events mutex poisoned").clone();
+        (result, events)
+    }
+
+    fn security_events(events: &[RecordedEvent]) -> Vec<&RecordedEvent> {
+        events
+            .iter()
+            .filter(|event| event.target == "gatehouse::security")
+            .collect()
+    }
 
     #[test]
     fn security_rule_metadata_builder_sets_fields() {
@@ -1807,6 +1895,40 @@ mod tests {
 
         fn policy_type(&self) -> String {
             "AlwaysDenyPolicy".to_string()
+        }
+    }
+
+    struct CustomMetadataDenyPolicy;
+
+    #[async_trait]
+    impl Policy<TestSubject, TestResource, TestAction, TestContext> for CustomMetadataDenyPolicy {
+        async fn evaluate_access(
+            &self,
+            _subject: &TestSubject,
+            _action: &TestAction,
+            _resource: &TestResource,
+            _context: &TestContext,
+        ) -> PolicyEvalResult {
+            PolicyEvalResult::Denied {
+                policy_type: self.policy_type(),
+                reason: "Blocked by custom rule".to_string(),
+            }
+        }
+
+        fn policy_type(&self) -> String {
+            "CustomMetadataDenyPolicy".to_string()
+        }
+
+        fn security_rule(&self) -> SecurityRuleMetadata {
+            SecurityRuleMetadata::new()
+                .with_name("CustomRuleName")
+                .with_category("Policy")
+                .with_description("Description from metadata")
+                .with_reference("https://example.com/rule")
+                .with_ruleset_name("CustomRuleset")
+                .with_uuid("rule-123")
+                .with_version("2026.03")
+                .with_license("MIT")
         }
     }
 
@@ -1945,6 +2067,188 @@ mod tests {
             assert_eq!(reason, "All policies denied access");
         } else {
             panic!("Expected AccessEvaluation::Denied, got {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_permission_checker_trace_omits_unevaluated_policies_after_grant() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysAllowPolicy);
+        checker.add_policy(AlwaysDenyPolicy("ShouldNotAppear"));
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = checker
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        let trace = match result {
+            AccessEvaluation::Granted { trace, .. } => trace,
+            other => panic!("Expected granted evaluation, got {other:?}"),
+        };
+
+        let root = trace.root().expect("trace should have a root result");
+        match root {
+            PolicyEvalResult::Combined { children, .. } => {
+                assert_eq!(
+                    children.len(),
+                    1,
+                    "Only the granting policy should be traced"
+                );
+                assert_eq!(
+                    children[0].reason(),
+                    Some("Always allow policy".to_string()),
+                    "The granting policy should be the only recorded child"
+                );
+            }
+            other => panic!("Expected combined root result, got {other:?}"),
+        }
+
+        let formatted = trace.format();
+        assert!(formatted.contains("AlwaysAllowPolicy"));
+        assert!(
+            !formatted.contains("ShouldNotAppear"),
+            "Trace should not mention policies that were never evaluated"
+        );
+    }
+
+    #[test]
+    fn test_tracing_uses_default_security_rule_fallbacks() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysAllowPolicy);
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let (_result, events) = with_recorded_events(|| {
+            tokio_test::block_on(async {
+                checker
+                    .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+                    .await
+            })
+        });
+
+        let security_events = security_events(&events);
+        assert_eq!(
+            security_events.len(),
+            1,
+            "Exactly one security event should be emitted for one evaluated policy"
+        );
+
+        let event = security_events[0];
+        assert_eq!(
+            event.fields.get("security_rule.name").map(String::as_str),
+            Some("AlwaysAllowPolicy")
+        );
+        assert_eq!(
+            event
+                .fields
+                .get("security_rule.category")
+                .map(String::as_str),
+            Some("Access Control")
+        );
+        assert_eq!(
+            event
+                .fields
+                .get("security_rule.ruleset.name")
+                .map(String::as_str),
+            Some("PermissionChecker")
+        );
+        assert_eq!(
+            event.fields.get("event.outcome").map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            event.fields.get("policy.type").map(String::as_str),
+            Some("AlwaysAllowPolicy")
+        );
+
+        let reason = event
+            .fields
+            .get("policy.result.reason")
+            .expect("policy.result.reason should be recorded");
+        assert!(
+            reason.contains("Always allow policy"),
+            "recorded reason should contain the policy reason, got {reason}"
+        );
+    }
+
+    #[test]
+    fn test_tracing_uses_custom_security_rule_metadata() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(CustomMetadataDenyPolicy);
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let (_result, events) = with_recorded_events(|| {
+            tokio_test::block_on(async {
+                checker
+                    .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+                    .await
+            })
+        });
+
+        let security_events = security_events(&events);
+        assert_eq!(security_events.len(), 1);
+
+        let event = security_events[0];
+        assert_eq!(
+            event.fields.get("security_rule.name").map(String::as_str),
+            Some("CustomRuleName")
+        );
+        assert_eq!(
+            event
+                .fields
+                .get("security_rule.category")
+                .map(String::as_str),
+            Some("Policy")
+        );
+        assert_eq!(
+            event
+                .fields
+                .get("security_rule.ruleset.name")
+                .map(String::as_str),
+            Some("CustomRuleset")
+        );
+        assert_eq!(
+            event.fields.get("event.outcome").map(String::as_str),
+            Some("failure")
+        );
+        assert_eq!(
+            event.fields.get("policy.type").map(String::as_str),
+            Some("CustomMetadataDenyPolicy")
+        );
+
+        for (field_name, expected_substring) in [
+            ("security_rule.description", "Description from metadata"),
+            ("security_rule.reference", "https://example.com/rule"),
+            ("security_rule.uuid", "rule-123"),
+            ("security_rule.version", "2026.03"),
+            ("security_rule.license", "MIT"),
+            ("policy.result.reason", "Blocked by custom rule"),
+        ] {
+            let value = event
+                .fields
+                .get(field_name)
+                .unwrap_or_else(|| panic!("{field_name} should be recorded"));
+            assert!(
+                value.contains(expected_substring),
+                "{field_name} should contain {expected_substring:?}, got {value:?}"
+            );
         }
     }
 
@@ -2840,6 +3144,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_access_evaluation_to_result_uses_summary_denial_reason() {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("First policy reason"));
+        checker.add_policy(AlwaysDenyPolicy("Second policy reason"));
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let result = checker
+            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
+            .await;
+
+        let converted: Result<(), String> = result.to_result(|reason| reason.to_string());
+        assert_eq!(
+            converted.unwrap_err(),
+            "All policies denied access",
+            "to_result should use the top-level summary denial reason"
+        );
+    }
+
+    #[tokio::test]
     async fn test_access_evaluation_display_trace_granted() {
         let mut checker = PermissionChecker::new();
         checker.add_policy(AlwaysAllowPolicy);
@@ -3260,6 +3589,43 @@ mod policy_builder_tests {
         assert!(
             !result.is_granted(),
             "Policy with effect Deny should result in denial even if the predicate passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_policy_builder_effect_deny_does_not_override_other_grants() {
+        let deny_policy = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
+            "ExplicitDenyLikePolicy",
+        )
+        .effect(Effect::Deny)
+        .subjects(|subject| subject.name == "Alice")
+        .build();
+
+        let allow_policy =
+            PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
+                "AllowAlicePolicy",
+            )
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(deny_policy);
+        checker.add_policy(allow_policy);
+
+        let result = checker
+            .evaluate_access(
+                &TestSubject {
+                    name: "Alice".into(),
+                },
+                &TestAction,
+                &TestResource,
+                &TestContext,
+            )
+            .await;
+
+        assert!(
+            result.is_granted(),
+            "A deny-effect builder policy should not override a later allow under PermissionChecker OR semantics"
         );
     }
 
