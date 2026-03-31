@@ -86,7 +86,10 @@ assert!(outcome.is_ok());
 
 The foundation of the authorization system:
 
-```rust,ignore
+```rust
+use async_trait::async_trait;
+use gatehouse::{PolicyEvalResult, SecurityRuleMetadata};
+
 #[async_trait]
 trait Policy<Subject, Resource, Action, Context>: Send + Sync {
     async fn evaluate_access(
