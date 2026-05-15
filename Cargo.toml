@@ -14,6 +14,7 @@ async-trait = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 axum = "0.8"
 tower = "0.5"
 hyper = "1"

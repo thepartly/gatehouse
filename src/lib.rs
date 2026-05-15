@@ -378,6 +378,17 @@ pub enum PolicyEvalResult {
     },
 }
 
+/// A borrowed resource/context pair passed to batch policy evaluators.
+///
+/// Values are borrowed from caller-owned batch items, so policy implementations
+/// can evaluate a batch without forcing resources or contexts to be cloned.
+pub struct PolicyBatchItem<'a, Resource, Context> {
+    /// The target resource for this item.
+    pub resource: &'a Resource,
+    /// Additional context for this item.
+    pub context: &'a Context,
+}
+
 /// The complete result of a permission evaluation.
 /// Contains both the final decision and a detailed trace for debugging.
 ///
@@ -655,7 +666,13 @@ impl fmt::Display for PolicyEvalResult {
 /// A policy determines if a subject is allowed to perform an action on
 /// a resource within a given context.
 #[async_trait]
-pub trait Policy<Subject, Resource, Action, Context>: Send + Sync {
+pub trait Policy<Subject, Resource, Action, Context>: Send + Sync
+where
+    Subject: Sync,
+    Resource: Sync,
+    Action: Sync,
+    Context: Sync,
+{
     /// Evaluates whether access should be granted.
     ///
     /// # Arguments
@@ -675,6 +692,28 @@ pub trait Policy<Subject, Resource, Action, Context>: Send + Sync {
         resource: &Resource,
         context: &Context,
     ) -> PolicyEvalResult;
+
+    /// Evaluates access for a batch of resource/context pairs.
+    ///
+    /// The default implementation preserves single-item semantics by evaluating
+    /// each item sequentially. Policies with set-oriented backends can override
+    /// this method to reduce round trips while returning one result per input
+    /// item in the same order.
+    async fn evaluate_access_batch<'item>(
+        &self,
+        subject: &'item Subject,
+        action: &'item Action,
+        items: &'item [PolicyBatchItem<'item, Resource, Context>],
+    ) -> Vec<PolicyEvalResult> {
+        let mut results = Vec::with_capacity(items.len());
+        for item in items {
+            results.push(
+                self.evaluate_access(subject, action, item.resource, item.context)
+                    .await,
+            );
+        }
+        results
+    }
 
     /// Policy name for debugging
     fn policy_type(&self) -> String;
@@ -698,13 +737,25 @@ pub struct PermissionChecker<S, R, A, C> {
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
 }
 
-impl<S, R, A, C> Default for PermissionChecker<S, R, A, C> {
+impl<S, R, A, C> Default for PermissionChecker<S, R, A, C>
+where
+    S: Sync,
+    R: Sync,
+    A: Sync,
+    C: Sync,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S, R, A, C> PermissionChecker<S, R, A, C> {
+impl<S, R, A, C> PermissionChecker<S, R, A, C>
+where
+    S: Sync,
+    R: Sync,
+    A: Sync,
+    C: Sync,
+{
     /// Creates a new `PermissionChecker` with no policies.
     pub fn new() -> Self {
         Self {
@@ -822,6 +873,266 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
             reason: "All policies denied access".to_string(),
         }
     }
+
+    /// Evaluates a batch of caller-owned items.
+    ///
+    /// The `parts` callback tells gatehouse how to borrow the resource and
+    /// context from each caller-owned item. Returned results preserve input
+    /// order, including duplicate resources. Policy evaluation still uses the
+    /// same OR semantics as [`Self::evaluate_access`], but the checker evaluates
+    /// each policy across the still-pending batch before moving to the next
+    /// policy. This lets policies with set-oriented backends override
+    /// [`Policy::evaluate_access_batch`] and collapse many point lookups into
+    /// one backend call.
+    ///
+    /// If a policy returns the wrong number of batch results, affected items are
+    /// denied rather than accidentally granted.
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # use async_trait::async_trait;
+    /// # #[derive(Clone)]
+    /// # struct User { id: u64 }
+    /// # #[derive(Clone)]
+    /// # struct Document { owner_id: u64 }
+    /// # struct Read;
+    /// # #[derive(Clone)]
+    /// # struct RequestContext;
+    /// # tokio_test::block_on(async {
+    /// let user = User { id: 7 };
+    /// let context = RequestContext;
+    /// let documents = vec![
+    ///     Document { owner_id: 7 },
+    ///     Document { owner_id: 42 },
+    /// ];
+    ///
+    /// let mut checker = PermissionChecker::new();
+    /// checker.add_policy(AbacPolicy::new(
+    ///     |user: &User, document: &Document, _action: &Read, _context: &RequestContext| {
+    ///         user.id == document.owner_id
+    ///     },
+    /// ));
+    ///
+    /// let visible = checker
+    ///     .filter_authorized_with_context_by(&user, &Read, documents, &context, |document| {
+    ///         document
+    ///     })
+    ///     .await;
+    ///
+    /// assert_eq!(visible.len(), 1);
+    /// # });
+    /// ```
+    #[tracing::instrument(skip_all, fields(item_count, granted_count, denied_count, policy_count = self.policies.len()))]
+    pub async fn evaluate_batch_by<I, F>(
+        &self,
+        subject: &S,
+        action: &A,
+        items: I,
+        parts: F,
+    ) -> Vec<(I::Item, AccessEvaluation)>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C),
+    {
+        let items: Vec<I::Item> = items.into_iter().collect();
+        let item_count = items.len();
+        tracing::Span::current().record("item_count", item_count);
+
+        let mut traces = vec![Vec::new(); item_count];
+        let mut evaluations: Vec<Option<AccessEvaluation>> = vec![None; item_count];
+
+        if self.policies.is_empty() {
+            let mut denied_count = 0usize;
+            let results = items
+                .into_iter()
+                .map(|item| {
+                    denied_count += 1;
+                    let result = PolicyEvalResult::Denied {
+                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                        reason: "No policies configured".to_string(),
+                    };
+                    (
+                        item,
+                        AccessEvaluation::Denied {
+                            trace: EvalTrace::with_root(result),
+                            reason: "No policies configured".to_string(),
+                        },
+                    )
+                })
+                .collect();
+            tracing::Span::current().record("granted_count", 0usize);
+            tracing::Span::current().record("denied_count", denied_count);
+            return results;
+        }
+
+        let mut pending: Vec<usize> = (0..item_count).collect();
+
+        for policy in &self.policies {
+            if pending.is_empty() {
+                break;
+            }
+
+            let batch_items: Vec<_> = pending
+                .iter()
+                .map(|&index| {
+                    let (resource, context) = parts(&items[index]);
+                    PolicyBatchItem { resource, context }
+                })
+                .collect();
+
+            let policy_results = policy
+                .evaluate_access_batch(subject, action, &batch_items)
+                .await;
+
+            if policy_results.len() != pending.len() {
+                for index in pending {
+                    let policy_result = PolicyEvalResult::Denied {
+                        policy_type: policy.policy_type(),
+                        reason: "Policy batch result count did not match input count".to_string(),
+                    };
+                    traces[index].push(policy_result);
+                    let combined = PolicyEvalResult::Combined {
+                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                        operation: CombineOp::Or,
+                        children: std::mem::take(&mut traces[index]),
+                        outcome: false,
+                    };
+                    evaluations[index] = Some(AccessEvaluation::Denied {
+                        trace: EvalTrace::with_root(combined),
+                        reason: "Policy batch result count did not match input count".to_string(),
+                    });
+                }
+                pending = Vec::new();
+                break;
+            }
+
+            let mut still_pending = Vec::new();
+            for (index, result) in pending.into_iter().zip(policy_results) {
+                let result_passes = result.is_granted();
+                let policy_type = policy.policy_type();
+                let reason = result.reason();
+
+                traces[index].push(result);
+
+                if result_passes {
+                    let combined = PolicyEvalResult::Combined {
+                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                        operation: CombineOp::Or,
+                        children: std::mem::take(&mut traces[index]),
+                        outcome: true,
+                    };
+                    evaluations[index] = Some(AccessEvaluation::Granted {
+                        policy_type,
+                        reason,
+                        trace: EvalTrace::with_root(combined),
+                    });
+                } else {
+                    still_pending.push(index);
+                }
+            }
+            pending = still_pending;
+        }
+
+        for index in pending {
+            let combined = PolicyEvalResult::Combined {
+                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                operation: CombineOp::Or,
+                children: std::mem::take(&mut traces[index]),
+                outcome: false,
+            };
+            evaluations[index] = Some(AccessEvaluation::Denied {
+                trace: EvalTrace::with_root(combined),
+                reason: "All policies denied access".to_string(),
+            });
+        }
+
+        let mut granted_count = 0usize;
+        let results = items
+            .into_iter()
+            .zip(evaluations.into_iter())
+            .map(|(item, evaluation)| {
+                let evaluation = evaluation.expect("every batch item should be evaluated");
+                if evaluation.is_granted() {
+                    granted_count += 1;
+                }
+                (item, evaluation)
+            })
+            .collect::<Vec<_>>();
+        let denied_count = item_count - granted_count;
+        tracing::Span::current().record("granted_count", granted_count);
+        tracing::Span::current().record("denied_count", denied_count);
+        results
+    }
+
+    /// Returns only the items granted by [`Self::evaluate_batch_by`].
+    pub async fn filter_authorized_by<I, F>(
+        &self,
+        subject: &S,
+        action: &A,
+        items: I,
+        parts: F,
+    ) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C),
+    {
+        self.evaluate_batch_by(subject, action, items, parts)
+            .await
+            .into_iter()
+            .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
+            .collect()
+    }
+
+    /// Evaluates caller-owned items that all share one context value.
+    ///
+    /// This is a convenience wrapper around [`Self::evaluate_batch_by`] for the
+    /// common list-endpoint shape where every candidate resource is evaluated in
+    /// the same request context.
+    pub async fn evaluate_batch_with_context_by<I, F>(
+        &self,
+        subject: &S,
+        action: &A,
+        items: I,
+        context: &C,
+        resource: F,
+    ) -> Vec<(I::Item, AccessEvaluation)>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item R,
+    {
+        let wrapped_items = items
+            .into_iter()
+            .map(|item| (item, context))
+            .collect::<Vec<_>>();
+
+        self.evaluate_batch_by(subject, action, wrapped_items, |(item, context)| {
+            (resource(item), *context)
+        })
+        .await
+        .into_iter()
+        .map(|((item, _context), evaluation)| (item, evaluation))
+        .collect()
+    }
+
+    /// Returns only authorized items when all items share one context value.
+    pub async fn filter_authorized_with_context_by<I, F>(
+        &self,
+        subject: &S,
+        action: &A,
+        items: I,
+        context: &C,
+        resource: F,
+    ) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item R,
+    {
+        self.evaluate_batch_with_context_by(subject, action, items, context, resource)
+            .await
+            .into_iter()
+            .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
+            .collect()
+    }
 }
 
 /// Represents the intended effect of a policy.
@@ -902,6 +1213,15 @@ where
         (**self)
             .evaluate_access(subject, action, resource, context)
             .await
+    }
+
+    async fn evaluate_access_batch<'item>(
+        &self,
+        subject: &'item S,
+        action: &'item A,
+        items: &'item [PolicyBatchItem<'item, R, C>],
+    ) -> Vec<PolicyEvalResult> {
+        (**self).evaluate_access_batch(subject, action, items).await
     }
 
     fn policy_type(&self) -> String {
@@ -1295,9 +1615,33 @@ where
 /// The relationship type `Re` is generic, so you can use strings, enums, or
 /// other domain-specific types.
 #[async_trait]
-pub trait RelationshipResolver<S, R, Re>: Send + Sync {
+pub trait RelationshipResolver<S, R, Re>: Send + Sync
+where
+    S: Sync,
+    R: Sync,
+    Re: Sync,
+{
     /// Returns `true` if `relationship` exists between `subject` and `resource`.
     async fn has_relationship(&self, subject: &S, resource: &R, relationship: &Re) -> bool;
+
+    /// Returns one relationship decision per resource, in input order.
+    ///
+    /// The default implementation loops over [`Self::has_relationship`].
+    /// Resolvers backed by SQL, graph stores, or remote authorization services
+    /// can override this method to perform one set-oriented lookup for the
+    /// whole batch.
+    async fn has_relationship_batch<'item>(
+        &self,
+        subject: &'item S,
+        resources: &'item [&'item R],
+        relationship: &'item Re,
+    ) -> Vec<bool> {
+        let mut results = Vec::with_capacity(resources.len());
+        for resource in resources {
+            results.push(self.has_relationship(subject, resource, relationship).await);
+        }
+        results
+    }
 }
 
 /// ### ReBAC Policy
@@ -1432,6 +1776,53 @@ where
                 ),
             }
         }
+    }
+
+    async fn evaluate_access_batch<'item>(
+        &self,
+        subject: &'item S,
+        _action: &'item A,
+        items: &'item [PolicyBatchItem<'item, R, C>],
+    ) -> Vec<PolicyEvalResult> {
+        let resources = items.iter().map(|item| item.resource).collect::<Vec<_>>();
+        let relationship_results = self
+            .resolver
+            .has_relationship_batch(subject, &resources, &self.relationship)
+            .await;
+
+        if relationship_results.len() != items.len() {
+            return items
+                .iter()
+                .map(|_| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type(),
+                    reason: "Relationship resolver returned the wrong number of batch results"
+                        .to_string(),
+                })
+                .collect();
+        }
+
+        relationship_results
+            .into_iter()
+            .map(|has_relationship| {
+                if has_relationship {
+                    PolicyEvalResult::Granted {
+                        policy_type: self.policy_type(),
+                        reason: Some(format!(
+                            "Subject has '{}' relationship with resource",
+                            self.relationship
+                        )),
+                    }
+                } else {
+                    PolicyEvalResult::Denied {
+                        policy_type: self.policy_type(),
+                        reason: format!(
+                            "Subject does not have '{}' relationship with resource",
+                            self.relationship
+                        ),
+                    }
+                }
+            })
+            .collect()
     }
 
     fn policy_type(&self) -> String {
@@ -1598,7 +1989,13 @@ pub struct NotPolicy<S, R, A, C> {
     policy: Arc<dyn Policy<S, R, A, C>>,
 }
 
-impl<S, R, A, C> NotPolicy<S, R, A, C> {
+impl<S, R, A, C> NotPolicy<S, R, A, C>
+where
+    S: Sync,
+    R: Sync,
+    A: Sync,
+    C: Sync,
+{
     /// Creates a new `NotPolicy` that inverts the given policy's decision.
     pub fn new(policy: impl Policy<S, R, A, C> + 'static) -> Self {
         Self {
@@ -1645,6 +2042,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Dummy resource/action/context types for testing
     #[derive(Debug, Clone)]
@@ -1731,6 +2129,56 @@ mod tests {
         }
     }
 
+    struct EvenResourceBatchPolicy {
+        batch_calls: Arc<AtomicUsize>,
+        single_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Policy<TestSubject, TestResource, TestAction, TestContext> for EvenResourceBatchPolicy {
+        async fn evaluate_access(
+            &self,
+            _subject: &TestSubject,
+            _action: &TestAction,
+            resource: &TestResource,
+            _context: &TestContext,
+        ) -> PolicyEvalResult {
+            self.single_calls.fetch_add(1, Ordering::SeqCst);
+            if resource.id.as_u128().is_multiple_of(2) {
+                PolicyEvalResult::Granted {
+                    policy_type: self.policy_type(),
+                    reason: Some("even resource".to_string()),
+                }
+            } else {
+                PolicyEvalResult::Denied {
+                    policy_type: self.policy_type(),
+                    reason: "odd resource".to_string(),
+                }
+            }
+        }
+
+        async fn evaluate_access_batch<'item>(
+            &self,
+            subject: &'item TestSubject,
+            action: &'item TestAction,
+            items: &'item [PolicyBatchItem<'item, TestResource, TestContext>],
+        ) -> Vec<PolicyEvalResult> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            let mut results = Vec::with_capacity(items.len());
+            for item in items {
+                results.push(
+                    self.evaluate_access(subject, action, item.resource, item.context)
+                        .await,
+                );
+            }
+            results
+        }
+
+        fn policy_type(&self) -> String {
+            "EvenResourceBatchPolicy".to_string()
+        }
+    }
+
     #[tokio::test]
     async fn test_no_policies() {
         let checker =
@@ -1752,6 +2200,101 @@ mod tests {
             }
             _ => panic!("Expected Denied(No policies configured), got {:?}", result),
         }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_batch_by_matches_single_item_loop() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..8)
+            .map(|value| TestResource {
+                id: uuid::Uuid::from_u128(value),
+            })
+            .collect::<Vec<_>>();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        });
+
+        let mut loop_results = Vec::new();
+        for resource in &resources {
+            loop_results.push(
+                checker
+                    .evaluate_access(&subject, &TestAction, resource, &TestContext)
+                    .await
+                    .is_granted(),
+            );
+        }
+
+        let batch_items = resources
+            .clone()
+            .into_iter()
+            .map(|resource| (resource, TestContext))
+            .collect::<Vec<_>>();
+        let batch_results = checker
+            .evaluate_batch_by(&subject, &TestAction, batch_items, |item| {
+                (&item.0, &item.1)
+            })
+            .await
+            .into_iter()
+            .map(|(_item, evaluation)| evaluation.is_granted())
+            .collect::<Vec<_>>();
+
+        assert_eq!(loop_results, batch_results);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 16);
+    }
+
+    #[tokio::test]
+    async fn test_filter_authorized_by_preserves_authorized_items_in_order() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = vec![
+            TestResource {
+                id: uuid::Uuid::from_u128(3),
+            },
+            TestResource {
+                id: uuid::Uuid::from_u128(2),
+            },
+            TestResource {
+                id: uuid::Uuid::from_u128(4),
+            },
+            TestResource {
+                id: uuid::Uuid::from_u128(5),
+            },
+        ];
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(EvenResourceBatchPolicy {
+            batch_calls,
+            single_calls,
+        });
+
+        let batch_items = resources
+            .into_iter()
+            .map(|resource| (resource, TestContext))
+            .collect::<Vec<_>>();
+        let authorized = checker
+            .filter_authorized_by(&subject, &TestAction, batch_items, |item| {
+                (&item.0, &item.1)
+            })
+            .await;
+
+        assert_eq!(
+            authorized
+                .into_iter()
+                .map(|(resource, _context)| resource.id.as_u128())
+                .collect::<Vec<_>>(),
+            vec![2, 4]
+        );
     }
 
     #[tokio::test]
@@ -2308,9 +2851,10 @@ mod tests {
     #[tokio::test]
     async fn test_abac_policy_grants_when_condition_true() {
         let policy = AbacPolicy::new(
-            |_subject: &TestSubject, _resource: &TestResource, _action: &TestAction, _context: &TestContext| {
-                true
-            },
+            |_subject: &TestSubject,
+             _resource: &TestResource,
+             _action: &TestAction,
+             _context: &TestContext| { true },
         );
 
         let subject = TestSubject {
@@ -2324,16 +2868,20 @@ mod tests {
             .evaluate_access(&subject, &TestAction, &resource, &TestContext)
             .await;
 
-        assert!(result.is_granted(), "AbacPolicy should grant when condition returns true");
+        assert!(
+            result.is_granted(),
+            "AbacPolicy should grant when condition returns true"
+        );
         assert_eq!(policy.policy_type(), "AbacPolicy");
     }
 
     #[tokio::test]
     async fn test_abac_policy_denies_when_condition_false() {
         let policy = AbacPolicy::new(
-            |_subject: &TestSubject, _resource: &TestResource, _action: &TestAction, _context: &TestContext| {
-                false
-            },
+            |_subject: &TestSubject,
+             _resource: &TestResource,
+             _action: &TestAction,
+             _context: &TestContext| { false },
         );
 
         let subject = TestSubject {
@@ -2347,9 +2895,15 @@ mod tests {
             .evaluate_access(&subject, &TestAction, &resource, &TestContext)
             .await;
 
-        assert!(!result.is_granted(), "AbacPolicy should deny when condition returns false");
+        assert!(
+            !result.is_granted(),
+            "AbacPolicy should deny when condition returns false"
+        );
         match result {
-            PolicyEvalResult::Denied { policy_type, reason } => {
+            PolicyEvalResult::Denied {
+                policy_type,
+                reason,
+            } => {
                 assert_eq!(policy_type, "AbacPolicy");
                 assert!(reason.contains("false"));
             }
@@ -2361,9 +2915,10 @@ mod tests {
     async fn test_abac_policy_with_attribute_check() {
         // Policy that checks if the subject owns the resource
         let policy = AbacPolicy::new(
-            |subject: &TestSubject, resource: &TestResource, _action: &TestAction, _context: &TestContext| {
-                subject.id == resource.id
-            },
+            |subject: &TestSubject,
+             resource: &TestResource,
+             _action: &TestAction,
+             _context: &TestContext| { subject.id == resource.id },
         );
 
         let owner_id = uuid::Uuid::new_v4();
@@ -2377,13 +2932,19 @@ mod tests {
         let result = policy
             .evaluate_access(&owner, &TestAction, &owned_resource, &TestContext)
             .await;
-        assert!(result.is_granted(), "Owner should have access to owned resource");
+        assert!(
+            result.is_granted(),
+            "Owner should have access to owned resource"
+        );
 
         // Owner should not have access to other resource
         let result = policy
             .evaluate_access(&owner, &TestAction, &other_resource, &TestContext)
             .await;
-        assert!(!result.is_granted(), "Owner should not have access to other resource");
+        assert!(
+            !result.is_granted(),
+            "Owner should not have access to other resource"
+        );
     }
 
     // ==================== RbacPolicy Tests ====================
@@ -2410,16 +2971,20 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-            &policy,
-            &admin_user,
-            &TestAction,
-            &resource,
-            &TestContext,
-        )
-        .await;
+        let result: PolicyEvalResult =
+            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+                &policy,
+                &admin_user,
+                &TestAction,
+                &resource,
+                &TestContext,
+            )
+            .await;
 
-        assert!(result.is_granted(), "User with required role should be granted access");
+        assert!(
+            result.is_granted(),
+            "User with required role should be granted access"
+        );
         assert_eq!(
             Policy::<RbacUser, TestResource, TestAction, TestContext>::policy_type(&policy),
             "RbacPolicy"
@@ -2448,18 +3013,25 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-            &policy,
-            &regular_user,
-            &TestAction,
-            &resource,
-            &TestContext,
-        )
-        .await;
+        let result: PolicyEvalResult =
+            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+                &policy,
+                &regular_user,
+                &TestAction,
+                &resource,
+                &TestContext,
+            )
+            .await;
 
-        assert!(!result.is_granted(), "User without required role should be denied");
+        assert!(
+            !result.is_granted(),
+            "User without required role should be denied"
+        );
         match result {
-            PolicyEvalResult::Denied { policy_type, reason } => {
+            PolicyEvalResult::Denied {
+                policy_type,
+                reason,
+            } => {
                 assert_eq!(policy_type, "RbacPolicy");
                 assert!(reason.contains("doesn't have required role"));
             }
@@ -2492,16 +3064,20 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-            &policy,
-            &user,
-            &TestAction,
-            &resource,
-            &TestContext,
-        )
-        .await;
+        let result: PolicyEvalResult =
+            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+                &policy,
+                &user,
+                &TestAction,
+                &resource,
+                &TestContext,
+            )
+            .await;
 
-        assert!(result.is_granted(), "User with any required role should be granted access");
+        assert!(
+            result.is_granted(),
+            "User with any required role should be granted access"
+        );
     }
 
     #[tokio::test]
@@ -2523,14 +3099,15 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-            &policy,
-            &user_no_roles,
-            &TestAction,
-            &resource,
-            &TestContext,
-        )
-        .await;
+        let result: PolicyEvalResult =
+            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+                &policy,
+                &user_no_roles,
+                &TestAction,
+                &resource,
+                &TestContext,
+            )
+            .await;
 
         assert!(!result.is_granted(), "User with no roles should be denied");
     }
@@ -2557,17 +3134,21 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult = Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-            &policy,
-            &user,
-            &TestAction,
-            &resource,
-            &TestContext,
-        )
-        .await;
+        let result: PolicyEvalResult =
+            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+                &policy,
+                &user,
+                &TestAction,
+                &resource,
+                &TestContext,
+            )
+            .await;
 
         // With empty required roles, no role can match, so access is denied
-        assert!(!result.is_granted(), "Empty required roles means no match is possible");
+        assert!(
+            !result.is_granted(),
+            "Empty required roles means no match is possible"
+        );
     }
 
     #[tokio::test]
@@ -2691,7 +3272,10 @@ mod tests {
 
         // to_result should return Ok for granted access
         let converted: Result<(), String> = result.to_result(|reason| reason.to_string());
-        assert!(converted.is_ok(), "to_result should return Ok for granted access");
+        assert!(
+            converted.is_ok(),
+            "to_result should return Ok for granted access"
+        );
     }
 
     #[tokio::test]
@@ -2712,7 +3296,10 @@ mod tests {
 
         // to_result should return Err for denied access
         let converted: Result<(), String> = result.to_result(|reason| reason.to_string());
-        assert!(converted.is_err(), "to_result should return Err for denied access");
+        assert!(
+            converted.is_err(),
+            "to_result should return Err for denied access"
+        );
         assert!(converted.unwrap_err().contains("denied"));
     }
 
@@ -2733,9 +3320,18 @@ mod tests {
             .await;
 
         let trace_display = result.display_trace();
-        assert!(trace_display.contains("GRANTED"), "Trace should show GRANTED");
-        assert!(trace_display.contains("AlwaysAllowPolicy"), "Trace should show policy name");
-        assert!(trace_display.contains("Evaluation Trace"), "Trace should include trace section");
+        assert!(
+            trace_display.contains("GRANTED"),
+            "Trace should show GRANTED"
+        );
+        assert!(
+            trace_display.contains("AlwaysAllowPolicy"),
+            "Trace should show policy name"
+        );
+        assert!(
+            trace_display.contains("Evaluation Trace"),
+            "Trace should include trace section"
+        );
     }
 
     #[tokio::test]
@@ -2756,7 +3352,10 @@ mod tests {
 
         let trace_display = result.display_trace();
         assert!(trace_display.contains("Denied"), "Trace should show Denied");
-        assert!(trace_display.contains("Test denial"), "Trace should show denial reason");
+        assert!(
+            trace_display.contains("Test denial"),
+            "Trace should show denial reason"
+        );
     }
 
     #[tokio::test]
@@ -2777,8 +3376,14 @@ mod tests {
 
         // Test Display trait
         let display_str = format!("{}", result);
-        assert!(display_str.contains("GRANTED"), "Display should show GRANTED");
-        assert!(display_str.contains("AlwaysAllowPolicy"), "Display should show policy name");
+        assert!(
+            display_str.contains("GRANTED"),
+            "Display should show GRANTED"
+        );
+        assert!(
+            display_str.contains("AlwaysAllowPolicy"),
+            "Display should show policy name"
+        );
     }
 
     // ==================== EvalTrace Tests ====================
@@ -2804,8 +3409,14 @@ mod tests {
 
         assert!(trace.root().is_some(), "Trace with root should have a root");
         let formatted = trace.format();
-        assert!(formatted.contains("TestPolicy"), "Formatted trace should contain policy name");
-        assert!(formatted.contains("GRANTED"), "Formatted trace should contain GRANTED");
+        assert!(
+            formatted.contains("TestPolicy"),
+            "Formatted trace should contain policy name"
+        );
+        assert!(
+            formatted.contains("GRANTED"),
+            "Formatted trace should contain GRANTED"
+        );
     }
 
     #[test]
@@ -2819,7 +3430,10 @@ mod tests {
         };
         trace.set_root(result);
 
-        assert!(trace.root().is_some(), "After set_root, trace should have a root");
+        assert!(
+            trace.root().is_some(),
+            "After set_root, trace should have a root"
+        );
         let formatted = trace.format();
         assert!(formatted.contains("DenyPolicy"));
         assert!(formatted.contains("DENIED"));
@@ -2866,7 +3480,11 @@ mod tests {
             children: vec![],
             outcome: true,
         };
-        assert_eq!(result.reason(), None, "Combined result should have no reason");
+        assert_eq!(
+            result.reason(),
+            None,
+            "Combined result should have no reason"
+        );
     }
 
     #[test]
@@ -2879,8 +3497,14 @@ mod tests {
         let formatted_0 = result.format(0);
         let formatted_4 = result.format(4);
 
-        assert!(formatted_0.starts_with("✔"), "Indent 0 should start with checkmark");
-        assert!(formatted_4.starts_with("    ✔"), "Indent 4 should have 4 spaces before checkmark");
+        assert!(
+            formatted_0.starts_with("✔"),
+            "Indent 0 should start with checkmark"
+        );
+        assert!(
+            formatted_4.starts_with("    ✔"),
+            "Indent 4 should have 4 spaces before checkmark"
+        );
     }
 
     #[test]
@@ -2924,7 +3548,10 @@ mod tests {
             .await;
 
         // Default checker has no policies, so should deny
-        assert!(!result.is_granted(), "Default checker with no policies should deny");
+        assert!(
+            !result.is_granted(),
+            "Default checker with no policies should deny"
+        );
     }
 
     // ==================== SecurityRuleMetadata Tests ====================
@@ -2968,7 +3595,8 @@ mod tests {
     async fn test_policy_default_security_rule() {
         // Test that the default security_rule implementation returns empty metadata
         let policy = AlwaysAllowPolicy;
-        let metadata = Policy::<TestSubject, TestResource, TestAction, TestContext>::security_rule(&policy);
+        let metadata =
+            Policy::<TestSubject, TestResource, TestAction, TestContext>::security_rule(&policy);
 
         assert_eq!(metadata, SecurityRuleMetadata::default());
     }
@@ -3177,16 +3805,21 @@ mod policy_builder_tests {
             pub name: String,
         }
 
-        let policy =
-            PolicyBuilder::<TestSubject, TestResource, ActionType, TestContext>::new("ActionPolicy")
-                .actions(|a: &ActionType| a.name == "read")
-                .build();
+        let policy = PolicyBuilder::<TestSubject, TestResource, ActionType, TestContext>::new(
+            "ActionPolicy",
+        )
+        .actions(|a: &ActionType| a.name == "read")
+        .build();
 
         // Should allow for "read" action
         let result = policy
             .evaluate_access(
-                &TestSubject { name: "Anyone".into() },
-                &ActionType { name: "read".into() },
+                &TestSubject {
+                    name: "Anyone".into(),
+                },
+                &ActionType {
+                    name: "read".into(),
+                },
                 &TestResource,
                 &TestContext,
             )
@@ -3196,8 +3829,12 @@ mod policy_builder_tests {
         // Should deny for "write" action
         let result = policy
             .evaluate_access(
-                &TestSubject { name: "Anyone".into() },
-                &ActionType { name: "write".into() },
+                &TestSubject {
+                    name: "Anyone".into(),
+                },
+                &ActionType {
+                    name: "write".into(),
+                },
                 &TestResource,
                 &TestContext,
             )
@@ -3222,7 +3859,9 @@ mod policy_builder_tests {
         // Should allow access to public resource
         let result = policy
             .evaluate_access(
-                &TestSubject { name: "Anyone".into() },
+                &TestSubject {
+                    name: "Anyone".into(),
+                },
                 &TestAction,
                 &ResourceType { public: true },
                 &TestContext,
@@ -3233,7 +3872,9 @@ mod policy_builder_tests {
         // Should deny access to private resource
         let result = policy
             .evaluate_access(
-                &TestSubject { name: "Anyone".into() },
+                &TestSubject {
+                    name: "Anyone".into(),
+                },
                 &TestAction,
                 &ResourceType { public: false },
                 &TestContext,
@@ -3259,7 +3900,9 @@ mod policy_builder_tests {
         // Should allow for internal requests
         let result = policy
             .evaluate_access(
-                &TestSubject { name: "Anyone".into() },
+                &TestSubject {
+                    name: "Anyone".into(),
+                },
                 &TestAction,
                 &TestResource,
                 &RequestContext { is_internal: true },
@@ -3270,16 +3913,15 @@ mod policy_builder_tests {
         // Should deny for external requests
         let result = policy
             .evaluate_access(
-                &TestSubject { name: "Anyone".into() },
+                &TestSubject {
+                    name: "Anyone".into(),
+                },
                 &TestAction,
                 &TestResource,
                 &RequestContext { is_internal: false },
             )
             .await;
-        assert!(
-            !result.is_granted(),
-            "Policy should deny external requests"
-        );
+        assert!(!result.is_granted(), "Policy should deny external requests");
     }
 
     // Test combining all predicates
@@ -3317,7 +3959,9 @@ mod policy_builder_tests {
                 &FullSubject {
                     role: "admin".into(),
                 },
-                &FullAction { name: "read".into() },
+                &FullAction {
+                    name: "read".into(),
+                },
                 &FullResource {
                     category: "document".into(),
                 },
@@ -3337,7 +3981,9 @@ mod policy_builder_tests {
                 &FullSubject {
                     role: "user".into(),
                 },
-                &FullAction { name: "read".into() },
+                &FullAction {
+                    name: "read".into(),
+                },
                 &FullResource {
                     category: "document".into(),
                 },
@@ -3373,7 +4019,9 @@ mod policy_builder_tests {
                 &FullSubject {
                     role: "admin".into(),
                 },
-                &FullAction { name: "read".into() },
+                &FullAction {
+                    name: "read".into(),
+                },
                 &FullResource {
                     category: "video".into(),
                 },
@@ -3390,7 +4038,9 @@ mod policy_builder_tests {
                 &FullSubject {
                     role: "admin".into(),
                 },
-                &FullAction { name: "read".into() },
+                &FullAction {
+                    name: "read".into(),
+                },
                 &FullResource {
                     category: "document".into(),
                 },

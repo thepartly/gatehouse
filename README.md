@@ -53,6 +53,20 @@ if result.is_granted() {
 }
 ```
 
+### Batch Authorization
+
+List and subscription endpoints often need to answer "which of these resources can this subject access?" Use `evaluate_batch_by` when you need the decision for every input item, or `filter_authorized_by` when you only need the authorized subset.
+
+```rust
+let visible_posts = checker
+    .filter_authorized_with_context_by(&user, &Action::View, posts, &request_context, |post| post)
+    .await;
+```
+
+The caller keeps ownership of resource loading and context construction. Gatehouse borrows the resource/context pair from each item, preserves input order, and applies the same per-item `OR` semantics as `evaluate_access`.
+
+Policies can override `Policy::evaluate_access_batch` to collapse backend work. `RebacPolicy` forwards batch checks to `RelationshipResolver::has_relationship_batch`, whose default implementation loops over `has_relationship`; SQL or graph-backed resolvers can override it with one set-oriented lookup.
+
 ### PolicyBuilder
 The `PolicyBuilder` provides a fluent API to construct custom policies by chaining predicate functions for 
 subjects, actions, resources, and context. Once built, the policy can be added to a [`PermissionChecker`].
@@ -98,3 +112,12 @@ cargo run --example rbac_policy
 Criterion benchmarks in `benches/permission_checker.rs` exercise `PermissionChecker::evaluate_access` across
 several policy stack sizes. Run them with `cargo bench` to track changes in evaluation latency as you evolve
 your policy definitions.
+
+The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC resolver using PostgreSQL 18. It compares N point queries through `evaluate_access` with one bulk `WITH ORDINALITY` query through `filter_authorized_with_context_by`:
+
+```shell
+DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
+  cargo run --example pg18_bulk_rebac --release
+```
+
+On a local PostgreSQL 18.3 container, the bulk path was roughly break-even for tiny batches, 10x faster for 100 resources, and over 150x faster for 10,000 resources.
