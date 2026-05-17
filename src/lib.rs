@@ -202,6 +202,7 @@
 #![allow(clippy::type_complexity)]
 use async_trait::async_trait;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 const DEFAULT_SECURITY_RULE_CATEGORY: &str = "Access Control";
@@ -735,6 +736,7 @@ where
 #[derive(Clone)]
 pub struct PermissionChecker<S, R, A, C> {
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
+    max_batch_size: Option<NonZeroUsize>,
 }
 
 impl<S, R, A, C> Default for PermissionChecker<S, R, A, C>
@@ -760,7 +762,18 @@ where
     pub fn new() -> Self {
         Self {
             policies: Vec::new(),
+            max_batch_size: None,
         }
+    }
+
+    /// Sets the maximum number of pending items passed to a policy batch call.
+    ///
+    /// By default, batch evaluation passes all pending items to each policy in a
+    /// single call. Configure this when backend limits, query planner behavior,
+    /// or remote service constraints require smaller chunks.
+    pub fn with_max_batch_size(mut self, max_batch_size: NonZeroUsize) -> Self {
+        self.max_batch_size = Some(max_batch_size);
+        self
     }
 
     /// Adds a policy to the checker.
@@ -922,7 +935,7 @@ where
     /// assert_eq!(visible.len(), 1);
     /// # });
     /// ```
-    #[tracing::instrument(skip_all, fields(item_count, granted_count, denied_count, policy_count = self.policies.len()))]
+    #[tracing::instrument(skip_all, fields(item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
     pub async fn evaluate_batch_by<I, F>(
         &self,
         subject: &S,
@@ -937,6 +950,9 @@ where
         let items: Vec<I::Item> = items.into_iter().collect();
         let item_count = items.len();
         tracing::Span::current().record("item_count", item_count);
+        if let Some(max_batch_size) = self.max_batch_size {
+            tracing::Span::current().record("max_batch_size", max_batch_size.get());
+        }
 
         let mut traces = vec![Vec::new(); item_count];
         let mut evaluations: Vec<Option<AccessEvaluation>> = vec![None; item_count];
@@ -972,62 +988,70 @@ where
                 break;
             }
 
-            let batch_items: Vec<_> = pending
-                .iter()
-                .map(|&index| {
-                    let (resource, context) = parts(&items[index]);
-                    PolicyBatchItem { resource, context }
-                })
-                .collect();
-
-            let policy_results = policy
-                .evaluate_access_batch(subject, action, &batch_items)
-                .await;
-
-            if policy_results.len() != pending.len() {
-                for index in pending {
-                    let policy_result = PolicyEvalResult::Denied {
-                        policy_type: policy.policy_type(),
-                        reason: "Policy batch result count did not match input count".to_string(),
-                    };
-                    traces[index].push(policy_result);
-                    let combined = PolicyEvalResult::Combined {
-                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
-                        operation: CombineOp::Or,
-                        children: std::mem::take(&mut traces[index]),
-                        outcome: false,
-                    };
-                    evaluations[index] = Some(AccessEvaluation::Denied {
-                        trace: EvalTrace::with_root(combined),
-                        reason: "Policy batch result count did not match input count".to_string(),
-                    });
-                }
-                pending = Vec::new();
-                break;
-            }
-
             let mut still_pending = Vec::new();
-            for (index, result) in pending.into_iter().zip(policy_results) {
-                let result_passes = result.is_granted();
-                let policy_type = policy.policy_type();
-                let reason = result.reason();
+            let chunk_size = self
+                .max_batch_size
+                .map_or(pending.len(), NonZeroUsize::get)
+                .max(1);
 
-                traces[index].push(result);
+            for pending_chunk in pending.chunks(chunk_size) {
+                let batch_items: Vec<_> = pending_chunk
+                    .iter()
+                    .map(|&index| {
+                        let (resource, context) = parts(&items[index]);
+                        PolicyBatchItem { resource, context }
+                    })
+                    .collect();
 
-                if result_passes {
-                    let combined = PolicyEvalResult::Combined {
-                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
-                        operation: CombineOp::Or,
-                        children: std::mem::take(&mut traces[index]),
-                        outcome: true,
-                    };
-                    evaluations[index] = Some(AccessEvaluation::Granted {
-                        policy_type,
-                        reason,
-                        trace: EvalTrace::with_root(combined),
-                    });
-                } else {
-                    still_pending.push(index);
+                let policy_results = policy
+                    .evaluate_access_batch(subject, action, &batch_items)
+                    .await;
+
+                if policy_results.len() != pending_chunk.len() {
+                    for &index in pending_chunk {
+                        let policy_result = PolicyEvalResult::Denied {
+                            policy_type: policy.policy_type(),
+                            reason: "Policy batch result count did not match input count"
+                                .to_string(),
+                        };
+                        traces[index].push(policy_result);
+                        let combined = PolicyEvalResult::Combined {
+                            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                            operation: CombineOp::Or,
+                            children: std::mem::take(&mut traces[index]),
+                            outcome: false,
+                        };
+                        evaluations[index] = Some(AccessEvaluation::Denied {
+                            trace: EvalTrace::with_root(combined),
+                            reason: "Policy batch result count did not match input count"
+                                .to_string(),
+                        });
+                    }
+                    continue;
+                }
+
+                for (&index, result) in pending_chunk.iter().zip(policy_results) {
+                    let result_passes = result.is_granted();
+                    let policy_type = policy.policy_type();
+                    let reason = result.reason();
+
+                    traces[index].push(result);
+
+                    if result_passes {
+                        let combined = PolicyEvalResult::Combined {
+                            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                            operation: CombineOp::Or,
+                            children: std::mem::take(&mut traces[index]),
+                            outcome: true,
+                        };
+                        evaluations[index] = Some(AccessEvaluation::Granted {
+                            policy_type,
+                            reason,
+                            trace: EvalTrace::with_root(combined),
+                        });
+                    } else {
+                        still_pending.push(index);
+                    }
                 }
             }
             pending = still_pending;
@@ -1909,6 +1933,82 @@ where
             outcome: true,
         }
     }
+
+    async fn evaluate_access_batch<'item>(
+        &self,
+        subject: &'item S,
+        action: &'item A,
+        items: &'item [PolicyBatchItem<'item, R, C>],
+    ) -> Vec<PolicyEvalResult> {
+        let mut children_by_item = vec![Vec::new(); items.len()];
+        let mut results = vec![None; items.len()];
+        let mut pending = (0..items.len()).collect::<Vec<_>>();
+
+        for policy in &self.policies {
+            if pending.is_empty() {
+                break;
+            }
+
+            let batch_items = pending
+                .iter()
+                .map(|&index| PolicyBatchItem {
+                    resource: items[index].resource,
+                    context: items[index].context,
+                })
+                .collect::<Vec<_>>();
+            let child_results = policy
+                .evaluate_access_batch(subject, action, &batch_items)
+                .await;
+
+            if child_results.len() != pending.len() {
+                for index in pending.drain(..) {
+                    children_by_item[index].push(PolicyEvalResult::Denied {
+                        policy_type: policy.policy_type(),
+                        reason: "Policy batch result count did not match input count".to_string(),
+                    });
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type(),
+                        operation: CombineOp::And,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: false,
+                    });
+                }
+                break;
+            }
+
+            let mut still_pending = Vec::new();
+            for (index, child_result) in pending.into_iter().zip(child_results) {
+                let is_granted = child_result.is_granted();
+                children_by_item[index].push(child_result);
+
+                if is_granted {
+                    still_pending.push(index);
+                } else {
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type(),
+                        operation: CombineOp::And,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: false,
+                    });
+                }
+            }
+            pending = still_pending;
+        }
+
+        for index in pending {
+            results[index] = Some(PolicyEvalResult::Combined {
+                policy_type: self.policy_type(),
+                operation: CombineOp::And,
+                children: std::mem::take(&mut children_by_item[index]),
+                outcome: true,
+            });
+        }
+
+        results
+            .into_iter()
+            .map(|result| result.expect("every batch item should be evaluated"))
+            .collect()
+    }
 }
 
 /// OrPolicy
@@ -1979,6 +2079,82 @@ where
             outcome: false,
         }
     }
+
+    async fn evaluate_access_batch<'item>(
+        &self,
+        subject: &'item S,
+        action: &'item A,
+        items: &'item [PolicyBatchItem<'item, R, C>],
+    ) -> Vec<PolicyEvalResult> {
+        let mut children_by_item = vec![Vec::new(); items.len()];
+        let mut results = vec![None; items.len()];
+        let mut pending = (0..items.len()).collect::<Vec<_>>();
+
+        for policy in &self.policies {
+            if pending.is_empty() {
+                break;
+            }
+
+            let batch_items = pending
+                .iter()
+                .map(|&index| PolicyBatchItem {
+                    resource: items[index].resource,
+                    context: items[index].context,
+                })
+                .collect::<Vec<_>>();
+            let child_results = policy
+                .evaluate_access_batch(subject, action, &batch_items)
+                .await;
+
+            if child_results.len() != pending.len() {
+                for index in pending.drain(..) {
+                    children_by_item[index].push(PolicyEvalResult::Denied {
+                        policy_type: policy.policy_type(),
+                        reason: "Policy batch result count did not match input count".to_string(),
+                    });
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type(),
+                        operation: CombineOp::Or,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: false,
+                    });
+                }
+                break;
+            }
+
+            let mut still_pending = Vec::new();
+            for (index, child_result) in pending.into_iter().zip(child_results) {
+                let is_granted = child_result.is_granted();
+                children_by_item[index].push(child_result);
+
+                if is_granted {
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type(),
+                        operation: CombineOp::Or,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: true,
+                    });
+                } else {
+                    still_pending.push(index);
+                }
+            }
+            pending = still_pending;
+        }
+
+        for index in pending {
+            results[index] = Some(PolicyEvalResult::Combined {
+                policy_type: self.policy_type(),
+                operation: CombineOp::Or,
+                children: std::mem::take(&mut children_by_item[index]),
+                outcome: false,
+            });
+        }
+
+        results
+            .into_iter()
+            .map(|result| result.expect("every batch item should be evaluated"))
+            .collect()
+    }
 }
 
 /// NotPolicy
@@ -2036,6 +2212,41 @@ where
             children: vec![inner_result],
             outcome: !is_granted,
         }
+    }
+
+    async fn evaluate_access_batch<'item>(
+        &self,
+        subject: &'item S,
+        action: &'item A,
+        items: &'item [PolicyBatchItem<'item, R, C>],
+    ) -> Vec<PolicyEvalResult> {
+        let inner_results = self
+            .policy
+            .evaluate_access_batch(subject, action, items)
+            .await;
+
+        if inner_results.len() != items.len() {
+            return items
+                .iter()
+                .map(|_| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type(),
+                    reason: "Policy batch result count did not match input count".to_string(),
+                })
+                .collect();
+        }
+
+        inner_results
+            .into_iter()
+            .map(|inner_result| {
+                let is_granted = inner_result.is_granted();
+                PolicyEvalResult::Combined {
+                    policy_type: self.policy_type(),
+                    operation: CombineOp::Not,
+                    children: vec![inner_result],
+                    outcome: !is_granted,
+                }
+            })
+            .collect()
     }
 }
 
@@ -2295,6 +2506,149 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 4]
         );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_batch_by_respects_max_batch_size() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..8)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut checker =
+            PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(3).unwrap());
+        checker.add_policy(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        });
+
+        let results = checker
+            .filter_authorized_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|(resource, _context)| resource.id.as_u128())
+                .collect::<Vec<_>>(),
+            vec![0, 2, 4, 6]
+        );
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn test_and_policy_batch_uses_inner_batch_hook() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..4)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
+            Arc::new(EvenResourceBatchPolicy {
+                batch_calls: Arc::clone(&batch_calls),
+                single_calls: Arc::clone(&single_calls),
+            });
+        let policy = AndPolicy::try_new(vec![inner]).unwrap();
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(policy);
+
+        let authorized = checker
+            .filter_authorized_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(authorized.len(), 2);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_or_policy_batch_uses_inner_batch_hook() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..4)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
+            Arc::new(EvenResourceBatchPolicy {
+                batch_calls: Arc::clone(&batch_calls),
+                single_calls: Arc::clone(&single_calls),
+            });
+        let policy = OrPolicy::try_new(vec![inner]).unwrap();
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(policy);
+
+        let authorized = checker
+            .filter_authorized_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(authorized.len(), 2);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_not_policy_batch_uses_inner_batch_hook() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..4)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let policy = NotPolicy::new(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        });
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(policy);
+
+        let authorized = checker
+            .filter_authorized_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(authorized.len(), 2);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

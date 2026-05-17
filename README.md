@@ -65,7 +65,16 @@ let visible_posts = checker
 
 The caller keeps ownership of resource loading and context construction. Gatehouse borrows the resource/context pair from each item, preserves input order, and applies the same per-item `OR` semantics as `evaluate_access`.
 
-Policies can override `Policy::evaluate_access_batch` to collapse backend work. `RebacPolicy` forwards batch checks to `RelationshipResolver::has_relationship_batch`, whose default implementation loops over `has_relationship`; SQL or graph-backed resolvers can override it with one set-oriented lookup.
+Policies can override `Policy::evaluate_access_batch` to collapse backend work. `RebacPolicy` forwards batch checks to `RelationshipResolver::has_relationship_batch`, whose default implementation loops over `has_relationship`; SQL or graph-backed resolvers can override it with one set-oriented lookup. Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner policies.
+
+If a backend needs smaller requests, configure a chunk size:
+
+```rust
+use std::num::NonZeroUsize;
+
+let checker = PermissionChecker::new()
+    .with_max_batch_size(NonZeroUsize::new(500).unwrap());
+```
 
 ### PolicyBuilder
 The `PolicyBuilder` provides a fluent API to construct custom policies by chaining predicate functions for 
@@ -120,4 +129,4 @@ DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_t
   cargo run --example pg18_bulk_rebac --release
 ```
 
-On a local PostgreSQL 18.3 container, the bulk path was roughly break-even for tiny batches, 10x faster for 100 resources, and over 150x faster for 10,000 resources.
+On a local PostgreSQL 18.3 container, the bulk path was roughly break-even for tiny batches, 10x faster for 100 resources, and over 200x faster for 10,000 resources.
