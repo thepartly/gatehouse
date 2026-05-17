@@ -4,7 +4,9 @@ use gatehouse::{
     PermissionChecker, Policy, PolicyBatchItem, PolicyBuilder, PolicyEvalResult, RebacPolicy,
     RelationshipQuery,
 };
+use proptest::prelude::*;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -72,6 +74,53 @@ impl BatchGrantPolicy {
         } else {
             PolicyEvalResult::Denied {
                 policy_type: self.name.to_string(),
+                reason: format!("{resource_id} denied"),
+            }
+        }
+    }
+}
+
+struct RandomStackPolicy {
+    name: String,
+    grant_percent: u8,
+    salt: u16,
+}
+
+#[async_trait]
+impl Policy<Subject, Resource, Action, Ctx> for RandomStackPolicy {
+    async fn evaluate(
+        &self,
+        ctx: &EvalCtx<'_, Subject, Resource, Action, Ctx>,
+    ) -> PolicyEvalResult {
+        self.result_for(ctx.resource.id)
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Subject, Resource, Action, Ctx>,
+    ) -> Vec<PolicyEvalResult> {
+        ctx.items
+            .iter()
+            .map(|item| self.result_for(item.resource.id))
+            .collect()
+    }
+
+    fn policy_type(&self) -> &str {
+        &self.name
+    }
+}
+
+impl RandomStackPolicy {
+    fn result_for(&self, resource_id: u8) -> PolicyEvalResult {
+        let score = ((resource_id as u16 * 37) ^ self.salt).wrapping_add(self.salt / 3) % 100;
+        if score < self.grant_percent as u16 {
+            PolicyEvalResult::Granted {
+                policy_type: self.name.clone(),
+                reason: Some(format!("{resource_id} granted")),
+            }
+        } else {
+            PolicyEvalResult::Denied {
+                policy_type: self.name.clone(),
                 reason: format!("{resource_id} denied"),
             }
         }
@@ -316,6 +365,67 @@ async fn batch_decisions_match_naive_loop_for_empty_and_mixed_items() {
         .await;
     assert_granted(&batch[0].1, true);
     assert_granted(&batch[1].1, false);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 1_000,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn batch_decisions_match_naive_loop_for_random_policy_stacks(
+        policy_specs in prop::collection::vec((0u8..=100, any::<u16>()), 1..=5),
+        resource_ids in prop::collection::vec(0u8..64, 0..50),
+        max_batch_size in prop::option::of(1usize..8),
+    ) {
+        let mut checker = if let Some(max_batch_size) = max_batch_size {
+            PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(max_batch_size).unwrap())
+        } else {
+            PermissionChecker::new()
+        };
+        for (index, (grant_percent, salt)) in policy_specs.into_iter().enumerate() {
+            checker.add_policy(RandomStackPolicy {
+                name: format!("random_{index}"),
+                grant_percent,
+                salt,
+            });
+        }
+
+        let subject = Subject;
+        let action = Action;
+        let items = resource_ids
+            .iter()
+            .copied()
+            .map(|id| (Resource { id }, Ctx))
+            .collect::<Vec<_>>();
+        let batch_session = EvaluationSession::empty();
+        let batch = tokio_test::block_on(checker.evaluate_batch_in_session_by(
+            &batch_session,
+            &subject,
+            &action,
+            items.clone(),
+            |item| (&item.0, &item.1),
+        ))
+        .into_iter()
+        .map(|(_item, evaluation)| evaluation.is_granted())
+        .collect::<Vec<_>>();
+
+        let mut naive = Vec::new();
+        for (resource, context) in &items {
+            let session = EvaluationSession::empty();
+            naive.push(tokio_test::block_on(checker.evaluate_in_session(
+                &session,
+                &subject,
+                &action,
+                resource,
+                context,
+            ))
+            .is_granted());
+        }
+
+        prop_assert_eq!(batch, naive);
+    }
 }
 
 #[derive(Clone)]

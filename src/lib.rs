@@ -650,6 +650,8 @@ impl EvaluationSession {
                                 .collect(),
                         );
                     }
+                    // Keep this immediately after the cache write, with no await in between.
+                    // The drop guard treats remaining keys as cancelled.
                     in_flight_guard.finish(chunk);
                 }
             } else {
