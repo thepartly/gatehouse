@@ -2,7 +2,8 @@
 //!
 //! This example demonstrates ReBAC in the v0.3 shape: `RebacPolicy` extracts
 //! flat IDs and loads relationship facts through a request-scoped
-//! `EvaluationSession`.
+//! `EvaluationSession`. Relationship store failures are returned as
+//! `FactLoadResult::Error` and fail closed to denial.
 //!
 //! To run this example:
 //! ```
