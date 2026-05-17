@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use gatehouse::{Effect, PermissionChecker, PolicyBuilder};
+use gatehouse::{Effect, EvaluationSession, PermissionChecker, PolicyBuilder};
 use std::hint::black_box;
 use tokio::runtime::Runtime;
 
@@ -57,7 +57,7 @@ fn bench_permission_checker(c: &mut Criterion) {
     let action: Action = ();
     let resource: Resource = ();
     let context: Context = ();
-    let mut group = c.benchmark_group("permission_checker_evaluate_access");
+    let mut group = c.benchmark_group("permission_checker_evaluate_in_session");
 
     for &policy_count in &[1usize, 4, 16, 64] {
         let allow_checker = build_trailing_allow_checker(policy_count);
@@ -66,8 +66,11 @@ fn bench_permission_checker(c: &mut Criterion) {
             &allow_checker,
             |b, checker| {
                 b.iter(|| {
-                    let result = runtime
-                        .block_on(checker.evaluate_access(&subject, &action, &resource, &context));
+                    let session = EvaluationSession::empty();
+                    let result = runtime.block_on(
+                        checker
+                            .evaluate_in_session(&session, &subject, &action, &resource, &context),
+                    );
                     black_box(result)
                 });
             },
@@ -79,8 +82,11 @@ fn bench_permission_checker(c: &mut Criterion) {
             &deny_checker,
             |b, checker| {
                 b.iter(|| {
-                    let result = runtime
-                        .block_on(checker.evaluate_access(&subject, &action, &resource, &context));
+                    let session = EvaluationSession::empty();
+                    let result = runtime.block_on(
+                        checker
+                            .evaluate_in_session(&session, &subject, &action, &resource, &context),
+                    );
                     black_box(result)
                 });
             },

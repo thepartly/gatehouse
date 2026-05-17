@@ -30,7 +30,9 @@
 use actix_web::{
     dev::Payload, web, App, FromRequest, HttpRequest, HttpResponse, HttpServer, Responder,
 };
-use gatehouse::{AccessEvaluation, AndPolicy, PermissionChecker, Policy, PolicyBuilder};
+use gatehouse::{
+    AccessEvaluation, AndPolicy, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
+};
 use std::future::{ready, Ready};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -288,9 +290,10 @@ pub async fn edit_post(
     let ctx = RequestContext {
         current_time: SystemTime::now(),
     };
+    let session = EvaluationSession::empty();
 
     match checker
-        .evaluate_access(&user, &Action::Edit, &Resource::Post(post), &ctx)
+        .evaluate_in_session(&session, &user, &Action::Edit, &Resource::Post(post), &ctx)
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post updated"),
@@ -311,9 +314,16 @@ pub async fn publish_post(
     let ctx = RequestContext {
         current_time: SystemTime::now(),
     };
+    let session = EvaluationSession::empty();
 
     match checker
-        .evaluate_access(&user, &Action::Publish, &Resource::Post(post), &ctx)
+        .evaluate_in_session(
+            &session,
+            &user,
+            &Action::Publish,
+            &Resource::Post(post),
+            &ctx,
+        )
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post published"),
@@ -341,9 +351,10 @@ pub async fn view_post(
     let ctx = RequestContext {
         current_time: SystemTime::now(),
     };
+    let session = EvaluationSession::empty();
 
     match checker
-        .evaluate_access(&user, &Action::View, &Resource::Post(post), &ctx)
+        .evaluate_in_session(&session, &user, &Action::View, &Resource::Post(post), &ctx)
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Here is your post"),

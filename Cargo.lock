@@ -817,12 +817,13 @@ dependencies = [
 
 [[package]]
 name = "gatehouse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "actix-web",
  "async-trait",
  "axum",
  "criterion",
+ "futures-channel",
  "hyper",
  "tokio",
  "tokio-postgres",

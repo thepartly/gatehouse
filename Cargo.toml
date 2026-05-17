@@ -1,6 +1,6 @@
 [package]
 name = "gatehouse"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/thepartly/gatehouse"
@@ -10,6 +10,7 @@ description = "A flexible authorization library that combines role-based (RBAC),
 tracing = "0.1"
 uuid = {version="1", features = ["serde", "v4"]}
 async-trait = "0.1"
+futures-channel = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

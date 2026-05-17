@@ -348,16 +348,14 @@ pub async fn view_invoice_handler(
 ) -> impl IntoResponse {
     // Simulate DB fetch
     let invoice = overrides.build_invoice(invoice_id);
+    let resource = Resource::Invoice(invoice.clone());
+    let context = RequestContext {
+        current_time: SystemTime::now(),
+    };
+    let session = EvaluationSession::empty();
 
     if checker
-        .evaluate_access(
-            &user,
-            &Action::View,
-            &Resource::Invoice(invoice.clone()),
-            &RequestContext {
-                current_time: SystemTime::now(),
-            },
-        )
+        .evaluate_in_session(&session, &user, &Action::View, &resource, &context)
         .await
         .is_granted()
     {
@@ -385,9 +383,10 @@ pub async fn edit_invoice_handler(
     let context = RequestContext {
         current_time: SystemTime::now(),
     };
+    let session = EvaluationSession::empty();
 
     let decision = checker
-        .evaluate_access(&user, &action, &resource, &context)
+        .evaluate_in_session(&session, &user, &action, &resource, &context)
         .await;
 
     if decision.is_granted() {
@@ -417,9 +416,10 @@ pub async fn approve_payment_handler(
     let context = RequestContext {
         current_time: SystemTime::now(),
     };
+    let session = EvaluationSession::empty();
 
     let decision = checker
-        .evaluate_access(&user, &action, &resource, &context)
+        .evaluate_in_session(&session, &user, &action, &resource, &context)
         .await;
 
     if decision.is_granted() {
@@ -463,6 +463,8 @@ async fn main() {
 mod tests {
     use super::*;
     use gatehouse::AccessEvaluation;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::time::{Duration, SystemTime};
 
     // Helper to quickly build an invoice with desired properties
@@ -489,6 +491,32 @@ mod tests {
     fn context_now() -> RequestContext {
         RequestContext {
             current_time: SystemTime::now(),
+        }
+    }
+
+    trait TestCheckerExt {
+        fn evaluate_access<'a>(
+            &'a self,
+            user: &'a User,
+            action: &'a Action,
+            resource: &'a Resource,
+            context: &'a RequestContext,
+        ) -> Pin<Box<dyn Future<Output = AccessEvaluation> + Send + 'a>>;
+    }
+
+    impl TestCheckerExt for PermissionChecker<User, Resource, Action, RequestContext> {
+        fn evaluate_access<'a>(
+            &'a self,
+            user: &'a User,
+            action: &'a Action,
+            resource: &'a Resource,
+            context: &'a RequestContext,
+        ) -> Pin<Box<dyn Future<Output = AccessEvaluation> + Send + 'a>> {
+            Box::pin(async move {
+                let session = EvaluationSession::empty();
+                self.evaluate_in_session(&session, user, action, resource, context)
+                    .await
+            })
         }
     }
 

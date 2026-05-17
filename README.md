@@ -25,13 +25,8 @@ The foundation of the authorization system:
 ```rust
 #[async_trait]
 trait Policy<Subject, Resource, Action, Context> {
-    async fn evaluate_access(
-        &self,
-        subject: &Subject,
-        action: &Action,
-        resource: &Resource,
-        context: &Context,
-    ) -> PolicyEvalResult;
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Subject, Resource, Action, Context>)
+        -> PolicyEvalResult;
 }
 ```
 
@@ -45,7 +40,10 @@ checker.add_policy(rbac_policy);
 checker.add_policy(owner_policy);
 
 // Check if access is granted
-let result = checker.evaluate_access(&user, &action, &resource, &context).await;
+let session = EvaluationSession::empty();
+let result = checker
+    .evaluate_in_session(&session, &user, &action, &resource, &context)
+    .await;
 if result.is_granted() {
     // Access allowed
 } else {
@@ -55,19 +53,27 @@ if result.is_granted() {
 
 ### Batch Authorization
 
-List and subscription endpoints often need to answer "which of these resources can this subject access?" Use `evaluate_batch_by` when you need the decision for every input item, or `filter_authorized_by` when you only need the authorized subset.
+List and subscription endpoints often need to answer "which of these resources can this subject access?" Use `evaluate_batch_in_session_by` when you need the decision for every input item, or `filter_authorized_in_session_by` when you only need the authorized subset.
 
 ```rust
+let session = EvaluationSession::empty();
 let visible_posts = checker
-    .filter_authorized_with_context_by(&user, &Action::View, posts, &request_context, |post| post)
+    .filter_authorized_with_context_in_session_by(
+        &session,
+        &user,
+        &Action::View,
+        posts,
+        &request_context,
+        |post| post,
+    )
     .await;
 ```
 
-The caller keeps ownership of resource loading and context construction. Gatehouse borrows the resource/context pair from each item, preserves input order, and applies the same per-item `OR` semantics as `evaluate_access`.
+The caller keeps ownership of resource loading and context construction. Gatehouse borrows the resource/context pair from each item, preserves input order, and applies the same per-item `OR` semantics as `evaluate_in_session`.
 
-Policies can override `Policy::evaluate_access_batch` to collapse backend work. `RebacPolicy` forwards batch checks to `RelationshipResolver::has_relationship_batch`, whose default implementation loops over `has_relationship`; SQL or graph-backed resolvers can override it with one set-oriented lookup. Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner policies.
+Policies can override `Policy::evaluate_batch` to collapse backend work. `RebacPolicy` builds `RelationshipQuery` fact keys and loads them through the request-scoped `EvaluationSession`, so deduplication, chunking, caching, and fail-closed source errors live in one `FactSource` layer. Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner policies.
 
-If a backend needs smaller requests, configure a chunk size:
+`PermissionChecker::with_max_batch_size` caps the number of still-pending items passed to each policy batch call. Fact-backed policies can also set `FactSource::max_batch_size`, which caps source-level loads after session deduplication.
 
 ```rust
 use std::num::NonZeroUsize;
@@ -118,15 +124,15 @@ cargo run --example rbac_policy
 
 ## Performance
 
-Criterion benchmarks in `benches/permission_checker.rs` exercise `PermissionChecker::evaluate_access` across
+Criterion benchmarks in `benches/permission_checker.rs` exercise `PermissionChecker::evaluate_in_session` across
 several policy stack sizes. Run them with `cargo bench` to track changes in evaluation latency as you evolve
 your policy definitions.
 
-The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC resolver using PostgreSQL 18. It compares N point queries through `evaluate_access` with one bulk `WITH ORDINALITY` query through `filter_authorized_with_context_by`:
+The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It compares N point queries through per-item sessions with one bulk `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
   cargo run --example pg18_bulk_rebac --release
 ```
 
-On a local PostgreSQL 18.3 container, the bulk path was roughly break-even for tiny batches, around 10x faster for 100 resources, and tens to hundreds of times faster for thousands of resources.
+On a local PostgreSQL 18.3 container, the bulk path was about 5x faster for 10 resources, 34x faster for 100 resources, and over 100x faster for 1,000+ resources.

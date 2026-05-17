@@ -92,37 +92,39 @@ async fn main() {
     };
 
     // Evaluate the policy with different target entities as context.
+    let session = EvaluationSession::empty();
+
     // 1. org1 should be granted access when the target is "org1".
     let result1 = checker
-        .evaluate_access(&org1, &(), &(), &"org1".to_string())
+        .evaluate_in_session(&session, &org1, &(), &(), &"org1".to_string())
         .await;
     println!("Org1 on 'org1': {}", result1);
     assert!(result1.is_granted());
 
     // 2. org2 should be denied access when the target is "org1".
     let result2 = checker
-        .evaluate_access(&org2, &(), &(), &"org1".to_string())
+        .evaluate_in_session(&session, &org2, &(), &(), &"org1".to_string())
         .await;
     println!("Org2 on 'org1': {}", result2);
     assert!(!result2.is_granted());
 
     // 3. org2 should be granted access when the target is "org2".
     let result3 = checker
-        .evaluate_access(&org2, &(), &(), &"org2".to_string())
+        .evaluate_in_session(&session, &org2, &(), &(), &"org2".to_string())
         .await;
     println!("Org2 on 'org2': {}", result3);
     assert!(result3.is_granted());
 
     // 4. org3 should be denied access regardless of the target since it doesn't have the correct permission.
     let result4 = checker
-        .evaluate_access(&org3, &(), &(), &"org1".to_string())
+        .evaluate_in_session(&session, &org3, &(), &(), &"org1".to_string())
         .await;
     println!("Org3 on 'org1': {}", result4);
     assert!(!result4.is_granted());
 
     // 5. org4 should be granted access since it has global admin permissions
     let result5 = checker
-        .evaluate_access(&org4, &(), &(), &"org1".to_string())
+        .evaluate_in_session(&session, &org4, &(), &(), &"org1".to_string())
         .await;
     println!("Org4 on 'org1': {}", result5);
     assert!(result5.is_granted());

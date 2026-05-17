@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use gatehouse::{PermissionChecker, RebacPolicy, RelationshipResolver};
+use gatehouse::{
+    EvaluationSession, FactLoadResult, FactSource, PermissionChecker, RebacPolicy,
+    RelationshipQuery,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_postgres::{Client, NoTls, Statement};
@@ -20,43 +23,45 @@ struct Post {
 struct View;
 
 #[derive(Clone)]
-struct PgRelationshipResolver {
+struct PgRelationshipSource {
     client: Arc<Client>,
     point_stmt: Arc<Statement>,
     bulk_stmt: Arc<Statement>,
 }
 
 #[async_trait]
-impl RelationshipResolver<User, Post, String> for PgRelationshipResolver {
-    async fn has_relationship(
+impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for PgRelationshipSource {
+    async fn load_many(
         &self,
-        subject: &User,
-        resource: &Post,
-        relationship: &String,
-    ) -> bool {
-        self.client
-            .query_one(
-                &*self.point_stmt,
-                &[&subject.id, relationship, &resource.id],
-            )
-            .await
-            .expect("point relationship query should succeed")
-            .get(0)
-    }
+        keys: &[RelationshipQuery<Uuid, Uuid, String>],
+    ) -> Vec<FactLoadResult<bool>> {
+        if keys.len() == 1 {
+            let key = &keys[0];
+            return vec![FactLoadResult::Found(
+                self.client
+                    .query_one(
+                        &*self.point_stmt,
+                        &[&key.subject_id, &key.relation, &key.resource_id],
+                    )
+                    .await
+                    .expect("point relationship query should succeed")
+                    .get(0),
+            )];
+        }
 
-    async fn has_relationship_batch<'item>(
-        &self,
-        subject: &'item User,
-        resources: &'item [&'item Post],
-        relationship: &'item String,
-    ) -> Vec<bool> {
-        let post_ids = resources.iter().map(|post| post.id).collect::<Vec<_>>();
+        let subject_ids = keys.iter().map(|key| key.subject_id).collect::<Vec<_>>();
+        let post_ids = keys.iter().map(|key| key.resource_id).collect::<Vec<_>>();
+        let relationships = keys
+            .iter()
+            .map(|key| key.relation.clone())
+            .collect::<Vec<_>>();
+
         self.client
-            .query(&*self.bulk_stmt, &[&subject.id, relationship, &post_ids])
+            .query(&*self.bulk_stmt, &[&subject_ids, &post_ids, &relationships])
             .await
             .expect("bulk relationship query should succeed")
             .into_iter()
-            .map(|row| row.get("allowed"))
+            .map(|row| FactLoadResult::Found(row.get("allowed")))
             .collect()
     }
 }
@@ -144,18 +149,19 @@ async fn main() {
         client
             .prepare(
                 "
-                WITH candidate_posts AS (
-                    SELECT post_id, ord
-                    FROM unnest($3::uuid[]) WITH ORDINALITY AS input(post_id, ord)
+                WITH candidate_relationships AS (
+                    SELECT subject_id, post_id, relationship, ord
+                    FROM unnest($1::uuid[], $2::uuid[], $3::text[])
+                        WITH ORDINALITY AS input(subject_id, post_id, relationship, ord)
                 )
                 SELECT
                     COALESCE(bool_or(g.post_id IS NOT NULL), false) AS allowed
-                FROM candidate_posts c
+                FROM candidate_relationships c
                 LEFT JOIN gatehouse_spike_post_grants g
-                  ON g.subject_id = $1
-                 AND g.relationship = $2
+                  ON g.subject_id = c.subject_id
+                 AND g.relationship = c.relationship
                  AND g.post_id = c.post_id
-                GROUP BY c.ord, c.post_id
+                GROUP BY c.ord, c.subject_id, c.post_id, c.relationship
                 ORDER BY c.ord
                 ",
             )
@@ -163,12 +169,13 @@ async fn main() {
             .expect("prepare bulk query"),
     );
 
-    let resolver = PgRelationshipResolver {
-        client,
-        point_stmt,
-        bulk_stmt,
-    };
-    let policy = RebacPolicy::<User, Post, View, (), _, _>::new(relationship, resolver);
+    let source: Arc<dyn FactSource<RelationshipQuery<Uuid, Uuid, String>>> =
+        Arc::new(PgRelationshipSource {
+            client,
+            point_stmt,
+            bulk_stmt,
+        });
+    let policy = RebacPolicy::new(|user: &User| user.id, |post: &Post| post.id, relationship);
     let mut checker = PermissionChecker::new();
     checker.add_policy(policy);
 
@@ -178,8 +185,10 @@ async fn main() {
         let naive = measure(|| async {
             let mut allowed = 0usize;
             for post in &sample {
+                let session = EvaluationSession::new();
+                session.register_arc::<RelationshipQuery<Uuid, Uuid, String>>(Arc::clone(&source));
                 if checker
-                    .evaluate_access(&subject, &View, post, &UNIT_CONTEXT)
+                    .evaluate_in_session(&session, &subject, &View, post, &UNIT_CONTEXT)
                     .await
                     .is_granted()
                 {
@@ -191,8 +200,11 @@ async fn main() {
         .await;
 
         let bulk = measure(|| async {
+            let session = EvaluationSession::new();
+            session.register_arc::<RelationshipQuery<Uuid, Uuid, String>>(Arc::clone(&source));
             checker
-                .filter_authorized_with_context_by(
+                .filter_authorized_with_context_in_session_by(
+                    &session,
                     &subject,
                     &View,
                     sample.clone(),
