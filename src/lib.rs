@@ -204,6 +204,7 @@ use async_trait::async_trait;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use tracing::Instrument;
 
 const DEFAULT_SECURITY_RULE_CATEGORY: &str = "Access Control";
 const PERMISSION_CHECKER_POLICY_TYPE: &str = "PermissionChecker";
@@ -700,6 +701,11 @@ where
     /// each item sequentially. Policies with set-oriented backends can override
     /// this method to reduce round trips while returning one result per input
     /// item in the same order.
+    ///
+    /// The checker still evaluates policies in policy order, so batched
+    /// evaluation can differ from a naive item-outer loop when later policies
+    /// have side effects or observe mutable external state. Prefer pure policy
+    /// predicates and use traces to audit the policy-ordered batch behavior.
     async fn evaluate_access_batch<'item>(
         &self,
         subject: &'item Subject,
@@ -898,6 +904,12 @@ where
     /// [`Policy::evaluate_access_batch`] and collapse many point lookups into
     /// one backend call.
     ///
+    /// The loop is intentionally policy-outer/items-inner, not a naive
+    /// item-outer loop. OR short-circuiting is preserved per item and policy
+    /// order is preserved globally, but callers should avoid relying on
+    /// side effects from interleaving one item through every policy before the
+    /// next item starts.
+    ///
     /// If a policy returns the wrong number of batch results, affected items are
     /// denied rather than accidentally granted.
     ///
@@ -981,6 +993,14 @@ where
             return results;
         }
 
+        let item_parts = items
+            .iter()
+            .map(|item| {
+                let (resource, context) = parts(item);
+                PolicyBatchItem { resource, context }
+            })
+            .collect::<Vec<_>>();
+
         let mut pending: Vec<usize> = (0..item_count).collect();
 
         for policy in &self.policies {
@@ -988,7 +1008,18 @@ where
                 break;
             }
 
+            let policy_type = policy.policy_type();
+            let policy_span = tracing::debug_span!(
+                "gatehouse.batch_policy",
+                policy.type = policy_type.as_str(),
+                policy.pending_count = pending.len(),
+                policy.granted_count = tracing::field::Empty,
+                policy.denied_count = tracing::field::Empty,
+            );
+
             let mut still_pending = Vec::new();
+            let mut policy_granted_count = 0usize;
+            let mut policy_denied_count = 0usize;
             let chunk_size = self
                 .max_batch_size
                 .map_or(pending.len(), NonZeroUsize::get)
@@ -997,20 +1028,22 @@ where
             for pending_chunk in pending.chunks(chunk_size) {
                 let batch_items: Vec<_> = pending_chunk
                     .iter()
-                    .map(|&index| {
-                        let (resource, context) = parts(&items[index]);
-                        PolicyBatchItem { resource, context }
+                    .map(|&index| PolicyBatchItem {
+                        resource: item_parts[index].resource,
+                        context: item_parts[index].context,
                     })
                     .collect();
 
                 let policy_results = policy
                     .evaluate_access_batch(subject, action, &batch_items)
+                    .instrument(policy_span.clone())
                     .await;
 
                 if policy_results.len() != pending_chunk.len() {
                     for &index in pending_chunk {
+                        policy_denied_count += 1;
                         let policy_result = PolicyEvalResult::Denied {
-                            policy_type: policy.policy_type(),
+                            policy_type: policy_type.clone(),
                             reason: "Policy batch result count did not match input count"
                                 .to_string(),
                         };
@@ -1032,12 +1065,12 @@ where
 
                 for (&index, result) in pending_chunk.iter().zip(policy_results) {
                     let result_passes = result.is_granted();
-                    let policy_type = policy.policy_type();
                     let reason = result.reason();
 
                     traces[index].push(result);
 
                     if result_passes {
+                        policy_granted_count += 1;
                         let combined = PolicyEvalResult::Combined {
                             policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
                             operation: CombineOp::Or,
@@ -1045,15 +1078,18 @@ where
                             outcome: true,
                         };
                         evaluations[index] = Some(AccessEvaluation::Granted {
-                            policy_type,
+                            policy_type: policy_type.clone(),
                             reason,
                             trace: EvalTrace::with_root(combined),
                         });
                     } else {
+                        policy_denied_count += 1;
                         still_pending.push(index);
                     }
                 }
             }
+            policy_span.record("policy.granted_count", policy_granted_count);
+            policy_span.record("policy.denied_count", policy_denied_count);
             pending = still_pending;
         }
 
@@ -1070,12 +1106,23 @@ where
             });
         }
 
+        drop(item_parts);
+
         let mut granted_count = 0usize;
         let results = items
             .into_iter()
             .zip(evaluations.into_iter())
             .map(|(item, evaluation)| {
-                let evaluation = evaluation.expect("every batch item should be evaluated");
+                let evaluation = evaluation.unwrap_or_else(|| {
+                    let result = PolicyEvalResult::Denied {
+                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                        reason: "Batch item was not evaluated".to_string(),
+                    };
+                    AccessEvaluation::Denied {
+                        trace: EvalTrace::with_root(result),
+                        reason: "Batch item was not evaluated".to_string(),
+                    }
+                });
                 if evaluation.is_granted() {
                     granted_count += 1;
                 }
@@ -1648,6 +1695,15 @@ where
     /// Returns `true` if `relationship` exists between `subject` and `resource`.
     async fn has_relationship(&self, subject: &S, resource: &R, relationship: &Re) -> bool;
 
+    /// Maximum number of resources this resolver wants in one batch call.
+    ///
+    /// The default leaves batches unconstrained. Backend resolvers can override
+    /// this when query planner behavior, parameter limits, or service limits
+    /// make smaller chunks safer.
+    fn max_batch_size(&self) -> Option<NonZeroUsize> {
+        None
+    }
+
     /// Returns one relationship decision per resource, in input order.
     ///
     /// The default implementation loops over [`Self::has_relationship`].
@@ -1808,26 +1864,35 @@ where
         _action: &'item A,
         items: &'item [PolicyBatchItem<'item, R, C>],
     ) -> Vec<PolicyEvalResult> {
-        let resources = items.iter().map(|item| item.resource).collect::<Vec<_>>();
-        let relationship_results = self
+        let mut results = Vec::with_capacity(items.len());
+        let chunk_size = self
             .resolver
-            .has_relationship_batch(subject, &resources, &self.relationship)
-            .await;
+            .max_batch_size()
+            .map_or(items.len(), NonZeroUsize::get)
+            .max(1);
 
-        if relationship_results.len() != items.len() {
-            return items
+        for item_chunk in items.chunks(chunk_size) {
+            let resources = item_chunk
                 .iter()
-                .map(|_| PolicyEvalResult::Denied {
-                    policy_type: self.policy_type(),
-                    reason: "Relationship resolver returned the wrong number of batch results"
-                        .to_string(),
-                })
-                .collect();
-        }
+                .map(|item| item.resource)
+                .collect::<Vec<_>>();
+            let relationship_results = self
+                .resolver
+                .has_relationship_batch(subject, &resources, &self.relationship)
+                .await;
 
-        relationship_results
-            .into_iter()
-            .map(|has_relationship| {
+            if relationship_results.len() != item_chunk.len() {
+                results.extend(item_chunk.iter().map(|_| {
+                    PolicyEvalResult::Denied {
+                        policy_type: self.policy_type(),
+                        reason: "Relationship resolver returned the wrong number of batch results"
+                            .to_string(),
+                    }
+                }));
+                continue;
+            }
+
+            results.extend(relationship_results.into_iter().map(|has_relationship| {
                 if has_relationship {
                     PolicyEvalResult::Granted {
                         policy_type: self.policy_type(),
@@ -1845,8 +1910,10 @@ where
                         ),
                     }
                 }
-            })
-            .collect()
+            }));
+        }
+
+        results
     }
 
     fn policy_type(&self) -> String {
@@ -2006,7 +2073,12 @@ where
 
         results
             .into_iter()
-            .map(|result| result.expect("every batch item should be evaluated"))
+            .map(|result| {
+                result.unwrap_or_else(|| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type(),
+                    reason: "Batch item was not evaluated".to_string(),
+                })
+            })
             .collect()
     }
 }
@@ -2152,7 +2224,12 @@ where
 
         results
             .into_iter()
-            .map(|result| result.expect("every batch item should be evaluated"))
+            .map(|result| {
+                result.unwrap_or_else(|| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type(),
+                    reason: "Batch item was not evaluated".to_string(),
+                })
+            })
             .collect()
     }
 }
@@ -2254,6 +2331,7 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     // Dummy resource/action/context types for testing
     #[derive(Debug, Clone)]
@@ -2387,6 +2465,44 @@ mod tests {
 
         fn policy_type(&self) -> String {
             "EvenResourceBatchPolicy".to_string()
+        }
+    }
+
+    struct MismatchedBatchPolicy;
+
+    #[async_trait]
+    impl Policy<TestSubject, TestResource, TestAction, TestContext> for MismatchedBatchPolicy {
+        async fn evaluate_access(
+            &self,
+            _subject: &TestSubject,
+            _action: &TestAction,
+            _resource: &TestResource,
+            _context: &TestContext,
+        ) -> PolicyEvalResult {
+            PolicyEvalResult::Granted {
+                policy_type: self.policy_type(),
+                reason: Some("single item fallback".to_string()),
+            }
+        }
+
+        async fn evaluate_access_batch<'item>(
+            &self,
+            _subject: &'item TestSubject,
+            _action: &'item TestAction,
+            items: &'item [PolicyBatchItem<'item, TestResource, TestContext>],
+        ) -> Vec<PolicyEvalResult> {
+            items
+                .iter()
+                .skip(1)
+                .map(|_| PolicyEvalResult::Granted {
+                    policy_type: self.policy_type(),
+                    reason: Some("wrong batch length".to_string()),
+                })
+                .collect()
+        }
+
+        fn policy_type(&self) -> String {
+            "MismatchedBatchPolicy".to_string()
         }
     }
 
@@ -2549,6 +2665,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_evaluate_batch_by_invokes_parts_once_per_item() {
+        let parts_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..4)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("first denial"));
+        checker.add_policy(AlwaysDenyPolicy("second denial"));
+
+        let results = checker
+            .evaluate_batch_by(&subject, &TestAction, resources, |item| {
+                parts_calls.fetch_add(1, Ordering::SeqCst);
+                (&item.0, &item.1)
+            })
+            .await;
+
+        assert_eq!(results.len(), 4);
+        assert!(results
+            .iter()
+            .all(|(_item, evaluation)| !evaluation.is_granted()));
+        assert_eq!(parts_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_batch_by_fails_closed_on_policy_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..3)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(MismatchedBatchPolicy);
+        checker.add_policy(AlwaysAllowPolicy);
+
+        let results = checker
+            .evaluate_batch_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(results.len(), 3);
+        for (_item, evaluation) in results {
+            assert!(!evaluation.is_granted());
+            match evaluation {
+                AccessEvaluation::Denied { reason, trace } => {
+                    assert_eq!(
+                        reason,
+                        "Policy batch result count did not match input count"
+                    );
+                    assert!(trace.format().contains("MismatchedBatchPolicy"));
+                }
+                AccessEvaluation::Granted { .. } => {
+                    panic!("mismatched batch result should fail closed");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_and_policy_batch_uses_inner_batch_hook() {
         let batch_calls = Arc::new(AtomicUsize::new(0));
         let single_calls = Arc::new(AtomicUsize::new(0));
@@ -2581,6 +2774,40 @@ mod tests {
         assert_eq!(authorized.len(), 2);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
         assert_eq!(single_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_and_policy_batch_fails_closed_on_inner_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let owned_items = (0..2)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
+            Arc::new(MismatchedBatchPolicy);
+        let policy = AndPolicy::try_new(vec![inner]).unwrap();
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| !result.is_granted()));
+        assert!(results
+            .iter()
+            .all(|result| result.format(0).contains("MismatchedBatchPolicy")));
     }
 
     #[tokio::test]
@@ -2619,6 +2846,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_or_policy_batch_fails_closed_on_inner_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let owned_items = (0..2)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
+            Arc::new(MismatchedBatchPolicy);
+        let policy = OrPolicy::try_new(vec![inner]).unwrap();
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| !result.is_granted()));
+        assert!(results
+            .iter()
+            .all(|result| result.format(0).contains("MismatchedBatchPolicy")));
+    }
+
+    #[tokio::test]
     async fn test_not_policy_batch_uses_inner_batch_hook() {
         let batch_calls = Arc::new(AtomicUsize::new(0));
         let single_calls = Arc::new(AtomicUsize::new(0));
@@ -2649,6 +2910,41 @@ mod tests {
         assert_eq!(authorized.len(), 2);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
         assert_eq!(single_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_not_policy_batch_fails_closed_on_inner_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let owned_items = (0..2)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let policy = NotPolicy::new(MismatchedBatchPolicy);
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| !result.is_granted()));
+        assert!(results.iter().all(|result| {
+            result
+                .reason()
+                .as_deref()
+                .is_some_and(|reason| reason.contains("batch result count"))
+        }));
     }
 
     #[tokio::test]
@@ -2795,6 +3091,62 @@ mod tests {
         }
     }
 
+    struct ChunkedRelationshipResolver {
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl RelationshipResolver<TestSubject, TestResource, String> for ChunkedRelationshipResolver {
+        async fn has_relationship(
+            &self,
+            _subject: &TestSubject,
+            resource: &TestResource,
+            _relationship: &String,
+        ) -> bool {
+            resource.id.as_u128().is_multiple_of(2)
+        }
+
+        fn max_batch_size(&self) -> Option<NonZeroUsize> {
+            NonZeroUsize::new(2)
+        }
+
+        async fn has_relationship_batch<'item>(
+            &self,
+            _subject: &'item TestSubject,
+            resources: &'item [&'item TestResource],
+            _relationship: &'item String,
+        ) -> Vec<bool> {
+            self.batch_sizes.lock().unwrap().push(resources.len());
+            resources
+                .iter()
+                .map(|resource| resource.id.as_u128().is_multiple_of(2))
+                .collect()
+        }
+    }
+
+    struct MismatchedRelationshipResolver;
+
+    #[async_trait]
+    impl RelationshipResolver<TestSubject, TestResource, String> for MismatchedRelationshipResolver {
+        async fn has_relationship(
+            &self,
+            _subject: &TestSubject,
+            _resource: &TestResource,
+            _relationship: &String,
+        ) -> bool {
+            true
+        }
+
+        async fn has_relationship_batch<'item>(
+            &self,
+            _subject: &'item TestSubject,
+            resources: &'item [&'item TestResource],
+            _relationship: &'item String,
+        ) -> Vec<bool> {
+            resources.iter().skip(1).map(|_| true).collect()
+        }
+    }
+
     #[tokio::test]
     async fn test_rebac_policy_allows_when_relationship_exists() {
         let subject_id = uuid::Uuid::new_v4();
@@ -2849,6 +3201,86 @@ mod tests {
             !result.is_granted(),
             "Access should be denied if relationship does not exist"
         );
+    }
+
+    #[tokio::test]
+    async fn test_rebac_policy_batch_respects_resolver_max_batch_size() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let relationship = "viewer".to_string();
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let resolver = ChunkedRelationshipResolver {
+            batch_sizes: Arc::clone(&batch_sizes),
+        };
+        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
+            relationship,
+            resolver,
+        );
+        let owned_items = (0..5)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(*batch_sizes.lock().unwrap(), vec![2, 2, 1]);
+        assert_eq!(
+            results
+                .iter()
+                .map(PolicyEvalResult::is_granted)
+                .collect::<Vec<_>>(),
+            vec![true, false, true, false, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebac_policy_batch_fails_closed_on_resolver_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
+            "viewer".to_string(),
+            MismatchedRelationshipResolver,
+        );
+        let owned_items = (0..3)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|result| !result.is_granted()));
+        assert!(results.iter().all(|result| {
+            result.reason().as_deref().is_some_and(|reason| {
+                reason.contains("Relationship resolver returned the wrong number")
+            })
+        }));
     }
 
     // RebacPolicy test with enum relationship type.
