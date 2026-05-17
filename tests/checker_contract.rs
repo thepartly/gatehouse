@@ -1,0 +1,426 @@
+use async_trait::async_trait;
+use gatehouse::{
+    AccessEvaluation, BatchEvalCtx, EvalCtx, EvaluationSession, FactLoadResult, FactSource,
+    PermissionChecker, Policy, PolicyBatchItem, PolicyBuilder, PolicyEvalResult, RebacPolicy,
+    RelationshipQuery,
+};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone)]
+struct Subject;
+
+#[derive(Debug, Clone)]
+struct Action;
+
+#[derive(Debug, Clone)]
+struct Ctx;
+
+#[derive(Debug, Clone)]
+struct Resource {
+    id: u8,
+}
+
+struct BatchGrantPolicy {
+    name: &'static str,
+    batch_calls: Arc<AtomicUsize>,
+    single_calls: Arc<AtomicUsize>,
+    seen_batches: Arc<Mutex<Vec<Vec<u8>>>>,
+    grant: Arc<dyn Fn(u8) -> bool + Send + Sync>,
+}
+
+#[async_trait]
+impl Policy<Subject, Resource, Action, Ctx> for BatchGrantPolicy {
+    async fn evaluate(
+        &self,
+        ctx: &EvalCtx<'_, Subject, Resource, Action, Ctx>,
+    ) -> PolicyEvalResult {
+        self.single_calls.fetch_add(1, Ordering::SeqCst);
+        self.result_for(ctx.resource.id)
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Subject, Resource, Action, Ctx>,
+    ) -> Vec<PolicyEvalResult> {
+        self.batch_calls.fetch_add(1, Ordering::SeqCst);
+        self.seen_batches.lock().unwrap().push(
+            ctx.items
+                .iter()
+                .map(|item| item.resource.id)
+                .collect::<Vec<_>>(),
+        );
+        ctx.items
+            .iter()
+            .map(|item| self.result_for(item.resource.id))
+            .collect()
+    }
+
+    fn policy_type(&self) -> &str {
+        self.name
+    }
+}
+
+impl BatchGrantPolicy {
+    fn result_for(&self, resource_id: u8) -> PolicyEvalResult {
+        if (self.grant)(resource_id) {
+            PolicyEvalResult::Granted {
+                policy_type: self.name.to_string(),
+                reason: Some(format!("{resource_id} granted")),
+            }
+        } else {
+            PolicyEvalResult::Denied {
+                policy_type: self.name.to_string(),
+                reason: format!("{resource_id} denied"),
+            }
+        }
+    }
+}
+
+struct NeverConsultedPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Policy<Subject, Resource, Action, Ctx> for NeverConsultedPolicy {
+    async fn evaluate(
+        &self,
+        _ctx: &EvalCtx<'_, Subject, Resource, Action, Ctx>,
+    ) -> PolicyEvalResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        PolicyEvalResult::Denied {
+            policy_type: self.policy_type().to_string(),
+            reason: "single called".to_string(),
+        }
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        _ctx: &BatchEvalCtx<'item, Subject, Resource, Action, Ctx>,
+    ) -> Vec<PolicyEvalResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    }
+
+    fn policy_type(&self) -> &str {
+        "NeverConsultedPolicy"
+    }
+}
+
+#[tokio::test]
+async fn empty_batch_returns_empty_and_does_not_consult_policies() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(NeverConsultedPolicy {
+        calls: Arc::clone(&calls),
+    });
+
+    let session = EvaluationSession::empty();
+    let results = checker
+        .evaluate_batch_in_session_by(
+            &session,
+            &Subject,
+            &Action,
+            Vec::<(Resource, Ctx)>::new(),
+            |item| (&item.0, &item.1),
+        )
+        .await;
+
+    assert!(results.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn single_item_batch_matches_single_evaluation() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(BatchGrantPolicy {
+        name: "even",
+        batch_calls: Arc::new(AtomicUsize::new(0)),
+        single_calls: Arc::new(AtomicUsize::new(0)),
+        seen_batches: Arc::new(Mutex::new(Vec::new())),
+        grant: Arc::new(|resource_id| resource_id % 2 == 0),
+    });
+    let session = EvaluationSession::empty();
+    let item = (Resource { id: 4 }, Ctx);
+
+    let single = checker
+        .evaluate_in_session(&session, &Subject, &Action, &item.0, &item.1)
+        .await
+        .is_granted();
+    let batch = checker
+        .evaluate_batch_in_session_by(&session, &Subject, &Action, vec![item], |item| {
+            (&item.0, &item.1)
+        })
+        .await
+        .into_iter()
+        .map(|(_item, evaluation)| evaluation.is_granted())
+        .collect::<Vec<_>>();
+
+    assert_eq!(batch, vec![single]);
+}
+
+#[tokio::test]
+async fn or_batch_does_not_re_evaluate_items_granted_by_earlier_policy() {
+    let first_seen = Arc::new(Mutex::new(Vec::new()));
+    let second_seen = Arc::new(Mutex::new(Vec::new()));
+    let first_batch_calls = Arc::new(AtomicUsize::new(0));
+    let second_batch_calls = Arc::new(AtomicUsize::new(0));
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(BatchGrantPolicy {
+        name: "even",
+        batch_calls: Arc::clone(&first_batch_calls),
+        single_calls: Arc::new(AtomicUsize::new(0)),
+        seen_batches: Arc::clone(&first_seen),
+        grant: Arc::new(|resource_id| resource_id % 2 == 0),
+    });
+    checker.add_policy(BatchGrantPolicy {
+        name: "all",
+        batch_calls: Arc::clone(&second_batch_calls),
+        single_calls: Arc::new(AtomicUsize::new(0)),
+        seen_batches: Arc::clone(&second_seen),
+        grant: Arc::new(|_| true),
+    });
+
+    let items = (0..6).map(|id| (Resource { id }, Ctx)).collect::<Vec<_>>();
+    let session = EvaluationSession::empty();
+    let results = checker
+        .evaluate_batch_in_session_by(&session, &Subject, &Action, items, |item| {
+            (&item.0, &item.1)
+        })
+        .await;
+
+    assert!(results
+        .iter()
+        .all(|(_item, evaluation)| evaluation.is_granted()));
+    assert_eq!(first_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(second_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*first_seen.lock().unwrap(), vec![vec![0, 1, 2, 3, 4, 5]]);
+    assert_eq!(*second_seen.lock().unwrap(), vec![vec![1, 3, 5]]);
+}
+
+#[tokio::test]
+async fn boxed_dyn_policy_dispatches_evaluate_batch_override() {
+    let batch_calls = Arc::new(AtomicUsize::new(0));
+    let single_calls = Arc::new(AtomicUsize::new(0));
+    let boxed: Box<dyn Policy<Subject, Resource, Action, Ctx>> = Box::new(BatchGrantPolicy {
+        name: "boxed",
+        batch_calls: Arc::clone(&batch_calls),
+        single_calls: Arc::clone(&single_calls),
+        seen_batches: Arc::new(Mutex::new(Vec::new())),
+        grant: Arc::new(|resource_id| resource_id == 1),
+    });
+    let session = EvaluationSession::empty();
+    let owned_items = [(Resource { id: 1 }, Ctx), (Resource { id: 2 }, Ctx)];
+    let batch_items = owned_items
+        .iter()
+        .map(|(resource, context)| PolicyBatchItem { resource, context })
+        .collect::<Vec<_>>();
+
+    let results = boxed
+        .evaluate_batch(&BatchEvalCtx {
+            session: &session,
+            subject: &Subject,
+            action: &Action,
+            items: &batch_items,
+        })
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(results[0].is_granted());
+    assert!(!results[1].is_granted());
+    assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        single_calls.load(Ordering::SeqCst),
+        0,
+        "boxed dyn Policy must forward evaluate_batch instead of using the default point loop"
+    );
+}
+
+#[tokio::test]
+async fn batch_decisions_match_naive_loop_for_simple_policy_stack() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(BatchGrantPolicy {
+        name: "divisible_by_three",
+        batch_calls: Arc::new(AtomicUsize::new(0)),
+        single_calls: Arc::new(AtomicUsize::new(0)),
+        seen_batches: Arc::new(Mutex::new(Vec::new())),
+        grant: Arc::new(|resource_id| resource_id % 3 == 0),
+    });
+    checker.add_policy(BatchGrantPolicy {
+        name: "greater_than_four",
+        batch_calls: Arc::new(AtomicUsize::new(0)),
+        single_calls: Arc::new(AtomicUsize::new(0)),
+        seen_batches: Arc::new(Mutex::new(Vec::new())),
+        grant: Arc::new(|resource_id| resource_id > 4),
+    });
+
+    let items = (0..10).map(|id| (Resource { id }, Ctx)).collect::<Vec<_>>();
+    let session = EvaluationSession::empty();
+    let batch = checker
+        .evaluate_batch_in_session_by(&session, &Subject, &Action, items.clone(), |item| {
+            (&item.0, &item.1)
+        })
+        .await
+        .into_iter()
+        .map(|(_item, evaluation)| evaluation.is_granted())
+        .collect::<Vec<_>>();
+
+    let mut naive = Vec::new();
+    for (resource, context) in &items {
+        let session = EvaluationSession::empty();
+        naive.push(
+            checker
+                .evaluate_in_session(&session, &Subject, &Action, resource, context)
+                .await
+                .is_granted(),
+        );
+    }
+
+    assert_eq!(batch, naive);
+}
+
+fn assert_granted(evaluation: &AccessEvaluation, expected: bool) {
+    assert_eq!(evaluation.is_granted(), expected);
+}
+
+#[tokio::test]
+async fn batch_decisions_match_naive_loop_for_empty_and_mixed_items() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(BatchGrantPolicy {
+        name: "odd",
+        batch_calls: Arc::new(AtomicUsize::new(0)),
+        single_calls: Arc::new(AtomicUsize::new(0)),
+        seen_batches: Arc::new(Mutex::new(Vec::new())),
+        grant: Arc::new(|resource_id| resource_id % 2 == 1),
+    });
+
+    let session = EvaluationSession::empty();
+    let empty = checker
+        .evaluate_batch_in_session_by(
+            &session,
+            &Subject,
+            &Action,
+            Vec::<(Resource, Ctx)>::new(),
+            |item| (&item.0, &item.1),
+        )
+        .await;
+    assert!(empty.is_empty());
+
+    let items = vec![(Resource { id: 1 }, Ctx), (Resource { id: 2 }, Ctx)];
+    let batch = checker
+        .evaluate_batch_in_session_by(&session, &Subject, &Action, items, |item| {
+            (&item.0, &item.1)
+        })
+        .await;
+    assert_granted(&batch[0].1, true);
+    assert_granted(&batch[1].1, false);
+}
+
+#[derive(Clone)]
+struct MixedSubject {
+    id: u8,
+}
+
+#[derive(Clone)]
+struct MixedResource {
+    id: u8,
+    public: bool,
+}
+
+struct MixedAction;
+struct MixedCtx;
+
+type MixedRelationshipQuery = RelationshipQuery<u8, u8, &'static str>;
+type MixedRelationshipCalls = Arc<Mutex<Vec<Vec<MixedRelationshipQuery>>>>;
+
+struct MixedRelationshipSource {
+    grants: HashSet<MixedRelationshipQuery>,
+    calls: MixedRelationshipCalls,
+}
+
+#[async_trait]
+impl FactSource<MixedRelationshipQuery> for MixedRelationshipSource {
+    async fn load_many(&self, keys: &[MixedRelationshipQuery]) -> Vec<FactLoadResult<bool>> {
+        self.calls.lock().unwrap().push(keys.to_vec());
+        keys.iter()
+            .map(|key| FactLoadResult::Found(self.grants.contains(key)))
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn mixed_policy_stack_uses_in_memory_policy_and_rebac_session() {
+    let subject = MixedSubject { id: 7 };
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let session = EvaluationSession::new();
+    session.register::<RelationshipQuery<u8, u8, &'static str>, _>(MixedRelationshipSource {
+        grants: HashSet::from([RelationshipQuery {
+            subject_id: subject.id,
+            resource_id: 2,
+            relation: "viewer",
+        }]),
+        calls: Arc::clone(&calls),
+    });
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(
+        PolicyBuilder::<MixedSubject, MixedResource, MixedAction, MixedCtx>::new("PublicResource")
+            .resources(|resource| resource.public)
+            .build(),
+    );
+    checker.add_policy(RebacPolicy::new(
+        |subject: &MixedSubject| subject.id,
+        |resource: &MixedResource| resource.id,
+        "viewer",
+    ));
+
+    let items = vec![
+        (
+            MixedResource {
+                id: 1,
+                public: true,
+            },
+            MixedCtx,
+        ),
+        (
+            MixedResource {
+                id: 2,
+                public: false,
+            },
+            MixedCtx,
+        ),
+        (
+            MixedResource {
+                id: 3,
+                public: false,
+            },
+            MixedCtx,
+        ),
+    ];
+    let results = checker
+        .evaluate_batch_in_session_by(&session, &subject, &MixedAction, items, |item| {
+            (&item.0, &item.1)
+        })
+        .await;
+
+    assert_granted(&results[0].1, true);
+    assert_granted(&results[1].1, true);
+    assert_granted(&results[2].1, false);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![vec![
+            RelationshipQuery {
+                subject_id: subject.id,
+                resource_id: 2,
+                relation: "viewer",
+            },
+            RelationshipQuery {
+                subject_id: subject.id,
+                resource_id: 3,
+                relation: "viewer",
+            },
+        ]]
+    );
+}

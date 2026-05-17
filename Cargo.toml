@@ -21,6 +21,7 @@ tower = "0.5"
 hyper = "1"
 actix-web = "4"
 criterion = { version = "0.8" }
+proptest = "1"
 
 [[bench]]
 name = "permission_checker"

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use gatehouse::{
-    EvaluationSession, FactLoadResult, FactSource, PermissionChecker, RebacPolicy,
+    EvaluationSession, FactLoadError, FactLoadResult, FactSource, PermissionChecker, RebacPolicy,
     RelationshipQuery,
 };
 use std::sync::Arc;
@@ -29,26 +29,28 @@ struct PgRelationshipSource {
     bulk_stmt: Arc<Statement>,
 }
 
-#[async_trait]
-impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for PgRelationshipSource {
-    async fn load_many(
+impl PgRelationshipSource {
+    async fn load_point(
+        &self,
+        key: &RelationshipQuery<Uuid, Uuid, String>,
+    ) -> FactLoadResult<bool> {
+        match self
+            .client
+            .query_one(
+                &*self.point_stmt,
+                &[&key.subject_id, &key.relation, &key.resource_id],
+            )
+            .await
+        {
+            Ok(row) => FactLoadResult::Found(row.get("allowed")),
+            Err(error) => FactLoadResult::Error(FactLoadError::backend(error)),
+        }
+    }
+
+    async fn load_bulk(
         &self,
         keys: &[RelationshipQuery<Uuid, Uuid, String>],
     ) -> Vec<FactLoadResult<bool>> {
-        if keys.len() == 1 {
-            let key = &keys[0];
-            return vec![FactLoadResult::Found(
-                self.client
-                    .query_one(
-                        &*self.point_stmt,
-                        &[&key.subject_id, &key.relation, &key.resource_id],
-                    )
-                    .await
-                    .expect("point relationship query should succeed")
-                    .get(0),
-            )];
-        }
-
         let subject_ids = keys.iter().map(|key| key.subject_id).collect::<Vec<_>>();
         let post_ids = keys.iter().map(|key| key.resource_id).collect::<Vec<_>>();
         let relationships = keys
@@ -56,13 +58,62 @@ impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for PgRelationshipSource 
             .map(|key| key.relation.clone())
             .collect::<Vec<_>>();
 
-        self.client
+        match self
+            .client
             .query(&*self.bulk_stmt, &[&subject_ids, &post_ids, &relationships])
             .await
-            .expect("bulk relationship query should succeed")
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| FactLoadResult::Found(row.get("allowed")))
+                .collect(),
+            Err(error) => {
+                let error = FactLoadError::backend(error);
+                keys.iter()
+                    .map(|_| FactLoadResult::Error(error.clone()))
+                    .collect()
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for PgRelationshipSource {
+    async fn load_many(
+        &self,
+        keys: &[RelationshipQuery<Uuid, Uuid, String>],
+    ) -> Vec<FactLoadResult<bool>> {
+        if keys.len() == 1 {
+            return vec![self.load_point(&keys[0]).await];
+        }
+
+        self.load_bulk(keys).await
+    }
+}
+
+async fn assert_point_and_bulk_agree(
+    source: &PgRelationshipSource,
+    keys: &[RelationshipQuery<Uuid, Uuid, String>],
+) {
+    for key in keys {
+        let point = source.load_point(key).await;
+        let bulk = source
+            .load_bulk(std::slice::from_ref(key))
+            .await
             .into_iter()
-            .map(|row| FactLoadResult::Found(row.get("allowed")))
-            .collect()
+            .next()
+            .expect("bulk load for one key should return one result");
+
+        match (point, bulk) {
+            (FactLoadResult::Found(point), FactLoadResult::Found(bulk)) => {
+                assert_eq!(point, bulk, "point and bulk SQL should agree for {key:?}");
+            }
+            (point, bulk) => {
+                panic!(
+                    "point and bulk SQL should both succeed in the example: {point:?} vs {bulk:?}"
+                );
+            }
+        }
     }
 }
 
@@ -169,12 +220,28 @@ async fn main() {
             .expect("prepare bulk query"),
     );
 
-    let source: Arc<dyn FactSource<RelationshipQuery<Uuid, Uuid, String>>> =
-        Arc::new(PgRelationshipSource {
-            client,
-            point_stmt,
-            bulk_stmt,
-        });
+    let source = Arc::new(PgRelationshipSource {
+        client,
+        point_stmt,
+        bulk_stmt,
+    });
+    assert_point_and_bulk_agree(
+        &source,
+        &[
+            RelationshipQuery {
+                subject_id: subject.id,
+                resource_id: posts[0].id,
+                relation: relationship.clone(),
+            },
+            RelationshipQuery {
+                subject_id: subject.id,
+                resource_id: posts[1].id,
+                relation: relationship.clone(),
+            },
+        ],
+    )
+    .await;
+    let source: Arc<dyn FactSource<RelationshipQuery<Uuid, Uuid, String>>> = source;
     let policy = RebacPolicy::new(|user: &User| user.id, |post: &Post| post.id, relationship);
     let mut checker = PermissionChecker::new();
     checker.add_policy(policy);

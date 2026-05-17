@@ -135,4 +135,4 @@ DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_t
   cargo run --example pg18_bulk_rebac --release
 ```
 
-On a local PostgreSQL 18.3 container, the bulk path was about 5x faster for 10 resources, 34x faster for 100 resources, and over 100x faster for 1,000+ resources.
+On a local PostgreSQL 18.3 container, the bulk path was about 6x faster for 10 resources, 41x faster for 100 resources, and 50-90x faster for 1,000+ resources.

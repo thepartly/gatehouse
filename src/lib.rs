@@ -420,19 +420,19 @@ pub enum FactLoadError {
         /// Diagnostic fact name from [`FactKey::NAME`].
         fact_name: &'static str,
     },
-    /// A source returned fewer results than requested.
-    SourceReturnedNoResult {
-        /// Diagnostic fact name from [`FactKey::NAME`].
-        fact_name: &'static str,
-    },
     /// A source violated the one-result-per-input-key contract.
-    WrongResultCount {
+    SourceContractViolation {
         /// Diagnostic fact name from [`FactKey::NAME`].
         fact_name: &'static str,
         /// Number of keys passed to the source.
         expected: usize,
         /// Number of results returned by the source.
         actual: usize,
+    },
+    /// The leader task for a fact load was cancelled before it completed.
+    LoaderCancelled {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
     },
     /// The registered source reported a backend error.
     Backend(Arc<dyn std::error::Error + Send + Sync>),
@@ -456,10 +456,7 @@ impl fmt::Display for FactLoadError {
             Self::SourceNotRegistered { fact_name } => {
                 write!(f, "No fact source registered for '{fact_name}'")
             }
-            Self::SourceReturnedNoResult { fact_name } => {
-                write!(f, "Fact source '{fact_name}' returned no result")
-            }
-            Self::WrongResultCount {
+            Self::SourceContractViolation {
                 fact_name,
                 expected,
                 actual,
@@ -467,6 +464,9 @@ impl fmt::Display for FactLoadError {
                 f,
                 "Fact source '{fact_name}' returned {actual} results for {expected} keys"
             ),
+            Self::LoaderCancelled { fact_name } => {
+                write!(f, "Fact load for '{fact_name}' was cancelled")
+            }
             Self::Backend(error) => write!(f, "{error}"),
         }
     }
@@ -549,12 +549,26 @@ impl EvaluationSession {
     /// Registers a shared fact source for one key type.
     ///
     /// Re-registering a source clears any cached facts for that key type in
-    /// this session.
+    /// this session. Register sources during session setup; replacing a source
+    /// while loads for the same key type are in flight is not a supported
+    /// operation.
     pub fn register_arc<K>(&self, source: Arc<dyn FactSource<K>>)
     where
         K: FactKey,
     {
         let type_id = TypeId::of::<K>();
+        let in_flight_empty = {
+            let mut in_flight = self
+                .inner
+                .in_flight
+                .lock()
+                .expect("fact in-flight registry mutex should not be poisoned");
+            Self::in_flight_for::<K>(&mut in_flight).is_empty()
+        };
+        debug_assert!(
+            in_flight_empty,
+            "fact sources should not be replaced while loads for the same key type are in flight",
+        );
         self.inner
             .sources
             .lock()
@@ -577,7 +591,11 @@ impl EvaluationSession {
             .into_iter()
             .next()
             .unwrap_or_else(|| {
-                FactLoadResult::Error(FactLoadError::SourceReturnedNoResult { fact_name: K::NAME })
+                FactLoadResult::Error(FactLoadError::SourceContractViolation {
+                    fact_name: K::NAME,
+                    expected: 1,
+                    actual: 0,
+                })
             })
     }
 
@@ -596,6 +614,7 @@ impl EvaluationSession {
 
         let source = self.source::<K>();
         let load_plan = self.plan_loads(keys);
+        let mut in_flight_guard = InFlightGuard::new(self.clone(), load_plan.keys.clone());
 
         if !load_plan.keys.is_empty() {
             if let Some(source) = source {
@@ -611,6 +630,7 @@ impl EvaluationSession {
                         fact.name = K::NAME,
                         fact.load_id = load_id,
                         fact.key_count = chunk.len(),
+                        fact.unique_key_count = chunk.len(),
                     );
                     let loaded = source.load_many(chunk).instrument(load_span).await;
                     if loaded.len() == chunk.len() {
@@ -621,7 +641,7 @@ impl EvaluationSession {
                             chunk
                                 .iter()
                                 .map(|_| {
-                                    FactLoadResult::Error(FactLoadError::WrongResultCount {
+                                    FactLoadResult::Error(FactLoadError::SourceContractViolation {
                                         fact_name: K::NAME,
                                         expected: chunk.len(),
                                         actual: loaded.len(),
@@ -630,7 +650,7 @@ impl EvaluationSession {
                                 .collect(),
                         );
                     }
-                    self.finish_in_flight::<K>(chunk);
+                    in_flight_guard.finish(chunk);
                 }
             } else {
                 self.cache_loaded(
@@ -645,7 +665,7 @@ impl EvaluationSession {
                         })
                         .collect(),
                 );
-                self.finish_in_flight::<K>(&load_plan.keys);
+                in_flight_guard.finish(&load_plan.keys);
             }
         }
 
@@ -759,8 +779,10 @@ impl EvaluationSession {
         keys.iter()
             .map(|key| {
                 cache.get(key).cloned().unwrap_or_else(|| {
-                    FactLoadResult::Error(FactLoadError::SourceReturnedNoResult {
+                    FactLoadResult::Error(FactLoadError::SourceContractViolation {
                         fact_name: K::NAME,
+                        expected: 1,
+                        actual: 0,
                     })
                 })
             })
@@ -797,6 +819,58 @@ impl EvaluationSession {
 struct LoadPlan<K> {
     keys: Vec<K>,
     waiters: Vec<oneshot::Receiver<()>>,
+}
+
+struct InFlightGuard<K>
+where
+    K: FactKey,
+{
+    session: EvaluationSession,
+    remaining: Vec<K>,
+}
+
+impl<K> InFlightGuard<K>
+where
+    K: FactKey,
+{
+    fn new(session: EvaluationSession, keys: Vec<K>) -> Self {
+        Self {
+            session,
+            remaining: keys,
+        }
+    }
+
+    fn finish(&mut self, keys: &[K]) {
+        self.session.finish_in_flight(keys);
+        if self.remaining.is_empty() {
+            return;
+        }
+
+        let finished = keys.iter().cloned().collect::<HashSet<_>>();
+        self.remaining.retain(|key| !finished.contains(key));
+    }
+}
+
+impl<K> Drop for InFlightGuard<K>
+where
+    K: FactKey,
+{
+    fn drop(&mut self) {
+        if self.remaining.is_empty() {
+            return;
+        }
+
+        self.session.cache_loaded(
+            &self.remaining,
+            self.remaining
+                .iter()
+                .map(|_| {
+                    FactLoadResult::Error(FactLoadError::LoaderCancelled { fact_name: K::NAME })
+                })
+                .collect(),
+        );
+        self.session.finish_in_flight(&self.remaining);
+    }
 }
 
 /// Per-item policy evaluation context.
@@ -1301,7 +1375,7 @@ where
     ///
     /// Policies are evaluated sequentially with OR semantics (short-circuiting on first success).
     /// Returns an [`AccessEvaluation`] with detailed tracing.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip_all, fields(policy_count = self.policies.len(), outcome = tracing::field::Empty, policy.type = tracing::field::Empty))]
     pub async fn evaluate_in_session(
         &self,
         session: &EvaluationSession,
@@ -1311,6 +1385,7 @@ where
         context: &C,
     ) -> AccessEvaluation {
         if self.policies.is_empty() {
+            tracing::Span::current().record("outcome", "denied");
             tracing::debug!("No policies configured");
             let result = PolicyEvalResult::Denied {
                 policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
@@ -1375,6 +1450,8 @@ where
 
             // If any policy allows access, return immediately
             if result_passes {
+                tracing::Span::current().record("outcome", "granted");
+                tracing::Span::current().record("policy.type", policy_type);
                 let combined = PolicyEvalResult::Combined {
                     policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
                     operation: CombineOp::Or,
@@ -1391,6 +1468,7 @@ where
         }
 
         // If all policies denied access
+        tracing::Span::current().record("outcome", "denied");
         tracing::trace!("No policies allowed access, returning Forbidden");
         let combined = PolicyEvalResult::Combined {
             policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
