@@ -288,6 +288,56 @@ async fn session_deduplicates_across_calls() {
 }
 
 #[tokio::test]
+async fn shared_source_serves_concurrent_sessions_with_separate_caches() {
+    let calls = new_calls();
+    let source: Arc<dyn FactSource<TestKey>> = Arc::new(RecordingSource::echo(Arc::clone(&calls)));
+    let keys = vec![TestKey(1), TestKey(2), TestKey(1)];
+
+    let sessions = (0..3)
+        .map(|_| {
+            EvaluationSession::builder()
+                .with_arc::<TestKey>(Arc::clone(&source))
+                .build()
+        })
+        .collect::<Vec<_>>();
+
+    let handles = sessions
+        .clone()
+        .into_iter()
+        .map(|session| {
+            let keys = keys.clone();
+            tokio::spawn(async move { session.get_many(&keys).await })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let results = handle.await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_found(&results[0], 1);
+        assert_found(&results[1], 2);
+        assert_found(&results[2], 1);
+    }
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "in-flight coalescing is per session, not global across shared sources"
+    );
+
+    for session in &sessions {
+        let cached = session.get_many(&keys).await;
+        assert_found(&cached[0], 1);
+        assert_found(&cached[1], 2);
+        assert_found(&cached[2], 1);
+    }
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "each session should reuse only its own request-scoped cache"
+    );
+}
+
+#[tokio::test]
 async fn fact_load_result_variants_round_trip_and_cache() {
     let calls = new_calls();
     let mut responses = HashMap::new();
@@ -387,13 +437,16 @@ fn source_panics_propagate_but_clean_in_flight_state() {
 }
 
 #[tokio::test]
-async fn missing_sources_fail_closed_and_re_registering_is_last_wins() {
+async fn missing_sources_fail_closed_and_source_registration_is_explicit() {
     let empty = EvaluationSession::new();
     let missing = empty.get(TestKey(1)).await;
     assert_source_not_registered(&missing, TestKey::NAME);
 
     let session = EvaluationSession::new();
+    let cached_missing = session.get(TestKey(1)).await;
+    assert_source_not_registered(&cached_missing, TestKey::NAME);
     session.register::<TestKey, _>(RecordingSource::echo(new_calls()));
+    assert_found(&session.get(TestKey(1)).await, 1);
     let missing_other = session.get(OtherKey(1)).await;
     assert_source_not_registered(&missing_other, OtherKey::NAME);
 
@@ -406,7 +459,21 @@ async fn missing_sources_fail_closed_and_re_registering_is_last_wins() {
     ));
     assert_found(&session.get(TestKey(1)).await, 1);
 
-    session.register::<TestKey, _>(RecordingSource::new(
+    let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.register::<TestKey, _>(RecordingSource::new(
+            Arc::clone(&second_calls),
+            None,
+            |_keys| vec![FactLoadResult::Found(2)],
+        ));
+    }));
+    assert!(
+        duplicate.is_err(),
+        "duplicate registration should fail fast"
+    );
+    assert_found(&session.get(TestKey(1)).await, 1);
+    assert_eq!(second_calls.lock().unwrap().len(), 0);
+
+    session.replace::<TestKey, _>(RecordingSource::new(
         Arc::clone(&second_calls),
         None,
         |_keys| vec![FactLoadResult::Found(2)],
@@ -415,8 +482,9 @@ async fn missing_sources_fail_closed_and_re_registering_is_last_wins() {
     assert_eq!(first_calls.lock().unwrap().len(), 1);
     assert_eq!(second_calls.lock().unwrap().len(), 1);
 
-    let other_session = EvaluationSession::new();
-    other_session.register::<OtherKey, _>(OtherSource);
+    let other_session = EvaluationSession::builder()
+        .with::<OtherKey, _>(OtherSource)
+        .build();
     assert_found(&other_session.get(OtherKey(5)).await, 5);
 }
 

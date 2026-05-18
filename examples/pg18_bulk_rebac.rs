@@ -156,9 +156,9 @@ fn build_checker() -> PermissionChecker<User, Post, View, ()> {
 }
 
 fn session_with(source: &Arc<dyn FactSource<RelationshipKey>>) -> EvaluationSession {
-    let session = EvaluationSession::new();
-    session.register_arc::<RelationshipKey>(Arc::clone(source));
-    session
+    EvaluationSession::builder()
+        .with_arc::<RelationshipKey>(Arc::clone(source))
+        .build()
 }
 
 #[tokio::main]

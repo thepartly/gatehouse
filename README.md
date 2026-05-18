@@ -176,13 +176,27 @@ let checker = PermissionChecker::new()
 
 ### Fact Sources And Sessions
 
-`EvaluationSession` is request-scoped. Register the fact sources needed for one request, run the checker, then drop the session. Cached facts, cached errors, and in-flight load state do not outlive the request.
+`EvaluationSession` is request-scoped. Register the fact sources needed for one request, run the checker, then drop the session. Declare all request sources in one place with `EvaluationSession::builder()`:
+
+```rust,ignore
+let session = EvaluationSession::builder()
+    .with_arc::<RelationshipQuery<Uuid, Uuid, Relation>>(Arc::clone(&relationships))
+    .build();
+```
+
+`register` and `register_arc` fail fast if the same fact key type is registered twice. Use `replace` or `replace_arc` only when overwriting a source is intentional.
+
+#### Cache Lifetime And Revocation
+
+Cached facts, cached errors, and in-flight load state do not outlive the request-scoped session. This is a correctness boundary as well as a performance detail: if a permission is revoked after one request has loaded it, a new request builds a new session and must load the fact again.
 
 `FactSource::load_many` receives unique keys and must return exactly one result per key in the same order. The session handles duplicate expansion and caller-order preservation. Missing sources, backend errors, missing facts, wrong result counts, and cancelled loader tasks all fail closed.
 
-`RebacPolicy` is the first built-in fact-backed policy. It extracts subject/resource IDs, builds `RelationshipQuery<SubjectId, ResourceId, Relation>` keys, and asks the session for those relationship facts. `LookupSource` reserves the complementary "what can this subject see?" shape for backends that can enumerate visible resources directly.
+`RebacPolicy` is the first built-in fact-backed policy. It extracts subject/resource IDs, builds `RelationshipQuery<SubjectId, ResourceId, Relation>` keys, and asks the session for those relationship facts.
 
 Use a typed relation enum when your domain has a fixed relation set, even if the backing store uses strings. The `EvaluationSession` deduplicates and caches by the typed `RelationshipQuery`; the `FactSource` owns the backend boundary and can convert `Relation::Viewer` to `"viewer"` when binding SQL parameters. The `pg18_bulk_rebac` example demonstrates this pattern against a PostgreSQL `text` column.
+
+If several relationship domains all look like `Uuid -> Uuid`, prefer one domain relation enum and dispatch inside the corresponding `FactSource`. If you need separate source registrations, wrap IDs in domain newtypes so each `RelationshipQuery<SubjectId, ResourceId, Relation>` has a distinct Rust type.
 
 ### PolicyBuilder
 The `PolicyBuilder` provides a fluent API to construct custom policies by chaining predicate functions for 
@@ -216,6 +230,16 @@ Fact-backed ReBAC failures fail closed: missing sources, missing facts, source e
 ## Tracing And Telemetry
 
 When trace-level events are enabled, `PermissionChecker::evaluate_in_session` creates an instrumented span and every evaluated policy records a `trace!` event on the `gatehouse::security` target. Batch evaluation records checker-level aggregate fields and nested `gatehouse.batch_policy` spans with per-policy pending/granted/denied counts.
+
+Span, event target, and field names listed here are public observability API. Renaming or removing them is treated as a semver-major change.
+
+Span and event names:
+
+- `evaluate_in_session` span for single-item checker evaluation
+- `evaluate_batch_in_session_by` span for batch checker evaluation
+- `gatehouse.batch_policy` span for each policy batch pass
+- `gatehouse.fact_load` span for each source-level fact load
+- `gatehouse::security` target for per-policy security events
 
 Single-item security event fields:
 
@@ -252,6 +276,13 @@ Nested `gatehouse.batch_policy` span fields:
 - `policy.granted_count`
 - `policy.denied_count`
 
+`gatehouse.fact_load` span fields:
+
+- `fact.name`
+- `fact.load_id`
+- `fact.key_count`
+- `fact.unique_key_count`
+
 Fallback behavior when `security_rule()` is not overridden:
 
 - `security_rule.name` falls back to `policy_type()`
@@ -264,6 +295,7 @@ See the `examples` directory for complete demonstrations of:
 - Role-based access control (`rbac_policy`)
 - Attribute-style custom policies with `PolicyBuilder` (`policy_builder`)
 - Relationship-based access control (`rebac_policy`)
+- In-RAM relationship facts shared across request sessions (`in_ram_rebac`)
 - PostgreSQL-backed batched relationship facts (`pg18_bulk_rebac`)
 - Group authorization with trace output (`groups_policy`)
 - Policy combinators (`combinator_policy`)
@@ -282,7 +314,7 @@ Criterion benchmarks in `benches/permission_checker.rs` exercise `PermissionChec
 several policy stack sizes. Run them with `cargo bench` to track changes in evaluation latency as you evolve
 your policy definitions.
 
-The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
+The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source itself is hot and in-process. The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
@@ -290,3 +322,5 @@ DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_t
 ```
 
 The example prints a CSV so you can compare your own database and machine. Local PostgreSQL 18.3 runs of the mixed-policy example show modest wins for tiny lists and tens-to-low-hundreds improvements once the list is large enough for round trips to dominate. Exact numbers vary; the important property is that the policy stack stays in Gatehouse while relationship fact loading collapses to batched SQL.
+
+The PostgreSQL example uses `tokio-postgres` directly to keep the demonstration small. `sqlx` users should keep the same boundary: implement `FactSource<RelationshipQuery<...>>`, map backend errors to `FactLoadError::backend`, and preserve the one-result-per-input-key contract.

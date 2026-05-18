@@ -290,9 +290,9 @@ impl AppState {
     }
 
     fn request_session(&self) -> EvaluationSession {
-        let session = EvaluationSession::new();
-        session.register_arc::<InvoiceRelationship>(Arc::clone(&self.invoice_relationships));
-        session
+        EvaluationSession::builder()
+            .with_arc::<InvoiceRelationship>(Arc::clone(&self.invoice_relationships))
+            .build()
     }
 }
 

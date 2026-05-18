@@ -21,6 +21,7 @@ tower = "0.5"
 hyper = "1"
 actix-web = "4"
 criterion = { version = "0.8" }
+dashmap = "6"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

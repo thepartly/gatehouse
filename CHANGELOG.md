@@ -11,15 +11,18 @@
 ### Added
 
 - Batch authorization APIs for evaluating or filtering caller-owned resource/context pairs while preserving input order and duplicate resources. (#17)
-- `FactKey`, `FactLoadResult`, `FactLoadError`, `FactSource`, `RelationshipQuery`, and `LookupSource` as the new fact-loading layer for ReBAC and future fact-backed policies.
+- `FactKey`, `FactLoadResult`, `FactLoadError`, `FactSource`, and `RelationshipQuery` as the new fact-loading layer for ReBAC and future fact-backed policies.
 - Request-scoped fact caching, duplicate-key expansion, source-level chunking via `FactSource::max_batch_size`, and in-flight load coalescing.
+- `EvaluationSession::builder()` for declaring all request-scoped fact sources in one place.
 - `PermissionChecker::with_max_batch_size` as a defensive cap for policy batch calls.
 - PostgreSQL 18 bulk ReBAC example demonstrating an in-memory public-post policy composed with SQL-backed relationship facts, ordered `unnest ... WITH ORDINALITY` loading, and point-vs-bulk behavior.
 - Axum example bulk invoice listing endpoint demonstrating app-state fact sources and request-scoped `EvaluationSession` registration.
+- In-RAM ReBAC example and Criterion benchmarks for shared in-process `FactSource` usage and session overhead.
 
 ### Changed
 
 - `AndPolicy`, `OrPolicy`, `NotPolicy`, boxed `dyn Policy`, and `RebacPolicy` now preserve batching through their batch evaluation paths.
+- `EvaluationSession::register` and `register_arc` now fail fast on duplicate fact-source registration; use `replace` or `replace_arc` when overwriting is intentional.
 - Evaluation tracing now records single-item outcome fields, batch item/grant/deny counts, and per-policy pending/grant/deny counts for batch evaluation.
 - README and rustdocs now frame Gatehouse as an in-process authorization engine with request-scoped fact loading, and document decision semantics, short-circuit trace behavior, batch authorization, fact-backed ReBAC, and telemetry fields.
 - README and rustdocs now document batch tracing fields and the typed-relation-to-backend-storage boundary for SQL-backed ReBAC sources.

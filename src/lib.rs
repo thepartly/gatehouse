@@ -54,9 +54,7 @@
 //!
 //! [`RebacPolicy`] is the first built-in policy backed by this model. It
 //! extracts flat subject/resource IDs, builds [`RelationshipQuery`] keys, and
-//! asks the session for relationship facts. [`LookupSource`] reserves the
-//! complementary "what can this subject see?" shape for backends that can
-//! enumerate visible resources directly.
+//! asks the session for relationship facts.
 //!
 //! ## Quick Start
 //!
@@ -463,6 +461,11 @@ pub struct PolicyBatchItem<'a, Resource, Context> {
 ///
 /// Keys are flat, cloneable, and hashable so the session can deduplicate and
 /// cache fact loads for the lifetime of one authorization request.
+///
+/// Session caching is deliberately request-scoped. Cached facts and cached
+/// errors are dropped with the [`EvaluationSession`], so permission revocations
+/// or backend changes are observed by the next request's session rather than
+/// being held in a process-global cache.
 pub trait FactKey: Eq + Hash + Clone + Send + Sync + 'static {
     /// The value returned by a [`FactSource`] for this key.
     type Value: Clone + Send + Sync + 'static;
@@ -508,6 +511,10 @@ pub enum FactLoadError {
         fact_name: &'static str,
     },
     /// The registered source reported a backend error.
+    ///
+    /// Backend errors are held behind [`Arc`], so cloned
+    /// [`FactLoadResult::Error`] values share the same error object rather than
+    /// requiring the backend error type itself to be cloneable.
     Backend(Arc<dyn std::error::Error + Send + Sync>),
 }
 
@@ -559,6 +566,10 @@ pub enum FactLoadResult<V> {
 }
 
 /// A batched source for one fact key type.
+///
+/// Sources can be shared across many request sessions. The source owns
+/// backend-specific serialization and I/O; the session owns per-request
+/// deduplication, caching, chunking, and in-flight coalescing.
 #[async_trait]
 pub trait FactSource<K>: Send + Sync
 where
@@ -590,7 +601,9 @@ struct EvaluationSessionInner {
 ///
 /// A session is intended to live for one request or one authorization pass. It
 /// owns registered fact sources and caches loaded facts by key type. The cache
-/// is deliberately not process-global.
+/// is deliberately not process-global. Cached facts and cached errors are
+/// dropped with the session, so permission revocations or backend changes are
+/// observed by the next request's session rather than being held process-wide.
 #[derive(Clone, Default)]
 pub struct EvaluationSession {
     inner: Arc<EvaluationSessionInner>,
@@ -610,7 +623,16 @@ impl EvaluationSession {
         Self::new()
     }
 
+    /// Starts building a request-scoped session with all fact sources declared
+    /// in one place.
+    pub fn builder() -> EvaluationSessionBuilder {
+        EvaluationSessionBuilder::new()
+    }
+
     /// Registers a fact source for one key type.
+    ///
+    /// Panics if a source for `K` is already registered. Use [`Self::replace`]
+    /// when replacing a source is intentional.
     pub fn register<K, S>(&self, source: S)
     where
         K: FactKey,
@@ -621,11 +643,42 @@ impl EvaluationSession {
 
     /// Registers a shared fact source for one key type.
     ///
-    /// Re-registering a source clears any cached facts for that key type in
-    /// this session. Register sources during session setup; replacing a source
-    /// while loads for the same key type are in flight is not a supported
-    /// operation.
+    /// Panics if a source for `K` is already registered. Register sources
+    /// during session setup; use [`Self::replace_arc`] only when overwriting is
+    /// deliberate.
     pub fn register_arc<K>(&self, source: Arc<dyn FactSource<K>>)
+    where
+        K: FactKey,
+    {
+        self.insert_source::<K>(source, false);
+    }
+
+    /// Explicitly replaces a fact source for one key type.
+    ///
+    /// Replacing a source clears any cached facts for that key type in this
+    /// session. Replacing while loads for the same key type are in flight is
+    /// not a supported operation and will panic.
+    pub fn replace<K, S>(&self, source: S)
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.replace_arc::<K>(Arc::new(source));
+    }
+
+    /// Explicitly replaces a shared fact source for one key type.
+    ///
+    /// Replacing a source clears any cached facts for that key type in this
+    /// session. Replacing while loads for the same key type are in flight is
+    /// not a supported operation and will panic.
+    pub fn replace_arc<K>(&self, source: Arc<dyn FactSource<K>>)
+    where
+        K: FactKey,
+    {
+        self.insert_source::<K>(source, true);
+    }
+
+    fn insert_source<K>(&self, source: Arc<dyn FactSource<K>>, replace: bool)
     where
         K: FactKey,
     {
@@ -638,15 +691,31 @@ impl EvaluationSession {
                 .expect("fact in-flight registry mutex should not be poisoned");
             Self::in_flight_for::<K>(&mut in_flight).is_empty()
         };
-        debug_assert!(
+        assert!(
             in_flight_empty,
             "fact sources should not be replaced while loads for the same key type are in flight",
         );
-        self.inner
-            .sources
-            .lock()
-            .expect("fact source registry mutex should not be poisoned")
-            .insert(type_id, Box::new(source));
+        let duplicate_registration = {
+            let mut sources = self
+                .inner
+                .sources
+                .lock()
+                .expect("fact source registry mutex should not be poisoned");
+            if !replace && sources.contains_key(&type_id) {
+                true
+            } else {
+                sources.insert(type_id, Box::new(source));
+                false
+            }
+        };
+
+        if duplicate_registration {
+            panic!(
+                "fact source for '{}' is already registered; use replace_arc to overwrite it",
+                K::NAME
+            );
+        }
+
         self.inner
             .caches
             .lock()
@@ -891,6 +960,48 @@ impl EvaluationSession {
     }
 }
 
+/// Builder for declaring all fact sources needed by a request-scoped
+/// [`EvaluationSession`].
+pub struct EvaluationSessionBuilder {
+    session: EvaluationSession,
+}
+
+impl EvaluationSessionBuilder {
+    fn new() -> Self {
+        Self {
+            session: EvaluationSession::new(),
+        }
+    }
+
+    /// Registers a source for one fact key type.
+    ///
+    /// Panics if the same fact key type is registered twice.
+    pub fn with<K, S>(self, source: S) -> Self
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.session.register::<K, _>(source);
+        self
+    }
+
+    /// Registers a shared source for one fact key type.
+    ///
+    /// Panics if the same fact key type is registered twice.
+    pub fn with_arc<K>(self, source: Arc<dyn FactSource<K>>) -> Self
+    where
+        K: FactKey,
+    {
+        self.session.register_arc::<K>(source);
+        self
+    }
+
+    /// Finishes the session.
+    pub fn build(self) -> EvaluationSession {
+        self.session
+    }
+}
+
 struct LoadPlan<K> {
     keys: Vec<K>,
     waiters: Vec<oneshot::Receiver<()>>,
@@ -994,65 +1105,6 @@ where
     type Value = bool;
 
     const NAME: &'static str = "relationship";
-}
-
-/// Error returned by lookup-oriented relationship sources.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LookupError {
-    message: String,
-}
-
-impl LookupError {
-    /// Creates a lookup error with a human-readable message.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-
-    /// Returns the error message.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for LookupError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for LookupError {}
-
-/// One page of lookup-oriented relationship results.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LookupPage<ResourceId, Cursor> {
-    /// Resources visible in this page.
-    pub resources: Vec<ResourceId>,
-    /// Cursor to request the next page, if more resources are available.
-    pub next_cursor: Option<Cursor>,
-}
-
-/// Optional graph-style relationship lookup source.
-#[async_trait]
-pub trait LookupSource<SubjectId, ResourceId, Relation>:
-    FactSource<RelationshipQuery<SubjectId, ResourceId, Relation>>
-where
-    SubjectId: Eq + Hash + Clone + Send + Sync + 'static,
-    ResourceId: Eq + Hash + Clone + Send + Sync + 'static,
-    Relation: Eq + Hash + Clone + Send + Sync + 'static,
-{
-    /// Opaque pagination cursor type used by this source.
-    type Cursor: Clone + Send + Sync + 'static;
-
-    /// Looks up one page of resources related to the subject by `relation`.
-    async fn lookup_resources(
-        &self,
-        subject: &SubjectId,
-        relation: &Relation,
-        cursor: Option<Self::Cursor>,
-        limit: Option<NonZeroUsize>,
-    ) -> Result<LookupPage<ResourceId, Self::Cursor>, LookupError>;
 }
 
 /// The complete result of a permission evaluation.
@@ -2372,6 +2424,21 @@ where
 /// `Relation::Viewer` to a `text` column value only when binding query
 /// parameters. The session deduplicates and caches by the typed key, not by the
 /// serialized storage representation.
+///
+/// When several relationship domains have the same ID shape, such as
+/// `Uuid -> Uuid`, use a domain relation enum and dispatch inside one
+/// `FactSource`, or newtype the IDs so each domain has a distinct
+/// `RelationshipQuery` type and therefore a distinct session registration.
+///
+/// `RebacPolicy` is the convenience policy for boolean relationship checks. If
+/// a relationship carries payload, such as rank, weight, or a scope set, define
+/// a custom [`FactKey`] with `Value = YourPayload` and write a [`Policy`] that
+/// interprets the loaded value.
+///
+/// `Relation` must implement [`fmt::Display`] only so Gatehouse can produce
+/// human-readable denial reasons and traces. Backend serialization should live
+/// in the [`FactSource`], not in the display string unless that is explicitly
+/// your storage format.
 ///
 /// ```rust
 /// use async_trait::async_trait;
