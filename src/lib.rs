@@ -2365,6 +2365,14 @@ where
 /// then loads relationship facts through the request-scoped
 /// [`EvaluationSession`].
 ///
+/// The `Relation` type can be a domain enum rather than a string. That keeps
+/// policy code type-safe while leaving backend-specific serialization inside
+/// the [`FactSource`]. For example, a SQL-backed source can load
+/// `RelationshipQuery<Uuid, Uuid, Relation>` keys and convert
+/// `Relation::Viewer` to a `text` column value only when binding query
+/// parameters. The session deduplicates and caches by the typed key, not by the
+/// serialized storage representation.
+///
 /// ```rust
 /// use async_trait::async_trait;
 /// use std::collections::HashSet;

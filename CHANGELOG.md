@@ -22,6 +22,7 @@
 - `AndPolicy`, `OrPolicy`, `NotPolicy`, boxed `dyn Policy`, and `RebacPolicy` now preserve batching through their batch evaluation paths.
 - Evaluation tracing now records single-item outcome fields, batch item/grant/deny counts, and per-policy pending/grant/deny counts for batch evaluation.
 - README and rustdocs now frame Gatehouse as an in-process authorization engine with request-scoped fact loading, and document decision semantics, short-circuit trace behavior, batch authorization, fact-backed ReBAC, and telemetry fields.
+- README and rustdocs now document batch tracing fields and the typed-relation-to-backend-storage boundary for SQL-backed ReBAC sources.
 
 ### Fixed
 

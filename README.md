@@ -182,6 +182,8 @@ let checker = PermissionChecker::new()
 
 `RebacPolicy` is the first built-in fact-backed policy. It extracts subject/resource IDs, builds `RelationshipQuery<SubjectId, ResourceId, Relation>` keys, and asks the session for those relationship facts. `LookupSource` reserves the complementary "what can this subject see?" shape for backends that can enumerate visible resources directly.
 
+Use a typed relation enum when your domain has a fixed relation set, even if the backing store uses strings. The `EvaluationSession` deduplicates and caches by the typed `RelationshipQuery`; the `FactSource` owns the backend boundary and can convert `Relation::Viewer` to `"viewer"` when binding SQL parameters. The `pg18_bulk_rebac` example demonstrates this pattern against a PostgreSQL `text` column.
+
 ### PolicyBuilder
 The `PolicyBuilder` provides a fluent API to construct custom policies by chaining predicate functions for 
 subjects, actions, resources, and context. Every configured predicate must pass for the built policy to grant access. Once built, the policy can be added to a `PermissionChecker`.
@@ -213,9 +215,9 @@ Fact-backed ReBAC failures fail closed: missing sources, missing facts, source e
 
 ## Tracing And Telemetry
 
-When trace-level events are enabled, `PermissionChecker::evaluate_in_session` creates an instrumented span and every evaluated policy records a `trace!` event on the `gatehouse::security` target. Batch evaluation records `item_count`, `granted_count`, `denied_count`, `policy_count`, and nested `gatehouse.batch_policy` spans with per-policy pending/granted/denied counts.
+When trace-level events are enabled, `PermissionChecker::evaluate_in_session` creates an instrumented span and every evaluated policy records a `trace!` event on the `gatehouse::security` target. Batch evaluation records checker-level aggregate fields and nested `gatehouse.batch_policy` spans with per-policy pending/granted/denied counts.
 
-Emitted fields:
+Single-item security event fields:
 
 - `security_rule.name`
 - `security_rule.category`
@@ -228,6 +230,27 @@ Emitted fields:
 - `event.outcome`
 - `policy.type`
 - `policy.result.reason`
+
+Single-item checker span fields:
+
+- `policy_count`
+- `outcome`
+- `policy.type`
+
+Batch checker span fields:
+
+- `item_count`
+- `granted_count`
+- `denied_count`
+- `policy_count`
+- `max_batch_size`
+
+Nested `gatehouse.batch_policy` span fields:
+
+- `policy.type`
+- `policy.pending_count`
+- `policy.granted_count`
+- `policy.denied_count`
 
 Fallback behavior when `security_rule()` is not overridden:
 
