@@ -1,7 +1,18 @@
+//! PostgreSQL-backed batch ReBAC example.
+//!
+//! This models a list endpoint with two policies:
+//!
+//! - public posts are visible through an in-memory predicate policy
+//! - private posts are visible when a `viewer` relationship exists in PostgreSQL
+//!
+//! The policy stack stays in Gatehouse. PostgreSQL is only responsible for
+//! loading relationship facts, and `EvaluationSession` batches, deduplicates,
+//! caches, and expands those facts back into caller order.
+
 use async_trait::async_trait;
 use gatehouse::{
-    EvaluationSession, FactLoadError, FactLoadResult, FactSource, PermissionChecker, RebacPolicy,
-    RelationshipQuery,
+    EvaluationSession, FactLoadError, FactLoadResult, FactSource, PermissionChecker, PolicyBuilder,
+    RebacPolicy, RelationshipQuery,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,6 +29,7 @@ struct User {
 #[derive(Clone)]
 struct Post {
     id: Uuid,
+    public: bool,
 }
 
 struct View;
@@ -143,8 +155,8 @@ async fn main() {
     client
         .batch_execute(
             "
-            DROP TABLE IF EXISTS gatehouse_spike_post_grants;
-            CREATE UNLOGGED TABLE gatehouse_spike_post_grants (
+            DROP TABLE IF EXISTS gatehouse_example_post_relationships;
+            CREATE UNLOGGED TABLE gatehouse_example_post_relationships (
                 subject_id uuid NOT NULL,
                 post_id uuid NOT NULL,
                 relationship text NOT NULL,
@@ -158,12 +170,15 @@ async fn main() {
     let subject = User { id: Uuid::new_v4() };
     let relationship = "viewer".to_string();
     let posts = (0..10_000)
-        .map(|_| Post { id: Uuid::new_v4() })
+        .map(|index| Post {
+            id: Uuid::new_v4(),
+            public: index % 5 == 0,
+        })
         .collect::<Vec<_>>();
     let granted_ids = posts
         .iter()
         .enumerate()
-        .filter_map(|(index, post)| (index % 2 == 0).then_some(post.id))
+        .filter_map(|(index, post)| (!post.public && index % 2 == 0).then_some(post.id))
         .collect::<Vec<_>>();
     let relationships = vec![relationship.clone(); granted_ids.len()];
     let subject_ids = vec![subject.id; granted_ids.len()];
@@ -171,7 +186,7 @@ async fn main() {
     client
         .execute(
             "
-            INSERT INTO gatehouse_spike_post_grants (subject_id, post_id, relationship)
+            INSERT INTO gatehouse_example_post_relationships (subject_id, post_id, relationship)
             SELECT *
             FROM unnest($1::uuid[], $2::uuid[], $3::text[])
             ",
@@ -186,7 +201,7 @@ async fn main() {
                 "
                 SELECT EXISTS (
                     SELECT 1
-                    FROM gatehouse_spike_post_grants
+                    FROM gatehouse_example_post_relationships
                     WHERE subject_id = $1
                       AND relationship = $2
                       AND post_id = $3
@@ -208,7 +223,7 @@ async fn main() {
                 SELECT
                     COALESCE(bool_or(g.post_id IS NOT NULL), false) AS allowed
                 FROM candidate_relationships c
-                LEFT JOIN gatehouse_spike_post_grants g
+                LEFT JOIN gatehouse_example_post_relationships g
                   ON g.subject_id = c.subject_id
                  AND g.relationship = c.relationship
                  AND g.post_id = c.post_id
@@ -230,25 +245,41 @@ async fn main() {
         &[
             RelationshipQuery {
                 subject_id: subject.id,
-                resource_id: posts[0].id,
+                resource_id: posts
+                    .iter()
+                    .find(|post| granted_ids.contains(&post.id))
+                    .expect("fixture should include a granted private post")
+                    .id,
                 relation: relationship.clone(),
             },
             RelationshipQuery {
                 subject_id: subject.id,
-                resource_id: posts[1].id,
+                resource_id: posts
+                    .iter()
+                    .enumerate()
+                    .find(|(index, post)| !post.public && index % 2 == 1)
+                    .expect("fixture should include a denied private post")
+                    .1
+                    .id,
                 relation: relationship.clone(),
             },
         ],
     )
     .await;
     let source: Arc<dyn FactSource<RelationshipQuery<Uuid, Uuid, String>>> = source;
-    let policy = RebacPolicy::new(|user: &User| user.id, |post: &Post| post.id, relationship);
+    let public_posts = PolicyBuilder::<User, Post, View, ()>::new("PublicPost")
+        .resources(|post| post.public)
+        .build();
+    let viewer_relationship =
+        RebacPolicy::new(|user: &User| user.id, |post: &Post| post.id, relationship);
     let mut checker = PermissionChecker::new();
-    checker.add_policy(policy);
+    checker.add_policy(public_posts);
+    checker.add_policy(viewer_relationship);
 
-    println!("size,naive_ms,bulk_ms,allowed,improvement");
+    println!("size,relationship_checks,naive_ms,bulk_ms,allowed,improvement");
     for &size in &[10usize, 100, 1_000, 5_000, 10_000] {
         let sample = posts.iter().take(size).cloned().collect::<Vec<_>>();
+        let relationship_checks = sample.iter().filter(|post| !post.public).count();
         let naive = measure(|| async {
             let mut allowed = 0usize;
             for post in &sample {
@@ -285,7 +316,7 @@ async fn main() {
 
         assert_eq!(naive.output, bulk.output);
         println!(
-            "{size},{:.3},{:.3},{},x{:.1}",
+            "{size},{relationship_checks},{:.3},{:.3},{},x{:.1}",
             naive.elapsed.as_secs_f64() * 1_000.0,
             bulk.elapsed.as_secs_f64() * 1_000.0,
             bulk.output,

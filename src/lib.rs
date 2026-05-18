@@ -1,9 +1,10 @@
-//! A flexible authorization library that combines role‐based (RBAC),
-//! attribute‐based (ABAC), and relationship‐based (ReBAC) policies.
-//! The library provides a generic `Policy` trait for defining custom policies,
-//! a builder pattern for creating custom policies as well as several built-in
-//! policies for common use cases, and combinators for composing complex
-//! authorization logic.
+//! An in-process authorization engine for Rust.
+//!
+//! Gatehouse composes role-based (RBAC), attribute-based (ABAC), and
+//! relationship-based (ReBAC) policies while keeping authorization logic in
+//! Rust. Relationship facts are loaded through request-scoped
+//! [`EvaluationSession`] values, so list endpoints can batch, deduplicate, and
+//! coalesce backend calls without moving policy logic into the data layer.
 //!
 //! # Overview
 //!
@@ -43,6 +44,20 @@
 //! evaluated. Because [`PermissionChecker`], [`AndPolicy`], and [`OrPolicy`]
 //! short-circuit, the trace tree does not include policies that were never run.
 //!
+//! ## Fact-Loaded Authorization
+//!
+//! Gatehouse treats non-trivial authorization as computation over facts loaded
+//! for one request. [`FactSource::load_many`] receives unique fact keys and
+//! returns exactly one result per key; [`EvaluationSession`] expands duplicate
+//! caller inputs, preserves caller order, caches results for the request, and
+//! joins concurrent in-flight loads for the same key.
+//!
+//! [`RebacPolicy`] is the first built-in policy backed by this model. It
+//! extracts flat subject/resource IDs, builds [`RelationshipQuery`] keys, and
+//! asks the session for relationship facts. [`LookupSource`] reserves the
+//! complementary "what can this subject see?" shape for backends that can
+//! enumerate visible resources directly.
+//!
 //! ## Quick Start
 //!
 //! The fastest way to define a policy is with [`PolicyBuilder`]:
@@ -80,7 +95,8 @@
 //! The library provides several built-in policies:
 //!  - [`RbacPolicy`]: A role-based access control policy.
 //!  - [`AbacPolicy`]: An attribute-based access control policy.
-//!  - [`RebacPolicy`]: A relationship-based access control policy.
+//!  - [`RebacPolicy`]: A relationship-based access control policy backed by
+//!    [`FactSource`] and [`EvaluationSession`].
 //!
 //! ## Custom Policies
 //!

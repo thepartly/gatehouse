@@ -4,12 +4,15 @@
 [![Crates.io](https://img.shields.io/crates/v/gatehouse)](https://crates.io/crates/gatehouse)
 [![Documentation](https://docs.rs/gatehouse/badge.svg)](https://docs.rs/gatehouse)
 
-A flexible authorization library that combines role-based (RBAC), attribute-based (ABAC), and relationship-based (ReBAC) access control policies.
+An in-process authorization engine for Rust. Compose RBAC, ABAC, and relationship-based policies; load relationship facts through a request-scoped session that batches, deduplicates, and coalesces backend calls. List endpoints stay correct and fast without pushing policy into your data layer.
 
 ![Gatehouse Logo](https://raw.githubusercontent.com/thepartly/gatehouse/main/.github/logo.svg)
 
 ## Features
-- **Multi-paradigm Authorization**: Support for RBAC, ABAC, and ReBAC patterns
+- **In-process authorization**: Keep policy logic in Rust without requiring a separate authorization service
+- **Multi-paradigm policies**: Compose RBAC, ABAC, and ReBAC patterns
+- **Request-scoped fact loading**: Load relationship facts through `EvaluationSession` and `FactSource`
+- **Batch-safe list endpoints**: Authorize many resources with policy-correct batching, deduplication, and caller-order preservation
 - **Policy Composition**: Combine policies with logical operators (`AND`, `OR`, `NOT`)
 - **Detailed Evaluation Tracing**: Decision trace for the policies and branches that were actually evaluated
 - **Fluent Builder API**: Construct custom policies with a PolicyBuilder.
@@ -69,6 +72,14 @@ let outcome: Result<(), String> = evaluation.to_result(|reason| reason.to_string
 assert!(outcome.is_ok());
 # });
 ```
+
+## Why v0.3 Matters
+
+Simple checks still look like normal Rust predicates. The difference shows up when an endpoint has to authorize a page, feed, subscription batch, or search result. Before v0.3, those paths either paid N policy evaluations and N backend round trips, or duplicated policy logic into SQL and risked bypassing later checker policies.
+
+Gatehouse now treats authorization as computation over request-scoped facts. A policy stack can keep in-memory checks, combinators, and relationship checks in one place, while `EvaluationSession` batches and caches the fact loads needed by that request.
+
+You do not need to model every check as a fact. RBAC and ABAC-style predicates stay simple and in-process; fact sources are the production path for data that would otherwise require per-resource I/O, such as relationship checks behind list endpoints.
 
 ## Decision Semantics
 
@@ -163,6 +174,14 @@ let checker = PermissionChecker::new()
     .with_max_batch_size(NonZeroUsize::new(500).unwrap());
 ```
 
+### Fact Sources And Sessions
+
+`EvaluationSession` is request-scoped. Register the fact sources needed for one request, run the checker, then drop the session. Cached facts, cached errors, and in-flight load state do not outlive the request.
+
+`FactSource::load_many` receives unique keys and must return exactly one result per key in the same order. The session handles duplicate expansion and caller-order preservation. Missing sources, backend errors, missing facts, wrong result counts, and cancelled loader tasks all fail closed.
+
+`RebacPolicy` is the first built-in fact-backed policy. It extracts subject/resource IDs, builds `RelationshipQuery<SubjectId, ResourceId, Relation>` keys, and asks the session for those relationship facts. `LookupSource` reserves the complementary "what can this subject see?" shape for backends that can enumerate visible resources directly.
+
 ### PolicyBuilder
 The `PolicyBuilder` provides a fluent API to construct custom policies by chaining predicate functions for 
 subjects, actions, resources, and context. Every configured predicate must pass for the built policy to grant access. Once built, the policy can be added to a `PermissionChecker`.
@@ -222,6 +241,7 @@ See the `examples` directory for complete demonstrations of:
 - Role-based access control (`rbac_policy`)
 - Attribute-style custom policies with `PolicyBuilder` (`policy_builder`)
 - Relationship-based access control (`rebac_policy`)
+- PostgreSQL-backed batched relationship facts (`pg18_bulk_rebac`)
 - Group authorization with trace output (`groups_policy`)
 - Policy combinators (`combinator_policy`)
 - Axum integration with shared policies (`axum`)
@@ -239,11 +259,11 @@ Criterion benchmarks in `benches/permission_checker.rs` exercise `PermissionChec
 several policy stack sizes. Run them with `cargo bench` to track changes in evaluation latency as you evolve
 your policy definitions.
 
-The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It compares N point queries through per-item sessions with one bulk `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
+The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
   cargo run --example pg18_bulk_rebac --release
 ```
 
-On a local PostgreSQL 18.3 container, the bulk path was about 6x faster for 10 resources, 41x faster for 100 resources, and 50-90x faster for 1,000+ resources.
+The example prints a CSV so you can compare your own database and machine. A local PostgreSQL 18.3 run of the mixed-policy example produced `x4.5` at 10 resources, `x63.4` at 1,000 resources, `x69.8` at 5,000 resources, and `x71.6` at 10,000 resources. Exact numbers vary; the important property is that the policy stack stays in Gatehouse while relationship fact loading collapses to batched SQL.
