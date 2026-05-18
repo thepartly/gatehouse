@@ -847,6 +847,7 @@ dependencies = [
  "futures-channel",
  "hyper",
  "proptest",
+ "serde",
  "tokio",
  "tokio-postgres",
  "tokio-test",

@@ -244,7 +244,7 @@ See the `examples` directory for complete demonstrations of:
 - PostgreSQL-backed batched relationship facts (`pg18_bulk_rebac`)
 - Group authorization with trace output (`groups_policy`)
 - Policy combinators (`combinator_policy`)
-- Axum integration with shared policies (`axum`)
+- Axum integration with shared policies, app state, request-scoped sessions, and a bulk invoice listing endpoint (`axum`)
 - Actix Web integration with shared policies (`actix_web`)
 
 Run with:
@@ -266,4 +266,4 @@ DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_t
   cargo run --example pg18_bulk_rebac --release
 ```
 
-The example prints a CSV so you can compare your own database and machine. A local PostgreSQL 18.3 run of the mixed-policy example produced `x4.5` at 10 resources, `x63.4` at 1,000 resources, `x69.8` at 5,000 resources, and `x71.6` at 10,000 resources. Exact numbers vary; the important property is that the policy stack stays in Gatehouse while relationship fact loading collapses to batched SQL.
+The example prints a CSV so you can compare your own database and machine. Local PostgreSQL 18.3 runs of the mixed-policy example show modest wins for tiny lists and tens-to-low-hundreds improvements once the list is large enough for round trips to dominate. Exact numbers vary; the important property is that the policy stack stays in Gatehouse while relationship fact loading collapses to batched SQL.

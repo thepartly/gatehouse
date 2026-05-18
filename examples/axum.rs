@@ -1,14 +1,18 @@
 // Axum service that authorizes multiple resource types (Invoices, Payments)
 // using a single PermissionChecker. Demonstrates multiple policies and actions.
 
+use async_trait::async_trait;
 use axum::{
-    extract::{Extension, FromRequestParts, Path},
+    extract::{FromRequestParts, Path, State},
     http::{request::Parts, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use gatehouse::*;
+use serde::Serialize;
+use std::collections::HashSet;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -88,7 +92,7 @@ impl InvoiceOverrides {
     fn build_invoice(&self, invoice_id: Uuid) -> Invoice {
         Invoice {
             id: invoice_id,
-            owner_id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            owner_id: demo_owner_id(),
             locked: self.locked.unwrap_or(false),
             created_at: SystemTime::now()
                 - Duration::from_secs(self.age_days.unwrap_or(10) * 24 * 60 * 60),
@@ -196,6 +200,133 @@ pub struct RequestContext {
     pub current_time: SystemTime,
 }
 
+impl RequestContext {
+    fn now() -> Self {
+        Self {
+            current_time: SystemTime::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Relation {
+    Viewer,
+}
+
+impl fmt::Display for Relation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Viewer => f.write_str("viewer"),
+        }
+    }
+}
+
+type InvoiceRelationship = RelationshipQuery<Uuid, Uuid, Relation>;
+
+#[derive(Clone)]
+pub struct InMemoryRelationshipSource {
+    grants: Arc<HashSet<InvoiceRelationship>>,
+}
+
+impl InMemoryRelationshipSource {
+    fn new(grants: impl IntoIterator<Item = InvoiceRelationship>) -> Self {
+        Self {
+            grants: Arc::new(grants.into_iter().collect()),
+        }
+    }
+}
+
+#[async_trait]
+impl FactSource<InvoiceRelationship> for InMemoryRelationshipSource {
+    async fn load_many(&self, keys: &[InvoiceRelationship]) -> Vec<FactLoadResult<bool>> {
+        keys.iter()
+            .map(|key| FactLoadResult::Found(self.grants.contains(key)))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InvoiceSummary {
+    pub id: Uuid,
+    pub owner_id: Uuid,
+    pub locked: bool,
+}
+
+impl From<Invoice> for InvoiceSummary {
+    fn from(invoice: Invoice) -> Self {
+        Self {
+            id: invoice.id,
+            owner_id: invoice.owner_id,
+            locked: invoice.locked,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    checker: PermissionChecker<User, Resource, Action, RequestContext>,
+    invoice_relationships: Arc<dyn FactSource<InvoiceRelationship>>,
+    invoices: Arc<Vec<Invoice>>,
+}
+
+impl AppState {
+    pub fn demo() -> Self {
+        let viewer_id = demo_viewer_id();
+        let invoices = Arc::new(demo_invoices());
+        let grants = invoices
+            .iter()
+            .filter(|invoice| invoice.owner_id != demo_owner_id())
+            .map(|invoice| InvoiceRelationship {
+                subject_id: viewer_id,
+                resource_id: invoice.id,
+                relation: Relation::Viewer,
+            });
+
+        Self {
+            checker: build_permission_checker(),
+            invoice_relationships: Arc::new(InMemoryRelationshipSource::new(grants)),
+            invoices,
+        }
+    }
+
+    fn request_session(&self) -> EvaluationSession {
+        let session = EvaluationSession::new();
+        session.register_arc::<InvoiceRelationship>(Arc::clone(&self.invoice_relationships));
+        session
+    }
+}
+
+fn demo_owner_id() -> Uuid {
+    Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap()
+}
+
+fn demo_viewer_id() -> Uuid {
+    Uuid::parse_str("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee").unwrap()
+}
+
+fn demo_invoices() -> Vec<Invoice> {
+    vec![
+        Invoice {
+            id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            owner_id: demo_owner_id(),
+            locked: false,
+            created_at: SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60),
+        },
+        Invoice {
+            id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            owner_id: Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap(),
+            locked: false,
+            created_at: SystemTime::now() - Duration::from_secs(5 * 24 * 60 * 60),
+        },
+        Invoice {
+            id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            owner_id: Uuid::parse_str("dddddddd-dddd-dddd-dddd-dddddddddddd").unwrap(),
+            locked: true,
+            created_at: SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60),
+        },
+    ]
+}
+
 /// --------------------------
 /// 2) Building Our Policies
 /// --------------------------
@@ -210,7 +341,37 @@ fn admin_override_policy() -> Box<dyn Policy<User, Resource, Action, RequestCont
         .build()
 }
 
-/// (B) `InvoiceEditingPolicy`
+/// (B) `InvoiceViewerPolicy`
+///     Allows viewing an invoice when the request user has a `viewer`
+///     relationship with that invoice. In a real service the source would wrap
+///     a database pool or graph client; this example uses an in-memory source
+///     so the request/session wiring is easy to see.
+fn invoice_viewer_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
+    let is_invoice_view: Arc<dyn Policy<User, Resource, Action, RequestContext>> = Arc::from(
+        PolicyBuilder::<User, Resource, Action, RequestContext>::new("IsInvoiceView")
+            .when(|_user, action, resource, _ctx| {
+                matches!(action, Action::View) && matches!(resource, Resource::Invoice(_))
+            })
+            .build(),
+    );
+
+    let viewer_relationship: Arc<dyn Policy<User, Resource, Action, RequestContext>> =
+        Arc::new(RebacPolicy::new(
+            |user: &User| user.id,
+            |resource: &Resource| match resource {
+                Resource::Invoice(invoice) => invoice.id,
+                _ => Uuid::nil(),
+            },
+            Relation::Viewer,
+        ));
+
+    Box::new(
+        AndPolicy::try_new(vec![is_invoice_view, viewer_relationship])
+            .expect("invoice viewer policy should have guard and relationship checks"),
+    )
+}
+
+/// (C) `InvoiceEditingPolicy`
 ///     Allows editing an invoice if:
 ///       - It's an `Invoice` resource and the requested action is `Action::Edit`,
 ///       - The user is the invoice owner,
@@ -278,7 +439,7 @@ fn invoice_editing_policy() -> Box<dyn Policy<User, Resource, Action, RequestCon
     Box::new(and_policy)
 }
 
-/// (C) `PaymentApprovePolicy`
+/// (D) `PaymentApprovePolicy`
 ///     Allows approving a payment if:
 ///       - It's a `Payment` resource
 ///       - Action is `Action::ApprovePayment`
@@ -297,7 +458,7 @@ fn payment_approve_policy() -> Box<dyn Policy<User, Resource, Action, RequestCon
         .build()
 }
 
-/// (D) `PaymentRefundPolicy`
+/// (E) `PaymentRefundPolicy`
 ///     Allows refunding a payment if:
 ///       - It's a `Payment` resource
 ///       - Action is `Action::RefundPayment`
@@ -319,7 +480,7 @@ fn payment_refund_policy() -> Box<dyn Policy<User, Resource, Action, RequestCont
     ))
 }
 
-/// (E) Combine all relevant policies into a single `PermissionChecker`.
+/// (F) Combine all relevant policies into a single `PermissionChecker`.
 ///     The checker uses OR semantics by default: if ANY policy returns Granted,
 ///     the request is allowed.
 pub fn build_permission_checker() -> PermissionChecker<User, Resource, Action, RequestContext> {
@@ -329,6 +490,7 @@ pub fn build_permission_checker() -> PermissionChecker<User, Resource, Action, R
     // but note that OR short-circuits on the first Granted. So
     // e.g. if "AdminOverridePolicy" passes, we never evaluate the others.
     checker.add_policy(admin_override_policy());
+    checker.add_policy(invoice_viewer_policy());
     checker.add_policy(invoice_editing_policy());
     checker.add_policy(payment_approve_policy());
     checker.add_policy(payment_refund_policy());
@@ -342,19 +504,18 @@ pub fn build_permission_checker() -> PermissionChecker<User, Resource, Action, R
 
 pub async fn view_invoice_handler(
     Path(invoice_id): Path<Uuid>,
-    Extension(checker): Extension<PermissionChecker<User, Resource, Action, RequestContext>>,
+    State(state): State<AppState>,
     AuthenticatedUser(user): AuthenticatedUser,
     overrides: InvoiceOverrides,
 ) -> impl IntoResponse {
     // Simulate DB fetch
     let invoice = overrides.build_invoice(invoice_id);
     let resource = Resource::Invoice(invoice.clone());
-    let context = RequestContext {
-        current_time: SystemTime::now(),
-    };
-    let session = EvaluationSession::empty();
+    let context = RequestContext::now();
+    let session = state.request_session();
 
-    if checker
+    if state
+        .checker
         .evaluate_in_session(&session, &user, &Action::View, &resource, &context)
         .await
         .is_granted()
@@ -363,15 +524,52 @@ pub async fn view_invoice_handler(
     } else {
         (
             StatusCode::FORBIDDEN,
-            "You are not authorized to edit this invoice",
+            "You are not authorized to view this invoice",
         )
             .into_response()
     }
 }
 
+pub async fn list_invoices_handler(
+    State(state): State<AppState>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> impl IntoResponse {
+    let context = RequestContext::now();
+    let action = Action::View;
+    let session = state.request_session();
+    let candidates = state
+        .invoices
+        .iter()
+        .cloned()
+        .map(Resource::Invoice)
+        .collect::<Vec<_>>();
+
+    // The session is request-scoped: app state owns the source, this request
+    // registers it, and the batch authorization call uses it for all invoices.
+    let visible = state
+        .checker
+        .filter_authorized_with_context_in_session_by(
+            &session,
+            &user,
+            &action,
+            candidates,
+            &context,
+            |resource| resource,
+        )
+        .await
+        .into_iter()
+        .filter_map(|resource| match resource {
+            Resource::Invoice(invoice) => Some(InvoiceSummary::from(invoice)),
+            Resource::Payment(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    Json(visible).into_response()
+}
+
 pub async fn edit_invoice_handler(
     Path(invoice_id): Path<Uuid>,
-    Extension(checker): Extension<PermissionChecker<User, Resource, Action, RequestContext>>,
+    State(state): State<AppState>,
     AuthenticatedUser(user): AuthenticatedUser,
     overrides: InvoiceOverrides,
 ) -> impl IntoResponse {
@@ -380,12 +578,11 @@ pub async fn edit_invoice_handler(
 
     let resource = Resource::Invoice(invoice);
     let action = Action::Edit;
-    let context = RequestContext {
-        current_time: SystemTime::now(),
-    };
-    let session = EvaluationSession::empty();
+    let context = RequestContext::now();
+    let session = state.request_session();
 
-    let decision = checker
+    let decision = state
+        .checker
         .evaluate_in_session(&session, &user, &action, &resource, &context)
         .await;
 
@@ -403,7 +600,7 @@ pub async fn edit_invoice_handler(
 
 pub async fn approve_payment_handler(
     Path(payment_id): Path<Uuid>,
-    Extension(checker): Extension<PermissionChecker<User, Resource, Action, RequestContext>>,
+    State(state): State<AppState>,
     AuthenticatedUser(user): AuthenticatedUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -413,12 +610,11 @@ pub async fn approve_payment_handler(
 
     let resource = Resource::Payment(payment);
     let action = Action::ApprovePayment;
-    let context = RequestContext {
-        current_time: SystemTime::now(),
-    };
-    let session = EvaluationSession::empty();
+    let context = RequestContext::now();
+    let session = state.request_session();
 
-    let decision = checker
+    let decision = state
+        .checker
         .evaluate_in_session(&session, &user, &action, &resource, &context)
         .await;
 
@@ -440,18 +636,20 @@ pub async fn approve_payment_handler(
 
 #[tokio::main]
 async fn main() {
-    // Build our single permission checker and share it with handlers as Extension state.
-    let checker = build_permission_checker();
+    // Build the long-lived checker and relationship source once, then create a
+    // fresh EvaluationSession inside each handler.
+    let state = AppState::demo();
 
     // Construct Axum Router
     let app = Router::new()
+        .route("/invoices", get(list_invoices_handler))
         .route("/invoices/{invoice_id}", get(view_invoice_handler))
         .route("/invoices/{invoice_id}/edit", post(edit_invoice_handler))
         .route(
             "/payments/{payment_id}/approve",
             post(approve_payment_handler),
         )
-        .layer(Extension(checker));
+        .with_state(state);
 
     // Run Axum App
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
@@ -809,10 +1007,9 @@ mod integration_tests {
     use tower::ServiceExt;
 
     fn test_app() -> Router {
-        let checker = build_permission_checker();
         Router::new()
             .route("/invoices/{invoice_id}/edit", post(edit_invoice_handler))
-            .layer(Extension(checker))
+            .with_state(AppState::demo())
     }
 
     #[tokio::test]

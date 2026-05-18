@@ -14,12 +14,14 @@ use gatehouse::{
     EvaluationSession, FactLoadError, FactLoadResult, FactSource, PermissionChecker, PolicyBuilder,
     RebacPolicy, RelationshipQuery,
 };
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_postgres::{Client, NoTls, Statement};
 use uuid::Uuid;
 
 static UNIT_CONTEXT: () = ();
+type RelationshipKey = RelationshipQuery<Uuid, Uuid, Relation>;
 
 #[derive(Clone)]
 struct User {
@@ -34,6 +36,25 @@ struct Post {
 
 struct View;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Relation {
+    Viewer,
+}
+
+impl Relation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+        }
+    }
+}
+
+impl fmt::Display for Relation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone)]
 struct PgRelationshipSource {
     client: Arc<Client>,
@@ -42,15 +63,13 @@ struct PgRelationshipSource {
 }
 
 impl PgRelationshipSource {
-    async fn load_point(
-        &self,
-        key: &RelationshipQuery<Uuid, Uuid, String>,
-    ) -> FactLoadResult<bool> {
+    async fn load_point(&self, key: &RelationshipKey) -> FactLoadResult<bool> {
+        let relationship = key.relation.as_str();
         match self
             .client
             .query_one(
                 &*self.point_stmt,
-                &[&key.subject_id, &key.relation, &key.resource_id],
+                &[&key.subject_id, &relationship, &key.resource_id],
             )
             .await
         {
@@ -59,15 +78,12 @@ impl PgRelationshipSource {
         }
     }
 
-    async fn load_bulk(
-        &self,
-        keys: &[RelationshipQuery<Uuid, Uuid, String>],
-    ) -> Vec<FactLoadResult<bool>> {
+    async fn load_bulk(&self, keys: &[RelationshipKey]) -> Vec<FactLoadResult<bool>> {
         let subject_ids = keys.iter().map(|key| key.subject_id).collect::<Vec<_>>();
         let post_ids = keys.iter().map(|key| key.resource_id).collect::<Vec<_>>();
         let relationships = keys
             .iter()
-            .map(|key| key.relation.clone())
+            .map(|key| key.relation.as_str())
             .collect::<Vec<_>>();
 
         match self
@@ -90,11 +106,8 @@ impl PgRelationshipSource {
 }
 
 #[async_trait]
-impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for PgRelationshipSource {
-    async fn load_many(
-        &self,
-        keys: &[RelationshipQuery<Uuid, Uuid, String>],
-    ) -> Vec<FactLoadResult<bool>> {
+impl FactSource<RelationshipKey> for PgRelationshipSource {
+    async fn load_many(&self, keys: &[RelationshipKey]) -> Vec<FactLoadResult<bool>> {
         if keys.len() == 1 {
             return vec![self.load_point(&keys[0]).await];
         }
@@ -103,10 +116,7 @@ impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for PgRelationshipSource 
     }
 }
 
-async fn assert_point_and_bulk_agree(
-    source: &PgRelationshipSource,
-    keys: &[RelationshipQuery<Uuid, Uuid, String>],
-) {
+async fn assert_point_and_bulk_agree(source: &PgRelationshipSource, keys: &[RelationshipKey]) {
     for key in keys {
         let point = source.load_point(key).await;
         let bulk = source
@@ -127,6 +137,28 @@ async fn assert_point_and_bulk_agree(
             }
         }
     }
+}
+
+fn build_checker() -> PermissionChecker<User, Post, View, ()> {
+    let public_posts = PolicyBuilder::<User, Post, View, ()>::new("PublicPost")
+        .resources(|post| post.public)
+        .build();
+    let viewer_relationship = RebacPolicy::new(
+        |user: &User| user.id,
+        |post: &Post| post.id,
+        Relation::Viewer,
+    );
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(public_posts);
+    checker.add_policy(viewer_relationship);
+    checker
+}
+
+fn session_with(source: &Arc<dyn FactSource<RelationshipKey>>) -> EvaluationSession {
+    let session = EvaluationSession::new();
+    session.register_arc::<RelationshipKey>(Arc::clone(source));
+    session
 }
 
 #[tokio::main]
@@ -168,7 +200,6 @@ async fn main() {
         .expect("setup schema");
 
     let subject = User { id: Uuid::new_v4() };
-    let relationship = "viewer".to_string();
     let posts = (0..10_000)
         .map(|index| Post {
             id: Uuid::new_v4(),
@@ -180,7 +211,7 @@ async fn main() {
         .enumerate()
         .filter_map(|(index, post)| (!post.public && index % 2 == 0).then_some(post.id))
         .collect::<Vec<_>>();
-    let relationships = vec![relationship.clone(); granted_ids.len()];
+    let relationships = vec![Relation::Viewer.as_str(); granted_ids.len()];
     let subject_ids = vec![subject.id; granted_ids.len()];
 
     client
@@ -250,7 +281,7 @@ async fn main() {
                     .find(|post| granted_ids.contains(&post.id))
                     .expect("fixture should include a granted private post")
                     .id,
-                relation: relationship.clone(),
+                relation: Relation::Viewer,
             },
             RelationshipQuery {
                 subject_id: subject.id,
@@ -261,20 +292,13 @@ async fn main() {
                     .expect("fixture should include a denied private post")
                     .1
                     .id,
-                relation: relationship.clone(),
+                relation: Relation::Viewer,
             },
         ],
     )
     .await;
-    let source: Arc<dyn FactSource<RelationshipQuery<Uuid, Uuid, String>>> = source;
-    let public_posts = PolicyBuilder::<User, Post, View, ()>::new("PublicPost")
-        .resources(|post| post.public)
-        .build();
-    let viewer_relationship =
-        RebacPolicy::new(|user: &User| user.id, |post: &Post| post.id, relationship);
-    let mut checker = PermissionChecker::new();
-    checker.add_policy(public_posts);
-    checker.add_policy(viewer_relationship);
+    let source: Arc<dyn FactSource<RelationshipKey>> = source;
+    let checker = build_checker();
 
     println!("size,relationship_checks,naive_ms,bulk_ms,allowed,improvement");
     for &size in &[10usize, 100, 1_000, 5_000, 10_000] {
@@ -283,8 +307,7 @@ async fn main() {
         let naive = measure(|| async {
             let mut allowed = 0usize;
             for post in &sample {
-                let session = EvaluationSession::new();
-                session.register_arc::<RelationshipQuery<Uuid, Uuid, String>>(Arc::clone(&source));
+                let session = session_with(&source);
                 if checker
                     .evaluate_in_session(&session, &subject, &View, post, &UNIT_CONTEXT)
                     .await
@@ -298,8 +321,7 @@ async fn main() {
         .await;
 
         let bulk = measure(|| async {
-            let session = EvaluationSession::new();
-            session.register_arc::<RelationshipQuery<Uuid, Uuid, String>>(Arc::clone(&source));
+            let session = session_with(&source);
             checker
                 .filter_authorized_with_context_in_session_by(
                     &session,
