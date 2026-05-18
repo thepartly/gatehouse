@@ -50,12 +50,9 @@ struct CountingPolicy {
 
 #[async_trait]
 impl Policy<User, Document, ViewAction, EmptyContext> for CountingPolicy {
-    async fn evaluate_access(
+    async fn evaluate(
         &self,
-        _subject: &User,
-        _action: &ViewAction,
-        _resource: &Document,
-        _context: &EmptyContext,
+        _ctx: &EvalCtx<'_, User, Document, ViewAction, EmptyContext>,
     ) -> PolicyEvalResult {
         // Increment evaluation counter
         self.counter.fetch_add(1, Ordering::SeqCst);
@@ -63,19 +60,19 @@ impl Policy<User, Document, ViewAction, EmptyContext> for CountingPolicy {
 
         if self.allow {
             PolicyEvalResult::Granted {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: Some(format!("{} grants access", self.name)),
             }
         } else {
             PolicyEvalResult::Denied {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: format!("{} denies access", self.name),
             }
         }
     }
 
-    fn policy_type(&self) -> String {
-        format!("CountingPolicy({})", self.name)
+    fn policy_type(&self) -> &str {
+        &self.name
     }
 }
 
@@ -85,6 +82,7 @@ async fn main() {
     let document = Document::new();
     let action = ViewAction;
     let context = EmptyContext;
+    let session = EvaluationSession::new();
 
     println!("=== AND Policy Short-Circuit Example ===");
     {
@@ -107,7 +105,13 @@ async fn main() {
 
         println!("Evaluating AND(DenyFirst, AllowSecond):");
         let result = and_policy
-            .evaluate_access(&user, &action, &document, &context)
+            .evaluate(&EvalCtx {
+                session: &session,
+                subject: &user,
+                action: &action,
+                resource: &document,
+                context: &context,
+            })
             .await;
         println!(
             "Result: {}",
@@ -145,7 +149,13 @@ async fn main() {
 
         println!("Evaluating OR(AllowFirst, DenySecond):");
         let result = or_policy
-            .evaluate_access(&user, &action, &document, &context)
+            .evaluate(&EvalCtx {
+                session: &session,
+                subject: &user,
+                action: &action,
+                resource: &document,
+                context: &context,
+            })
             .await;
         println!(
             "Result: {}",
@@ -193,7 +203,13 @@ async fn main() {
 
         println!("Evaluating OR(AND(DenyInner, AllowInner), AllowOuter):");
         let result = complex_policy
-            .evaluate_access(&user, &action, &document, &context)
+            .evaluate(&EvalCtx {
+                session: &session,
+                subject: &user,
+                action: &action,
+                resource: &document,
+                context: &context,
+            })
             .await;
         println!(
             "Result: {} for document with ID {} for user with ID {}",

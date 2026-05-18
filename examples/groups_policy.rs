@@ -36,28 +36,25 @@ struct OrgAdminPolicy;
 
 #[async_trait]
 impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for OrgAdminPolicy {
-    async fn evaluate_access(
+    async fn evaluate(
         &self,
-        subject: &SubjectV2,
-        _action: &GroupManagementAction,
-        _resource: &Group,
-        _context: &EmptyContext,
+        ctx: &EvalCtx<'_, SubjectV2, Group, GroupManagementAction, EmptyContext>,
     ) -> PolicyEvalResult {
-        if subject.authorization_details.is_org_admin {
+        if ctx.subject.authorization_details.is_org_admin {
             PolicyEvalResult::Granted {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: Some("User is organization admin".to_string()),
             }
         } else {
             PolicyEvalResult::Denied {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: "User is not organization admin".to_string(),
             }
         }
     }
 
-    fn policy_type(&self) -> String {
-        "OrgAdminPolicy".to_string()
+    fn policy_type(&self) -> &str {
+        "OrgAdminPolicy"
     }
 }
 
@@ -66,33 +63,31 @@ struct StaffPolicy;
 
 #[async_trait]
 impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for StaffPolicy {
-    async fn evaluate_access(
+    async fn evaluate(
         &self,
-        subject: &SubjectV2,
-        _action: &GroupManagementAction,
-        _resource: &Group,
-        _context: &EmptyContext,
+        ctx: &EvalCtx<'_, SubjectV2, Group, GroupManagementAction, EmptyContext>,
     ) -> PolicyEvalResult {
-        if subject
+        if ctx
+            .subject
             .authorization_details
             .permissions
             .iter()
             .any(|p| p.scope == "staff")
         {
             PolicyEvalResult::Granted {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: Some("User has staff permission".to_string()),
             }
         } else {
             PolicyEvalResult::Denied {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: "User lacks staff permission".to_string(),
             }
         }
     }
 
-    fn policy_type(&self) -> String {
-        "StaffPolicy".to_string()
+    fn policy_type(&self) -> &str {
+        "StaffPolicy"
     }
 }
 
@@ -124,8 +119,9 @@ async fn main() {
     let context = EmptyContext;
 
     let checker = create_group_management_checker();
+    let session = EvaluationSession::empty();
     let result = checker
-        .evaluate_access(&subject, &action, &group, &context)
+        .evaluate_in_session(&session, &subject, &action, &group, &context)
         .await;
     assert!(result.is_granted());
     println!(
