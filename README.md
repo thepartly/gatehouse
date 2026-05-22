@@ -169,6 +169,8 @@ If the item itself is the resource and the context type is `()`, use `evaluate_b
 
 Policies can override `Policy::evaluate_batch` to collapse backend work. `RebacPolicy` builds `RelationshipQuery` fact keys and loads them through the request-scoped `EvaluationSession`, so deduplication, chunking, caching, and fail-closed source errors live in one `FactSource` layer. Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner policies.
 
+Checker and combinator batch evaluation remain sequential by design: they preserve policy order, per-item short-circuiting, and trace shape. Parallel work belongs inside policy implementations or fact sources today; any future checker-level parallel batch API should be explicit. `EvaluationSession` is safe to share across those parallel loaders, and its fact state is sharded by key type and key stripe so unrelated fact keys do not contend on one global cache or in-flight lock.
+
 `PermissionChecker::with_max_batch_size` caps the number of still-pending items passed to each policy batch call. Fact-backed policies can also set `FactSource::max_batch_size`, which caps source-level loads after session deduplication.
 
 ```rust
