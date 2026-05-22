@@ -163,6 +163,8 @@ let visible_posts = checker
 
 The caller keeps ownership of resource loading and context construction. Gatehouse borrows the resource/context pair from each item, preserves input order, and applies the same per-item `OR` semantics as `evaluate_in_session`.
 
+If the item itself is the resource and the context type is `()`, use `evaluate_batch_resources_in_session` or `filter_authorized_resources_in_session`.
+
 Policies can override `Policy::evaluate_batch` to collapse backend work. `RebacPolicy` builds `RelationshipQuery` fact keys and loads them through the request-scoped `EvaluationSession`, so deduplication, chunking, caching, and fail-closed source errors live in one `FactSource` layer. Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner policies.
 
 `PermissionChecker::with_max_batch_size` caps the number of still-pending items passed to each policy batch call. Fact-backed policies can also set `FactSource::max_batch_size`, which caps source-level loads after session deduplication.
@@ -185,6 +187,10 @@ let session = EvaluationSession::builder()
 ```
 
 `register` and `register_arc` fail fast if the same fact key type is registered twice. Use `replace` or `replace_arc` only when overwriting a source is intentional.
+
+For hot RBAC/ABAC-only paths, `EvaluationSession::shared_empty()` returns a process-wide empty session and avoids per-call allocation. Only use it when no fact-backed policies are expected; it rejects source registration.
+
+The source registry is keyed by the exact Rust fact key type. If two backends serve the same logical key shape, define distinct key/newtype wrappers rather than registering both under one `RelationshipQuery<...>` type.
 
 #### Cache Lifetime And Revocation
 
@@ -218,6 +224,7 @@ let custom_policy = PolicyBuilder::<MySubject, MyResource, MyAction, MyContext>:
 - `RbacPolicy`: Role-based access control. Grants when at least one required role for `(resource, action)` is present in the subject's roles.
 - `AbacPolicy`: Attribute-based access control. Grants when its boolean condition closure returns `true`.
 - `RebacPolicy`: Relationship-based access control. Extracts flat subject/resource IDs, builds `RelationshipQuery` keys, and grants when the request-scoped `EvaluationSession` loads `Found(true)` from a registered `FactSource`.
+- `DelegatingPolicy`: Delegates a decision to another `PermissionChecker` after mapping parent-domain inputs into child-domain inputs. Batch delegation preserves the child checker's batch path and trace.
 
 Fact-backed ReBAC failures fail closed: missing sources, missing facts, source errors, and source contract violations produce denied decisions rather than panics or accidental grants.
 
@@ -226,6 +233,7 @@ Fact-backed ReBAC failures fail closed: missing sources, missing facts, source e
 - `AndPolicy`: Grants access only if all inner policies allow access. Must be created with at least one policy.
 - `OrPolicy`: Grants access if any inner policy allows access. Must be created with at least one policy.
 - `NotPolicy`: Inverts the decision of an inner policy.
+- `DelegatingPolicy`: Cross-domain delegation through another checker, useful when one resource's access depends on another authorization domain.
 
 ## Tracing And Telemetry
 

@@ -488,6 +488,22 @@ async fn missing_sources_fail_closed_and_source_registration_is_explicit() {
     assert_found(&other_session.get(OtherKey(5)).await, 5);
 }
 
+#[test]
+fn shared_empty_session_is_static_and_rejects_source_registration() {
+    let first = EvaluationSession::shared_empty() as *const EvaluationSession;
+    let second = EvaluationSession::shared_empty() as *const EvaluationSession;
+    assert_eq!(first, second);
+
+    let duplicate = std::panic::catch_unwind(|| {
+        EvaluationSession::shared_empty()
+            .register::<TestKey, _>(RecordingSource::echo(new_calls()));
+    });
+    assert!(
+        duplicate.is_err(),
+        "shared empty sessions must not become mutable source registries"
+    );
+}
+
 #[tokio::test]
 async fn source_max_batch_size_chunks_after_dedup_without_reordering() {
     let calls = new_calls();

@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use gatehouse::{
-    AccessEvaluation, BatchEvalCtx, EvalCtx, EvaluationSession, FactLoadResult, FactSource,
-    PermissionChecker, Policy, PolicyBatchItem, PolicyBuilder, PolicyEvalResult, RebacPolicy,
-    RelationshipQuery,
+    AccessEvaluation, BatchEvalCtx, DelegatingPolicy, EvalCtx, EvaluationSession, FactLoadResult,
+    FactSource, PermissionChecker, Policy, PolicyBatchItem, PolicyBuilder, PolicyEvalResult,
+    RebacPolicy, RelationshipQuery,
 };
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -207,6 +207,110 @@ async fn single_item_batch_matches_single_evaluation() {
         .collect::<Vec<_>>();
 
     assert_eq!(batch, vec![single]);
+}
+
+#[tokio::test]
+async fn resource_batch_shortcut_uses_unit_context() {
+    let mut checker = PermissionChecker::<Subject, Resource, Action, ()>::new();
+    checker.add_policy(
+        PolicyBuilder::<Subject, Resource, Action, ()>::new("even-resource")
+            .resources(|resource: &Resource| resource.id.is_multiple_of(2))
+            .build(),
+    );
+
+    let session = EvaluationSession::empty();
+    let results = checker
+        .evaluate_batch_resources_in_session(
+            &session,
+            &Subject,
+            &Action,
+            vec![Resource { id: 1 }, Resource { id: 2 }, Resource { id: 3 }],
+        )
+        .await;
+
+    let decisions = results
+        .iter()
+        .map(|(resource, evaluation)| (resource.id, evaluation.is_granted()))
+        .collect::<Vec<_>>();
+    assert_eq!(decisions, vec![(1, false), (2, true), (3, false)]);
+
+    let visible = checker
+        .filter_authorized_resources_in_session(
+            &session,
+            &Subject,
+            &Action,
+            vec![Resource { id: 1 }, Resource { id: 2 }, Resource { id: 3 }],
+        )
+        .await;
+    assert_eq!(
+        visible
+            .iter()
+            .map(|resource| resource.id)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[tokio::test]
+async fn delegating_policy_preserves_child_batch_evaluation() {
+    let child_batch_calls = Arc::new(AtomicUsize::new(0));
+    let child_single_calls = Arc::new(AtomicUsize::new(0));
+    let child_seen = Arc::new(Mutex::new(Vec::new()));
+
+    let mut child_checker = PermissionChecker::new();
+    child_checker.add_policy(BatchGrantPolicy {
+        name: "child-even",
+        batch_calls: Arc::clone(&child_batch_calls),
+        single_calls: Arc::clone(&child_single_calls),
+        seen_batches: Arc::clone(&child_seen),
+        grant: Arc::new(|resource_id| resource_id % 2 == 0),
+    });
+
+    let delegating_policy = DelegatingPolicy::new(
+        "DelegatedRead",
+        child_checker,
+        |_subject: &Subject| Subject,
+        |_action: &Action| Action,
+        |_subject: &Subject, resource: &Resource, _action: &Action, _context: &Ctx| Resource {
+            id: resource.id + 1,
+        },
+        |_subject: &Subject, _resource: &Resource, _action: &Action, _context: &Ctx| Ctx,
+    );
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(delegating_policy);
+
+    let session = EvaluationSession::empty();
+    let results = checker
+        .evaluate_batch_with_context_in_session_by(
+            &session,
+            &Subject,
+            &Action,
+            vec![Resource { id: 0 }, Resource { id: 1 }, Resource { id: 2 }],
+            &Ctx,
+            |resource| resource,
+        )
+        .await;
+
+    let decisions = results
+        .iter()
+        .map(|(resource, evaluation)| (resource.id, evaluation.is_granted()))
+        .collect::<Vec<_>>();
+    assert_eq!(decisions, vec![(0, false), (1, true), (2, false)]);
+    assert_eq!(child_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(child_single_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *child_seen.lock().unwrap(),
+        vec![vec![1, 2, 3]],
+        "delegation should preserve one child batch call with mapped resources"
+    );
+
+    let delegated_node = match &results[1].1 {
+        AccessEvaluation::Granted { trace, .. } => trace.root().unwrap(),
+        AccessEvaluation::Denied { .. } => panic!("expected delegated decision to grant"),
+    };
+    assert!(delegated_node.format(0).contains("DelegatedRead"));
+    assert!(delegated_node.format(0).contains("child-even"));
 }
 
 #[tokio::test]

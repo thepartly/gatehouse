@@ -7,6 +7,7 @@
 - **FactSource-backed ReBAC**: `RelationshipResolver` has been removed. `RebacPolicy` now extracts subject/resource IDs, builds `RelationshipQuery` keys, and loads relationship facts through a request-scoped `EvaluationSession` registered with a `FactSource`. (#20)
 - **Session-aware policy API**: `Policy::evaluate_access(...)` has been replaced by `Policy::evaluate(&EvalCtx)` and `Policy::evaluate_batch(&BatchEvalCtx)`. `PermissionChecker` evaluation now takes an explicit `EvaluationSession`; RBAC/ABAC-only callers can use `EvaluationSession::empty()`.
 - **Borrowed policy type names**: `Policy::policy_type` now returns `&str` instead of allocating a `String`.
+- **Sync policy inputs**: `Policy` and `PermissionChecker` now require `Subject`, `Resource`, `Action`, and `Context` to be `Sync` so batch contexts can borrow them across async evaluation.
 
 ### Added
 
@@ -14,6 +15,9 @@
 - `FactKey`, `FactLoadResult`, `FactLoadError`, `FactSource`, and `RelationshipQuery` as the new fact-loading layer for ReBAC and future fact-backed policies.
 - Request-scoped fact caching, duplicate-key expansion, source-level chunking via `FactSource::max_batch_size`, and in-flight load coalescing.
 - `EvaluationSession::builder()` for declaring all request-scoped fact sources in one place.
+- `EvaluationSession::shared_empty()` for hot RBAC/ABAC-only paths that should not allocate a fresh empty session per call.
+- `DelegatingPolicy` for cross-domain authorization delegation through a child `PermissionChecker` while preserving child batch evaluation and trace output.
+- `PermissionChecker::evaluate_batch_resources_in_session` and `filter_authorized_resources_in_session` for resource-only batches with unit context.
 - `PermissionChecker::with_max_batch_size` as a defensive cap for policy batch calls.
 - PostgreSQL 18 bulk ReBAC example demonstrating an in-memory public-post policy composed with SQL-backed relationship facts, ordered `unnest ... WITH ORDINALITY` loading, and point-vs-bulk behavior.
 - Axum example bulk invoice listing endpoint demonstrating app-state fact sources and request-scoped `EvaluationSession` registration.

@@ -256,6 +256,9 @@
 //! - [`OrPolicy`]: Grants access if any inner policy allows access; otherwise returns a
 //!   combined error.
 //! - [`NotPolicy`]: Inverts the decision of an inner policy.
+//! - [`DelegatingPolicy`]: Maps the current inputs into another authorization
+//!   domain and delegates to a child [`PermissionChecker`] while preserving
+//!   batching.
 //!
 //!
 
@@ -269,7 +272,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::Instrument;
 
 const DEFAULT_SECURITY_RULE_CATEGORY: &str = "Access Control";
@@ -395,6 +398,8 @@ pub enum CombineOp {
     Or,
     /// The inner policy's decision is inverted.
     Not,
+    /// A parent policy delegated the decision to another checker.
+    Delegate,
 }
 
 impl fmt::Display for CombineOp {
@@ -403,6 +408,7 @@ impl fmt::Display for CombineOp {
             CombineOp::And => write!(f, "AND"),
             CombineOp::Or => write!(f, "OR"),
             CombineOp::Not => write!(f, "NOT"),
+            CombineOp::Delegate => write!(f, "DELEGATE"),
         }
     }
 }
@@ -506,6 +512,12 @@ pub enum FactLoadError {
         actual: usize,
     },
     /// The leader task for a fact load was cancelled before it completed.
+    ///
+    /// The session caches this error for the affected keys and wakes any
+    /// waiters. This is correct for request-scoped sessions: the request fails
+    /// closed and the next request builds a fresh session. Do not share a
+    /// fact-loaded session across independent requests, because cancellation in
+    /// one request would cache this error for the others.
     LoaderCancelled {
         /// Diagnostic fact name from [`FactKey::NAME`].
         fact_name: &'static str,
@@ -595,6 +607,7 @@ struct EvaluationSessionInner {
     caches: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     in_flight: Mutex<HashMap<TypeId, Box<dyn Any + Send>>>,
     next_load_id: AtomicU64,
+    shared_empty: bool,
 }
 
 /// Request-scoped fact loading and caching state.
@@ -619,8 +632,28 @@ impl EvaluationSession {
     ///
     /// This is equivalent to [`Self::new`]. It can make call sites clearer when
     /// only RBAC/ABAC policies are expected and no fact sources are registered.
+    /// For very hot RBAC/ABAC-only loops, use [`Self::shared_empty`] to avoid
+    /// allocating a new empty session per call.
     pub fn empty() -> Self {
         Self::new()
+    }
+
+    /// Returns a process-wide empty session for hot paths that never use fact
+    /// sources.
+    ///
+    /// This avoids allocating a new empty session for RBAC/ABAC-only checks in
+    /// tight loops such as fanout or SSE frame authorization. It is only safe
+    /// when no fact-backed policies are expected. Calling [`Self::register`],
+    /// [`Self::register_arc`], [`Self::replace`], or [`Self::replace_arc`] on
+    /// this session will panic.
+    pub fn shared_empty() -> &'static Self {
+        static SHARED_EMPTY: OnceLock<EvaluationSession> = OnceLock::new();
+        SHARED_EMPTY.get_or_init(|| EvaluationSession {
+            inner: Arc::new(EvaluationSessionInner {
+                shared_empty: true,
+                ..EvaluationSessionInner::default()
+            }),
+        })
     }
 
     /// Starts building a request-scoped session with all fact sources declared
@@ -646,6 +679,13 @@ impl EvaluationSession {
     /// Panics if a source for `K` is already registered. Register sources
     /// during session setup; use [`Self::replace_arc`] only when overwriting is
     /// deliberate.
+    ///
+    /// The registry is keyed by the exact Rust fact key type. If two production
+    /// backends serve the same logical shape, such as the same
+    /// `RelationshipQuery<UserId, ConversationId, ParticipantRelation>`, they
+    /// cannot both be registered under that exact type in one session. Wrap one
+    /// ID/relation type or define distinct fact keys so each backend has a
+    /// separate registry entry.
     pub fn register_arc<K>(&self, source: Arc<dyn FactSource<K>>)
     where
         K: FactKey,
@@ -682,6 +722,10 @@ impl EvaluationSession {
     where
         K: FactKey,
     {
+        assert!(
+            !self.inner.shared_empty,
+            "EvaluationSession::shared_empty() cannot register fact sources; use EvaluationSession::new() or EvaluationSession::builder()",
+        );
         let type_id = TypeId::of::<K>();
         let in_flight_empty = {
             let mut in_flight = self
@@ -711,7 +755,7 @@ impl EvaluationSession {
 
         if duplicate_registration {
             panic!(
-                "fact source for '{}' is already registered; use replace_arc to overwrite it",
+                "fact source for '{}' is already registered; use replace or replace_arc to overwrite it",
                 K::NAME
             );
         }
@@ -1389,6 +1433,9 @@ impl fmt::Display for PolicyEvalResult {
 /// A generic async trait representing a single authorization policy.
 /// A policy determines if a subject is allowed to perform an action on
 /// a resource within a given context.
+///
+/// The input types must be [`Sync`] because policies receive borrowed inputs
+/// across async evaluation, including [`BatchEvalCtx`] batch evaluation.
 #[async_trait]
 pub trait Policy<Subject, Resource, Action, Context>: Send + Sync
 where
@@ -1944,6 +1991,58 @@ where
         .into_iter()
         .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
         .collect()
+    }
+}
+
+impl<S, R, A> PermissionChecker<S, R, A, ()>
+where
+    S: Sync,
+    R: Sync,
+    A: Sync,
+{
+    /// Evaluates a batch where each caller-owned item is the resource and the
+    /// context type is `()`.
+    ///
+    /// This is the ergonomic shortcut for list-like checks that do not need a
+    /// per-item context value.
+    pub async fn evaluate_batch_resources_in_session<I>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        resources: I,
+    ) -> Vec<(R, AccessEvaluation)>
+    where
+        I: IntoIterator<Item = R>,
+    {
+        self.evaluate_batch_with_context_in_session_by(
+            session,
+            subject,
+            action,
+            resources,
+            &(),
+            |resource| resource,
+        )
+        .await
+    }
+
+    /// Returns only resources granted by
+    /// [`Self::evaluate_batch_resources_in_session`].
+    pub async fn filter_authorized_resources_in_session<I>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        resources: I,
+    ) -> Vec<R>
+    where
+        I: IntoIterator<Item = R>,
+    {
+        self.evaluate_batch_resources_in_session(session, subject, action, resources)
+            .await
+            .into_iter()
+            .filter_map(|(resource, evaluation)| evaluation.is_granted().then_some(resource))
+            .collect()
     }
 }
 
@@ -2620,6 +2719,167 @@ where
                 reason: format!("Relationship '{}' fact load failed: {error}", self.relation),
             },
         }
+    }
+}
+
+fn delegated_evaluation_to_result(
+    policy_type: &str,
+    evaluation: AccessEvaluation,
+) -> PolicyEvalResult {
+    match evaluation {
+        AccessEvaluation::Granted {
+            policy_type: child_policy_type,
+            reason,
+            trace,
+        } => PolicyEvalResult::Combined {
+            policy_type: policy_type.to_string(),
+            operation: CombineOp::Delegate,
+            children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::Granted {
+                policy_type: child_policy_type,
+                reason,
+            })],
+            outcome: true,
+        },
+        AccessEvaluation::Denied { reason, trace } => PolicyEvalResult::Combined {
+            policy_type: policy_type.to_string(),
+            operation: CombineOp::Delegate,
+            children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::Denied {
+                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                reason,
+            })],
+            outcome: false,
+        },
+    }
+}
+
+/// A policy that delegates its decision to another [`PermissionChecker`].
+///
+/// Use this when one authorization domain needs to ask another domain's checker
+/// for a decision while preserving the policy-layer trace. For example, a
+/// messaging `ReadConversation` policy can map a conversation to the
+/// procurement object it represents, then delegate to the procurement checker
+/// using the same [`EvaluationSession`].
+///
+/// The subject and action mappers run once per batch. Resource and context
+/// mappers run once per item. Mapper closures return child-domain values; use
+/// lightweight IDs, newtypes, or `Arc` values when mapping larger objects.
+pub struct DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext> {
+    policy_type: String,
+    security_rule: SecurityRuleMetadata,
+    checker: PermissionChecker<ChildSubject, ChildResource, ChildAction, ChildContext>,
+    subject: Arc<dyn Fn(&S) -> ChildSubject + Send + Sync>,
+    action: Arc<dyn Fn(&A) -> ChildAction + Send + Sync>,
+    resource: Arc<dyn Fn(&S, &R, &A, &C) -> ChildResource + Send + Sync>,
+    context: Arc<dyn Fn(&S, &R, &A, &C) -> ChildContext + Send + Sync>,
+}
+
+impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
+    DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
+{
+    /// Creates a delegating policy from a child checker and mapping functions.
+    pub fn new<SubjectFn, ActionFn, ResourceFn, ContextFn>(
+        policy_type: impl Into<String>,
+        checker: PermissionChecker<ChildSubject, ChildResource, ChildAction, ChildContext>,
+        subject: SubjectFn,
+        action: ActionFn,
+        resource: ResourceFn,
+        context: ContextFn,
+    ) -> Self
+    where
+        SubjectFn: Fn(&S) -> ChildSubject + Send + Sync + 'static,
+        ActionFn: Fn(&A) -> ChildAction + Send + Sync + 'static,
+        ResourceFn: Fn(&S, &R, &A, &C) -> ChildResource + Send + Sync + 'static,
+        ContextFn: Fn(&S, &R, &A, &C) -> ChildContext + Send + Sync + 'static,
+    {
+        Self {
+            policy_type: policy_type.into(),
+            security_rule: SecurityRuleMetadata::default(),
+            checker,
+            subject: Arc::new(subject),
+            action: Arc::new(action),
+            resource: Arc::new(resource),
+            context: Arc::new(context),
+        }
+    }
+
+    /// Sets the telemetry metadata emitted for the delegating policy itself.
+    pub fn with_security_rule(mut self, security_rule: SecurityRuleMetadata) -> Self {
+        self.security_rule = security_rule;
+        self
+    }
+}
+
+#[async_trait]
+impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext> Policy<S, R, A, C>
+    for DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
+where
+    S: Send + Sync,
+    R: Send + Sync,
+    A: Send + Sync,
+    C: Send + Sync,
+    ChildSubject: Send + Sync,
+    ChildResource: Send + Sync,
+    ChildAction: Send + Sync,
+    ChildContext: Send + Sync,
+{
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+        let child_subject = (self.subject)(ctx.subject);
+        let child_action = (self.action)(ctx.action);
+        let child_resource = (self.resource)(ctx.subject, ctx.resource, ctx.action, ctx.context);
+        let child_context = (self.context)(ctx.subject, ctx.resource, ctx.action, ctx.context);
+        let evaluation = self
+            .checker
+            .evaluate_in_session(
+                ctx.session,
+                &child_subject,
+                &child_action,
+                &child_resource,
+                &child_context,
+            )
+            .await;
+
+        delegated_evaluation_to_result(&self.policy_type, evaluation)
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+    ) -> Vec<PolicyEvalResult> {
+        let child_subject = (self.subject)(ctx.subject);
+        let child_action = (self.action)(ctx.action);
+        let child_items = ctx
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    (self.resource)(ctx.subject, item.resource, ctx.action, item.context),
+                    (self.context)(ctx.subject, item.resource, ctx.action, item.context),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        self.checker
+            .evaluate_batch_in_session_by(
+                ctx.session,
+                &child_subject,
+                &child_action,
+                child_items,
+                |(resource, context)| (resource, context),
+            )
+            .await
+            .into_iter()
+            .map(|(_item, evaluation)| {
+                delegated_evaluation_to_result(&self.policy_type, evaluation)
+            })
+            .collect()
+    }
+
+    fn policy_type(&self) -> &str {
+        &self.policy_type
+    }
+
+    fn security_rule(&self) -> SecurityRuleMetadata {
+        self.security_rule.clone()
     }
 }
 
