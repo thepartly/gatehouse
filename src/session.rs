@@ -265,7 +265,9 @@ impl EvaluationSession {
     /// Registers a fact source for one key type.
     ///
     /// Panics if a source for `K` is already registered. Use [`Self::replace`]
-    /// when replacing a source is intentional.
+    /// when replacing a source is intentional. Register sources during session
+    /// setup; registering while loads for the same key type are in flight is
+    /// not a supported operation and will panic.
     pub fn register<K, S>(&self, source: S)
     where
         K: FactKey,
@@ -278,7 +280,8 @@ impl EvaluationSession {
     ///
     /// Panics if a source for `K` is already registered. Register sources
     /// during session setup; use [`Self::replace_arc`] only when overwriting is
-    /// deliberate.
+    /// deliberate. Registering while loads for the same key type are in flight
+    /// is not a supported operation and will panic.
     ///
     /// The registry is keyed by the exact Rust fact key type. If two production
     /// backends serve the same logical shape, such as the same
