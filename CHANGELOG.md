@@ -22,7 +22,7 @@
 - `PermissionChecker::with_max_batch_size` as a defensive cap for policy batch calls.
 - PostgreSQL 18 bulk ReBAC example demonstrating an in-memory public-post policy composed with SQL-backed relationship facts, ordered `unnest ... WITH ORDINALITY` loading, and point-vs-bulk behavior.
 - Axum example bulk invoice listing endpoint demonstrating app-state fact sources and request-scoped `EvaluationSession` registration.
-- In-RAM ReBAC example and Criterion benchmarks for shared in-process `FactSource` usage and session overhead.
+- In-RAM ReBAC example and Criterion benchmarks for shared in-process `FactSource` usage, session overhead, latency-injected batching, and in-flight coalescing.
 
 ### Changed
 

@@ -328,7 +328,9 @@ Criterion benchmarks in `benches/permission_checker.rs` exercise `PermissionChec
 several policy stack sizes. Run them with `cargo bench` to track changes in evaluation latency as you evolve
 your policy definitions.
 
-The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source itself is hot and in-process; it is not a benchmark for network or database latency. The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
+The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source itself is hot and in-process; it is not a benchmark for network or database latency. The `latency_fact_source` group injects a fixed async delay per source call so the benchmarks also show the intended shape under backend latency: N per-item sessions versus one batched session, and independent repeated loads versus shared-session in-flight coalescing.
+
+The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
