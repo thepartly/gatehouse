@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use gatehouse::{EvaluationSession, FactKey, FactLoadError, FactLoadResult, FactSource};
+use gatehouse::{
+    EvaluationSession, FactKey, FactLoadError, FactLoadResult, FactSource,
+    FactSourceRegistrationError,
+};
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -193,6 +196,16 @@ fn assert_load_cancelled(result: &FactLoadResult<u16>) {
             assert_eq!(*fact_name, TestKey::NAME);
         }
         other => panic!("expected LoaderCancelled, got {other:?}"),
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = panic.downcast_ref::<&'static str>() {
+        message.to_string()
+    } else {
+        "<non-string panic>".to_string()
     }
 }
 
@@ -470,6 +483,16 @@ async fn missing_sources_fail_closed_and_source_registration_is_explicit() {
         duplicate.is_err(),
         "duplicate registration should fail fast"
     );
+    assert!(matches!(
+        session.try_register::<TestKey, _>(RecordingSource::new(
+            Arc::clone(&second_calls),
+            None,
+            |_keys| vec![FactLoadResult::Found(2)],
+        )),
+        Err(FactSourceRegistrationError::AlreadyRegistered {
+            fact_name: TestKey::NAME
+        })
+    ));
     assert_found(&session.get(TestKey(1)).await, 1);
     assert_eq!(second_calls.lock().unwrap().len(), 0);
 
@@ -488,6 +511,50 @@ async fn missing_sources_fail_closed_and_source_registration_is_explicit() {
     assert_found(&other_session.get(OtherKey(5)).await, 5);
 }
 
+#[tokio::test]
+async fn source_registration_and_replacement_reject_in_flight_loads() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let session = session_with_source(BlockingErrorSource {
+        calls: Arc::clone(&calls),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
+
+    let leader_session = session.clone();
+    let leader = tokio::spawn(async move { leader_session.get(TestKey(8)).await });
+    started.notified().await;
+
+    let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.register::<TestKey, _>(RecordingSource::echo(new_calls()));
+    }))
+    .expect_err("duplicate registration should panic before inspecting in-flight loads");
+    assert!(
+        panic_message(duplicate).contains("already registered"),
+        "duplicate registration should keep the actionable duplicate-source message"
+    );
+
+    let replacement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.replace::<TestKey, _>(RecordingSource::echo(new_calls()));
+    }))
+    .expect_err("replacement during in-flight load should panic");
+    assert!(
+        panic_message(replacement).contains("registered or replaced while loads"),
+        "replacement panic should describe both public source-registration verbs"
+    );
+    assert!(matches!(
+        session.try_replace::<TestKey, _>(RecordingSource::echo(new_calls())),
+        Err(FactSourceRegistrationError::InFlight {
+            fact_name: TestKey::NAME
+        })
+    ));
+
+    release.notify_one();
+    let leader_result = leader.await.unwrap();
+    assert_backend_error_contains(&leader_result, "down");
+}
+
 #[test]
 fn shared_empty_session_is_static_and_rejects_source_registration() {
     let first = EvaluationSession::shared_empty() as *const EvaluationSession;
@@ -502,6 +569,13 @@ fn shared_empty_session_is_static_and_rejects_source_registration() {
         duplicate.is_err(),
         "shared empty sessions must not become mutable source registries"
     );
+    assert!(matches!(
+        EvaluationSession::shared_empty()
+            .try_register::<TestKey, _>(RecordingSource::echo(new_calls())),
+        Err(FactSourceRegistrationError::SharedEmptySession {
+            fact_name: TestKey::NAME
+        })
+    ));
 }
 
 #[tokio::test]

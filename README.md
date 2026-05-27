@@ -81,6 +81,8 @@ Gatehouse now treats authorization as computation over request-scoped facts. A p
 
 You do not need to model every check as a fact. RBAC and ABAC-style predicates stay simple and in-process; fact sources are the production path for data that would otherwise require per-resource I/O, such as relationship checks behind list endpoints.
 
+If you are upgrading from 0.2, see `MIGRATION.md` for the `RelationshipResolver` to `FactSource` migration path and `Policy` trait changes.
+
 ## Decision Semantics
 
 - `PermissionChecker` evaluates policies sequentially with `OR` semantics and short-circuits on the first grant.
@@ -186,7 +188,7 @@ let session = EvaluationSession::builder()
     .build();
 ```
 
-`register` and `register_arc` fail fast if the same fact key type is registered twice. Use `replace` or `replace_arc` only when overwriting a source is intentional.
+`register` and `register_arc` fail fast if the same fact key type is registered twice. Use `replace` or `replace_arc` only when overwriting a source is intentional. Use `try_register`, `try_register_arc`, `try_replace`, or `try_replace_arc` when setup code should handle registration errors without panicking.
 
 For hot RBAC/ABAC-only paths, `EvaluationSession::shared_empty()` returns a process-wide empty session and avoids per-call allocation. Only use it when no fact-backed policies are expected; it rejects source registration.
 
@@ -197,6 +199,8 @@ The source registry is keyed by the exact Rust fact key type. If two backends se
 Cached facts, cached errors, and in-flight load state do not outlive the request-scoped session. This is a correctness boundary as well as a performance detail: if a permission is revoked after one request has loaded it, a new request builds a new session and must load the fact again.
 
 `FactSource::load_many` receives unique keys and must return exactly one result per key in the same order. The session handles duplicate expansion and caller-order preservation. Missing sources, backend errors, missing facts, wrong result counts, and cancelled loader tasks all fail closed.
+
+If the leader task for an in-flight fact load is cancelled or panics, the session caches `FactLoadError::LoaderCancelled` for those keys and wakes waiters. That intentionally poisons those keys for the rest of the request-scoped session so the request fails closed instead of hanging. Build a fresh session for a retry or a new request.
 
 `RebacPolicy` is the first built-in fact-backed policy. It extracts subject/resource IDs, builds `RelationshipQuery<SubjectId, ResourceId, Relation>` keys, and asks the session for those relationship facts.
 
@@ -281,6 +285,8 @@ Nested `gatehouse.batch_policy` span fields:
 
 - `policy.type`
 - `policy.pending_count`
+- `policy.chunk_index`
+- `policy.chunk_count`
 - `policy.granted_count`
 - `policy.denied_count`
 
@@ -322,7 +328,7 @@ Criterion benchmarks in `benches/permission_checker.rs` exercise `PermissionChec
 several policy stack sizes. Run them with `cargo bench` to track changes in evaluation latency as you evolve
 your policy definitions.
 
-The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source itself is hot and in-process. The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
+The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source itself is hot and in-process; it is not a benchmark for network or database latency. The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \

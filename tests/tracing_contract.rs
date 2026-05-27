@@ -274,14 +274,57 @@ fn tracing_fields_are_recorded_for_granted_decisions() {
         &[
             "policy.type",
             "policy.pending_count",
+            "policy.chunk_index",
+            "policy.chunk_count",
             "policy.granted_count",
             "policy.denied_count",
         ],
     );
     assert_value(policy, "policy.type", "TracePolicy");
     assert_value(policy, "policy.pending_count", "1");
+    assert_value(policy, "policy.chunk_index", "0");
+    assert_value(policy, "policy.chunk_count", "1");
     assert_value(policy, "policy.granted_count", "1");
     assert_value(policy, "policy.denied_count", "0");
+}
+
+#[test]
+fn tracing_records_one_batch_policy_span_per_chunk() {
+    let checker = checker_with_policy();
+    let session = EvaluationSession::empty();
+    let (_result, spans) = capture_async(|| async {
+        checker
+            .evaluate_batch_in_session_by(
+                &session,
+                &Subject,
+                &Action,
+                vec![
+                    (Resource { allowed: true }, Ctx),
+                    (Resource { allowed: false }, Ctx),
+                    (Resource { allowed: true }, Ctx),
+                ],
+                |item| (&item.0, &item.1),
+            )
+            .await
+    });
+
+    let policy_spans = spans
+        .iter()
+        .filter(|span| span.name == "gatehouse.batch_policy")
+        .collect::<Vec<_>>();
+    assert_eq!(policy_spans.len(), 2, "expected one span per policy chunk");
+
+    assert_value(policy_spans[0], "policy.pending_count", "2");
+    assert_value(policy_spans[0], "policy.chunk_index", "0");
+    assert_value(policy_spans[0], "policy.chunk_count", "2");
+    assert_value(policy_spans[0], "policy.granted_count", "1");
+    assert_value(policy_spans[0], "policy.denied_count", "1");
+
+    assert_value(policy_spans[1], "policy.pending_count", "1");
+    assert_value(policy_spans[1], "policy.chunk_index", "1");
+    assert_value(policy_spans[1], "policy.chunk_count", "2");
+    assert_value(policy_spans[1], "policy.granted_count", "1");
+    assert_value(policy_spans[1], "policy.denied_count", "0");
 }
 
 #[test]

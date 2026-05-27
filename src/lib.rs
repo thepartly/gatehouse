@@ -601,13 +601,59 @@ where
     }
 }
 
+/// Error returned by non-panicking fact-source registration helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactSourceRegistrationError {
+    /// The session is the process-wide empty session and cannot accept sources.
+    SharedEmptySession {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+    },
+    /// A source is already registered for this exact fact key type.
+    AlreadyRegistered {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+    },
+    /// Loads for this fact key type are currently in flight.
+    InFlight {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+    },
+}
+
+impl fmt::Display for FactSourceRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SharedEmptySession { .. } => write!(
+                f,
+                "EvaluationSession::shared_empty() cannot register fact sources; use EvaluationSession::new() or EvaluationSession::builder()",
+            ),
+            Self::AlreadyRegistered { fact_name } => write!(
+                f,
+                "fact source for '{fact_name}' is already registered; use replace or replace_arc to overwrite it",
+            ),
+            Self::InFlight { .. } => write!(
+                f,
+                "fact sources should not be registered or replaced while loads for the same key type are in flight",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FactSourceRegistrationError {}
+
 #[derive(Default)]
 struct EvaluationSessionInner {
-    sources: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
-    caches: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
-    in_flight: Mutex<HashMap<TypeId, Box<dyn Any + Send>>>,
+    registry: Mutex<FactRegistry>,
     next_load_id: AtomicU64,
     shared_empty: bool,
+}
+
+#[derive(Default)]
+struct FactRegistry {
+    sources: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    caches: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    in_flight: HashMap<TypeId, Box<dyn Any + Send>>,
 }
 
 /// Request-scoped fact loading and caching state.
@@ -665,7 +711,10 @@ impl EvaluationSession {
     /// Registers a fact source for one key type.
     ///
     /// Panics if a source for `K` is already registered. Use [`Self::replace`]
-    /// when replacing a source is intentional.
+    /// when replacing a source is intentional. Register sources during session
+    /// setup; registering while loads for the same key type are in flight is
+    /// not a supported operation and will panic. Use [`Self::try_register`]
+    /// when the caller should handle registration errors without panicking.
     pub fn register<K, S>(&self, source: S)
     where
         K: FactKey,
@@ -674,11 +723,22 @@ impl EvaluationSession {
         self.register_arc::<K>(Arc::new(source));
     }
 
+    /// Attempts to register a fact source for one key type.
+    pub fn try_register<K, S>(&self, source: S) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.try_register_arc::<K>(Arc::new(source))
+    }
+
     /// Registers a shared fact source for one key type.
     ///
     /// Panics if a source for `K` is already registered. Register sources
     /// during session setup; use [`Self::replace_arc`] only when overwriting is
-    /// deliberate.
+    /// deliberate. Registering while loads for the same key type are in flight
+    /// is not a supported operation and will panic. Use [`Self::try_register_arc`]
+    /// when the caller should handle registration errors without panicking.
     ///
     /// The registry is keyed by the exact Rust fact key type. If two production
     /// backends serve the same logical shape, such as the same
@@ -690,7 +750,19 @@ impl EvaluationSession {
     where
         K: FactKey,
     {
-        self.insert_source::<K>(source, false);
+        self.try_register_arc::<K>(source)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// Attempts to register a shared fact source for one key type.
+    pub fn try_register_arc<K>(
+        &self,
+        source: Arc<dyn FactSource<K>>,
+    ) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+    {
+        self.insert_source::<K>(source, false)
     }
 
     /// Explicitly replaces a fact source for one key type.
@@ -706,6 +778,15 @@ impl EvaluationSession {
         self.replace_arc::<K>(Arc::new(source));
     }
 
+    /// Attempts to replace a fact source for one key type.
+    pub fn try_replace<K, S>(&self, source: S) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.try_replace_arc::<K>(Arc::new(source))
+    }
+
     /// Explicitly replaces a shared fact source for one key type.
     ///
     /// Replacing a source clears any cached facts for that key type in this
@@ -715,56 +796,52 @@ impl EvaluationSession {
     where
         K: FactKey,
     {
-        self.insert_source::<K>(source, true);
+        self.try_replace_arc::<K>(source)
+            .unwrap_or_else(|error| panic!("{error}"));
     }
 
-    fn insert_source<K>(&self, source: Arc<dyn FactSource<K>>, replace: bool)
+    /// Attempts to replace a shared fact source for one key type.
+    pub fn try_replace_arc<K>(
+        &self,
+        source: Arc<dyn FactSource<K>>,
+    ) -> Result<(), FactSourceRegistrationError>
     where
         K: FactKey,
     {
-        assert!(
-            !self.inner.shared_empty,
-            "EvaluationSession::shared_empty() cannot register fact sources; use EvaluationSession::new() or EvaluationSession::builder()",
-        );
-        let type_id = TypeId::of::<K>();
-        let in_flight_empty = {
-            let mut in_flight = self
-                .inner
-                .in_flight
-                .lock()
-                .expect("fact in-flight registry mutex should not be poisoned");
-            Self::in_flight_for::<K>(&mut in_flight).is_empty()
-        };
-        assert!(
-            in_flight_empty,
-            "fact sources should not be replaced while loads for the same key type are in flight",
-        );
-        let duplicate_registration = {
-            let mut sources = self
-                .inner
-                .sources
-                .lock()
-                .expect("fact source registry mutex should not be poisoned");
-            if !replace && sources.contains_key(&type_id) {
-                true
-            } else {
-                sources.insert(type_id, Box::new(source));
-                false
-            }
-        };
+        self.insert_source::<K>(source, true)
+    }
 
-        if duplicate_registration {
-            panic!(
-                "fact source for '{}' is already registered; use replace or replace_arc to overwrite it",
-                K::NAME
-            );
+    fn insert_source<K>(
+        &self,
+        source: Arc<dyn FactSource<K>>,
+        replace: bool,
+    ) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+    {
+        if self.inner.shared_empty {
+            return Err(FactSourceRegistrationError::SharedEmptySession { fact_name: K::NAME });
         }
 
-        self.inner
-            .caches
-            .lock()
-            .expect("fact cache mutex should not be poisoned")
-            .remove(&type_id);
+        let type_id = TypeId::of::<K>();
+        {
+            let mut registry = self
+                .inner
+                .registry
+                .lock()
+                .expect("fact registry mutex should not be poisoned");
+
+            if !replace && registry.sources.contains_key(&type_id) {
+                return Err(FactSourceRegistrationError::AlreadyRegistered { fact_name: K::NAME });
+            } else if !Self::in_flight_for::<K>(&mut registry.in_flight).is_empty() {
+                return Err(FactSourceRegistrationError::InFlight { fact_name: K::NAME });
+            } else {
+                registry.sources.insert(type_id, Box::new(source));
+                registry.caches.remove(&type_id);
+            }
+        }
+
+        Ok(())
     }
 
     /// Loads one fact through the session cache.
@@ -798,12 +875,15 @@ impl EvaluationSession {
             return Vec::new();
         }
 
-        let source = self.source::<K>();
         let load_plan = self.plan_loads(keys);
+        if let Some(results) = load_plan.cached_results {
+            return results;
+        }
+
         let mut in_flight_guard = InFlightGuard::new(self.clone(), load_plan.keys.clone());
 
         if !load_plan.keys.is_empty() {
-            if let Some(source) = source {
+            if let Some(source) = load_plan.source.clone() {
                 let chunk_size = source
                     .max_batch_size()
                     .map_or(load_plan.keys.len(), NonZeroUsize::get)
@@ -864,44 +944,59 @@ impl EvaluationSession {
         self.results_from_cache(keys)
     }
 
-    fn source<K>(&self) -> Option<Arc<dyn FactSource<K>>>
-    where
-        K: FactKey,
-    {
-        self.inner
-            .sources
-            .lock()
-            .expect("fact source registry mutex should not be poisoned")
-            .get(&TypeId::of::<K>())
-            .and_then(|source| source.downcast_ref::<Arc<dyn FactSource<K>>>().cloned())
-    }
-
     fn plan_loads<K>(&self, keys: &[K]) -> LoadPlan<K>
     where
         K: FactKey,
     {
         let mut seen = HashSet::new();
         let mut missing = Vec::new();
-        let mut caches = self
+        let mut registry = self
             .inner
-            .caches
+            .registry
             .lock()
-            .expect("fact cache mutex should not be poisoned");
-        let cache = Self::cache_for::<K>(&mut caches);
+            .expect("fact registry mutex should not be poisoned");
+        let source = registry
+            .sources
+            .get(&TypeId::of::<K>())
+            .and_then(|source| source.downcast_ref::<Arc<dyn FactSource<K>>>().cloned());
+        let cached_results = {
+            let cache = Self::cache_for::<K>(&mut registry.caches);
+            let mut results = Vec::with_capacity(keys.len());
+            let mut all_cached = true;
 
-        let mut in_flight = self
-            .inner
-            .in_flight
-            .lock()
-            .expect("fact in-flight registry mutex should not be poisoned");
-        let in_flight = Self::in_flight_for::<K>(&mut in_flight);
+            for key in keys {
+                if let Some(result) = cache.get(key) {
+                    results.push(result.clone());
+                } else {
+                    all_cached = false;
+                    break;
+                }
+            }
+
+            all_cached.then_some(results)
+        };
+
+        if let Some(cached_results) = cached_results {
+            return LoadPlan {
+                source,
+                cached_results: Some(cached_results),
+                keys: Vec::new(),
+                waiters: Vec::new(),
+            };
+        }
+
         let mut waiters = Vec::new();
 
         for key in keys.iter().filter(|key| seen.insert((*key).clone())) {
-            if cache.contains_key(key) {
+            let is_cached = {
+                let cache = Self::cache_for::<K>(&mut registry.caches);
+                cache.contains_key(key)
+            };
+            if is_cached {
                 continue;
             }
 
+            let in_flight = Self::in_flight_for::<K>(&mut registry.in_flight);
             if let Some(existing_waiters) = in_flight.get_mut(key) {
                 let (sender, receiver) = oneshot::channel();
                 existing_waiters.push(sender);
@@ -913,6 +1008,8 @@ impl EvaluationSession {
         }
 
         LoadPlan {
+            source,
+            cached_results: None,
             keys: missing,
             waiters,
         }
@@ -922,12 +1019,12 @@ impl EvaluationSession {
     where
         K: FactKey,
     {
-        let mut in_flight = self
+        let mut registry = self
             .inner
-            .in_flight
+            .registry
             .lock()
-            .expect("fact in-flight registry mutex should not be poisoned");
-        let in_flight = Self::in_flight_for::<K>(&mut in_flight);
+            .expect("fact registry mutex should not be poisoned");
+        let in_flight = Self::in_flight_for::<K>(&mut registry.in_flight);
 
         for key in keys {
             if let Some(waiters) = in_flight.remove(key) {
@@ -942,12 +1039,12 @@ impl EvaluationSession {
     where
         K: FactKey,
     {
-        let mut caches = self
+        let mut registry = self
             .inner
-            .caches
+            .registry
             .lock()
-            .expect("fact cache mutex should not be poisoned");
-        let cache = Self::cache_for::<K>(&mut caches);
+            .expect("fact registry mutex should not be poisoned");
+        let cache = Self::cache_for::<K>(&mut registry.caches);
 
         for (key, result) in keys.iter().cloned().zip(results) {
             cache.insert(key, result);
@@ -958,12 +1055,12 @@ impl EvaluationSession {
     where
         K: FactKey,
     {
-        let mut caches = self
+        let mut registry = self
             .inner
-            .caches
+            .registry
             .lock()
-            .expect("fact cache mutex should not be poisoned");
-        let cache = Self::cache_for::<K>(&mut caches);
+            .expect("fact registry mutex should not be poisoned");
+        let cache = Self::cache_for::<K>(&mut registry.caches);
         keys.iter()
             .map(|key| {
                 cache.get(key).cloned().unwrap_or_else(|| {
@@ -1046,7 +1143,12 @@ impl EvaluationSessionBuilder {
     }
 }
 
-struct LoadPlan<K> {
+struct LoadPlan<K>
+where
+    K: FactKey,
+{
+    source: Option<Arc<dyn FactSource<K>>>,
+    cached_results: Option<Vec<FactLoadResult<K::Value>>>,
     keys: Vec<K>,
     waiters: Vec<oneshot::Receiver<()>>,
 }
@@ -1785,23 +1887,23 @@ where
             }
 
             let policy_type = policy.policy_type();
-            let policy_span = tracing::debug_span!(
-                "gatehouse.batch_policy",
-                policy.type = policy_type,
-                policy.pending_count = pending.len(),
-                policy.granted_count = tracing::field::Empty,
-                policy.denied_count = tracing::field::Empty,
-            );
-
             let mut still_pending = Vec::new();
-            let mut policy_granted_count = 0usize;
-            let mut policy_denied_count = 0usize;
             let chunk_size = self
                 .max_batch_size
                 .map_or(pending.len(), NonZeroUsize::get)
                 .max(1);
+            let chunk_count = pending.len().div_ceil(chunk_size);
 
-            for pending_chunk in pending.chunks(chunk_size) {
+            for (chunk_index, pending_chunk) in pending.chunks(chunk_size).enumerate() {
+                let policy_span = tracing::debug_span!(
+                    "gatehouse.batch_policy",
+                    policy.type = policy_type,
+                    policy.pending_count = pending_chunk.len(),
+                    policy.chunk_index = chunk_index,
+                    policy.chunk_count = chunk_count,
+                    policy.granted_count = tracing::field::Empty,
+                    policy.denied_count = tracing::field::Empty,
+                );
                 let batch_items: Vec<_> = pending_chunk
                     .iter()
                     .map(|&index| PolicyBatchItem {
@@ -1821,9 +1923,12 @@ where
                     .instrument(policy_span.clone())
                     .await;
 
+                let mut chunk_granted_count = 0usize;
+                let mut chunk_denied_count = 0usize;
+
                 if policy_results.len() != pending_chunk.len() {
                     for &index in pending_chunk {
-                        policy_denied_count += 1;
+                        chunk_denied_count += 1;
                         let policy_result = PolicyEvalResult::Denied {
                             policy_type: policy_type.to_string(),
                             reason: "Policy batch result count did not match input count"
@@ -1842,6 +1947,8 @@ where
                                 .to_string(),
                         });
                     }
+                    policy_span.record("policy.granted_count", chunk_granted_count);
+                    policy_span.record("policy.denied_count", chunk_denied_count);
                     continue;
                 }
 
@@ -1852,7 +1959,7 @@ where
                     traces[index].push(result);
 
                     if result_passes {
-                        policy_granted_count += 1;
+                        chunk_granted_count += 1;
                         let combined = PolicyEvalResult::Combined {
                             policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
                             operation: CombineOp::Or,
@@ -1865,13 +1972,13 @@ where
                             trace: EvalTrace::with_root(combined),
                         });
                     } else {
-                        policy_denied_count += 1;
+                        chunk_denied_count += 1;
                         still_pending.push(index);
                     }
                 }
+                policy_span.record("policy.granted_count", chunk_granted_count);
+                policy_span.record("policy.denied_count", chunk_denied_count);
             }
-            policy_span.record("policy.granted_count", policy_granted_count);
-            policy_span.record("policy.denied_count", policy_denied_count);
             pending = still_pending;
         }
 
@@ -2655,11 +2762,12 @@ where
         &self,
         ctx: &BatchEvalCtx<'item, S, R, A, C>,
     ) -> Vec<PolicyEvalResult> {
+        let subject_id = (self.subject_id)(ctx.subject);
         let keys = ctx
             .items
             .iter()
             .map(|item| RelationshipQuery {
-                subject_id: (self.subject_id)(ctx.subject),
+                subject_id: subject_id.clone(),
                 resource_id: (self.resource_id)(item.resource),
                 relation: self.relation.clone(),
             })
