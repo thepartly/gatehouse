@@ -169,6 +169,8 @@ If the item itself is the resource and the context type is `()`, use `evaluate_b
 
 Policies can override `Policy::evaluate_batch` to collapse backend work. `RebacPolicy` builds `RelationshipQuery` fact keys and loads them through the request-scoped `EvaluationSession`, so deduplication, chunking, caching, and fail-closed source errors live in one `FactSource` layer. Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner policies.
 
+Checker and combinator batch evaluation remain sequential by design: they preserve policy order, per-item short-circuiting, and trace shape. Parallel work belongs inside policy implementations or fact sources today; any future checker-level parallel batch API should be explicit. `EvaluationSession` is safe to share across those parallel loaders, and unrelated fact keys do not contend on one global cache or in-flight lock.
+
 `PermissionChecker::with_max_batch_size` caps the number of still-pending items passed to each policy batch call. Fact-backed policies can also set `FactSource::max_batch_size`, which caps source-level loads after session deduplication.
 
 ```rust
@@ -308,13 +310,15 @@ Fallback behavior when `security_rule()` is not overridden:
 See the `examples` directory for complete demonstrations of:
 - Role-based access control (`rbac_policy`)
 - Attribute-style custom policies with `PolicyBuilder` (`policy_builder`)
-- Relationship-based access control (`rebac_policy`)
+- Relationship-based access control with request-scoped fact sources (`rebac_policy`)
 - In-RAM relationship facts shared across request sessions (`in_ram_rebac`)
-- PostgreSQL-backed batched relationship facts (`pg18_bulk_rebac`)
+- PostgreSQL-backed batched relationship facts for list endpoints (`pg18_bulk_rebac`)
 - Group authorization with trace output (`groups_policy`)
 - Policy combinators (`combinator_policy`)
 - Axum integration with shared policies, app state, request-scoped sessions, and a bulk invoice listing endpoint (`axum`)
 - Actix Web integration with shared policies (`actix_web`)
+
+For the v0.3 request-scoped design, start with `rebac_policy`, then read `in_ram_rebac` for a small list endpoint and `pg18_bulk_rebac` for the same boundary backed by SQL.
 
 Run with:
 

@@ -2,7 +2,9 @@
 //!
 //! This example demonstrates ReBAC in the v0.3 shape: `RebacPolicy` extracts
 //! flat IDs and loads relationship facts through a request-scoped
-//! `EvaluationSession`. Relationship store failures are returned as
+//! `EvaluationSession`. The happy path declares sources with
+//! `EvaluationSession::builder()` so all request-scoped dependencies are
+//! visible in one place. Relationship store failures are returned as
 //! `FactLoadResult::Error` and fail closed to denial.
 //!
 //! To run this example:
@@ -122,10 +124,11 @@ async fn main() {
         },
     ]);
 
-    let session = EvaluationSession::new();
-    session.register::<RelationshipQuery<Uuid, Uuid, String>, _>(ProjectRelationshipSource::new(
-        relationships.clone(),
-    ));
+    let session = EvaluationSession::builder()
+        .with::<RelationshipQuery<Uuid, Uuid, String>, _>(ProjectRelationshipSource::new(
+            relationships.clone(),
+        ))
+        .build();
 
     let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
     checker.add_policy(RebacPolicy::new(
@@ -146,10 +149,11 @@ async fn main() {
     test_access(&checker, &session, &unauthorized, &project).await;
 
     println!("\n=== Error During Relationship Loading ===\n");
-    let error_session = EvaluationSession::new();
-    error_session.register::<RelationshipQuery<Uuid, Uuid, String>, _>(
-        ProjectRelationshipSource::new(relationships).with_error(),
-    );
+    let error_session = EvaluationSession::builder()
+        .with::<RelationshipQuery<Uuid, Uuid, String>, _>(
+            ProjectRelationshipSource::new(relationships).with_error(),
+        )
+        .build();
     test_access(&checker, &error_session, &owner, &project).await;
 
     enum_relationship_example().await;
@@ -240,26 +244,27 @@ async fn enum_relationship_example() {
         name: "Typed Project".to_string(),
     };
 
-    let session = EvaluationSession::new();
-    session.register::<RelationshipQuery<Uuid, Uuid, Relation>, _>(EnumRelationshipSource {
-        relationships: HashSet::from([
-            RelationshipQuery {
-                subject_id: alice.id,
-                resource_id: project.id,
-                relation: Relation::Owner,
-            },
-            RelationshipQuery {
-                subject_id: bob.id,
-                resource_id: project.id,
-                relation: Relation::Contributor,
-            },
-            RelationshipQuery {
-                subject_id: charlie.id,
-                resource_id: project.id,
-                relation: Relation::Viewer,
-            },
-        ]),
-    });
+    let session = EvaluationSession::builder()
+        .with::<RelationshipQuery<Uuid, Uuid, Relation>, _>(EnumRelationshipSource {
+            relationships: HashSet::from([
+                RelationshipQuery {
+                    subject_id: alice.id,
+                    resource_id: project.id,
+                    relation: Relation::Owner,
+                },
+                RelationshipQuery {
+                    subject_id: bob.id,
+                    resource_id: project.id,
+                    relation: Relation::Contributor,
+                },
+                RelationshipQuery {
+                    subject_id: charlie.id,
+                    resource_id: project.id,
+                    relation: Relation::Viewer,
+                },
+            ]),
+        })
+        .build();
 
     let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
     checker.add_policy(RebacPolicy::new(

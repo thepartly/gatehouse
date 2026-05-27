@@ -5,9 +5,10 @@ use gatehouse::{
 };
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -27,6 +28,98 @@ impl FactKey for OtherKey {
     type Value = u16;
 
     const NAME: &'static str = "other";
+}
+
+#[derive(Clone)]
+struct BlockingHashKey {
+    value: u16,
+    blocker: Option<Arc<HashBlocker>>,
+}
+
+impl BlockingHashKey {
+    fn plain(value: u16) -> Self {
+        Self {
+            value,
+            blocker: None,
+        }
+    }
+
+    fn blocking(value: u16, blocker: Arc<HashBlocker>) -> Self {
+        Self {
+            value,
+            blocker: Some(blocker),
+        }
+    }
+}
+
+impl std::fmt::Debug for BlockingHashKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BlockingHashKey").field(&self.value).finish()
+    }
+}
+
+impl PartialEq for BlockingHashKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for BlockingHashKey {}
+
+impl Hash for BlockingHashKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+        if let Some(blocker) = &self.blocker {
+            blocker.block_once();
+        }
+    }
+}
+
+impl FactKey for BlockingHashKey {
+    type Value = u16;
+
+    const NAME: &'static str = "blocking_hash";
+}
+
+struct HashBlocker {
+    should_block: AtomicBool,
+    entered: AtomicBool,
+    released: Mutex<bool>,
+    released_changed: Condvar,
+}
+
+impl HashBlocker {
+    fn new() -> Self {
+        Self {
+            should_block: AtomicBool::new(true),
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            released_changed: Condvar::new(),
+        }
+    }
+
+    fn block_once(&self) {
+        if !self.should_block.swap(false, Ordering::SeqCst) {
+            return;
+        }
+
+        self.entered.store(true, Ordering::SeqCst);
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.released_changed.wait(released).unwrap();
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        while !self.entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.released_changed.notify_all();
+    }
 }
 
 type TestCalls = Arc<Mutex<Vec<Vec<TestKey>>>>;
@@ -84,6 +177,17 @@ impl FactSource<OtherKey> for OtherSource {
     }
 }
 
+struct BlockingHashSource;
+
+#[async_trait]
+impl FactSource<BlockingHashKey> for BlockingHashSource {
+    async fn load_many(&self, keys: &[BlockingHashKey]) -> Vec<FactLoadResult<u16>> {
+        keys.iter()
+            .map(|key| FactLoadResult::Found(key.value))
+            .collect()
+    }
+}
+
 struct NeverCompletesSource {
     calls: Arc<AtomicUsize>,
     started: Arc<Notify>,
@@ -96,6 +200,26 @@ impl FactSource<TestKey> for NeverCompletesSource {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         std::future::pending().await
+    }
+}
+
+struct PartiallyBlockingSource {
+    blocked_calls: Arc<AtomicUsize>,
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl FactSource<TestKey> for PartiallyBlockingSource {
+    async fn load_many(&self, keys: &[TestKey]) -> Vec<FactLoadResult<u16>> {
+        if keys == [TestKey(7)] {
+            self.blocked_calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            std::future::pending().await
+        } else {
+            keys.iter()
+                .map(|key| FactLoadResult::Found(key.0))
+                .collect()
+        }
     }
 }
 
@@ -658,6 +782,68 @@ async fn chunking_with_duplicates_expands_to_original_positions() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrelated_fact_keys_do_not_contend_on_one_session_lock() {
+    let blocker = Arc::new(HashBlocker::new());
+    let session = EvaluationSession::builder()
+        .with::<BlockingHashKey, _>(BlockingHashSource)
+        .build();
+
+    let leader_session = session.clone();
+    let leader_blocker = Arc::clone(&blocker);
+    let leader = tokio::spawn(async move {
+        leader_session
+            .get(BlockingHashKey::blocking(7, leader_blocker))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), blocker.wait_until_entered())
+        .await
+        .expect("leader should reach the intentionally blocked hash");
+
+    let unrelated = tokio::time::timeout(
+        Duration::from_millis(100),
+        session.get(BlockingHashKey::plain(8)),
+    )
+    .await
+    .expect("unrelated key should not wait on the blocked key's planning lock");
+    assert_found(&unrelated, 8);
+
+    blocker.release();
+    let leader_result = leader.await.unwrap();
+    assert_found(&leader_result, 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrelated_fact_types_do_not_contend_on_one_session_lock() {
+    let blocker = Arc::new(HashBlocker::new());
+    let session = EvaluationSession::builder()
+        .with::<BlockingHashKey, _>(BlockingHashSource)
+        .with::<OtherKey, _>(OtherSource)
+        .build();
+
+    let leader_session = session.clone();
+    let leader_blocker = Arc::clone(&blocker);
+    let leader = tokio::spawn(async move {
+        leader_session
+            .get(BlockingHashKey::blocking(7, leader_blocker))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), blocker.wait_until_entered())
+        .await
+        .expect("leader should reach the intentionally blocked hash");
+
+    let unrelated = tokio::time::timeout(Duration::from_millis(100), session.get(OtherKey(8)))
+        .await
+        .expect("unrelated fact type should not wait on the blocked key's planning lock");
+    assert_found(&unrelated, 8);
+
+    blocker.release();
+    let leader_result = leader.await.unwrap();
+    assert_found(&leader_result, 7);
+}
+
 #[tokio::test]
 async fn cancelling_leader_get_cleans_in_flight_entry() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -678,6 +864,39 @@ async fn cancelling_leader_get_cleans_in_flight_entry() {
         .expect("follow-up get should not wait forever");
     assert_load_cancelled(&result);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_parallel_loader_wakes_waiters_and_preserves_unrelated_keys() {
+    let blocked_calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let session = session_with_source(PartiallyBlockingSource {
+        blocked_calls: Arc::clone(&blocked_calls),
+        started: Arc::clone(&started),
+    });
+
+    let leader_session = session.clone();
+    let leader = tokio::spawn(async move { leader_session.get(TestKey(7)).await });
+    started.notified().await;
+
+    let waiter_session = session.clone();
+    let waiter = tokio::spawn(async move { waiter_session.get(TestKey(7)).await });
+    tokio::task::yield_now().await;
+
+    leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
+
+    let waiter_result = tokio::time::timeout(Duration::from_millis(100), waiter)
+        .await
+        .expect("waiter should be woken when the leader is cancelled")
+        .unwrap();
+    assert_load_cancelled(&waiter_result);
+
+    let unrelated = tokio::time::timeout(Duration::from_millis(100), session.get(TestKey(8)))
+        .await
+        .expect("unrelated key should still be loadable after cancellation");
+    assert_found(&unrelated, 8);
+    assert_eq!(blocked_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

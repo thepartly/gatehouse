@@ -4,8 +4,9 @@ use gatehouse::{
     Effect, EvaluationSession, FactLoadResult, FactSource, PermissionChecker, PolicyBuilder,
     RebacPolicy, RelationshipQuery,
 };
+use std::collections::HashMap;
 use std::hint::black_box;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -177,6 +178,30 @@ impl FactSource<BenchRelationship> for LatencyFoundSource {
     async fn load_many(&self, keys: &[BenchRelationship]) -> Vec<FactLoadResult<bool>> {
         self.wait().await;
         keys.iter().map(|_| FactLoadResult::Found(true)).collect()
+    }
+}
+
+struct CoarseReferenceSession {
+    cache: Mutex<HashMap<BenchRelationship, FactLoadResult<bool>>>,
+}
+
+impl CoarseReferenceSession {
+    fn cached(keys: &[BenchRelationship]) -> Self {
+        Self {
+            cache: Mutex::new(
+                keys.iter()
+                    .cloned()
+                    .map(|key| (key, FactLoadResult::Found(true)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn get_many(&self, keys: &[BenchRelationship]) -> Vec<FactLoadResult<bool>> {
+        let cache = self.cache.lock().unwrap();
+        keys.iter()
+            .map(|key| cache.get(key).cloned().unwrap_or(FactLoadResult::Missing))
+            .collect()
     }
 }
 
@@ -414,10 +439,99 @@ fn bench_latency_fact_source(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_parallel_fact_state(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("failed to create Tokio runtime");
+    let subject = BenchUser { id: Uuid::new_v4() };
+    let source: Arc<dyn FactSource<BenchRelationship>> = Arc::new(AlwaysFoundSource);
+    let mut group = c.benchmark_group("parallel_in_ram_fact_state");
+
+    for &item_count in &[100usize, 1_000, 10_000] {
+        let resources = (0..item_count)
+            .map(|_| BenchResource { id: Uuid::new_v4() })
+            .collect::<Vec<_>>();
+        let keys = resources
+            .iter()
+            .map(|resource| BenchRelationship {
+                subject_id: subject.id,
+                resource_id: resource.id,
+                relation: BenchRelation::Viewer,
+            })
+            .collect::<Vec<_>>();
+        let chunk_len = keys.len().div_ceil(4);
+        let chunks = keys
+            .chunks(chunk_len)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 4);
+
+        let coarse = Arc::new(CoarseReferenceSession::cached(&keys));
+        group.bench_with_input(
+            BenchmarkId::new("coarse_reference_cached_4_tasks", item_count),
+            &chunks,
+            |b, chunks| {
+                b.iter(|| {
+                    let coarse = Arc::clone(&coarse);
+                    runtime.block_on(async {
+                        let chunk_a = black_box(chunks[0].clone());
+                        let chunk_b = black_box(chunks[1].clone());
+                        let chunk_c = black_box(chunks[2].clone());
+                        let chunk_d = black_box(chunks[3].clone());
+                        let coarse_a = Arc::clone(&coarse);
+                        let coarse_b = Arc::clone(&coarse);
+                        let coarse_c = Arc::clone(&coarse);
+                        let coarse_d = Arc::clone(&coarse);
+                        let a = tokio::spawn(async move { coarse_a.get_many(&chunk_a) });
+                        let b = tokio::spawn(async move { coarse_b.get_many(&chunk_b) });
+                        let c = tokio::spawn(async move { coarse_c.get_many(&chunk_c) });
+                        let d = tokio::spawn(async move { coarse_d.get_many(&chunk_d) });
+                        let (a, b, c, d) = tokio::join!(a, b, c, d);
+                        black_box((a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap()))
+                    })
+                });
+            },
+        );
+
+        let sharded = Arc::new(
+            EvaluationSession::builder()
+                .with_arc::<BenchRelationship>(Arc::clone(&source))
+                .build(),
+        );
+        runtime.block_on(sharded.get_many(&keys));
+        group.bench_with_input(
+            BenchmarkId::new("sharded_session_cached_4_tasks", item_count),
+            &chunks,
+            |b, chunks| {
+                b.iter(|| {
+                    let sharded = Arc::clone(&sharded);
+                    runtime.block_on(async {
+                        let chunk_a = black_box(chunks[0].clone());
+                        let chunk_b = black_box(chunks[1].clone());
+                        let chunk_c = black_box(chunks[2].clone());
+                        let chunk_d = black_box(chunks[3].clone());
+                        let sharded_a = Arc::clone(&sharded);
+                        let sharded_b = Arc::clone(&sharded);
+                        let sharded_c = Arc::clone(&sharded);
+                        let sharded_d = Arc::clone(&sharded);
+                        let a = tokio::spawn(async move { sharded_a.get_many(&chunk_a).await });
+                        let b = tokio::spawn(async move { sharded_b.get_many(&chunk_b).await });
+                        let c = tokio::spawn(async move { sharded_c.get_many(&chunk_c).await });
+                        let d = tokio::spawn(async move { sharded_d.get_many(&chunk_d).await });
+                        let (a, b, c, d) = tokio::join!(a, b, c, d);
+                        black_box((a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap()))
+                    })
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_permission_checker,
     bench_in_ram_fact_source,
-    bench_latency_fact_source
+    bench_latency_fact_source,
+    bench_parallel_fact_state
 );
 criterion_main!(benches);
