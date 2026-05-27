@@ -1,9 +1,10 @@
-//! A flexible authorization library that combines role‐based (RBAC),
-//! attribute‐based (ABAC), and relationship‐based (ReBAC) policies.
-//! The library provides a generic `Policy` trait for defining custom policies,
-//! a builder pattern for creating custom policies as well as several built-in
-//! policies for common use cases, and combinators for composing complex
-//! authorization logic.
+//! An in-process authorization engine for Rust.
+//!
+//! Gatehouse composes role-based (RBAC), attribute-based (ABAC), and
+//! relationship-based (ReBAC) policies while keeping authorization logic in
+//! Rust. Relationship facts are loaded through request-scoped
+//! [`EvaluationSession`] values, so list endpoints can batch, deduplicate, and
+//! coalesce backend calls without moving policy logic into the data layer.
 //!
 //! # Overview
 //!
@@ -12,7 +13,7 @@
 //! [`Policy`] trait. A [`PermissionChecker`] aggregates multiple policies and uses OR
 //! logic by default (i.e. if any policy grants access, then access is allowed).
 //! The [`PolicyBuilder`] offers a builder pattern for creating custom policies.
-//! Custom [`Policy`] implementations must provide both [`Policy::evaluate_access`]
+//! Custom [`Policy`] implementations must provide both [`Policy::evaluate`]
 //! and [`Policy::policy_type`].
 //!
 //! ## Decision Semantics
@@ -43,6 +44,18 @@
 //! evaluated. Because [`PermissionChecker`], [`AndPolicy`], and [`OrPolicy`]
 //! short-circuit, the trace tree does not include policies that were never run.
 //!
+//! ## Fact-Loaded Authorization
+//!
+//! Gatehouse treats non-trivial authorization as computation over facts loaded
+//! for one request. [`FactSource::load_many`] receives unique fact keys and
+//! returns exactly one result per key; [`EvaluationSession`] expands duplicate
+//! caller inputs, preserves caller order, caches results for the request, and
+//! joins concurrent in-flight loads for the same key.
+//!
+//! [`RebacPolicy`] is the first built-in policy backed by this model. It
+//! extracts flat subject/resource IDs, builds [`RelationshipQuery`] keys, and
+//! asks the session for relationship facts.
+//!
 //! ## Quick Start
 //!
 //! The fastest way to define a policy is with [`PolicyBuilder`]:
@@ -66,11 +79,12 @@
 //! checker.add_policy(policy);
 //!
 //! # tokio_test::block_on(async {
+//! let session = EvaluationSession::empty();
 //! let admin = User { roles: vec!["admin".into()] };
-//! assert!(checker.evaluate_access(&admin, &ReadAction, &Document, &AppContext).await.is_granted());
+//! assert!(checker.evaluate_in_session(&session, &admin, &ReadAction, &Document, &AppContext).await.is_granted());
 //!
 //! let guest = User { roles: vec!["guest".into()] };
-//! assert!(!checker.evaluate_access(&guest, &ReadAction, &Document, &AppContext).await.is_granted());
+//! assert!(!checker.evaluate_in_session(&session, &guest, &ReadAction, &Document, &AppContext).await.is_granted());
 //! # });
 //! ```
 //!
@@ -79,7 +93,8 @@
 //! The library provides several built-in policies:
 //!  - [`RbacPolicy`]: A role-based access control policy.
 //!  - [`AbacPolicy`]: An attribute-based access control policy.
-//!  - [`RebacPolicy`]: A relationship-based access control policy.
+//!  - [`RebacPolicy`]: A relationship-based access control policy backed by
+//!    [`FactSource`] and [`EvaluationSession`].
 //!
 //! ## Custom Policies
 //!
@@ -116,26 +131,20 @@
 //! struct AdminPolicy;
 //! #[async_trait]
 //! impl Policy<User, Document, ReadAction, EmptyContext> for AdminPolicy {
-//!     async fn evaluate_access(
-//!         &self,
-//!         user: &User,
-//!         _action: &ReadAction,
-//!         _resource: &Document,
-//!         _context: &EmptyContext,
-//!     ) -> PolicyEvalResult {
-//!         if user.roles.contains(&"admin".to_string()) {
+//!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
+//!         if ctx.subject.roles.contains(&"admin".to_string()) {
 //!             PolicyEvalResult::Granted {
-//!                 policy_type: self.policy_type(),
+//!                 policy_type: self.policy_type().to_string(),
 //!                 reason: Some("User is admin".to_string()),
 //!             }
 //!         } else {
 //!             PolicyEvalResult::Denied {
-//!                 policy_type: self.policy_type(),
+//!                 policy_type: self.policy_type().to_string(),
 //!                 reason: "User is not admin".to_string(),
 //!             }
 //!         }
 //!     }
-//!     fn policy_type(&self) -> String { "AdminPolicy".to_string() }
+//!     fn policy_type(&self) -> &str { "AdminPolicy" }
 //! }
 //!
 //! // An ABAC policy: grant access if the user is the owner of the document.
@@ -143,27 +152,21 @@
 //!
 //! #[async_trait]
 //! impl Policy<User, Document, ReadAction, EmptyContext> for OwnerPolicy {
-//!     async fn evaluate_access(
-//!         &self,
-//!         user: &User,
-//!         _action: &ReadAction,
-//!         document: &Document,
-//!         _context: &EmptyContext,
-//!     ) -> PolicyEvalResult {
-//!         if user.id == document.owner_id {
+//!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
+//!         if ctx.subject.id == ctx.resource.owner_id {
 //!             PolicyEvalResult::Granted {
-//!                 policy_type: self.policy_type(),
+//!                 policy_type: self.policy_type().to_string(),
 //!                 reason: Some("User is the owner".to_string()),
 //!             }
 //!         } else {
 //!             PolicyEvalResult::Denied {
-//!                policy_type: self.policy_type(),
+//!                policy_type: self.policy_type().to_string(),
 //!                reason: "User is not the owner".to_string(),
 //!            }
 //!         }
 //!     }
-//!     fn policy_type(&self) -> String {
-//!         "OwnerPolicy".to_string()
+//!     fn policy_type(&self) -> &str {
+//!         "OwnerPolicy"
 //!     }
 //! }
 //!
@@ -192,19 +195,20 @@
 //! };
 //!
 //! let checker = create_document_checker();
+//! let session = EvaluationSession::empty();
 //!
 //! // An admin should have access.
-//! assert!(checker.evaluate_access(&admin_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(checker.evaluate_in_session(&session, &admin_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //!
 //! // The owner should have access.
-//! assert!(checker.evaluate_access(&owner_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(checker.evaluate_in_session(&session, &owner_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //!
 //! // A random user should be denied access.
 //! let random_user = User {
 //!     id: Uuid::new_v4(),
 //!     roles: vec!["user".into()],
 //! };
-//! assert!(!checker.evaluate_access(&random_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(!checker.evaluate_in_session(&session, &random_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //! # });
 //! ```
 //!
@@ -215,9 +219,11 @@
 //!
 //! ## Tracing And Telemetry
 //!
-//! When trace-level events are enabled, [`PermissionChecker::evaluate_access`]
+//! When trace-level events are enabled, [`PermissionChecker::evaluate_in_session`]
 //! creates an instrumented span and each evaluated policy records a `trace!`
-//! event on the `gatehouse::security` target.
+//! event on the `gatehouse::security` target. Batch evaluation records
+//! aggregate item counts on [`PermissionChecker::evaluate_batch_in_session_by`]
+//! and per-policy counts on nested `gatehouse.batch_policy` spans.
 //!
 //! Emitted fields:
 //!
@@ -250,14 +256,24 @@
 //! - [`OrPolicy`]: Grants access if any inner policy allows access; otherwise returns a
 //!   combined error.
 //! - [`NotPolicy`]: Inverts the decision of an inner policy.
+//! - [`DelegatingPolicy`]: Maps the current inputs into another authorization
+//!   domain and delegates to a child [`PermissionChecker`] while preserving
+//!   batching.
 //!
 //!
 
 #![warn(missing_docs)]
 #![allow(clippy::type_complexity)]
 use async_trait::async_trait;
+use futures_channel::oneshot;
+use std::any::{Any, TypeId};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::hash::Hash;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use tracing::Instrument;
 
 const DEFAULT_SECURITY_RULE_CATEGORY: &str = "Access Control";
 const PERMISSION_CHECKER_POLICY_TYPE: &str = "PermissionChecker";
@@ -382,6 +398,8 @@ pub enum CombineOp {
     Or,
     /// The inner policy's decision is inverted.
     Not,
+    /// A parent policy delegated the decision to another checker.
+    Delegate,
 }
 
 impl fmt::Display for CombineOp {
@@ -390,6 +408,7 @@ impl fmt::Display for CombineOp {
             CombineOp::And => write!(f, "AND"),
             CombineOp::Or => write!(f, "OR"),
             CombineOp::Not => write!(f, "NOT"),
+            CombineOp::Delegate => write!(f, "DELEGATE"),
         }
     }
 }
@@ -433,6 +452,807 @@ pub enum PolicyEvalResult {
     },
 }
 
+/// A borrowed resource/context pair passed to batch policy evaluators.
+///
+/// Values are borrowed from caller-owned batch items, so policy implementations
+/// can evaluate a batch without forcing resources or contexts to be cloned.
+pub struct PolicyBatchItem<'a, Resource, Context> {
+    /// The target resource for this item.
+    pub resource: &'a Resource,
+    /// Additional context for this item.
+    pub context: &'a Context,
+}
+
+/// A typed fact key that can be loaded through an [`EvaluationSession`].
+///
+/// Keys are flat, cloneable, and hashable so the session can deduplicate and
+/// cache fact loads for the lifetime of one authorization request.
+///
+/// Session caching is deliberately request-scoped. Cached facts and cached
+/// errors are dropped with the [`EvaluationSession`], so permission revocations
+/// or backend changes are observed by the next request's session rather than
+/// being held in a process-global cache.
+pub trait FactKey: Eq + Hash + Clone + Send + Sync + 'static {
+    /// The value returned by a [`FactSource`] for this key.
+    type Value: Clone + Send + Sync + 'static;
+
+    /// Stable fact name used only in diagnostics and tracing.
+    ///
+    /// The session registry is keyed by [`TypeId`], not by this name, so two
+    /// unrelated key types with the same name do not share a source or cache.
+    const NAME: &'static str;
+}
+
+#[derive(Debug)]
+struct MessageError(String);
+
+impl fmt::Display for MessageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for MessageError {}
+
+/// Error raised while loading a fact.
+#[derive(Debug, Clone)]
+pub enum FactLoadError {
+    /// No source is registered for the requested fact key type.
+    SourceNotRegistered {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+    },
+    /// A source violated the one-result-per-input-key contract.
+    SourceContractViolation {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+        /// Number of keys passed to the source.
+        expected: usize,
+        /// Number of results returned by the source.
+        actual: usize,
+    },
+    /// The leader task for a fact load was cancelled before it completed.
+    ///
+    /// The session caches this error for the affected keys and wakes any
+    /// waiters. This is correct for request-scoped sessions: the request fails
+    /// closed and the next request builds a fresh session. Do not share a
+    /// fact-loaded session across independent requests, because cancellation in
+    /// one request would cache this error for the others.
+    LoaderCancelled {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+    },
+    /// The registered source reported a backend error.
+    ///
+    /// Backend errors are held behind [`Arc`], so cloned
+    /// [`FactLoadResult::Error`] values share the same error object rather than
+    /// requiring the backend error type itself to be cloneable.
+    Backend(Arc<dyn std::error::Error + Send + Sync>),
+}
+
+impl FactLoadError {
+    /// Wraps a backend error.
+    pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Backend(Arc::new(error))
+    }
+
+    /// Wraps a human-readable backend error message.
+    pub fn backend_message(message: impl Into<String>) -> Self {
+        Self::backend(MessageError(message.into()))
+    }
+}
+
+impl fmt::Display for FactLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceNotRegistered { fact_name } => {
+                write!(f, "No fact source registered for '{fact_name}'")
+            }
+            Self::SourceContractViolation {
+                fact_name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Fact source '{fact_name}' returned {actual} results for {expected} keys"
+            ),
+            Self::LoaderCancelled { fact_name } => {
+                write!(f, "Fact load for '{fact_name}' was cancelled")
+            }
+            Self::Backend(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FactLoadError {}
+
+/// Result of loading one fact.
+#[derive(Debug, Clone)]
+pub enum FactLoadResult<V> {
+    /// The fact exists and has the given value.
+    Found(V),
+    /// The fact source was reached, but no value exists for the key.
+    Missing,
+    /// Loading failed. Policies should map this to a denied decision.
+    Error(FactLoadError),
+}
+
+/// A batched source for one fact key type.
+///
+/// Sources can be shared across many request sessions. The source owns
+/// backend-specific serialization and I/O; the session owns per-request
+/// deduplication, caching, chunking, and in-flight coalescing.
+#[async_trait]
+pub trait FactSource<K>: Send + Sync
+where
+    K: FactKey,
+{
+    /// Loads one result per key, in input order.
+    ///
+    /// The session deduplicates before calling a source, so `keys` are unique
+    /// within each call. Implementations must return exactly one
+    /// [`FactLoadResult`] per input key, in the same order. The session expands
+    /// results back to caller-visible order, including duplicate keys.
+    async fn load_many(&self, keys: &[K]) -> Vec<FactLoadResult<K::Value>>;
+
+    /// Maximum number of keys this source wants to load in one call.
+    fn max_batch_size(&self) -> Option<NonZeroUsize> {
+        None
+    }
+}
+
+/// Error returned by non-panicking fact-source registration helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactSourceRegistrationError {
+    /// The session is the process-wide empty session and cannot accept sources.
+    SharedEmptySession {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+    },
+    /// A source is already registered for this exact fact key type.
+    AlreadyRegistered {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+    },
+    /// Loads for this fact key type are currently in flight.
+    InFlight {
+        /// Diagnostic fact name from [`FactKey::NAME`].
+        fact_name: &'static str,
+    },
+}
+
+impl fmt::Display for FactSourceRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SharedEmptySession { .. } => write!(
+                f,
+                "EvaluationSession::shared_empty() cannot register fact sources; use EvaluationSession::new() or EvaluationSession::builder()",
+            ),
+            Self::AlreadyRegistered { fact_name } => write!(
+                f,
+                "fact source for '{fact_name}' is already registered; use replace or replace_arc to overwrite it",
+            ),
+            Self::InFlight { .. } => write!(
+                f,
+                "fact sources should not be registered or replaced while loads for the same key type are in flight",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FactSourceRegistrationError {}
+
+#[derive(Default)]
+struct EvaluationSessionInner {
+    registry: Mutex<FactRegistry>,
+    next_load_id: AtomicU64,
+    shared_empty: bool,
+}
+
+#[derive(Default)]
+struct FactRegistry {
+    sources: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    caches: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    in_flight: HashMap<TypeId, Box<dyn Any + Send>>,
+}
+
+/// Request-scoped fact loading and caching state.
+///
+/// A session is intended to live for one request or one authorization pass. It
+/// owns registered fact sources and caches loaded facts by key type. The cache
+/// is deliberately not process-global. Cached facts and cached errors are
+/// dropped with the session, so permission revocations or backend changes are
+/// observed by the next request's session rather than being held process-wide.
+#[derive(Clone, Default)]
+pub struct EvaluationSession {
+    inner: Arc<EvaluationSessionInner>,
+}
+
+impl EvaluationSession {
+    /// Creates an empty request-scoped session.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates an explicitly empty request-scoped session.
+    ///
+    /// This is equivalent to [`Self::new`]. It can make call sites clearer when
+    /// only RBAC/ABAC policies are expected and no fact sources are registered.
+    /// For very hot RBAC/ABAC-only loops, use [`Self::shared_empty`] to avoid
+    /// allocating a new empty session per call.
+    pub fn empty() -> Self {
+        Self::new()
+    }
+
+    /// Returns a process-wide empty session for hot paths that never use fact
+    /// sources.
+    ///
+    /// This avoids allocating a new empty session for RBAC/ABAC-only checks in
+    /// tight loops such as fanout or SSE frame authorization. It is only safe
+    /// when no fact-backed policies are expected. Calling [`Self::register`],
+    /// [`Self::register_arc`], [`Self::replace`], or [`Self::replace_arc`] on
+    /// this session will panic.
+    pub fn shared_empty() -> &'static Self {
+        static SHARED_EMPTY: OnceLock<EvaluationSession> = OnceLock::new();
+        SHARED_EMPTY.get_or_init(|| EvaluationSession {
+            inner: Arc::new(EvaluationSessionInner {
+                shared_empty: true,
+                ..EvaluationSessionInner::default()
+            }),
+        })
+    }
+
+    /// Starts building a request-scoped session with all fact sources declared
+    /// in one place.
+    pub fn builder() -> EvaluationSessionBuilder {
+        EvaluationSessionBuilder::new()
+    }
+
+    /// Registers a fact source for one key type.
+    ///
+    /// Panics if a source for `K` is already registered. Use [`Self::replace`]
+    /// when replacing a source is intentional. Register sources during session
+    /// setup; registering while loads for the same key type are in flight is
+    /// not a supported operation and will panic. Use [`Self::try_register`]
+    /// when the caller should handle registration errors without panicking.
+    pub fn register<K, S>(&self, source: S)
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.register_arc::<K>(Arc::new(source));
+    }
+
+    /// Attempts to register a fact source for one key type.
+    pub fn try_register<K, S>(&self, source: S) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.try_register_arc::<K>(Arc::new(source))
+    }
+
+    /// Registers a shared fact source for one key type.
+    ///
+    /// Panics if a source for `K` is already registered. Register sources
+    /// during session setup; use [`Self::replace_arc`] only when overwriting is
+    /// deliberate. Registering while loads for the same key type are in flight
+    /// is not a supported operation and will panic. Use [`Self::try_register_arc`]
+    /// when the caller should handle registration errors without panicking.
+    ///
+    /// The registry is keyed by the exact Rust fact key type. If two production
+    /// backends serve the same logical shape, such as the same
+    /// `RelationshipQuery<UserId, ConversationId, ParticipantRelation>`, they
+    /// cannot both be registered under that exact type in one session. Wrap one
+    /// ID/relation type or define distinct fact keys so each backend has a
+    /// separate registry entry.
+    pub fn register_arc<K>(&self, source: Arc<dyn FactSource<K>>)
+    where
+        K: FactKey,
+    {
+        self.try_register_arc::<K>(source)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// Attempts to register a shared fact source for one key type.
+    pub fn try_register_arc<K>(
+        &self,
+        source: Arc<dyn FactSource<K>>,
+    ) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+    {
+        self.insert_source::<K>(source, false)
+    }
+
+    /// Explicitly replaces a fact source for one key type.
+    ///
+    /// Replacing a source clears any cached facts for that key type in this
+    /// session. Replacing while loads for the same key type are in flight is
+    /// not a supported operation and will panic.
+    pub fn replace<K, S>(&self, source: S)
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.replace_arc::<K>(Arc::new(source));
+    }
+
+    /// Attempts to replace a fact source for one key type.
+    pub fn try_replace<K, S>(&self, source: S) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.try_replace_arc::<K>(Arc::new(source))
+    }
+
+    /// Explicitly replaces a shared fact source for one key type.
+    ///
+    /// Replacing a source clears any cached facts for that key type in this
+    /// session. Replacing while loads for the same key type are in flight is
+    /// not a supported operation and will panic.
+    pub fn replace_arc<K>(&self, source: Arc<dyn FactSource<K>>)
+    where
+        K: FactKey,
+    {
+        self.try_replace_arc::<K>(source)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// Attempts to replace a shared fact source for one key type.
+    pub fn try_replace_arc<K>(
+        &self,
+        source: Arc<dyn FactSource<K>>,
+    ) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+    {
+        self.insert_source::<K>(source, true)
+    }
+
+    fn insert_source<K>(
+        &self,
+        source: Arc<dyn FactSource<K>>,
+        replace: bool,
+    ) -> Result<(), FactSourceRegistrationError>
+    where
+        K: FactKey,
+    {
+        if self.inner.shared_empty {
+            return Err(FactSourceRegistrationError::SharedEmptySession { fact_name: K::NAME });
+        }
+
+        let type_id = TypeId::of::<K>();
+        {
+            let mut registry = self
+                .inner
+                .registry
+                .lock()
+                .expect("fact registry mutex should not be poisoned");
+
+            if !replace && registry.sources.contains_key(&type_id) {
+                return Err(FactSourceRegistrationError::AlreadyRegistered { fact_name: K::NAME });
+            } else if !Self::in_flight_for::<K>(&mut registry.in_flight).is_empty() {
+                return Err(FactSourceRegistrationError::InFlight { fact_name: K::NAME });
+            } else {
+                registry.sources.insert(type_id, Box::new(source));
+                registry.caches.remove(&type_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Loads one fact through the session cache.
+    pub async fn get<K>(&self, key: K) -> FactLoadResult<K::Value>
+    where
+        K: FactKey,
+    {
+        self.get_many(&[key])
+            .await
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                FactLoadResult::Error(FactLoadError::SourceContractViolation {
+                    fact_name: K::NAME,
+                    expected: 1,
+                    actual: 0,
+                })
+            })
+    }
+
+    /// Loads facts through the session cache.
+    ///
+    /// Results preserve input order and duplicate keys. Missing cache entries
+    /// are deduplicated before they are loaded, then chunked according to the
+    /// source's [`FactSource::max_batch_size`] hint.
+    pub async fn get_many<K>(&self, keys: &[K]) -> Vec<FactLoadResult<K::Value>>
+    where
+        K: FactKey,
+    {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        let load_plan = self.plan_loads(keys);
+        if let Some(results) = load_plan.cached_results {
+            return results;
+        }
+
+        let mut in_flight_guard = InFlightGuard::new(self.clone(), load_plan.keys.clone());
+
+        if !load_plan.keys.is_empty() {
+            if let Some(source) = load_plan.source.clone() {
+                let chunk_size = source
+                    .max_batch_size()
+                    .map_or(load_plan.keys.len(), NonZeroUsize::get)
+                    .max(1);
+
+                for chunk in load_plan.keys.chunks(chunk_size) {
+                    let load_id = self.inner.next_load_id.fetch_add(1, Ordering::Relaxed);
+                    let load_span = tracing::debug_span!(
+                        "gatehouse.fact_load",
+                        fact.name = K::NAME,
+                        fact.load_id = load_id,
+                        fact.key_count = chunk.len(),
+                        fact.unique_key_count = chunk.len(),
+                    );
+                    let loaded = source.load_many(chunk).instrument(load_span).await;
+                    if loaded.len() == chunk.len() {
+                        self.cache_loaded(chunk, loaded);
+                    } else {
+                        self.cache_loaded(
+                            chunk,
+                            chunk
+                                .iter()
+                                .map(|_| {
+                                    FactLoadResult::Error(FactLoadError::SourceContractViolation {
+                                        fact_name: K::NAME,
+                                        expected: chunk.len(),
+                                        actual: loaded.len(),
+                                    })
+                                })
+                                .collect(),
+                        );
+                    }
+                    // Keep this immediately after the cache write, with no await in between.
+                    // The drop guard treats remaining keys as cancelled.
+                    in_flight_guard.finish(chunk);
+                }
+            } else {
+                self.cache_loaded(
+                    &load_plan.keys,
+                    load_plan
+                        .keys
+                        .iter()
+                        .map(|_| {
+                            FactLoadResult::Error(FactLoadError::SourceNotRegistered {
+                                fact_name: K::NAME,
+                            })
+                        })
+                        .collect(),
+                );
+                in_flight_guard.finish(&load_plan.keys);
+            }
+        }
+
+        for waiter in load_plan.waiters {
+            let _ = waiter.await;
+        }
+
+        self.results_from_cache(keys)
+    }
+
+    fn plan_loads<K>(&self, keys: &[K]) -> LoadPlan<K>
+    where
+        K: FactKey,
+    {
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .expect("fact registry mutex should not be poisoned");
+        let source = registry
+            .sources
+            .get(&TypeId::of::<K>())
+            .and_then(|source| source.downcast_ref::<Arc<dyn FactSource<K>>>().cloned());
+        let cached_results = {
+            let cache = Self::cache_for::<K>(&mut registry.caches);
+            let mut results = Vec::with_capacity(keys.len());
+            let mut all_cached = true;
+
+            for key in keys {
+                if let Some(result) = cache.get(key) {
+                    results.push(result.clone());
+                } else {
+                    all_cached = false;
+                    break;
+                }
+            }
+
+            all_cached.then_some(results)
+        };
+
+        if let Some(cached_results) = cached_results {
+            return LoadPlan {
+                source,
+                cached_results: Some(cached_results),
+                keys: Vec::new(),
+                waiters: Vec::new(),
+            };
+        }
+
+        let mut waiters = Vec::new();
+
+        for key in keys.iter().filter(|key| seen.insert((*key).clone())) {
+            let is_cached = {
+                let cache = Self::cache_for::<K>(&mut registry.caches);
+                cache.contains_key(key)
+            };
+            if is_cached {
+                continue;
+            }
+
+            let in_flight = Self::in_flight_for::<K>(&mut registry.in_flight);
+            if let Some(existing_waiters) = in_flight.get_mut(key) {
+                let (sender, receiver) = oneshot::channel();
+                existing_waiters.push(sender);
+                waiters.push(receiver);
+            } else {
+                in_flight.insert(key.clone(), Vec::new());
+                missing.push(key.clone());
+            }
+        }
+
+        LoadPlan {
+            source,
+            cached_results: None,
+            keys: missing,
+            waiters,
+        }
+    }
+
+    fn finish_in_flight<K>(&self, keys: &[K])
+    where
+        K: FactKey,
+    {
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .expect("fact registry mutex should not be poisoned");
+        let in_flight = Self::in_flight_for::<K>(&mut registry.in_flight);
+
+        for key in keys {
+            if let Some(waiters) = in_flight.remove(key) {
+                for waiter in waiters {
+                    let _ = waiter.send(());
+                }
+            }
+        }
+    }
+
+    fn cache_loaded<K>(&self, keys: &[K], results: Vec<FactLoadResult<K::Value>>)
+    where
+        K: FactKey,
+    {
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .expect("fact registry mutex should not be poisoned");
+        let cache = Self::cache_for::<K>(&mut registry.caches);
+
+        for (key, result) in keys.iter().cloned().zip(results) {
+            cache.insert(key, result);
+        }
+    }
+
+    fn results_from_cache<K>(&self, keys: &[K]) -> Vec<FactLoadResult<K::Value>>
+    where
+        K: FactKey,
+    {
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .expect("fact registry mutex should not be poisoned");
+        let cache = Self::cache_for::<K>(&mut registry.caches);
+        keys.iter()
+            .map(|key| {
+                cache.get(key).cloned().unwrap_or_else(|| {
+                    FactLoadResult::Error(FactLoadError::SourceContractViolation {
+                        fact_name: K::NAME,
+                        expected: 1,
+                        actual: 0,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    fn cache_for<K>(
+        caches: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    ) -> &mut HashMap<K, FactLoadResult<K::Value>>
+    where
+        K: FactKey,
+    {
+        caches
+            .entry(TypeId::of::<K>())
+            .or_insert_with(|| Box::new(HashMap::<K, FactLoadResult<K::Value>>::new()))
+            .downcast_mut::<HashMap<K, FactLoadResult<K::Value>>>()
+            .expect("fact cache type should match registry key")
+    }
+
+    fn in_flight_for<K>(
+        in_flight: &mut HashMap<TypeId, Box<dyn Any + Send>>,
+    ) -> &mut HashMap<K, Vec<oneshot::Sender<()>>>
+    where
+        K: FactKey,
+    {
+        in_flight
+            .entry(TypeId::of::<K>())
+            .or_insert_with(|| Box::new(HashMap::<K, Vec<oneshot::Sender<()>>>::new()))
+            .downcast_mut::<HashMap<K, Vec<oneshot::Sender<()>>>>()
+            .expect("fact in-flight type should match registry key")
+    }
+}
+
+/// Builder for declaring all fact sources needed by a request-scoped
+/// [`EvaluationSession`].
+pub struct EvaluationSessionBuilder {
+    session: EvaluationSession,
+}
+
+impl EvaluationSessionBuilder {
+    fn new() -> Self {
+        Self {
+            session: EvaluationSession::new(),
+        }
+    }
+
+    /// Registers a source for one fact key type.
+    ///
+    /// Panics if the same fact key type is registered twice.
+    pub fn with<K, S>(self, source: S) -> Self
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.session.register::<K, _>(source);
+        self
+    }
+
+    /// Registers a shared source for one fact key type.
+    ///
+    /// Panics if the same fact key type is registered twice.
+    pub fn with_arc<K>(self, source: Arc<dyn FactSource<K>>) -> Self
+    where
+        K: FactKey,
+    {
+        self.session.register_arc::<K>(source);
+        self
+    }
+
+    /// Finishes the session.
+    pub fn build(self) -> EvaluationSession {
+        self.session
+    }
+}
+
+struct LoadPlan<K>
+where
+    K: FactKey,
+{
+    source: Option<Arc<dyn FactSource<K>>>,
+    cached_results: Option<Vec<FactLoadResult<K::Value>>>,
+    keys: Vec<K>,
+    waiters: Vec<oneshot::Receiver<()>>,
+}
+
+struct InFlightGuard<K>
+where
+    K: FactKey,
+{
+    session: EvaluationSession,
+    remaining: Vec<K>,
+}
+
+impl<K> InFlightGuard<K>
+where
+    K: FactKey,
+{
+    fn new(session: EvaluationSession, keys: Vec<K>) -> Self {
+        Self {
+            session,
+            remaining: keys,
+        }
+    }
+
+    fn finish(&mut self, keys: &[K]) {
+        self.session.finish_in_flight(keys);
+        if self.remaining.is_empty() {
+            return;
+        }
+
+        let finished = keys.iter().cloned().collect::<HashSet<_>>();
+        self.remaining.retain(|key| !finished.contains(key));
+    }
+}
+
+impl<K> Drop for InFlightGuard<K>
+where
+    K: FactKey,
+{
+    fn drop(&mut self) {
+        if self.remaining.is_empty() {
+            return;
+        }
+
+        self.session.cache_loaded(
+            &self.remaining,
+            self.remaining
+                .iter()
+                .map(|_| {
+                    FactLoadResult::Error(FactLoadError::LoaderCancelled { fact_name: K::NAME })
+                })
+                .collect(),
+        );
+        self.session.finish_in_flight(&self.remaining);
+    }
+}
+
+/// Per-item policy evaluation context.
+pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
+    /// Request-scoped fact session.
+    pub session: &'a EvaluationSession,
+    /// Entity requesting access.
+    pub subject: &'a Subject,
+    /// Action being performed.
+    pub action: &'a Action,
+    /// Target resource.
+    pub resource: &'a Resource,
+    /// Additional evaluation context.
+    pub context: &'a Context,
+}
+
+/// Batch policy evaluation context.
+pub struct BatchEvalCtx<'a, Subject, Resource, Action, Context> {
+    /// Request-scoped fact session.
+    pub session: &'a EvaluationSession,
+    /// Entity requesting access.
+    pub subject: &'a Subject,
+    /// Action being performed.
+    pub action: &'a Action,
+    /// Borrowed resource/context pairs.
+    pub items: &'a [PolicyBatchItem<'a, Resource, Context>],
+}
+
+/// Canonical ReBAC fact key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RelationshipQuery<SubjectId, ResourceId, Relation> {
+    /// Subject identifier.
+    pub subject_id: SubjectId,
+    /// Resource identifier.
+    pub resource_id: ResourceId,
+    /// Relationship being checked.
+    pub relation: Relation,
+}
+
+impl<SubjectId, ResourceId, Relation> FactKey for RelationshipQuery<SubjectId, ResourceId, Relation>
+where
+    SubjectId: Eq + Hash + Clone + Send + Sync + 'static,
+    ResourceId: Eq + Hash + Clone + Send + Sync + 'static,
+    Relation: Eq + Hash + Clone + Send + Sync + 'static,
+{
+    type Value = bool;
+
+    const NAME: &'static str = "relationship";
+}
+
 /// The complete result of a permission evaluation.
 /// Contains both the final decision and a detailed trace for debugging.
 ///
@@ -457,7 +1277,8 @@ pub enum PolicyEvalResult {
 /// #     let mut checker = PermissionChecker::<User, Document, ReadAction, EmptyContext>::new();
 /// #     let user = User { id: Uuid::new_v4() };
 /// #     let document = Document { id: Uuid::new_v4() };
-/// #     checker.evaluate_access(&user, &ReadAction, &document, &EmptyContext).await
+/// #     let session = EvaluationSession::empty();
+/// #     checker.evaluate_in_session(&session, &user, &ReadAction, &document, &EmptyContext).await
 /// # }
 /// #
 /// # tokio_test::block_on(async {
@@ -522,7 +1343,8 @@ impl AccessEvaluation {
     /// # struct Ctx;
     /// # tokio_test::block_on(async {
     /// let checker = PermissionChecker::<User, Resource, Action, Ctx>::new();
-    /// let result = checker.evaluate_access(&User, &Action, &Resource, &Ctx).await;
+    /// let session = EvaluationSession::empty();
+    /// let result = checker.evaluate_in_session(&session, &User, &Action, &Resource, &Ctx).await;
     ///
     /// // Map a denial into a standard error:
     /// let outcome: Result<(), String> = result.to_result(|reason| reason.to_string());
@@ -713,30 +1535,54 @@ impl fmt::Display for PolicyEvalResult {
 /// A generic async trait representing a single authorization policy.
 /// A policy determines if a subject is allowed to perform an action on
 /// a resource within a given context.
+///
+/// The input types must be [`Sync`] because policies receive borrowed inputs
+/// across async evaluation, including [`BatchEvalCtx`] batch evaluation.
 #[async_trait]
-pub trait Policy<Subject, Resource, Action, Context>: Send + Sync {
+pub trait Policy<Subject, Resource, Action, Context>: Send + Sync
+where
+    Subject: Sync,
+    Resource: Sync,
+    Action: Sync,
+    Context: Sync,
+{
     /// Evaluates whether access should be granted.
-    ///
-    /// # Arguments
-    ///
-    /// * `subject` - The entity requesting access.
-    /// * `action` - The action being performed.
-    /// * `resource` - The target resource.
-    /// * `context` - Additional context that may affect the decision.
-    ///
-    /// # Returns
-    ///
-    /// A [`PolicyEvalResult`] indicating whether access is granted or denied.
-    async fn evaluate_access(
+    async fn evaluate(
         &self,
-        subject: &Subject,
-        action: &Action,
-        resource: &Resource,
-        context: &Context,
+        ctx: &EvalCtx<'_, Subject, Resource, Action, Context>,
     ) -> PolicyEvalResult;
 
+    /// Evaluates access for a batch of resource/context pairs.
+    ///
+    /// The default implementation preserves single-item semantics by evaluating
+    /// each item sequentially. Policies with set-oriented backends can override
+    /// this method to reduce round trips while returning one result per input
+    /// item in the same order.
+    ///
+    /// The checker still evaluates policies in policy order, so batched
+    /// evaluation can differ from a naive item-outer loop when later policies
+    /// have side effects or observe mutable external state. Prefer pure policy
+    /// predicates and use traces to audit the policy-ordered batch behavior.
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Subject, Resource, Action, Context>,
+    ) -> Vec<PolicyEvalResult> {
+        let mut results = Vec::with_capacity(ctx.items.len());
+        for item in ctx.items {
+            let item_ctx = EvalCtx {
+                session: ctx.session,
+                subject: ctx.subject,
+                action: ctx.action,
+                resource: item.resource,
+                context: item.context,
+            };
+            results.push(self.evaluate(&item_ctx).await);
+        }
+        results
+    }
+
     /// Policy name for debugging, trace trees, and telemetry fallbacks.
-    fn policy_type(&self) -> String;
+    fn policy_type(&self) -> &str;
 
     /// Metadata describing the security rule that backs this policy.
     ///
@@ -755,20 +1601,44 @@ pub trait Policy<Subject, Resource, Action, Context>: Send + Sync {
 #[derive(Clone)]
 pub struct PermissionChecker<S, R, A, C> {
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
+    max_batch_size: Option<NonZeroUsize>,
 }
 
-impl<S, R, A, C> Default for PermissionChecker<S, R, A, C> {
+impl<S, R, A, C> Default for PermissionChecker<S, R, A, C>
+where
+    S: Sync,
+    R: Sync,
+    A: Sync,
+    C: Sync,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S, R, A, C> PermissionChecker<S, R, A, C> {
+impl<S, R, A, C> PermissionChecker<S, R, A, C>
+where
+    S: Sync,
+    R: Sync,
+    A: Sync,
+    C: Sync,
+{
     /// Creates a new `PermissionChecker` with no policies.
     pub fn new() -> Self {
         Self {
             policies: Vec::new(),
+            max_batch_size: None,
         }
+    }
+
+    /// Sets the maximum number of pending items passed to a policy batch call.
+    ///
+    /// By default, batch evaluation passes all pending items to each policy in a
+    /// single call. Configure this when backend limits, query planner behavior,
+    /// or remote service constraints require smaller chunks.
+    pub fn with_max_batch_size(mut self, max_batch_size: NonZeroUsize) -> Self {
+        self.max_batch_size = Some(max_batch_size);
+        self
     }
 
     /// Adds a policy to the checker.
@@ -780,24 +1650,28 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
         self.policies.push(Arc::new(policy));
     }
 
-    /// Evaluates all policies against the given parameters.
+    /// Evaluates all policies against the given parameters using a caller-owned
+    /// request session.
     ///
-    /// Policies are evaluated sequentially with OR semantics and short-circuit on
-    /// the first success. The returned [`AccessEvaluation`] contains a trace tree
-    /// for the policies that were actually evaluated before short-circuiting.
+    /// Policies are evaluated sequentially with OR semantics and short-circuit
+    /// on the first success. The returned [`AccessEvaluation`] contains a
+    /// trace tree for the policies that were actually evaluated before
+    /// short-circuiting.
     ///
-    /// If every policy denies access, the top-level denial reason is the summary
-    /// string `"All policies denied access"`. Inspect the trace for individual
-    /// policy reasons.
-    #[tracing::instrument(skip_all)]
-    pub async fn evaluate_access(
+    /// If every policy denies access, the top-level denial reason is the
+    /// summary string `"All policies denied access"`. Inspect the trace for
+    /// individual policy reasons.
+    #[tracing::instrument(skip_all, fields(policy_count = self.policies.len(), outcome = tracing::field::Empty, policy.type = tracing::field::Empty))]
+    pub async fn evaluate_in_session(
         &self,
+        session: &EvaluationSession,
         subject: &S,
         action: &A,
         resource: &R,
         context: &C,
     ) -> AccessEvaluation {
         if self.policies.is_empty() {
+            tracing::Span::current().record("outcome", "denied");
             tracing::debug!("No policies configured");
             let result = PolicyEvalResult::Denied {
                 policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
@@ -815,14 +1689,19 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
 
         // Evaluate each policy
         for policy in &self.policies {
-            let result = policy
-                .evaluate_access(subject, action, resource, context)
-                .await;
+            let ctx = EvalCtx {
+                session,
+                subject,
+                action,
+                resource,
+                context,
+            };
+            let result = policy.evaluate(&ctx).await;
             let result_passes = result.is_granted();
 
             // Extract metadata for tracing (always needed for security audit)
             let policy_type = policy.policy_type();
-            let policy_type_str = policy_type.as_str();
+            let policy_type_str = policy_type;
             let metadata = policy.security_rule();
             let reason = result.reason();
             let reason_str = reason.as_deref();
@@ -857,6 +1736,8 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
 
             // If any policy allows access, return immediately
             if result_passes {
+                tracing::Span::current().record("outcome", "granted");
+                tracing::Span::current().record("policy.type", policy_type);
                 let combined = PolicyEvalResult::Combined {
                     policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
                     operation: CombineOp::Or,
@@ -865,7 +1746,7 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
                 };
 
                 return AccessEvaluation::Granted {
-                    policy_type,
+                    policy_type: policy_type.to_string(),
                     reason,
                     trace: EvalTrace::with_root(combined),
                 };
@@ -873,6 +1754,7 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
         }
 
         // If all policies denied access
+        tracing::Span::current().record("outcome", "denied");
         tracing::trace!("No policies allowed access, returning Forbidden");
         let combined = PolicyEvalResult::Combined {
             policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
@@ -885,6 +1767,389 @@ impl<S, R, A, C> PermissionChecker<S, R, A, C> {
             trace: EvalTrace::with_root(combined),
             reason: "All policies denied access".to_string(),
         }
+    }
+
+    /// Evaluates a batch of caller-owned items using a caller-owned session.
+    ///
+    /// The `parts` callback tells gatehouse how to borrow the resource and
+    /// context from each caller-owned item. Returned results preserve input
+    /// order, including duplicate resources. Policy evaluation still uses the
+    /// same OR semantics as [`Self::evaluate_in_session`], but the checker evaluates
+    /// each policy across the still-pending batch before moving to the next
+    /// policy. This lets policies with set-oriented backends override
+    /// [`Policy::evaluate_batch`] and collapse many point lookups into
+    /// one backend call.
+    ///
+    /// The loop is intentionally policy-outer/items-inner, not a naive
+    /// item-outer loop. OR short-circuiting is preserved per item and policy
+    /// order is preserved globally, but callers should avoid relying on
+    /// side effects from interleaving one item through every policy before the
+    /// next item starts.
+    ///
+    /// If a policy returns the wrong number of batch results, affected items are
+    /// denied rather than accidentally granted.
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # use async_trait::async_trait;
+    /// # #[derive(Clone)]
+    /// # struct User { id: u64 }
+    /// # #[derive(Clone)]
+    /// # struct Document { owner_id: u64 }
+    /// # struct Read;
+    /// # #[derive(Clone)]
+    /// # struct RequestContext;
+    /// # tokio_test::block_on(async {
+    /// let user = User { id: 7 };
+    /// let context = RequestContext;
+    /// let session = EvaluationSession::empty();
+    /// let documents = vec![
+    ///     Document { owner_id: 7 },
+    ///     Document { owner_id: 42 },
+    /// ];
+    ///
+    /// let mut checker = PermissionChecker::new();
+    /// checker.add_policy(AbacPolicy::new(
+    ///     |user: &User, document: &Document, _action: &Read, _context: &RequestContext| {
+    ///         user.id == document.owner_id
+    ///     },
+    /// ));
+    ///
+    /// let visible = checker
+    ///     .filter_authorized_with_context_in_session_by(&session, &user, &Read, documents, &context, |document| {
+    ///         document
+    ///     })
+    ///     .await;
+    ///
+    /// assert_eq!(visible.len(), 1);
+    /// # });
+    /// ```
+    #[tracing::instrument(skip_all, fields(item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
+    pub async fn evaluate_batch_in_session_by<I, F>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        items: I,
+        parts: F,
+    ) -> Vec<(I::Item, AccessEvaluation)>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C),
+    {
+        let items: Vec<I::Item> = items.into_iter().collect();
+        let item_count = items.len();
+        tracing::Span::current().record("item_count", item_count);
+        if let Some(max_batch_size) = self.max_batch_size {
+            tracing::Span::current().record("max_batch_size", max_batch_size.get());
+        }
+
+        let mut traces = vec![Vec::new(); item_count];
+        let mut evaluations: Vec<Option<AccessEvaluation>> = vec![None; item_count];
+
+        if self.policies.is_empty() {
+            let mut denied_count = 0usize;
+            let results = items
+                .into_iter()
+                .map(|item| {
+                    denied_count += 1;
+                    let result = PolicyEvalResult::Denied {
+                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                        reason: "No policies configured".to_string(),
+                    };
+                    (
+                        item,
+                        AccessEvaluation::Denied {
+                            trace: EvalTrace::with_root(result),
+                            reason: "No policies configured".to_string(),
+                        },
+                    )
+                })
+                .collect();
+            tracing::Span::current().record("granted_count", 0usize);
+            tracing::Span::current().record("denied_count", denied_count);
+            return results;
+        }
+
+        let item_parts = items
+            .iter()
+            .map(|item| {
+                let (resource, context) = parts(item);
+                PolicyBatchItem { resource, context }
+            })
+            .collect::<Vec<_>>();
+
+        let mut pending: Vec<usize> = (0..item_count).collect();
+
+        for policy in &self.policies {
+            if pending.is_empty() {
+                break;
+            }
+
+            let policy_type = policy.policy_type();
+            let mut still_pending = Vec::new();
+            let chunk_size = self
+                .max_batch_size
+                .map_or(pending.len(), NonZeroUsize::get)
+                .max(1);
+            let chunk_count = pending.len().div_ceil(chunk_size);
+
+            for (chunk_index, pending_chunk) in pending.chunks(chunk_size).enumerate() {
+                let policy_span = tracing::debug_span!(
+                    "gatehouse.batch_policy",
+                    policy.type = policy_type,
+                    policy.pending_count = pending_chunk.len(),
+                    policy.chunk_index = chunk_index,
+                    policy.chunk_count = chunk_count,
+                    policy.granted_count = tracing::field::Empty,
+                    policy.denied_count = tracing::field::Empty,
+                );
+                let batch_items: Vec<_> = pending_chunk
+                    .iter()
+                    .map(|&index| PolicyBatchItem {
+                        resource: item_parts[index].resource,
+                        context: item_parts[index].context,
+                    })
+                    .collect();
+
+                let batch_ctx = BatchEvalCtx {
+                    session,
+                    subject,
+                    action,
+                    items: &batch_items,
+                };
+                let policy_results = policy
+                    .evaluate_batch(&batch_ctx)
+                    .instrument(policy_span.clone())
+                    .await;
+
+                let mut chunk_granted_count = 0usize;
+                let mut chunk_denied_count = 0usize;
+
+                if policy_results.len() != pending_chunk.len() {
+                    for &index in pending_chunk {
+                        chunk_denied_count += 1;
+                        let policy_result = PolicyEvalResult::Denied {
+                            policy_type: policy_type.to_string(),
+                            reason: "Policy batch result count did not match input count"
+                                .to_string(),
+                        };
+                        traces[index].push(policy_result);
+                        let combined = PolicyEvalResult::Combined {
+                            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                            operation: CombineOp::Or,
+                            children: std::mem::take(&mut traces[index]),
+                            outcome: false,
+                        };
+                        evaluations[index] = Some(AccessEvaluation::Denied {
+                            trace: EvalTrace::with_root(combined),
+                            reason: "Policy batch result count did not match input count"
+                                .to_string(),
+                        });
+                    }
+                    policy_span.record("policy.granted_count", chunk_granted_count);
+                    policy_span.record("policy.denied_count", chunk_denied_count);
+                    continue;
+                }
+
+                for (&index, result) in pending_chunk.iter().zip(policy_results) {
+                    let result_passes = result.is_granted();
+                    let reason = result.reason();
+
+                    traces[index].push(result);
+
+                    if result_passes {
+                        chunk_granted_count += 1;
+                        let combined = PolicyEvalResult::Combined {
+                            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                            operation: CombineOp::Or,
+                            children: std::mem::take(&mut traces[index]),
+                            outcome: true,
+                        };
+                        evaluations[index] = Some(AccessEvaluation::Granted {
+                            policy_type: policy_type.to_string(),
+                            reason,
+                            trace: EvalTrace::with_root(combined),
+                        });
+                    } else {
+                        chunk_denied_count += 1;
+                        still_pending.push(index);
+                    }
+                }
+                policy_span.record("policy.granted_count", chunk_granted_count);
+                policy_span.record("policy.denied_count", chunk_denied_count);
+            }
+            pending = still_pending;
+        }
+
+        for index in pending {
+            let combined = PolicyEvalResult::Combined {
+                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                operation: CombineOp::Or,
+                children: std::mem::take(&mut traces[index]),
+                outcome: false,
+            };
+            evaluations[index] = Some(AccessEvaluation::Denied {
+                trace: EvalTrace::with_root(combined),
+                reason: "All policies denied access".to_string(),
+            });
+        }
+
+        drop(item_parts);
+
+        let mut granted_count = 0usize;
+        let results = items
+            .into_iter()
+            .zip(evaluations.into_iter())
+            .map(|(item, evaluation)| {
+                let evaluation = evaluation.unwrap_or_else(|| {
+                    let result = PolicyEvalResult::Denied {
+                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                        reason: "Batch item was not evaluated".to_string(),
+                    };
+                    AccessEvaluation::Denied {
+                        trace: EvalTrace::with_root(result),
+                        reason: "Batch item was not evaluated".to_string(),
+                    }
+                });
+                if evaluation.is_granted() {
+                    granted_count += 1;
+                }
+                (item, evaluation)
+            })
+            .collect::<Vec<_>>();
+        let denied_count = item_count - granted_count;
+        tracing::Span::current().record("granted_count", granted_count);
+        tracing::Span::current().record("denied_count", denied_count);
+        results
+    }
+
+    /// Returns only the items granted by [`Self::evaluate_batch_in_session_by`].
+    pub async fn filter_authorized_in_session_by<I, F>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        items: I,
+        parts: F,
+    ) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C),
+    {
+        self.evaluate_batch_in_session_by(session, subject, action, items, parts)
+            .await
+            .into_iter()
+            .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
+            .collect()
+    }
+
+    /// Evaluates caller-owned items that all share one context value, using a
+    /// caller-owned session.
+    pub async fn evaluate_batch_with_context_in_session_by<I, F>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        items: I,
+        context: &C,
+        resource: F,
+    ) -> Vec<(I::Item, AccessEvaluation)>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item R,
+    {
+        let wrapped_items = items
+            .into_iter()
+            .map(|item| (item, context))
+            .collect::<Vec<_>>();
+
+        self.evaluate_batch_in_session_by(
+            session,
+            subject,
+            action,
+            wrapped_items,
+            |(item, context)| (resource(item), *context),
+        )
+        .await
+        .into_iter()
+        .map(|((item, _context), evaluation)| (item, evaluation))
+        .collect()
+    }
+
+    /// Returns only authorized items with a shared context and caller-owned session.
+    pub async fn filter_authorized_with_context_in_session_by<I, F>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        items: I,
+        context: &C,
+        resource: F,
+    ) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item R,
+    {
+        self.evaluate_batch_with_context_in_session_by(
+            session, subject, action, items, context, resource,
+        )
+        .await
+        .into_iter()
+        .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
+        .collect()
+    }
+}
+
+impl<S, R, A> PermissionChecker<S, R, A, ()>
+where
+    S: Sync,
+    R: Sync,
+    A: Sync,
+{
+    /// Evaluates a batch where each caller-owned item is the resource and the
+    /// context type is `()`.
+    ///
+    /// This is the ergonomic shortcut for list-like checks that do not need a
+    /// per-item context value.
+    pub async fn evaluate_batch_resources_in_session<I>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        resources: I,
+    ) -> Vec<(R, AccessEvaluation)>
+    where
+        I: IntoIterator<Item = R>,
+    {
+        self.evaluate_batch_with_context_in_session_by(
+            session,
+            subject,
+            action,
+            resources,
+            &(),
+            |resource| resource,
+        )
+        .await
+    }
+
+    /// Returns only resources granted by
+    /// [`Self::evaluate_batch_resources_in_session`].
+    pub async fn filter_authorized_resources_in_session<I>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        resources: I,
+    ) -> Vec<R>
+    where
+        I: IntoIterator<Item = R>,
+    {
+        self.evaluate_batch_resources_in_session(session, subject, action, resources)
+            .await
+            .into_iter()
+            .filter_map(|(resource, evaluation)| evaluation.is_granted().then_some(resource))
+            .collect()
     }
 }
 
@@ -915,14 +2180,8 @@ where
     A: Send + Sync,
     C: Send + Sync,
 {
-    async fn evaluate_access(
-        &self,
-        subject: &S,
-        action: &A,
-        resource: &R,
-        context: &C,
-    ) -> PolicyEvalResult {
-        if (self.predicate)(subject, action, resource, context) {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+        if (self.predicate)(ctx.subject, ctx.action, ctx.resource, ctx.context) {
             match self.effect {
                 Effect::Allow => PolicyEvalResult::Granted {
                     policy_type: self.name.clone(),
@@ -941,8 +2200,8 @@ where
             }
         }
     }
-    fn policy_type(&self) -> String {
-        self.name.clone()
+    fn policy_type(&self) -> &str {
+        &self.name
     }
 }
 
@@ -956,19 +2215,18 @@ where
     A: Send + Sync,
     C: Send + Sync,
 {
-    async fn evaluate_access(
-        &self,
-        subject: &S,
-        action: &A,
-        resource: &R,
-        context: &C,
-    ) -> PolicyEvalResult {
-        (**self)
-            .evaluate_access(subject, action, resource, context)
-            .await
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+        (**self).evaluate(ctx).await
     }
 
-    fn policy_type(&self) -> String {
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+    ) -> Vec<PolicyEvalResult> {
+        (**self).evaluate_batch(ctx).await
+    }
+
+    fn policy_type(&self) -> &str {
         (**self).policy_type()
     }
 
@@ -1024,12 +2282,13 @@ where
 /// let user_id = Uuid::new_v4();
 /// let user = User { id: user_id, roles: vec!["editor".into()] };
 /// let doc = Document { owner_id: user_id, classification: "internal".into() };
+/// let session = EvaluationSession::empty();
 ///
 /// // User is an editor, action is "edit", doc is not top-secret, and user owns it:
-/// assert!(checker.evaluate_access(&user, &Action("edit".into()), &doc, &Ctx).await.is_granted());
+/// assert!(checker.evaluate_in_session(&session, &user, &Action("edit".into()), &doc, &Ctx).await.is_granted());
 ///
 /// // Wrong action — predicate fails:
-/// assert!(!checker.evaluate_access(&user, &Action("delete".into()), &doc, &Ctx).await.is_granted());
+/// assert!(!checker.evaluate_in_session(&session, &user, &Action("delete".into()), &doc, &Ctx).await.is_granted());
 /// # });
 /// ```
 pub struct PolicyBuilder<S, R, A, C>
@@ -1045,7 +2304,7 @@ where
     action_pred: Option<Box<dyn Fn(&A) -> bool + Send + Sync>>,
     resource_pred: Option<Box<dyn Fn(&R) -> bool + Send + Sync>>,
     context_pred: Option<Box<dyn Fn(&C) -> bool + Send + Sync>>,
-    // Note the order here matches the evaluate_access signature
+    // Note the order here matches the EvalCtx fields used by Policy::evaluate.
     extra_condition: Option<Box<dyn Fn(&S, &A, &R, &C) -> bool + Send + Sync>>,
 }
 
@@ -1188,11 +2447,12 @@ where
 /// checker.add_policy(rbac);
 ///
 /// # tokio_test::block_on(async {
+/// let session = EvaluationSession::empty();
 /// let authorised = User { role_ids: vec![editor_role] };
-/// assert!(checker.evaluate_access(&authorised, &Action, &Resource, &Ctx).await.is_granted());
+/// assert!(checker.evaluate_in_session(&session, &authorised, &Action, &Resource, &Ctx).await.is_granted());
 ///
 /// let unauthorised = User { role_ids: vec![Uuid::new_v4()] };
-/// assert!(!checker.evaluate_access(&unauthorised, &Action, &Resource, &Ctx).await.is_granted());
+/// assert!(!checker.evaluate_in_session(&session, &unauthorised, &Action, &Resource, &Ctx).await.is_granted());
 /// # });
 /// ```
 pub struct RbacPolicy<S, F1, F2> {
@@ -1222,32 +2482,26 @@ where
     F1: Fn(&R, &A) -> Vec<uuid::Uuid> + Sync + Send,
     F2: Fn(&S) -> Vec<uuid::Uuid> + Sync + Send,
 {
-    async fn evaluate_access(
-        &self,
-        subject: &S,
-        action: &A,
-        resource: &R,
-        _context: &C,
-    ) -> PolicyEvalResult {
-        let required_roles = (self.required_roles_resolver)(resource, action);
-        let user_roles = (self.user_roles_resolver)(subject);
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+        let required_roles = (self.required_roles_resolver)(ctx.resource, ctx.action);
+        let user_roles = (self.user_roles_resolver)(ctx.subject);
         let has_role = required_roles.iter().any(|role| user_roles.contains(role));
 
         if has_role {
             PolicyEvalResult::Granted {
-                policy_type: Policy::<S, R, A, C>::policy_type(self),
+                policy_type: Policy::<S, R, A, C>::policy_type(self).to_string(),
                 reason: Some("User has required role".to_string()),
             }
         } else {
             PolicyEvalResult::Denied {
-                policy_type: Policy::<S, R, A, C>::policy_type(self),
+                policy_type: Policy::<S, R, A, C>::policy_type(self).to_string(),
                 reason: "User doesn't have required role".to_string(),
             }
         }
     }
 
-    fn policy_type(&self) -> String {
-        "RbacPolicy".to_string()
+    fn policy_type(&self) -> &str {
+        "RbacPolicy"
     }
 }
 
@@ -1306,13 +2560,14 @@ where
 /// let owned_resource = Resource { owner_id: user.id };
 /// let other_resource = Resource { owner_id: Uuid::new_v4() };
 /// let context = EmptyContext;
+/// let session = EvaluationSession::empty();
 ///
 /// # tokio_test::block_on(async {
 /// // This check should succeed because the user is the owner:
-/// assert!(checker.evaluate_access(&user, &Action, &owned_resource, &context).await.is_granted());
+/// assert!(checker.evaluate_in_session(&session, &user, &Action, &owned_resource, &context).await.is_granted());
 ///
 /// // This check should fail because the user is not the owner:
-/// assert!(!checker.evaluate_access(&user, &Action, &other_resource, &context).await.is_granted());
+/// assert!(!checker.evaluate_in_session(&session, &user, &Action, &other_resource, &context).await.is_granted());
 /// # });
 /// ```
 ///
@@ -1340,70 +2595,68 @@ where
     C: Sync + Send,
     F: Fn(&S, &R, &A, &C) -> bool + Sync + Send,
 {
-    async fn evaluate_access(
-        &self,
-        subject: &S,
-        action: &A,
-        resource: &R,
-        context: &C,
-    ) -> PolicyEvalResult {
-        let condition_met = (self.condition)(subject, resource, action, context);
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+        let condition_met = (self.condition)(ctx.subject, ctx.resource, ctx.action, ctx.context);
 
         if condition_met {
             PolicyEvalResult::Granted {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: Some("Condition evaluated to true".to_string()),
             }
         } else {
             PolicyEvalResult::Denied {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: "Condition evaluated to false".to_string(),
             }
         }
     }
 
-    fn policy_type(&self) -> String {
-        "AbacPolicy".to_string()
+    fn policy_type(&self) -> &str {
+        "AbacPolicy"
     }
-}
-
-/// A trait that abstracts a relationship resolver.
-/// Given a subject and a resource, the resolver answers whether the
-/// specified relationship e.g. "creator", "manager" exists between them.
-///
-/// The relationship type `Re` is generic, so you can use strings, enums, or
-/// other domain-specific types.
-///
-/// This trait returns `bool` rather than a `Result`, so lookup failures,
-/// timeouts, and other resolver-specific errors must be handled by the
-/// implementation itself and mapped into `false` or external telemetry/logging.
-#[async_trait]
-pub trait RelationshipResolver<S, R, Re>: Send + Sync {
-    /// Returns `true` if `relationship` exists between `subject` and `resource`.
-    async fn has_relationship(&self, subject: &S, resource: &R, relationship: &Re) -> bool;
 }
 
 /// ### ReBAC Policy
 ///
-/// In this example, we show how to use a built-in relationship-based (ReBAC) policy. We define
-/// a dummy relationship resolver that checks if a user is the manager of a project.
+/// ReBAC is backed by [`FactSource`] in v0.3. A policy extracts flat,
+/// hashable IDs from the subject and resource, builds a [`RelationshipQuery`],
+/// then loads relationship facts through the request-scoped
+/// [`EvaluationSession`].
+///
+/// The `Relation` type can be a domain enum rather than a string. That keeps
+/// policy code type-safe while leaving backend-specific serialization inside
+/// the [`FactSource`]. For example, a SQL-backed source can load
+/// `RelationshipQuery<Uuid, Uuid, Relation>` keys and convert
+/// `Relation::Viewer` to a `text` column value only when binding query
+/// parameters. The session deduplicates and caches by the typed key, not by the
+/// serialized storage representation.
+///
+/// When several relationship domains have the same ID shape, such as
+/// `Uuid -> Uuid`, use a domain relation enum and dispatch inside one
+/// `FactSource`, or newtype the IDs so each domain has a distinct
+/// `RelationshipQuery` type and therefore a distinct session registration.
+///
+/// `RebacPolicy` is the convenience policy for boolean relationship checks. If
+/// a relationship carries payload, such as rank, weight, or a scope set, define
+/// a custom [`FactKey`] with `Value = YourPayload` and write a [`Policy`] that
+/// interprets the loaded value.
+///
+/// `Relation` must implement [`fmt::Display`] only so Gatehouse can produce
+/// human-readable denial reasons and traces. Backend serialization should live
+/// in the [`FactSource`], not in the display string unless that is explicitly
+/// your storage format.
 ///
 /// ```rust
 /// use async_trait::async_trait;
-/// use std::sync::Arc;
+/// use std::collections::HashSet;
 /// use uuid::Uuid;
 /// use gatehouse::*;
 ///
 /// #[derive(Debug, Clone)]
-/// pub struct Employee {
-///     pub id: Uuid,
-/// }
+/// pub struct Employee { pub id: Uuid }
 ///
 /// #[derive(Debug, Clone)]
-/// pub struct Project {
-///     pub id: Uuid,
-///     pub manager_id: Uuid,
-/// }
+/// pub struct Project { pub id: Uuid }
 ///
 /// #[derive(Debug, Clone)]
 /// pub struct AccessAction;
@@ -1411,114 +2664,333 @@ pub trait RelationshipResolver<S, R, Re>: Send + Sync {
 /// #[derive(Debug, Clone)]
 /// pub struct EmptyContext;
 ///
-/// // Define a dummy relationship resolver that considers an employee to be a manager
-/// // of a project if their id matches the project's manager_id.
-/// struct DummyRelationshipResolver;
+/// struct ProjectRelationships {
+///     grants: HashSet<RelationshipQuery<Uuid, Uuid, String>>,
+/// }
 ///
 /// #[async_trait]
-/// impl RelationshipResolver<Employee, Project, String> for DummyRelationshipResolver {
-///     async fn has_relationship(
+/// impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for ProjectRelationships {
+///     async fn load_many(
 ///         &self,
-///         employee: &Employee,
-///         project: &Project,
-///         relationship: &String,
-///     ) -> bool {
-///         relationship == "manager" && employee.id == project.manager_id
+///         keys: &[RelationshipQuery<Uuid, Uuid, String>],
+///     ) -> Vec<FactLoadResult<bool>> {
+///         keys.iter()
+///             .map(|key| FactLoadResult::Found(self.grants.contains(key)))
+///             .collect()
 ///     }
 /// }
 ///
-/// // Create a ReBAC policy that checks for the "manager" relationship.
-/// let rebac_policy = RebacPolicy::<Employee, Project, AccessAction, EmptyContext, _, _>::new(
-///     "manager".to_string(),
-///     DummyRelationshipResolver,
+/// let manager = Employee { id: Uuid::new_v4() };
+/// let project = Project { id: Uuid::new_v4() };
+/// let relationship = "manager".to_string();
+/// let grants = HashSet::from([RelationshipQuery {
+///     subject_id: manager.id,
+///     resource_id: project.id,
+///     relation: relationship.clone(),
+/// }]);
+///
+/// let session = EvaluationSession::new();
+/// session.register::<RelationshipQuery<Uuid, Uuid, String>, _>(ProjectRelationships { grants });
+///
+/// let rebac_policy = RebacPolicy::new(
+///     |employee: &Employee| employee.id,
+///     |project: &Project| project.id,
+///     relationship,
 /// );
 ///
-/// // Create a PermissionChecker and add the ReBAC policy.
 /// let mut checker = PermissionChecker::<Employee, Project, AccessAction, EmptyContext>::new();
 /// checker.add_policy(rebac_policy);
 ///
-/// // Create a sample employee and project.
-/// let manager = Employee { id: Uuid::new_v4() };
-/// let project = Project {
-///     id: Uuid::new_v4(),
-///     manager_id: manager.id,
-/// };
-/// let context = EmptyContext;
-///
-/// // The manager should have access.
 /// # tokio_test::block_on(async {
-/// assert!(checker.evaluate_access(&manager, &AccessAction, &project, &context).await.is_granted());
-///
-/// // A different employee should be denied access.
-/// let other_employee = Employee { id: Uuid::new_v4() };
-/// assert!(!checker.evaluate_access(&other_employee, &AccessAction, &project, &context).await.is_granted());
+/// assert!(checker
+///     .evaluate_in_session(&session, &manager, &AccessAction, &project, &EmptyContext)
+///     .await
+///     .is_granted());
 /// # });
 /// ```
-///
-/// The relationship type `Re` must implement [`fmt::Display`] so that policy
-/// evaluation reasons can include the relationship value in log messages.
-pub struct RebacPolicy<S, R, A, C, Re, RG> {
-    /// The relationship to check (e.g. `"manager"`, or an enum variant).
-    pub relationship: Re,
-    /// The resolver that determines whether the relationship exists.
-    pub resolver: RG,
-    _marker: std::marker::PhantomData<(S, R, A, C)>,
+pub struct RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation> {
+    subject_id: Arc<dyn Fn(&S) -> SubjectId + Send + Sync>,
+    resource_id: Arc<dyn Fn(&R) -> ResourceId + Send + Sync>,
+    relation: Relation,
+    _marker: std::marker::PhantomData<(A, C)>,
 }
 
-impl<S, R, A, C, Re, RG> RebacPolicy<S, R, A, C, Re, RG> {
-    /// Creates a new `RebacPolicy` for a given relationship.
-    pub fn new(relationship: Re, resolver: RG) -> Self {
+impl<S, R, A, C, SubjectId, ResourceId, Relation>
+    RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation>
+{
+    /// Creates a ReBAC policy from subject/resource ID extractors and a relation.
+    pub fn new<SubjectIdFn, ResourceIdFn>(
+        subject_id: SubjectIdFn,
+        resource_id: ResourceIdFn,
+        relation: Relation,
+    ) -> Self
+    where
+        SubjectIdFn: Fn(&S) -> SubjectId + Send + Sync + 'static,
+        ResourceIdFn: Fn(&R) -> ResourceId + Send + Sync + 'static,
+    {
         Self {
-            relationship,
-            resolver,
+            subject_id: Arc::new(subject_id),
+            resource_id: Arc::new(resource_id),
+            relation,
             _marker: std::marker::PhantomData,
         }
     }
 }
 
 #[async_trait]
-impl<S, R, A, C, Re, RG> Policy<S, R, A, C> for RebacPolicy<S, R, A, C, Re, RG>
+impl<S, R, A, C, SubjectId, ResourceId, Relation> Policy<S, R, A, C>
+    for RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation>
 where
     S: Sync + Send,
     R: Sync + Send,
     A: Sync + Send,
     C: Sync + Send,
-    Re: Sync + Send + fmt::Display,
-    RG: RelationshipResolver<S, R, Re>,
+    SubjectId: Eq + Hash + Clone + Send + Sync + 'static,
+    ResourceId: Eq + Hash + Clone + Send + Sync + 'static,
+    Relation: Eq + Hash + Clone + Send + Sync + fmt::Display + 'static,
 {
-    async fn evaluate_access(
-        &self,
-        subject: &S,
-        _action: &A,
-        resource: &R,
-        _context: &C,
-    ) -> PolicyEvalResult {
-        let has_relationship = self
-            .resolver
-            .has_relationship(subject, resource, &self.relationship)
-            .await;
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+        let key = RelationshipQuery {
+            subject_id: (self.subject_id)(ctx.subject),
+            resource_id: (self.resource_id)(ctx.resource),
+            relation: self.relation.clone(),
+        };
+        self.result_from_fact(ctx.session.get(key).await)
+    }
 
-        if has_relationship {
-            PolicyEvalResult::Granted {
-                policy_type: self.policy_type(),
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+    ) -> Vec<PolicyEvalResult> {
+        let subject_id = (self.subject_id)(ctx.subject);
+        let keys = ctx
+            .items
+            .iter()
+            .map(|item| RelationshipQuery {
+                subject_id: subject_id.clone(),
+                resource_id: (self.resource_id)(item.resource),
+                relation: self.relation.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let facts = ctx.session.get_many(&keys).await;
+        if facts.len() != ctx.items.len() {
+            return ctx
+                .items
+                .iter()
+                .map(|_| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type().to_string(),
+                    reason: "Relationship fact source returned the wrong number of results"
+                        .to_string(),
+                })
+                .collect();
+        }
+
+        facts
+            .into_iter()
+            .map(|fact| self.result_from_fact(fact))
+            .collect()
+    }
+
+    fn policy_type(&self) -> &str {
+        "RebacPolicy"
+    }
+}
+
+impl<S, R, A, C, SubjectId, ResourceId, Relation>
+    RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation>
+where
+    Relation: fmt::Display,
+{
+    fn result_from_fact(&self, fact: FactLoadResult<bool>) -> PolicyEvalResult {
+        match fact {
+            FactLoadResult::Found(true) => PolicyEvalResult::Granted {
+                policy_type: "RebacPolicy".to_string(),
                 reason: Some(format!(
                     "Subject has '{}' relationship with resource",
-                    self.relationship
+                    self.relation
                 )),
-            }
-        } else {
-            PolicyEvalResult::Denied {
-                policy_type: self.policy_type(),
+            },
+            FactLoadResult::Found(false) => PolicyEvalResult::Denied {
+                policy_type: "RebacPolicy".to_string(),
                 reason: format!(
                     "Subject does not have '{}' relationship with resource",
-                    self.relationship
+                    self.relation
                 ),
-            }
+            },
+            FactLoadResult::Missing => PolicyEvalResult::Denied {
+                policy_type: "RebacPolicy".to_string(),
+                reason: format!("Relationship '{}' fact is missing", self.relation),
+            },
+            FactLoadResult::Error(error) => PolicyEvalResult::Denied {
+                policy_type: "RebacPolicy".to_string(),
+                reason: format!("Relationship '{}' fact load failed: {error}", self.relation),
+            },
+        }
+    }
+}
+
+fn delegated_evaluation_to_result(
+    policy_type: &str,
+    evaluation: AccessEvaluation,
+) -> PolicyEvalResult {
+    match evaluation {
+        AccessEvaluation::Granted {
+            policy_type: child_policy_type,
+            reason,
+            trace,
+        } => PolicyEvalResult::Combined {
+            policy_type: policy_type.to_string(),
+            operation: CombineOp::Delegate,
+            children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::Granted {
+                policy_type: child_policy_type,
+                reason,
+            })],
+            outcome: true,
+        },
+        AccessEvaluation::Denied { reason, trace } => PolicyEvalResult::Combined {
+            policy_type: policy_type.to_string(),
+            operation: CombineOp::Delegate,
+            children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::Denied {
+                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                reason,
+            })],
+            outcome: false,
+        },
+    }
+}
+
+/// A policy that delegates its decision to another [`PermissionChecker`].
+///
+/// Use this when one authorization domain needs to ask another domain's checker
+/// for a decision while preserving the policy-layer trace. For example, a
+/// messaging `ReadConversation` policy can map a conversation to the
+/// procurement object it represents, then delegate to the procurement checker
+/// using the same [`EvaluationSession`].
+///
+/// The subject and action mappers run once per batch. Resource and context
+/// mappers run once per item. Mapper closures return child-domain values; use
+/// lightweight IDs, newtypes, or `Arc` values when mapping larger objects.
+///
+/// `DelegatingPolicy` does not detect cycles or self-delegation; avoid wiring a
+/// child checker that can delegate back into the same decision path.
+pub struct DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext> {
+    policy_type: String,
+    security_rule: SecurityRuleMetadata,
+    checker: PermissionChecker<ChildSubject, ChildResource, ChildAction, ChildContext>,
+    subject: Arc<dyn Fn(&S) -> ChildSubject + Send + Sync>,
+    action: Arc<dyn Fn(&A) -> ChildAction + Send + Sync>,
+    resource: Arc<dyn Fn(&S, &R, &A, &C) -> ChildResource + Send + Sync>,
+    context: Arc<dyn Fn(&S, &R, &A, &C) -> ChildContext + Send + Sync>,
+}
+
+impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
+    DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
+{
+    /// Creates a delegating policy from a child checker and mapping functions.
+    pub fn new<SubjectFn, ActionFn, ResourceFn, ContextFn>(
+        policy_type: impl Into<String>,
+        checker: PermissionChecker<ChildSubject, ChildResource, ChildAction, ChildContext>,
+        subject: SubjectFn,
+        action: ActionFn,
+        resource: ResourceFn,
+        context: ContextFn,
+    ) -> Self
+    where
+        SubjectFn: Fn(&S) -> ChildSubject + Send + Sync + 'static,
+        ActionFn: Fn(&A) -> ChildAction + Send + Sync + 'static,
+        ResourceFn: Fn(&S, &R, &A, &C) -> ChildResource + Send + Sync + 'static,
+        ContextFn: Fn(&S, &R, &A, &C) -> ChildContext + Send + Sync + 'static,
+    {
+        Self {
+            policy_type: policy_type.into(),
+            security_rule: SecurityRuleMetadata::default(),
+            checker,
+            subject: Arc::new(subject),
+            action: Arc::new(action),
+            resource: Arc::new(resource),
+            context: Arc::new(context),
         }
     }
 
-    fn policy_type(&self) -> String {
-        "RebacPolicy".to_string()
+    /// Sets the telemetry metadata emitted for the delegating policy itself.
+    pub fn with_security_rule(mut self, security_rule: SecurityRuleMetadata) -> Self {
+        self.security_rule = security_rule;
+        self
+    }
+}
+
+#[async_trait]
+impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext> Policy<S, R, A, C>
+    for DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
+where
+    S: Send + Sync,
+    R: Send + Sync,
+    A: Send + Sync,
+    C: Send + Sync,
+    ChildSubject: Send + Sync,
+    ChildResource: Send + Sync,
+    ChildAction: Send + Sync,
+    ChildContext: Send + Sync,
+{
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+        let child_subject = (self.subject)(ctx.subject);
+        let child_action = (self.action)(ctx.action);
+        let child_resource = (self.resource)(ctx.subject, ctx.resource, ctx.action, ctx.context);
+        let child_context = (self.context)(ctx.subject, ctx.resource, ctx.action, ctx.context);
+        let evaluation = self
+            .checker
+            .evaluate_in_session(
+                ctx.session,
+                &child_subject,
+                &child_action,
+                &child_resource,
+                &child_context,
+            )
+            .await;
+
+        delegated_evaluation_to_result(&self.policy_type, evaluation)
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+    ) -> Vec<PolicyEvalResult> {
+        let child_subject = (self.subject)(ctx.subject);
+        let child_action = (self.action)(ctx.action);
+        let child_items = ctx
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    (self.resource)(ctx.subject, item.resource, ctx.action, item.context),
+                    (self.context)(ctx.subject, item.resource, ctx.action, item.context),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        self.checker
+            .evaluate_batch_in_session_by(
+                ctx.session,
+                &child_subject,
+                &child_action,
+                child_items,
+                |(resource, context)| (resource, context),
+            )
+            .await
+            .into_iter()
+            .map(|(_item, evaluation)| {
+                delegated_evaluation_to_result(&self.policy_type, evaluation)
+            })
+            .collect()
+    }
+
+    fn policy_type(&self) -> &str {
+        &self.policy_type
+    }
+
+    fn security_rule(&self) -> SecurityRuleMetadata {
+        self.security_rule.clone()
     }
 }
 
@@ -1562,30 +3034,22 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> String {
-        "AndPolicy".to_string()
+    fn policy_type(&self) -> &str {
+        "AndPolicy"
     }
 
-    async fn evaluate_access(
-        &self,
-        subject: &S,
-        action: &A,
-        resource: &R,
-        context: &C,
-    ) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
-            let result = policy
-                .evaluate_access(subject, action, resource, context)
-                .await;
+            let result = policy.evaluate(ctx).await;
             let is_granted = result.is_granted();
             children_results.push(result);
 
             // Short-circuit on first denial
             if !is_granted {
                 return PolicyEvalResult::Combined {
-                    policy_type: self.policy_type(),
+                    policy_type: self.policy_type().to_string(),
                     operation: CombineOp::And,
                     children: children_results,
                     outcome: false,
@@ -1595,11 +3059,94 @@ where
 
         // All policies granted access
         PolicyEvalResult::Combined {
-            policy_type: self.policy_type(),
+            policy_type: self.policy_type().to_string(),
             operation: CombineOp::And,
             children: children_results,
             outcome: true,
         }
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+    ) -> Vec<PolicyEvalResult> {
+        let mut children_by_item = vec![Vec::new(); ctx.items.len()];
+        let mut results = vec![None; ctx.items.len()];
+        let mut pending = (0..ctx.items.len()).collect::<Vec<_>>();
+
+        for policy in &self.policies {
+            if pending.is_empty() {
+                break;
+            }
+
+            let batch_items = pending
+                .iter()
+                .map(|&index| PolicyBatchItem {
+                    resource: ctx.items[index].resource,
+                    context: ctx.items[index].context,
+                })
+                .collect::<Vec<_>>();
+            let batch_ctx = BatchEvalCtx {
+                session: ctx.session,
+                subject: ctx.subject,
+                action: ctx.action,
+                items: &batch_items,
+            };
+            let child_results = policy.evaluate_batch(&batch_ctx).await;
+
+            if child_results.len() != pending.len() {
+                for index in pending.drain(..) {
+                    children_by_item[index].push(PolicyEvalResult::Denied {
+                        policy_type: policy.policy_type().to_string(),
+                        reason: "Policy batch result count did not match input count".to_string(),
+                    });
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type().to_string(),
+                        operation: CombineOp::And,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: false,
+                    });
+                }
+                break;
+            }
+
+            let mut still_pending = Vec::new();
+            for (index, child_result) in pending.into_iter().zip(child_results) {
+                let is_granted = child_result.is_granted();
+                children_by_item[index].push(child_result);
+
+                if is_granted {
+                    still_pending.push(index);
+                } else {
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type().to_string(),
+                        operation: CombineOp::And,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: false,
+                    });
+                }
+            }
+            pending = still_pending;
+        }
+
+        for index in pending {
+            results[index] = Some(PolicyEvalResult::Combined {
+                policy_type: self.policy_type().to_string(),
+                operation: CombineOp::And,
+                children: std::mem::take(&mut children_by_item[index]),
+                outcome: true,
+            });
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type().to_string(),
+                    reason: "Batch item was not evaluated".to_string(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -1633,29 +3180,21 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> String {
-        "OrPolicy".to_string()
+    fn policy_type(&self) -> &str {
+        "OrPolicy"
     }
-    async fn evaluate_access(
-        &self,
-        subject: &S,
-        action: &A,
-        resource: &R,
-        context: &C,
-    ) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
-            let result = policy
-                .evaluate_access(subject, action, resource, context)
-                .await;
+            let result = policy.evaluate(ctx).await;
             let is_granted = result.is_granted();
             children_results.push(result);
 
             // Short-circuit on first success
             if is_granted {
                 return PolicyEvalResult::Combined {
-                    policy_type: self.policy_type(),
+                    policy_type: self.policy_type().to_string(),
                     operation: CombineOp::Or,
                     children: children_results,
                     outcome: true,
@@ -1665,11 +3204,94 @@ where
 
         // All policies denied access
         PolicyEvalResult::Combined {
-            policy_type: self.policy_type(),
+            policy_type: self.policy_type().to_string(),
             operation: CombineOp::Or,
             children: children_results,
             outcome: false,
         }
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+    ) -> Vec<PolicyEvalResult> {
+        let mut children_by_item = vec![Vec::new(); ctx.items.len()];
+        let mut results = vec![None; ctx.items.len()];
+        let mut pending = (0..ctx.items.len()).collect::<Vec<_>>();
+
+        for policy in &self.policies {
+            if pending.is_empty() {
+                break;
+            }
+
+            let batch_items = pending
+                .iter()
+                .map(|&index| PolicyBatchItem {
+                    resource: ctx.items[index].resource,
+                    context: ctx.items[index].context,
+                })
+                .collect::<Vec<_>>();
+            let batch_ctx = BatchEvalCtx {
+                session: ctx.session,
+                subject: ctx.subject,
+                action: ctx.action,
+                items: &batch_items,
+            };
+            let child_results = policy.evaluate_batch(&batch_ctx).await;
+
+            if child_results.len() != pending.len() {
+                for index in pending.drain(..) {
+                    children_by_item[index].push(PolicyEvalResult::Denied {
+                        policy_type: policy.policy_type().to_string(),
+                        reason: "Policy batch result count did not match input count".to_string(),
+                    });
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type().to_string(),
+                        operation: CombineOp::Or,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: false,
+                    });
+                }
+                break;
+            }
+
+            let mut still_pending = Vec::new();
+            for (index, child_result) in pending.into_iter().zip(child_results) {
+                let is_granted = child_result.is_granted();
+                children_by_item[index].push(child_result);
+
+                if is_granted {
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type().to_string(),
+                        operation: CombineOp::Or,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: true,
+                    });
+                } else {
+                    still_pending.push(index);
+                }
+            }
+            pending = still_pending;
+        }
+
+        for index in pending {
+            results[index] = Some(PolicyEvalResult::Combined {
+                policy_type: self.policy_type().to_string(),
+                operation: CombineOp::Or,
+                children: std::mem::take(&mut children_by_item[index]),
+                outcome: false,
+            });
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type().to_string(),
+                    reason: "Batch item was not evaluated".to_string(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -1681,7 +3303,13 @@ pub struct NotPolicy<S, R, A, C> {
     policy: Arc<dyn Policy<S, R, A, C>>,
 }
 
-impl<S, R, A, C> NotPolicy<S, R, A, C> {
+impl<S, R, A, C> NotPolicy<S, R, A, C>
+where
+    S: Sync,
+    R: Sync,
+    A: Sync,
+    C: Sync,
+{
     /// Creates a new `NotPolicy` that inverts the given policy's decision.
     pub fn new(policy: impl Policy<S, R, A, C> + 'static) -> Self {
         Self {
@@ -1699,36 +3327,61 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> String {
-        "NotPolicy".to_string()
+    fn policy_type(&self) -> &str {
+        "NotPolicy"
     }
 
-    async fn evaluate_access(
-        &self,
-        subject: &S,
-        action: &A,
-        resource: &R,
-        context: &C,
-    ) -> PolicyEvalResult {
-        let inner_result = self
-            .policy
-            .evaluate_access(subject, action, resource, context)
-            .await;
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+        let inner_result = self.policy.evaluate(ctx).await;
         let is_granted = inner_result.is_granted();
 
         PolicyEvalResult::Combined {
-            policy_type: Policy::<S, R, A, C>::policy_type(self),
+            policy_type: Policy::<S, R, A, C>::policy_type(self).to_string(),
             operation: CombineOp::Not,
             children: vec![inner_result],
             outcome: !is_granted,
         }
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+    ) -> Vec<PolicyEvalResult> {
+        let inner_results = self.policy.evaluate_batch(ctx).await;
+
+        if inner_results.len() != ctx.items.len() {
+            return ctx
+                .items
+                .iter()
+                .map(|_| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type().to_string(),
+                    reason: "Policy batch result count did not match input count".to_string(),
+                })
+                .collect();
+        }
+
+        inner_results
+            .into_iter()
+            .map(|inner_result| {
+                let is_granted = inner_result.is_granted();
+                PolicyEvalResult::Combined {
+                    policy_type: self.policy_type().to_string(),
+                    operation: CombineOp::Not,
+                    children: vec![inner_result],
+                    outcome: !is_granted,
+                }
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Subscriber};
@@ -1736,6 +3389,175 @@ mod tests {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::Registry;
 
+    trait TestPolicyExt<S, R, A, C>: Policy<S, R, A, C>
+    where
+        S: Send + Sync,
+        R: Send + Sync,
+        A: Send + Sync,
+        C: Send + Sync,
+    {
+        fn evaluate_access<'a>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            resource: &'a R,
+            context: &'a C,
+        ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>>;
+
+        fn evaluate_access_batch<'a>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            items: &'a [PolicyBatchItem<'a, R, C>],
+        ) -> Pin<Box<dyn Future<Output = Vec<PolicyEvalResult>> + Send + 'a>>;
+    }
+
+    impl<T, S, R, A, C> TestPolicyExt<S, R, A, C> for T
+    where
+        T: Policy<S, R, A, C>,
+        S: Send + Sync,
+        R: Send + Sync,
+        A: Send + Sync,
+        C: Send + Sync,
+    {
+        fn evaluate_access<'a>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            resource: &'a R,
+            context: &'a C,
+        ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
+            Box::pin(async move {
+                let session = EvaluationSession::new();
+                let ctx = EvalCtx {
+                    session: &session,
+                    subject,
+                    action,
+                    resource,
+                    context,
+                };
+                self.evaluate(&ctx).await
+            })
+        }
+
+        fn evaluate_access_batch<'a>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            items: &'a [PolicyBatchItem<'a, R, C>],
+        ) -> Pin<Box<dyn Future<Output = Vec<PolicyEvalResult>> + Send + 'a>> {
+            Box::pin(async move {
+                let session = EvaluationSession::new();
+                let ctx = BatchEvalCtx {
+                    session: &session,
+                    subject,
+                    action,
+                    items,
+                };
+                self.evaluate_batch(&ctx).await
+            })
+        }
+    }
+
+    trait TestCheckerExt<S, R, A, C>
+    where
+        S: Sync,
+        R: Sync,
+        A: Sync,
+        C: Sync,
+    {
+        fn evaluate_access<'a>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            resource: &'a R,
+            context: &'a C,
+        ) -> Pin<Box<dyn Future<Output = AccessEvaluation> + Send + 'a>>;
+
+        fn evaluate_batch_by<'a, I, F>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            items: I,
+            parts: F,
+        ) -> Pin<Box<dyn Future<Output = Vec<(I::Item, AccessEvaluation)>> + Send + 'a>>
+        where
+            I: IntoIterator + Send + 'a,
+            I::Item: Send + 'a,
+            F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C) + Send + 'a;
+
+        fn filter_authorized_by<'a, I, F>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            items: I,
+            parts: F,
+        ) -> Pin<Box<dyn Future<Output = Vec<I::Item>> + Send + 'a>>
+        where
+            I: IntoIterator + Send + 'a,
+            I::Item: Send + 'a,
+            F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C) + Send + 'a;
+    }
+
+    impl<S, R, A, C> TestCheckerExt<S, R, A, C> for PermissionChecker<S, R, A, C>
+    where
+        S: Sync,
+        R: Sync,
+        A: Sync,
+        C: Sync,
+    {
+        fn evaluate_access<'a>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            resource: &'a R,
+            context: &'a C,
+        ) -> Pin<Box<dyn Future<Output = AccessEvaluation> + Send + 'a>> {
+            Box::pin(async move {
+                let session = EvaluationSession::empty();
+                self.evaluate_in_session(&session, subject, action, resource, context)
+                    .await
+            })
+        }
+
+        fn evaluate_batch_by<'a, I, F>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            items: I,
+            parts: F,
+        ) -> Pin<Box<dyn Future<Output = Vec<(I::Item, AccessEvaluation)>> + Send + 'a>>
+        where
+            I: IntoIterator + Send + 'a,
+            I::Item: Send + 'a,
+            F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C) + Send + 'a,
+        {
+            Box::pin(async move {
+                let session = EvaluationSession::empty();
+                self.evaluate_batch_in_session_by(&session, subject, action, items, parts)
+                    .await
+            })
+        }
+
+        fn filter_authorized_by<'a, I, F>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            items: I,
+            parts: F,
+        ) -> Pin<Box<dyn Future<Output = Vec<I::Item>> + Send + 'a>>
+        where
+            I: IntoIterator + Send + 'a,
+            I::Item: Send + 'a,
+            F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C) + Send + 'a,
+        {
+            Box::pin(async move {
+                let session = EvaluationSession::empty();
+                self.filter_authorized_in_session_by(&session, subject, action, items, parts)
+                    .await
+            })
+        }
+    }
     // Dummy resource/action/context types for testing
     #[derive(Debug, Clone)]
     pub struct TestSubject {
@@ -1857,21 +3679,18 @@ mod tests {
 
     #[async_trait]
     impl Policy<TestSubject, TestResource, TestAction, TestContext> for AlwaysAllowPolicy {
-        async fn evaluate_access(
+        async fn evaluate(
             &self,
-            _subject: &TestSubject,
-            _action: &TestAction,
-            _resource: &TestResource,
-            _context: &TestContext,
+            _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
             PolicyEvalResult::Granted {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: Some("Always allow policy".to_string()),
             }
         }
 
-        fn policy_type(&self) -> String {
-            "AlwaysAllowPolicy".to_string()
+        fn policy_type(&self) -> &str {
+            "AlwaysAllowPolicy"
         }
     }
 
@@ -1880,21 +3699,100 @@ mod tests {
 
     #[async_trait]
     impl Policy<TestSubject, TestResource, TestAction, TestContext> for AlwaysDenyPolicy {
-        async fn evaluate_access(
+        async fn evaluate(
             &self,
-            _subject: &TestSubject,
-            _action: &TestAction,
-            _resource: &TestResource,
-            _context: &TestContext,
+            _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
             PolicyEvalResult::Denied {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: self.0.to_string(),
             }
         }
 
-        fn policy_type(&self) -> String {
-            "AlwaysDenyPolicy".to_string()
+        fn policy_type(&self) -> &str {
+            "AlwaysDenyPolicy"
+        }
+    }
+
+    struct EvenResourceBatchPolicy {
+        batch_calls: Arc<AtomicUsize>,
+        single_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Policy<TestSubject, TestResource, TestAction, TestContext> for EvenResourceBatchPolicy {
+        async fn evaluate(
+            &self,
+            ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
+        ) -> PolicyEvalResult {
+            self.single_calls.fetch_add(1, Ordering::SeqCst);
+            if ctx.resource.id.as_u128().is_multiple_of(2) {
+                PolicyEvalResult::Granted {
+                    policy_type: self.policy_type().to_string(),
+                    reason: Some("even resource".to_string()),
+                }
+            } else {
+                PolicyEvalResult::Denied {
+                    policy_type: self.policy_type().to_string(),
+                    reason: "odd resource".to_string(),
+                }
+            }
+        }
+
+        async fn evaluate_batch<'item>(
+            &self,
+            ctx: &BatchEvalCtx<'item, TestSubject, TestResource, TestAction, TestContext>,
+        ) -> Vec<PolicyEvalResult> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            let mut results = Vec::with_capacity(ctx.items.len());
+            for item in ctx.items {
+                let item_ctx = EvalCtx {
+                    session: ctx.session,
+                    subject: ctx.subject,
+                    action: ctx.action,
+                    resource: item.resource,
+                    context: item.context,
+                };
+                results.push(self.evaluate(&item_ctx).await);
+            }
+            results
+        }
+
+        fn policy_type(&self) -> &str {
+            "EvenResourceBatchPolicy"
+        }
+    }
+
+    struct MismatchedBatchPolicy;
+
+    #[async_trait]
+    impl Policy<TestSubject, TestResource, TestAction, TestContext> for MismatchedBatchPolicy {
+        async fn evaluate(
+            &self,
+            _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
+        ) -> PolicyEvalResult {
+            PolicyEvalResult::Granted {
+                policy_type: self.policy_type().to_string(),
+                reason: Some("single item fallback".to_string()),
+            }
+        }
+
+        async fn evaluate_batch<'item>(
+            &self,
+            ctx: &BatchEvalCtx<'item, TestSubject, TestResource, TestAction, TestContext>,
+        ) -> Vec<PolicyEvalResult> {
+            ctx.items
+                .iter()
+                .skip(1)
+                .map(|_| PolicyEvalResult::Granted {
+                    policy_type: self.policy_type().to_string(),
+                    reason: Some("wrong batch length".to_string()),
+                })
+                .collect()
+        }
+
+        fn policy_type(&self) -> &str {
+            "MismatchedBatchPolicy"
         }
     }
 
@@ -1902,21 +3800,18 @@ mod tests {
 
     #[async_trait]
     impl Policy<TestSubject, TestResource, TestAction, TestContext> for CustomMetadataDenyPolicy {
-        async fn evaluate_access(
+        async fn evaluate(
             &self,
-            _subject: &TestSubject,
-            _action: &TestAction,
-            _resource: &TestResource,
-            _context: &TestContext,
+            _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
             PolicyEvalResult::Denied {
-                policy_type: self.policy_type(),
+                policy_type: self.policy_type().to_string(),
                 reason: "Blocked by custom rule".to_string(),
             }
         }
 
-        fn policy_type(&self) -> String {
-            "CustomMetadataDenyPolicy".to_string()
+        fn policy_type(&self) -> &str {
+            "CustomMetadataDenyPolicy"
         }
 
         fn security_rule(&self) -> SecurityRuleMetadata {
@@ -1953,6 +3848,424 @@ mod tests {
             }
             _ => panic!("Expected Denied(No policies configured), got {:?}", result),
         }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_batch_by_matches_single_item_loop() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..8)
+            .map(|value| TestResource {
+                id: uuid::Uuid::from_u128(value),
+            })
+            .collect::<Vec<_>>();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        });
+
+        let mut loop_results = Vec::new();
+        for resource in &resources {
+            loop_results.push(
+                checker
+                    .evaluate_access(&subject, &TestAction, resource, &TestContext)
+                    .await
+                    .is_granted(),
+            );
+        }
+
+        let batch_items = resources
+            .clone()
+            .into_iter()
+            .map(|resource| (resource, TestContext))
+            .collect::<Vec<_>>();
+        let batch_results = checker
+            .evaluate_batch_by(&subject, &TestAction, batch_items, |item| {
+                (&item.0, &item.1)
+            })
+            .await
+            .into_iter()
+            .map(|(_item, evaluation)| evaluation.is_granted())
+            .collect::<Vec<_>>();
+
+        assert_eq!(loop_results, batch_results);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 16);
+    }
+
+    #[tokio::test]
+    async fn test_filter_authorized_by_preserves_authorized_items_in_order() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = vec![
+            TestResource {
+                id: uuid::Uuid::from_u128(3),
+            },
+            TestResource {
+                id: uuid::Uuid::from_u128(2),
+            },
+            TestResource {
+                id: uuid::Uuid::from_u128(4),
+            },
+            TestResource {
+                id: uuid::Uuid::from_u128(5),
+            },
+        ];
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(EvenResourceBatchPolicy {
+            batch_calls,
+            single_calls,
+        });
+
+        let batch_items = resources
+            .into_iter()
+            .map(|resource| (resource, TestContext))
+            .collect::<Vec<_>>();
+        let authorized = checker
+            .filter_authorized_by(&subject, &TestAction, batch_items, |item| {
+                (&item.0, &item.1)
+            })
+            .await;
+
+        assert_eq!(
+            authorized
+                .into_iter()
+                .map(|(resource, _context)| resource.id.as_u128())
+                .collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_batch_by_respects_max_batch_size() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..8)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut checker =
+            PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(3).unwrap());
+        checker.add_policy(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        });
+
+        let results = checker
+            .filter_authorized_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|(resource, _context)| resource.id.as_u128())
+                .collect::<Vec<_>>(),
+            vec![0, 2, 4, 6]
+        );
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_batch_by_invokes_parts_once_per_item() {
+        let parts_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..4)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("first denial"));
+        checker.add_policy(AlwaysDenyPolicy("second denial"));
+
+        let results = checker
+            .evaluate_batch_by(&subject, &TestAction, resources, |item| {
+                parts_calls.fetch_add(1, Ordering::SeqCst);
+                (&item.0, &item.1)
+            })
+            .await;
+
+        assert_eq!(results.len(), 4);
+        assert!(results
+            .iter()
+            .all(|(_item, evaluation)| !evaluation.is_granted()));
+        assert_eq!(parts_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_batch_by_fails_closed_on_policy_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..3)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(MismatchedBatchPolicy);
+        checker.add_policy(AlwaysAllowPolicy);
+
+        let results = checker
+            .evaluate_batch_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(results.len(), 3);
+        for (_item, evaluation) in results {
+            assert!(!evaluation.is_granted());
+            match evaluation {
+                AccessEvaluation::Denied { reason, trace } => {
+                    assert_eq!(
+                        reason,
+                        "Policy batch result count did not match input count"
+                    );
+                    assert!(trace.format().contains("MismatchedBatchPolicy"));
+                }
+                AccessEvaluation::Granted { .. } => {
+                    panic!("mismatched batch result should fail closed");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_and_policy_batch_uses_inner_batch_hook() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..4)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
+            Arc::new(EvenResourceBatchPolicy {
+                batch_calls: Arc::clone(&batch_calls),
+                single_calls: Arc::clone(&single_calls),
+            });
+        let policy = AndPolicy::try_new(vec![inner]).unwrap();
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(policy);
+
+        let authorized = checker
+            .filter_authorized_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(authorized.len(), 2);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_and_policy_batch_fails_closed_on_inner_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let owned_items = (0..2)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
+            Arc::new(MismatchedBatchPolicy);
+        let policy = AndPolicy::try_new(vec![inner]).unwrap();
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| !result.is_granted()));
+        assert!(results
+            .iter()
+            .all(|result| result.format(0).contains("MismatchedBatchPolicy")));
+    }
+
+    #[tokio::test]
+    async fn test_or_policy_batch_uses_inner_batch_hook() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..4)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
+            Arc::new(EvenResourceBatchPolicy {
+                batch_calls: Arc::clone(&batch_calls),
+                single_calls: Arc::clone(&single_calls),
+            });
+        let policy = OrPolicy::try_new(vec![inner]).unwrap();
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(policy);
+
+        let authorized = checker
+            .filter_authorized_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(authorized.len(), 2);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_or_policy_batch_fails_closed_on_inner_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let owned_items = (0..2)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
+            Arc::new(MismatchedBatchPolicy);
+        let policy = OrPolicy::try_new(vec![inner]).unwrap();
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| !result.is_granted()));
+        assert!(results
+            .iter()
+            .all(|result| result.format(0).contains("MismatchedBatchPolicy")));
+    }
+
+    #[tokio::test]
+    async fn test_not_policy_batch_uses_inner_batch_hook() {
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resources = (0..4)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let policy = NotPolicy::new(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        });
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(policy);
+
+        let authorized = checker
+            .filter_authorized_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
+            .await;
+
+        assert_eq!(authorized.len(), 2);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(single_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_not_policy_batch_fails_closed_on_inner_length_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let owned_items = (0..2)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let policy = NotPolicy::new(MismatchedBatchPolicy);
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| !result.is_granted()));
+        assert!(results.iter().all(|result| {
+            result
+                .reason()
+                .as_deref()
+                .is_some_and(|reason| reason.contains("batch result count"))
+        }));
     }
 
     #[tokio::test]
@@ -2252,33 +4565,112 @@ mod tests {
         }
     }
 
-    // RebacPolicy tests with a dummy resolver.
+    // RebacPolicy tests with fact-backed relationship sources.
 
-    /// In-memory relationship resolver for testing.
-    /// It holds a vector of tuples (subject_id, resource_id, relationship)
-    /// to represent existing relationships.
-    pub struct DummyRelationshipResolver {
-        relationships: Vec<(uuid::Uuid, uuid::Uuid, String)>,
-    }
-
-    impl DummyRelationshipResolver {
-        pub fn new(relationships: Vec<(uuid::Uuid, uuid::Uuid, String)>) -> Self {
-            Self { relationships }
-        }
+    struct TestRelationshipSource {
+        grants: HashSet<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>>,
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+        max_batch_size: Option<NonZeroUsize>,
     }
 
     #[async_trait]
-    impl RelationshipResolver<TestSubject, TestResource, String> for DummyRelationshipResolver {
-        async fn has_relationship(
+    impl FactSource<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>> for TestRelationshipSource {
+        async fn load_many(
             &self,
-            subject: &TestSubject,
-            resource: &TestResource,
-            relationship: &String,
-        ) -> bool {
-            self.relationships
-                .iter()
-                .any(|(s, r, rel)| s == &subject.id && r == &resource.id && rel == relationship)
+            keys: &[RelationshipQuery<uuid::Uuid, uuid::Uuid, String>],
+        ) -> Vec<FactLoadResult<bool>> {
+            self.batch_sizes.lock().unwrap().push(keys.len());
+            keys.iter()
+                .map(|key| FactLoadResult::Found(self.grants.contains(key)))
+                .collect()
         }
+
+        fn max_batch_size(&self) -> Option<NonZeroUsize> {
+            self.max_batch_size
+        }
+    }
+
+    struct MismatchedRelationshipSource;
+
+    #[async_trait]
+    impl FactSource<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>>
+        for MismatchedRelationshipSource
+    {
+        async fn load_many(
+            &self,
+            keys: &[RelationshipQuery<uuid::Uuid, uuid::Uuid, String>],
+        ) -> Vec<FactLoadResult<bool>> {
+            keys.iter()
+                .skip(1)
+                .map(|_| FactLoadResult::Found(true))
+                .collect()
+        }
+    }
+
+    struct MissingRelationshipSource;
+
+    #[async_trait]
+    impl FactSource<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>> for MissingRelationshipSource {
+        async fn load_many(
+            &self,
+            keys: &[RelationshipQuery<uuid::Uuid, uuid::Uuid, String>],
+        ) -> Vec<FactLoadResult<bool>> {
+            keys.iter().map(|_| FactLoadResult::Missing).collect()
+        }
+    }
+
+    struct ErrorRelationshipSource;
+
+    #[async_trait]
+    impl FactSource<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>> for ErrorRelationshipSource {
+        async fn load_many(
+            &self,
+            keys: &[RelationshipQuery<uuid::Uuid, uuid::Uuid, String>],
+        ) -> Vec<FactLoadResult<bool>> {
+            keys.iter()
+                .map(|_| {
+                    FactLoadResult::Error(FactLoadError::backend_message("database unavailable"))
+                })
+                .collect()
+        }
+    }
+
+    struct BlockingRelationshipSource {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl FactSource<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>> for BlockingRelationshipSource {
+        async fn load_many(
+            &self,
+            keys: &[RelationshipQuery<uuid::Uuid, uuid::Uuid, String>],
+        ) -> Vec<FactLoadResult<bool>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(keys.len(), 1);
+            self.started.notify_one();
+            self.release.notified().await;
+            keys.iter().map(|_| FactLoadResult::Found(true)).collect()
+        }
+    }
+
+    fn relationship_policy(
+        relationship: String,
+    ) -> RebacPolicy<
+        TestSubject,
+        TestResource,
+        TestAction,
+        TestContext,
+        uuid::Uuid,
+        uuid::Uuid,
+        String,
+    > {
+        RebacPolicy::new(
+            |subject: &TestSubject| subject.id,
+            |resource: &TestResource| resource.id,
+            relationship,
+        )
     }
 
     #[tokio::test]
@@ -2286,60 +4678,213 @@ mod tests {
         let subject_id = uuid::Uuid::new_v4();
         let resource_id = uuid::Uuid::new_v4();
         let relationship = "manager".to_string();
-
         let subject = TestSubject { id: subject_id };
         let resource = TestResource { id: resource_id };
-
-        // Create a dummy resolver that knows the subject is a manager of the resource.
-        let resolver =
-            DummyRelationshipResolver::new(vec![(subject_id, resource_id, relationship.clone())]);
-
-        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
-            relationship,
-            resolver,
+        let session = EvaluationSession::new();
+        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+            TestRelationshipSource {
+                grants: HashSet::from([RelationshipQuery {
+                    subject_id,
+                    resource_id,
+                    relation: relationship.clone(),
+                }]),
+                batch_sizes: Arc::new(Mutex::new(Vec::new())),
+                max_batch_size: None,
+            },
         );
+        let policy = relationship_policy(relationship);
 
-        // Action and context are not used by RebacPolicy, so we pass dummy values.
-        let result = policy
-            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
-            .await;
+        let ctx = EvalCtx {
+            session: &session,
+            subject: &subject,
+            action: &TestAction,
+            resource: &resource,
+            context: &TestContext,
+        };
+        let result = policy.evaluate(&ctx).await;
 
-        assert!(
-            result.is_granted(),
-            "Access should be allowed if relationship exists"
-        );
+        assert!(result.is_granted());
     }
 
     #[tokio::test]
-    async fn test_rebac_policy_denies_when_relationship_missing() {
-        let subject_id = uuid::Uuid::new_v4();
-        let resource_id = uuid::Uuid::new_v4();
-        let relationship = "manager".to_string();
+    async fn test_rebac_policy_denies_without_registered_source() {
+        let policy = relationship_policy("manager".to_string());
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+        let session = EvaluationSession::new();
+        let ctx = EvalCtx {
+            session: &session,
+            subject: &subject,
+            action: &TestAction,
+            resource: &resource,
+            context: &TestContext,
+        };
 
-        let subject = TestSubject { id: subject_id };
-        let resource = TestResource { id: resource_id };
+        let result = policy.evaluate(&ctx).await;
 
-        // Create a dummy resolver with no relationships.
-        let resolver = DummyRelationshipResolver::new(vec![]);
+        assert!(!result.is_granted());
+        assert!(result
+            .reason()
+            .as_deref()
+            .is_some_and(|reason| reason.contains("No fact source registered")));
+    }
 
-        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
-            relationship,
-            resolver,
+    #[tokio::test]
+    async fn test_rebac_policy_batch_uses_session_dedup_and_source_chunking() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let relationship = "viewer".to_string();
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let resources = (0..5)
+            .map(|value| TestResource {
+                id: uuid::Uuid::from_u128(value),
+            })
+            .collect::<Vec<_>>();
+        let grants = resources
+            .iter()
+            .filter(|resource| resource.id.as_u128().is_multiple_of(2))
+            .map(|resource| RelationshipQuery {
+                subject_id: subject.id,
+                resource_id: resource.id,
+                relation: relationship.clone(),
+            })
+            .collect::<HashSet<_>>();
+        let session = EvaluationSession::new();
+        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+            TestRelationshipSource {
+                grants,
+                batch_sizes: Arc::clone(&batch_sizes),
+                max_batch_size: NonZeroUsize::new(2),
+            },
+        );
+        let owned_items = [
+            (resources[0].clone(), TestContext),
+            (resources[1].clone(), TestContext),
+            (resources[0].clone(), TestContext),
+            (resources[2].clone(), TestContext),
+            (resources[3].clone(), TestContext),
+        ];
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let policy = relationship_policy(relationship);
+        let ctx = BatchEvalCtx {
+            session: &session,
+            subject: &subject,
+            action: &TestAction,
+            items: &batch_items,
+        };
+
+        let results = policy.evaluate_batch(&ctx).await;
+
+        assert_eq!(*batch_sizes.lock().unwrap(), vec![2, 2]);
+        assert_eq!(
+            results
+                .iter()
+                .map(PolicyEvalResult::is_granted)
+                .collect::<Vec<_>>(),
+            vec![true, false, true, true, false]
         );
 
-        let result = policy
-            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
-            .await;
-        // Check access is denied
-        assert!(
-            !result.is_granted(),
-            "Access should be denied if relationship does not exist"
+        let _ = policy.evaluate_batch(&ctx).await;
+        assert_eq!(*batch_sizes.lock().unwrap(), vec![2, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_session_joins_concurrent_get_for_in_flight_key() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let session = EvaluationSession::new();
+        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+            BlockingRelationshipSource {
+                calls: Arc::clone(&calls),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            },
         );
+        let key = RelationshipQuery {
+            subject_id: uuid::Uuid::new_v4(),
+            resource_id: uuid::Uuid::new_v4(),
+            relation: "viewer".to_string(),
+        };
+
+        let first_session = session.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move { first_session.get(first_key).await });
+
+        started.notified().await;
+
+        let second_session = session.clone();
+        let second = tokio::spawn(async move { second_session.get(key).await });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release.notify_one();
+        for result in [first.await.unwrap(), second.await.unwrap()] {
+            assert!(matches!(result, FactLoadResult::Found(true)));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rebac_policy_fails_closed_on_missing_error_and_mismatch() {
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+        let policy = relationship_policy("viewer".to_string());
+
+        for (session, expected_reason) in [
+            {
+                let session = EvaluationSession::new();
+                session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+                    MissingRelationshipSource,
+                );
+                (session, "fact is missing")
+            },
+            {
+                let session = EvaluationSession::new();
+                session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+                    ErrorRelationshipSource,
+                );
+                (session, "database unavailable")
+            },
+            {
+                let session = EvaluationSession::new();
+                session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+                    MismatchedRelationshipSource,
+                );
+                (session, "returned")
+            },
+        ] {
+            let ctx = EvalCtx {
+                session: &session,
+                subject: &subject,
+                action: &TestAction,
+                resource: &resource,
+                context: &TestContext,
+            };
+            let result = policy.evaluate(&ctx).await;
+            assert!(!result.is_granted());
+            assert!(result
+                .reason()
+                .as_deref()
+                .is_some_and(|reason| reason.contains(expected_reason)));
+        }
     }
 
     // RebacPolicy test with enum relationship type.
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     enum TestRelation {
         Manager,
         Viewer,
@@ -2354,21 +4899,21 @@ mod tests {
         }
     }
 
-    struct EnumRelationshipResolver {
-        relationships: Vec<(uuid::Uuid, uuid::Uuid, TestRelation)>,
+    struct EnumRelationshipSource {
+        grants: HashSet<RelationshipQuery<uuid::Uuid, uuid::Uuid, TestRelation>>,
     }
 
     #[async_trait]
-    impl RelationshipResolver<TestSubject, TestResource, TestRelation> for EnumRelationshipResolver {
-        async fn has_relationship(
+    impl FactSource<RelationshipQuery<uuid::Uuid, uuid::Uuid, TestRelation>>
+        for EnumRelationshipSource
+    {
+        async fn load_many(
             &self,
-            subject: &TestSubject,
-            resource: &TestResource,
-            relationship: &TestRelation,
-        ) -> bool {
-            self.relationships
-                .iter()
-                .any(|(s, r, rel)| s == &subject.id && r == &resource.id && rel == relationship)
+            keys: &[RelationshipQuery<uuid::Uuid, uuid::Uuid, TestRelation>],
+        ) -> Vec<FactLoadResult<bool>> {
+            keys.iter()
+                .map(|key| FactLoadResult::Found(self.grants.contains(key)))
+                .collect()
         }
     }
 
@@ -2380,37 +4925,43 @@ mod tests {
         let subject = TestSubject { id: subject_id };
         let resource = TestResource { id: resource_id };
 
-        let resolver = EnumRelationshipResolver {
-            relationships: vec![(subject_id, resource_id, TestRelation::Manager)],
-        };
+        let session = EvaluationSession::new();
+        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, TestRelation>, _>(
+            EnumRelationshipSource {
+                grants: HashSet::from([RelationshipQuery {
+                    subject_id,
+                    resource_id,
+                    relation: TestRelation::Manager,
+                }]),
+            },
+        );
 
-        let policy = RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
+        let policy = RebacPolicy::new(
+            |subject: &TestSubject| subject.id,
+            |resource: &TestResource| resource.id,
             TestRelation::Manager,
-            resolver,
         );
 
         // Manager relationship exists — should be granted.
-        let result = policy
-            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
-            .await;
+        let ctx = EvalCtx {
+            session: &session,
+            subject: &subject,
+            action: &TestAction,
+            resource: &resource,
+            context: &TestContext,
+        };
+        let result = policy.evaluate(&ctx).await;
         assert!(
             result.is_granted(),
             "Access should be granted for matching enum relationship"
         );
 
-        // Viewer policy with same resolver (no viewer relationship) — should be denied.
-        let resolver = EnumRelationshipResolver {
-            relationships: vec![(subject_id, resource_id, TestRelation::Manager)],
-        };
-        let viewer_policy =
-            RebacPolicy::<TestSubject, TestResource, TestAction, TestContext, _, _>::new(
-                TestRelation::Viewer,
-                resolver,
-            );
-
-        let result = viewer_policy
-            .evaluate_access(&subject, &TestAction, &resource, &TestContext)
-            .await;
+        let viewer_policy = RebacPolicy::new(
+            |subject: &TestSubject| subject.id,
+            |resource: &TestResource| resource.id,
+            TestRelation::Viewer,
+        );
+        let result = viewer_policy.evaluate(&ctx).await;
         assert!(
             !result.is_granted(),
             "Access should be denied when enum relationship does not match"
@@ -2632,28 +5183,25 @@ mod tests {
 
     #[async_trait]
     impl Policy<TestSubject, TestResource, TestAction, FeatureFlagContext> for FeatureFlagPolicy {
-        async fn evaluate_access(
+        async fn evaluate(
             &self,
-            _subject: &TestSubject,
-            _action: &TestAction,
-            _resource: &TestResource,
-            context: &FeatureFlagContext,
+            ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, FeatureFlagContext>,
         ) -> PolicyEvalResult {
-            if context.feature_enabled {
+            if ctx.context.feature_enabled {
                 PolicyEvalResult::Granted {
-                    policy_type: self.policy_type(),
+                    policy_type: self.policy_type().to_string(),
                     reason: Some("Feature flag enabled".to_string()),
                 }
             } else {
                 PolicyEvalResult::Denied {
-                    policy_type: self.policy_type(),
+                    policy_type: self.policy_type().to_string(),
                     reason: "Feature flag disabled".to_string(),
                 }
             }
         }
 
-        fn policy_type(&self) -> String {
-            "FeatureFlagPolicy".to_string()
+        fn policy_type(&self) -> &str {
+            "FeatureFlagPolicy"
         }
     }
 
@@ -2811,15 +5359,15 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult =
-            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-                &policy,
-                &admin_user,
-                &TestAction,
-                &resource,
-                &TestContext,
-            )
-            .await;
+        let result: PolicyEvalResult = TestPolicyExt::<
+            RbacUser,
+            TestResource,
+            TestAction,
+            TestContext,
+        >::evaluate_access(
+            &policy, &admin_user, &TestAction, &resource, &TestContext
+        )
+        .await;
 
         assert!(
             result.is_granted(),
@@ -2854,7 +5402,7 @@ mod tests {
         };
 
         let result: PolicyEvalResult =
-            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+            TestPolicyExt::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
                 &policy,
                 &regular_user,
                 &TestAction,
@@ -2904,15 +5452,15 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult =
-            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-                &policy,
-                &user,
-                &TestAction,
-                &resource,
-                &TestContext,
-            )
-            .await;
+        let result: PolicyEvalResult = TestPolicyExt::<
+            RbacUser,
+            TestResource,
+            TestAction,
+            TestContext,
+        >::evaluate_access(
+            &policy, &user, &TestAction, &resource, &TestContext
+        )
+        .await;
 
         assert!(
             result.is_granted(),
@@ -2940,7 +5488,7 @@ mod tests {
         };
 
         let result: PolicyEvalResult =
-            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+            TestPolicyExt::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
                 &policy,
                 &user_no_roles,
                 &TestAction,
@@ -2974,15 +5522,15 @@ mod tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult =
-            Policy::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-                &policy,
-                &user,
-                &TestAction,
-                &resource,
-                &TestContext,
-            )
-            .await;
+        let result: PolicyEvalResult = TestPolicyExt::<
+            RbacUser,
+            TestResource,
+            TestAction,
+            TestContext,
+        >::evaluate_access(
+            &policy, &user, &TestAction, &resource, &TestContext
+        )
+        .await;
 
         // With empty required roles, no role can match, so access is denied
         assert!(
@@ -3006,30 +5554,27 @@ mod tests {
 
         #[async_trait]
         impl Policy<TestSubject, TestResource, TestAction, TestContext> for CountingPolicy {
-            async fn evaluate_access(
+            async fn evaluate(
                 &self,
-                _subject: &TestSubject,
-                _action: &TestAction,
-                _resource: &TestResource,
-                _context: &TestContext,
+                _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
             ) -> PolicyEvalResult {
                 self.counter.fetch_add(1, Ordering::SeqCst);
 
                 if self.result {
                     PolicyEvalResult::Granted {
-                        policy_type: self.policy_type(),
+                        policy_type: self.policy_type().to_string(),
                         reason: Some("Counting policy granted".to_string()),
                     }
                 } else {
                     PolicyEvalResult::Denied {
-                        policy_type: self.policy_type(),
+                        policy_type: self.policy_type().to_string(),
                         reason: "Counting policy denied".to_string(),
                     }
                 }
             }
 
-            fn policy_type(&self) -> String {
-                "CountingPolicy".to_string()
+            fn policy_type(&self) -> &str {
+                "CountingPolicy"
             }
         }
 
@@ -3490,7 +6035,53 @@ mod tests {
 #[cfg(test)]
 mod policy_builder_tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
     use uuid::Uuid;
+
+    trait PolicyBoxExt<S, R, A, C>
+    where
+        S: Send + Sync,
+        R: Send + Sync,
+        A: Send + Sync,
+        C: Send + Sync,
+    {
+        fn evaluate_access<'a>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            resource: &'a R,
+            context: &'a C,
+        ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>>;
+    }
+
+    impl<S, R, A, C> PolicyBoxExt<S, R, A, C> for Box<dyn Policy<S, R, A, C>>
+    where
+        S: Send + Sync,
+        R: Send + Sync,
+        A: Send + Sync,
+        C: Send + Sync,
+    {
+        fn evaluate_access<'a>(
+            &'a self,
+            subject: &'a S,
+            action: &'a A,
+            resource: &'a R,
+            context: &'a C,
+        ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
+            Box::pin(async move {
+                let session = EvaluationSession::new();
+                let ctx = EvalCtx {
+                    session: &session,
+                    subject,
+                    action,
+                    resource,
+                    context,
+                };
+                self.evaluate(&ctx).await
+            })
+        }
+    }
 
     // Define simple test types
     #[derive(Debug, Clone)]
@@ -3612,8 +6203,10 @@ mod policy_builder_tests {
         checker.add_policy(deny_policy);
         checker.add_policy(allow_policy);
 
+        let session = EvaluationSession::empty();
         let result = checker
-            .evaluate_access(
+            .evaluate_in_session(
+                &session,
                 &TestSubject {
                     name: "Alice".into(),
                 },

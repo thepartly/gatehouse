@@ -1,9 +1,9 @@
 //! # Relationship-Based Access Control Policy Example
 //!
-//! This example demonstrates how to use the built-in ReBAC policy
-//! for relationship-based permissions management, including how resolver
-//! failures such as database errors or timeouts must be flattened into
-//! denial because `RelationshipResolver` returns `bool`.
+//! This example demonstrates ReBAC in the v0.3 shape: `RebacPolicy` extracts
+//! flat IDs and loads relationship facts through a request-scoped
+//! `EvaluationSession`. Relationship store failures are returned as
+//! `FactLoadResult::Error` and fail closed to denial.
 //!
 //! To run this example:
 //! ```
@@ -12,11 +12,10 @@
 
 use async_trait::async_trait;
 use gatehouse::*;
+use std::collections::HashSet;
 use std::fmt;
-use std::time::Duration;
 use uuid::Uuid;
 
-// Define types for our permission system
 #[derive(Debug, Clone)]
 struct User {
     id: Uuid,
@@ -35,75 +34,48 @@ struct EditAction;
 #[derive(Debug, Clone)]
 struct EmptyContext;
 
-// A relationship resolver that simulates database access
-// and can demonstrate different error conditions
 #[derive(Debug, Clone)]
-struct ProjectRelationshipResolver {
-    // Simulate a database of relationships: (user_id, project_id, relationship_type)
-    relationships: Vec<(Uuid, Uuid, String)>,
-    // Flag to simulate a database error
-    simulate_error: bool,
-    // Flag to simulate a timeout
-    simulate_timeout: bool,
+struct ProjectRelationshipSource {
+    relationships: HashSet<RelationshipQuery<Uuid, Uuid, String>>,
+    fail: bool,
 }
 
-impl ProjectRelationshipResolver {
-    fn new(relationships: Vec<(Uuid, Uuid, String)>) -> Self {
+impl ProjectRelationshipSource {
+    fn new(relationships: HashSet<RelationshipQuery<Uuid, Uuid, String>>) -> Self {
         Self {
             relationships,
-            simulate_error: false,
-            simulate_timeout: false,
+            fail: false,
         }
     }
 
     fn with_error(mut self) -> Self {
-        self.simulate_error = true;
-        self
-    }
-
-    fn with_timeout(mut self) -> Self {
-        self.simulate_timeout = true;
+        self.fail = true;
         self
     }
 }
 
 #[async_trait]
-impl RelationshipResolver<User, Project, String> for ProjectRelationshipResolver {
-    async fn has_relationship(
+impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for ProjectRelationshipSource {
+    async fn load_many(
         &self,
-        user: &User,
-        project: &Project,
-        relationship: &String,
-    ) -> bool {
-        println!(
-            "Checking if user {} has '{}' relationship with project {}",
-            user.name, relationship, project.name
-        );
+        keys: &[RelationshipQuery<Uuid, Uuid, String>],
+    ) -> Vec<FactLoadResult<bool>> {
+        keys.iter()
+            .map(|key| {
+                println!(
+                    "Loading relationship fact: subject={} relation={} resource={}",
+                    key.subject_id, key.relation, key.resource_id
+                );
 
-        // Simulate a database error
-        if self.simulate_error {
-            println!("⚠️  Database error while checking relationship!");
-            return false; // Return false on error
-        }
-
-        // Simulate a timeout
-        if self.simulate_timeout {
-            println!("⏱️  Simulating database timeout (3 seconds)...");
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            println!("⚠️  Database timeout while checking relationship!");
-            return false; // Return false on timeout
-        }
-
-        // Normal processing - check if relationship exists
-        let has_rel = self.relationships.iter().any(|(user_id, project_id, rel)| {
-            *user_id == user.id && *project_id == project.id && rel == relationship
-        });
-
-        println!(
-            "Relationship check result: {}",
-            if has_rel { "EXISTS ✓" } else { "MISSING ✗" }
-        );
-        has_rel
+                if self.fail {
+                    FactLoadResult::Error(FactLoadError::backend_message(
+                        "simulated relationship store error",
+                    ))
+                } else {
+                    FactLoadResult::Found(self.relationships.contains(key))
+                }
+            })
+            .collect()
     }
 }
 
@@ -111,122 +83,81 @@ impl RelationshipResolver<User, Project, String> for ProjectRelationshipResolver
 async fn main() {
     println!("=== ReBAC Policy Example ===\n");
 
-    // Create some users
     let owner = User {
         id: Uuid::new_v4(),
         name: "Alice (Owner)".to_string(),
     };
-
     let contributor = User {
         id: Uuid::new_v4(),
         name: "Bob (Contributor)".to_string(),
     };
-
     let viewer = User {
         id: Uuid::new_v4(),
         name: "Charlie (Viewer)".to_string(),
     };
-
     let unauthorized = User {
         id: Uuid::new_v4(),
         name: "Dave (Unauthorized)".to_string(),
     };
-
-    println!("Users:");
-    println!("  Owner:        {}", owner.name);
-    println!("  Contributor:  {}", contributor.name);
-    println!("  Viewer:       {}", viewer.name);
-    println!("  Unauthorized: {}", unauthorized.name);
-    println!();
-
-    // Create a project
     let project = Project {
         id: Uuid::new_v4(),
         name: "Sample Project".to_string(),
     };
 
-    println!("Project:");
-    println!("  Name: {}", project.name);
-    println!("  ID:   {}", project.id);
-    println!();
+    let relationships = HashSet::from([
+        RelationshipQuery {
+            subject_id: owner.id,
+            resource_id: project.id,
+            relation: "owner".to_string(),
+        },
+        RelationshipQuery {
+            subject_id: contributor.id,
+            resource_id: project.id,
+            relation: "contributor".to_string(),
+        },
+        RelationshipQuery {
+            subject_id: viewer.id,
+            resource_id: project.id,
+            relation: "viewer".to_string(),
+        },
+    ]);
 
-    // Setup relationship database
-    let relationships = vec![
-        (owner.id, project.id, "owner".to_string()),
-        (contributor.id, project.id, "contributor".to_string()),
-        (viewer.id, project.id, "viewer".to_string()),
-    ];
+    let session = EvaluationSession::new();
+    session.register::<RelationshipQuery<Uuid, Uuid, String>, _>(ProjectRelationshipSource::new(
+        relationships.clone(),
+    ));
 
-    println!("=== Normal Relationship Resolution ===\n");
-
-    // Create resolver with normal operation
-    let normal_resolver = ProjectRelationshipResolver::new(relationships.clone());
-
-    // Create ReBAC policies for different relationships
-    let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
-        "owner".to_string(),
-        normal_resolver.clone(),
-    );
-
-    let contributor_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
-        "contributor".to_string(),
-        normal_resolver.clone(),
-    );
-
-    let _viewer_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, String, _>::new(
-        "viewer".to_string(),
-        normal_resolver,
-    );
-
-    // Create a permission checker with multiple policies
-    // Only owners and contributors can edit, not viewers
     let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
-    checker.add_policy(owner_policy);
-    checker.add_policy(contributor_policy);
+    checker.add_policy(RebacPolicy::new(
+        |user: &User| user.id,
+        |project: &Project| project.id,
+        "owner".to_string(),
+    ));
+    checker.add_policy(RebacPolicy::new(
+        |user: &User| user.id,
+        |project: &Project| project.id,
+        "contributor".to_string(),
+    ));
 
-    // Test normal access
     println!("Testing normal access patterns:");
-    test_access(&checker, &owner, &project).await;
-    test_access(&checker, &contributor, &project).await;
-    test_access(&checker, &viewer, &project).await;
-    test_access(&checker, &unauthorized, &project).await;
+    test_access(&checker, &session, &owner, &project).await;
+    test_access(&checker, &session, &contributor, &project).await;
+    test_access(&checker, &session, &viewer, &project).await;
+    test_access(&checker, &session, &unauthorized, &project).await;
 
-    println!("\n=== Error During Relationship Resolution ===\n");
-
-    // Create a resolver that simulates a database error
-    let error_resolver = ProjectRelationshipResolver::new(relationships.clone()).with_error();
-    let error_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
-        "owner".to_string(),
-        error_resolver,
+    println!("\n=== Error During Relationship Loading ===\n");
+    let error_session = EvaluationSession::new();
+    error_session.register::<RelationshipQuery<Uuid, Uuid, String>, _>(
+        ProjectRelationshipSource::new(relationships).with_error(),
     );
+    test_access(&checker, &error_session, &owner, &project).await;
 
-    let mut error_checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
-    error_checker.add_policy(error_policy);
-
-    println!("Testing with database error:");
-    test_access(&error_checker, &owner, &project).await;
-
-    println!("\n=== Timeout During Relationship Resolution ===\n");
-
-    // Create a resolver that simulates a timeout
-    let timeout_resolver = ProjectRelationshipResolver::new(relationships).with_timeout();
-    let timeout_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
-        "owner".to_string(),
-        timeout_resolver,
-    );
-
-    let mut timeout_checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
-    timeout_checker.add_policy(timeout_policy);
-
-    println!("Testing with database timeout:");
-    test_access(&timeout_checker, &owner, &project).await;
-
-    // Demonstrate enum-based relationships (type-safe alternative to strings)
     enum_relationship_example().await;
 }
 
 async fn test_access(
     checker: &PermissionChecker<User, Project, EditAction, EmptyContext>,
+    session: &EvaluationSession,
     user: &User,
     project: &Project,
 ) {
@@ -235,19 +166,18 @@ async fn test_access(
 
     println!("\nChecking if {} can edit {}:", user.name, project.name);
     let result = checker
-        .evaluate_access(user, &action, project, &context)
+        .evaluate_in_session(session, user, &action, project, &context)
         .await;
 
     println!(
         "Access {} for {}",
         if result.is_granted() {
-            "GRANTED ✓"
+            "GRANTED"
         } else {
-            "DENIED ✗"
+            "DENIED"
         },
         user.name
     );
-
     println!(
         "Evaluation trace:\n{}\n",
         match &result {
@@ -257,13 +187,7 @@ async fn test_access(
     );
 }
 
-// --- Enum-based relationship example ---
-//
-// The relationship type parameter is generic, so you can use enums instead
-// of strings for compile-time safety. A typo like "contibutor" becomes a
-// compile error rather than a silent permission failure.
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Relation {
     Owner,
     Contributor,
@@ -280,21 +204,19 @@ impl fmt::Display for Relation {
     }
 }
 
-struct EnumRelationshipResolver {
-    relationships: Vec<(Uuid, Uuid, Relation)>,
+struct EnumRelationshipSource {
+    relationships: HashSet<RelationshipQuery<Uuid, Uuid, Relation>>,
 }
 
 #[async_trait]
-impl RelationshipResolver<User, Project, Relation> for EnumRelationshipResolver {
-    async fn has_relationship(
+impl FactSource<RelationshipQuery<Uuid, Uuid, Relation>> for EnumRelationshipSource {
+    async fn load_many(
         &self,
-        user: &User,
-        project: &Project,
-        relationship: &Relation,
-    ) -> bool {
-        self.relationships
-            .iter()
-            .any(|(uid, pid, rel)| *uid == user.id && *pid == project.id && rel == relationship)
+        keys: &[RelationshipQuery<Uuid, Uuid, Relation>],
+    ) -> Vec<FactLoadResult<bool>> {
+        keys.iter()
+            .map(|key| FactLoadResult::Found(self.relationships.contains(key)))
+            .collect()
     }
 }
 
@@ -309,33 +231,42 @@ async fn enum_relationship_example() {
         id: Uuid::new_v4(),
         name: "Bob".to_string(),
     };
-
+    let charlie = User {
+        id: Uuid::new_v4(),
+        name: "Charlie".to_string(),
+    };
     let project = Project {
         id: Uuid::new_v4(),
         name: "Typed Project".to_string(),
     };
 
-    let charlie = User {
-        id: Uuid::new_v4(),
-        name: "Charlie".to_string(),
-    };
+    let session = EvaluationSession::new();
+    session.register::<RelationshipQuery<Uuid, Uuid, Relation>, _>(EnumRelationshipSource {
+        relationships: HashSet::from([
+            RelationshipQuery {
+                subject_id: alice.id,
+                resource_id: project.id,
+                relation: Relation::Owner,
+            },
+            RelationshipQuery {
+                subject_id: bob.id,
+                resource_id: project.id,
+                relation: Relation::Contributor,
+            },
+            RelationshipQuery {
+                subject_id: charlie.id,
+                resource_id: project.id,
+                relation: Relation::Viewer,
+            },
+        ]),
+    });
 
-    let resolver = EnumRelationshipResolver {
-        relationships: vec![
-            (alice.id, project.id, Relation::Owner),
-            (bob.id, project.id, Relation::Contributor),
-            (charlie.id, project.id, Relation::Viewer),
-        ],
-    };
-
-    // Only owners can edit — using an enum variant instead of a string.
-    let owner_policy = RebacPolicy::<User, Project, EditAction, EmptyContext, _, _>::new(
+    let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
+    checker.add_policy(RebacPolicy::new(
+        |user: &User| user.id,
+        |project: &Project| project.id,
         Relation::Owner,
-        resolver,
-    );
-
-    let mut checker = PermissionChecker::new();
-    checker.add_policy(owner_policy);
+    ));
 
     let context = EmptyContext;
     let action = EditAction;
@@ -346,23 +277,17 @@ async fn enum_relationship_example() {
         (&charlie, false, "viewer"),
     ] {
         let result = checker
-            .evaluate_access(user, &action, &project, &context)
+            .evaluate_in_session(&session, user, &action, &project, &context)
             .await;
-        let status = if result.is_granted() {
-            "GRANTED ✓"
-        } else {
-            "DENIED ✗"
-        };
         println!(
-            "{} ({}) edit access: {} (expected: {})",
+            "{} ({}) edit access: {}",
             user.name,
             role,
-            status,
-            if expected_granted {
-                "granted"
+            if result.is_granted() {
+                "GRANTED"
             } else {
-                "denied"
-            }
+                "DENIED"
+            },
         );
         assert_eq!(result.is_granted(), expected_granted);
     }

@@ -1,8 +1,8 @@
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     http::{Request, StatusCode},
     routing::{get, post},
-    Extension, Router,
+    Router,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -13,9 +13,8 @@ mod axum_example {
 }
 
 fn axum_app() -> Router {
-    let checker = axum_example::build_permission_checker();
-
     Router::new()
+        .route("/invoices", get(axum_example::list_invoices_handler))
         .route(
             "/invoices/{invoice_id}",
             get(axum_example::view_invoice_handler),
@@ -28,7 +27,7 @@ fn axum_app() -> Router {
             "/payments/{payment_id}/approve",
             post(axum_example::approve_payment_handler),
         )
-        .layer(Extension(checker))
+        .with_state(axum_example::AppState::demo())
 }
 
 #[tokio::test]
@@ -82,6 +81,53 @@ async fn view_invoice_handles_invalid_user_header() {
 
 fn owner_id() -> Uuid {
     Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap()
+}
+
+fn viewer_id() -> Uuid {
+    Uuid::parse_str("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee").unwrap()
+}
+
+#[tokio::test]
+async fn list_invoices_uses_request_session_relationships() {
+    let app = axum_app();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/invoices")
+        .header("x-user-id", viewer_id().to_string())
+        .header("x-roles", "viewer")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("22222222-2222-2222-2222-222222222222"));
+    assert!(body.contains("33333333-3333-3333-3333-333333333333"));
+    assert!(!body.contains("11111111-1111-1111-1111-111111111111"));
+}
+
+#[tokio::test]
+async fn list_invoices_allows_admin_all_candidates() {
+    let app = axum_app();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/invoices")
+        .header("x-roles", "admin")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("11111111-1111-1111-1111-111111111111"));
+    assert!(body.contains("22222222-2222-2222-2222-222222222222"));
+    assert!(body.contains("33333333-3333-3333-3333-333333333333"));
 }
 
 #[tokio::test]
