@@ -814,6 +814,36 @@ async fn unrelated_fact_keys_do_not_contend_on_one_session_lock() {
     assert_found(&leader_result, 7);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrelated_fact_types_do_not_contend_on_one_session_lock() {
+    let blocker = Arc::new(HashBlocker::new());
+    let session = EvaluationSession::builder()
+        .with::<BlockingHashKey, _>(BlockingHashSource)
+        .with::<OtherKey, _>(OtherSource)
+        .build();
+
+    let leader_session = session.clone();
+    let leader_blocker = Arc::clone(&blocker);
+    let leader = tokio::spawn(async move {
+        leader_session
+            .get(BlockingHashKey::blocking(7, leader_blocker))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), blocker.wait_until_entered())
+        .await
+        .expect("leader should reach the intentionally blocked hash");
+
+    let unrelated = tokio::time::timeout(Duration::from_millis(100), session.get(OtherKey(8)))
+        .await
+        .expect("unrelated fact type should not wait on the blocked key's planning lock");
+    assert_found(&unrelated, 8);
+
+    blocker.release();
+    let leader_result = leader.await.unwrap();
+    assert_found(&leader_result, 7);
+}
+
 #[tokio::test]
 async fn cancelling_leader_get_cleans_in_flight_entry() {
     let calls = Arc::new(AtomicUsize::new(0));

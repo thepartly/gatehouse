@@ -472,13 +472,20 @@ fn bench_parallel_fact_state(c: &mut Criterion) {
                 b.iter(|| {
                     let coarse = Arc::clone(&coarse);
                     runtime.block_on(async {
-                        let (a, b, c, d) = tokio::join!(
-                            async { coarse.get_many(black_box(&chunks[0])) },
-                            async { coarse.get_many(black_box(&chunks[1])) },
-                            async { coarse.get_many(black_box(&chunks[2])) },
-                            async { coarse.get_many(black_box(&chunks[3])) },
-                        );
-                        black_box((a, b, c, d))
+                        let chunk_a = black_box(chunks[0].clone());
+                        let chunk_b = black_box(chunks[1].clone());
+                        let chunk_c = black_box(chunks[2].clone());
+                        let chunk_d = black_box(chunks[3].clone());
+                        let coarse_a = Arc::clone(&coarse);
+                        let coarse_b = Arc::clone(&coarse);
+                        let coarse_c = Arc::clone(&coarse);
+                        let coarse_d = Arc::clone(&coarse);
+                        let a = tokio::spawn(async move { coarse_a.get_many(&chunk_a) });
+                        let b = tokio::spawn(async move { coarse_b.get_many(&chunk_b) });
+                        let c = tokio::spawn(async move { coarse_c.get_many(&chunk_c) });
+                        let d = tokio::spawn(async move { coarse_d.get_many(&chunk_d) });
+                        let (a, b, c, d) = tokio::join!(a, b, c, d);
+                        black_box((a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap()))
                     })
                 });
             },
@@ -497,13 +504,20 @@ fn bench_parallel_fact_state(c: &mut Criterion) {
                 b.iter(|| {
                     let sharded = Arc::clone(&sharded);
                     runtime.block_on(async {
-                        let (a, b, c, d) = tokio::join!(
-                            async { sharded.get_many(black_box(&chunks[0])).await },
-                            async { sharded.get_many(black_box(&chunks[1])).await },
-                            async { sharded.get_many(black_box(&chunks[2])).await },
-                            async { sharded.get_many(black_box(&chunks[3])).await },
-                        );
-                        black_box((a, b, c, d))
+                        let chunk_a = black_box(chunks[0].clone());
+                        let chunk_b = black_box(chunks[1].clone());
+                        let chunk_c = black_box(chunks[2].clone());
+                        let chunk_d = black_box(chunks[3].clone());
+                        let sharded_a = Arc::clone(&sharded);
+                        let sharded_b = Arc::clone(&sharded);
+                        let sharded_c = Arc::clone(&sharded);
+                        let sharded_d = Arc::clone(&sharded);
+                        let a = tokio::spawn(async move { sharded_a.get_many(&chunk_a).await });
+                        let b = tokio::spawn(async move { sharded_b.get_many(&chunk_b).await });
+                        let c = tokio::spawn(async move { sharded_c.get_many(&chunk_c).await });
+                        let d = tokio::spawn(async move { sharded_d.get_many(&chunk_d).await });
+                        let (a, b, c, d) = tokio::join!(a, b, c, d);
+                        black_box((a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap()))
                     })
                 });
             },
