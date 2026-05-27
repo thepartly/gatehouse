@@ -2871,6 +2871,9 @@ fn delegated_evaluation_to_result(
 /// The subject and action mappers run once per batch. Resource and context
 /// mappers run once per item. Mapper closures return child-domain values; use
 /// lightweight IDs, newtypes, or `Arc` values when mapping larger objects.
+///
+/// `DelegatingPolicy` does not detect cycles or self-delegation; avoid wiring a
+/// child checker that can delegate back into the same decision path.
 pub struct DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext> {
     policy_type: String,
     security_rule: SecurityRuleMetadata,
