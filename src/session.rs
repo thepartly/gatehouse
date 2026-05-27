@@ -105,6 +105,18 @@ where
     }
 
     fn plan_loads(&self, keys: &[K]) -> LoadPlan<K> {
+        let key_stripes = keys
+            .iter()
+            .map(|key| self.stripe_index(key))
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        let unique_keys = keys
+            .iter()
+            .zip(key_stripes.iter().copied())
+            .filter(|(key, _)| seen.insert((*key).clone()))
+            .map(|(key, stripe_index)| (key.clone(), stripe_index))
+            .collect::<Vec<_>>();
+
         let source_guard = self
             .source
             .lock()
@@ -113,8 +125,8 @@ where
 
         let cached_results = keys
             .iter()
-            .map(|key| {
-                let stripe_index = self.stripe_index(key);
+            .zip(key_stripes.iter().copied())
+            .map(|(key, stripe_index)| {
                 let stripe = self.stripes[stripe_index]
                     .lock()
                     .expect("fact state stripe mutex should not be poisoned");
@@ -131,21 +143,19 @@ where
             };
         }
 
-        let mut seen = HashSet::new();
         let mut missing = Vec::new();
         let mut waiters = Vec::new();
 
-        for key in keys.iter().filter(|key| seen.insert((*key).clone())) {
-            let stripe_index = self.stripe_index(key);
+        for (key, stripe_index) in unique_keys {
             let mut stripe = self.stripes[stripe_index]
                 .lock()
                 .expect("fact state stripe mutex should not be poisoned");
 
-            if stripe.cache.contains_key(key) {
+            if stripe.cache.contains_key(&key) {
                 continue;
             }
 
-            if let Some(existing_waiters) = stripe.in_flight.get_mut(key) {
+            if let Some(existing_waiters) = stripe.in_flight.get_mut(&key) {
                 let (sender, receiver) = oneshot::channel();
                 existing_waiters.push(sender);
                 waiters.push(receiver);

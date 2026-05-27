@@ -305,7 +305,7 @@ where
                 .max_batch_size
                 .map_or(pending.len(), NonZeroUsize::get)
                 .max(1);
-            let chunk_count = (pending.len() + chunk_size - 1) / chunk_size;
+            let chunk_count = pending.len().div_ceil(chunk_size);
 
             for (chunk_index, pending_chunk) in pending.chunks(chunk_size).enumerate() {
                 let policy_span = tracing::debug_span!(
