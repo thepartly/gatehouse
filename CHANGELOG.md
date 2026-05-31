@@ -2,13 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- `LookupSource` and `Hydrator` traits plus `PermissionChecker::lookup_authorized` and `lookup_authorized_page` for "what can this subject see?" list endpoints. The source enumerates a candidate superset; the hydrator resolves IDs to caller-owned resources (with explicit "no longer exists" via `Option<Resource>`); the full policy stack still authorizes each hydrated candidate. Cursor-progress is enforced (no infinite loops on stuck sources). See `examples/lookup_in_ram.rs`. (#24)
+
 ### Changed
 
 - Internal refactor: the per-stripe session state machine is now a private synchronous core (`FactStripeCore<K, W>`) with no async, no tracing, and a generic waiter type. `FactState<K>` remains the async adapter that owns locks, the source, and tracing. No public API change. (#28)
 
 ### Tests
 
-- Loom permutation-test harness for the session fact-load state machine. Six models cover leader-election uniqueness, waiter wake-up, fail-closed cancellation, cache-write visibility, replacement atomicity, and idle cache clearing. Run under `RUSTFLAGS="--cfg loom" cargo test --lib --release` and as a separate CI job. (#29)
+- Loom permutation-test harness for the session fact-load state machine. Seven models cover leader-election uniqueness, exactly-once waiter wake-up on finish, fail-closed cancellation, cache-write visibility, replacement atomicity w.r.t. planning, multi-stripe independence, and replacement rejection while a leader is in flight. Run under `RUSTFLAGS="--cfg loom" cargo test --lib --release` and as a separate CI job. (#29)
 
 ## [0.3.0-alpha.1] - 2026-05-27
 

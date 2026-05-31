@@ -269,6 +269,7 @@ mod builder;
 mod checker;
 mod combinators;
 mod facts;
+mod lookup;
 mod metadata;
 mod policies;
 mod policy;
@@ -282,6 +283,7 @@ pub use facts::{
     FactKey, FactLoadError, FactLoadResult, FactSource, FactSourceRegistrationError,
     RelationshipQuery,
 };
+pub use lookup::{Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupPage, LookupSource};
 pub use metadata::SecurityRuleMetadata;
 pub(crate) use metadata::{DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE};
 pub use policies::{AbacPolicy, DelegatingPolicy, RbacPolicy, RebacPolicy};

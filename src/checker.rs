@@ -1,7 +1,7 @@
 use crate::{
-    AccessEvaluation, BatchEvalCtx, CombineOp, EvalCtx, EvalTrace, EvaluationSession, Policy,
-    PolicyBatchItem, PolicyEvalResult, DEFAULT_SECURITY_RULE_CATEGORY,
-    PERMISSION_CHECKER_POLICY_TYPE,
+    AccessEvaluation, BatchEvalCtx, CombineOp, EvalCtx, EvalTrace, EvaluationSession, Hydrator,
+    LookupAuthorizedError, LookupAuthorizedPage, LookupSource, Policy, PolicyBatchItem,
+    PolicyEvalResult, DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -510,6 +510,175 @@ where
         .into_iter()
         .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
         .collect()
+    }
+
+    /// Look up one page of candidate IDs from `lookup`, hydrate them via
+    /// `hydrator`, and return only the resources that the full policy
+    /// stack authorizes.
+    ///
+    /// This is the page-oriented primitive behind
+    /// [`Self::lookup_authorized`]. Use it directly when you need
+    /// candidate-page-grained streaming — for example, a list endpoint
+    /// that emits results as they are confirmed without buffering the
+    /// whole authorized population.
+    ///
+    /// `next_cursor` paginates the **candidate** stream from `lookup`,
+    /// not the authorized output. A `Some(cursor)` with an empty
+    /// `resources` vector is normal: every candidate in this page was
+    /// denied by the policy stack. Continue paging until `next_cursor`
+    /// is `None`.
+    ///
+    /// Cursor-progress is enforced here, not just in
+    /// [`Self::lookup_authorized`]: if the source returns a `next_cursor`
+    /// equal to the cursor that was just consumed, this method aborts
+    /// with [`LookupAuthorizedError::LookupCursorStuck`] rather than
+    /// returning a page that would lead a streaming caller into an
+    /// infinite loop.
+    ///
+    /// See [`LookupSource`] for the completeness contract: the source
+    /// must enumerate a superset of every resource that any policy in
+    /// this checker could grant; lookup narrows the candidate set but
+    /// does not replace policy evaluation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "orchestration entry point: session + subject + action + context + lookup + \
+                  cursor + limit + hydrator are all genuinely independent inputs; bundling \
+                  them would obscure the call site without saving anything."
+    )]
+    pub async fn lookup_authorized_page<L, H>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        context: &C,
+        lookup: &L,
+        cursor: Option<&[u8]>,
+        limit: NonZeroUsize,
+        hydrator: &H,
+    ) -> Result<LookupAuthorizedPage<R>, LookupAuthorizedError<L::Error, H::Error>>
+    where
+        L: LookupSource<Subject = S>,
+        H: Hydrator<L::Id, Resource = R>,
+        R: Send,
+    {
+        let lookup_span = tracing::debug_span!(
+            "gatehouse.lookup",
+            lookup.limit = limit.get(),
+            lookup.has_cursor = cursor.is_some(),
+        );
+        let page = lookup
+            .lookup_page(subject, cursor, limit)
+            .instrument(lookup_span)
+            .await
+            .map_err(LookupAuthorizedError::Lookup)?;
+
+        // Enforce the cursor-progress contract before anything else: if the
+        // source returned the same cursor that was just consumed, a caller
+        // following the "loop until next_cursor is None" guidance would
+        // spin. Catch it here (not just in the collecting loop) so the
+        // page-oriented streaming API is just as safe.
+        if cursor.is_some() && page.next_cursor.as_deref() == cursor {
+            return Err(LookupAuthorizedError::LookupCursorStuck);
+        }
+
+        if page.ids.is_empty() {
+            return Ok(LookupAuthorizedPage {
+                resources: Vec::new(),
+                next_cursor: page.next_cursor,
+            });
+        }
+
+        let hydrate_span = tracing::debug_span!(
+            "gatehouse.hydrate",
+            hydrate.candidate_count = page.ids.len()
+        );
+        let hydrated = hydrator
+            .hydrate(&page.ids)
+            .instrument(hydrate_span)
+            .await
+            .map_err(LookupAuthorizedError::Hydrate)?;
+
+        if hydrated.len() != page.ids.len() {
+            return Err(LookupAuthorizedError::HydratorContractViolation {
+                expected: page.ids.len(),
+                actual: hydrated.len(),
+            });
+        }
+
+        let resources: Vec<R> = hydrated.into_iter().flatten().collect();
+        let authorized = self
+            .filter_authorized_with_context_in_session_by(
+                session,
+                subject,
+                action,
+                resources,
+                context,
+                |resource| resource,
+            )
+            .await;
+
+        Ok(LookupAuthorizedPage {
+            resources: authorized,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    /// Drive [`Self::lookup_authorized_page`] until the source is
+    /// exhausted, collecting every authorized resource into a single
+    /// `Vec`.
+    ///
+    /// This is the all-or-error convenience: any backend error from the
+    /// lookup source or hydrator aborts the whole operation; the caller
+    /// does not see partial results. For very large authorized
+    /// populations, prefer [`Self::lookup_authorized_page`] and stream
+    /// results page by page.
+    ///
+    /// Cursor-progress is enforced: if the source returns a `next_cursor`
+    /// equal to the cursor that was just consumed, gatehouse aborts with
+    /// [`LookupAuthorizedError::LookupCursorStuck`] rather than loop
+    /// forever.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "see lookup_authorized_page for the rationale."
+    )]
+    pub async fn lookup_authorized<L, H>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        context: &C,
+        lookup: &L,
+        page_size: NonZeroUsize,
+        hydrator: &H,
+    ) -> Result<Vec<R>, LookupAuthorizedError<L::Error, H::Error>>
+    where
+        L: LookupSource<Subject = S>,
+        H: Hydrator<L::Id, Resource = R>,
+        R: Send,
+    {
+        let mut authorized = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .lookup_authorized_page(
+                    session,
+                    subject,
+                    action,
+                    context,
+                    lookup,
+                    cursor.as_deref(),
+                    page_size,
+                    hydrator,
+                )
+                .await?;
+            authorized.extend(page.resources);
+            // Cursor-progress is enforced inside `lookup_authorized_page`,
+            // so we just trust the returned `next_cursor` here.
+            match page.next_cursor {
+                None => return Ok(authorized),
+                Some(next) => cursor = Some(next),
+            }
+        }
     }
 }
 
