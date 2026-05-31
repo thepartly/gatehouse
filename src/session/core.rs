@@ -612,63 +612,102 @@ mod loom_tests {
     }
 
     /// Tiny adapter mirroring `FactState::insert_source` / `plan_loads` for
-    /// the source-vs-planner models below. One stripe is enough to exercise
-    /// the source-held-across-planning discipline; production has 64.
+    /// the source-vs-planner models below. Uses `LOOM_STRIPES = 2` so
+    /// multi-stripe interleavings are reachable; production has 64. The
+    /// keying is `K(n).0 % LOOM_STRIPES` so `K(0)` and `K(1)` land on
+    /// different stripes.
+    ///
+    /// Drift hazard: this adapter mirrors the production `FactState` lock
+    /// discipline. If `FactState::insert_source` or `plan_loads` change their
+    /// lock ordering, this mirror must follow.
+    const LOOM_STRIPES: usize = 2;
+
     struct LoomAdapter {
         source: Mutex<Option<u32>>,
-        stripe: Mutex<FactStripeCore<K, LoomWaiter>>,
+        stripes: [Mutex<FactStripeCore<K, LoomWaiter>>; LOOM_STRIPES],
     }
 
     impl LoomAdapter {
         fn new(initial_source: Option<u32>) -> Self {
             Self {
                 source: Mutex::new(initial_source),
-                stripe: Mutex::new(FactStripeCore::new()),
+                stripes: [
+                    Mutex::new(FactStripeCore::new()),
+                    Mutex::new(FactStripeCore::new()),
+                ],
             }
         }
 
+        fn stripe_index(key: &K) -> usize {
+            (key.0 as usize) % LOOM_STRIPES
+        }
+
         /// Plan-equivalent: snapshot source, peek cache. The source lock is
-        /// held while peeking — the same discipline as
+        /// held across the stripe peek — the same discipline as
         /// `FactState::plan_loads` — so replacement either fully precedes
         /// or fully follows the planning observation.
         fn plan(&self, key: &K) -> (Option<u32>, Option<FactLoadResult<u32>>) {
             let source_guard = self.source.lock().unwrap();
             let source = *source_guard;
-            let stripe = self.stripe.lock().unwrap();
+            let stripe = self.stripes[Self::stripe_index(key)].lock().unwrap();
             let cached = stripe.peek_cache(key);
             (source, cached)
         }
 
-        /// Replace-equivalent: acquire source, then stripe, check idle, swap,
-        /// clear cache, atomically.
+        /// Replace-equivalent: acquire source, then ALL stripes (in index
+        /// order), check idle, swap, clear caches, atomically.
         fn replace(&self, new_source: u32) -> bool {
             let mut source_guard = self.source.lock().unwrap();
-            let mut stripe_guard = self.stripe.lock().unwrap();
-            if !stripe_guard.is_idle() {
+            let mut s0 = self.stripes[0].lock().unwrap();
+            let mut s1 = self.stripes[1].lock().unwrap();
+            if !s0.is_idle() || !s1.is_idle() {
                 return false;
             }
             *source_guard = Some(new_source);
-            stripe_guard.clear_cache();
+            s0.clear_cache();
+            s1.clear_cache();
             true
         }
 
-        /// Single-threaded test setup helper. Not part of the modeled
-        /// protocol; runs before any thread is spawned.
+        /// Single-threaded helper: claim leader and finish in one call.
         fn seed_cache(&self, key: K, value: u32) {
-            let mut stripe = self.stripe.lock().unwrap();
+            let mut stripe = self.stripes[Self::stripe_index(&key)].lock().unwrap();
             let outcome = stripe.try_register::<_, LoomWaiter>(&key, || unreachable!());
             assert!(matches!(outcome, Registration::Leading));
             stripe.finish(key, FactLoadResult::Found(value));
+        }
+
+        /// Single-threaded helper: claim leader only. The caller is then
+        /// responsible for calling `finish_leader` later (possibly from
+        /// another thread).
+        fn lead(&self, key: &K) {
+            let mut stripe = self.stripes[Self::stripe_index(key)].lock().unwrap();
+            let outcome = stripe.try_register::<_, LoomWaiter>(key, || unreachable!());
+            assert!(matches!(outcome, Registration::Leading));
+        }
+
+        /// Finish a previously-claimed leader. Signals any joined waiters
+        /// outside the stripe lock.
+        fn finish_leader(&self, key: K, value: u32) {
+            let waiters = {
+                let mut stripe = self.stripes[Self::stripe_index(&key)].lock().unwrap();
+                stripe.finish(key, FactLoadResult::Found(value))
+            };
+            signal_all(waiters);
         }
     }
 
     // Model 5: replacement is atomic w.r.t. planning.
     // Setup: source = Some(1), cache has K(1) -> Found(100).
     // Thread A plans; thread B replaces source with 2 (clearing cache).
-    // The only legal observations from A are:
+    // Loom explores both orderings; the only legal observations are:
     //   * (Some(1), Some(Found(100))) — plan ran first
     //   * (Some(2), None)             — replace ran first
     // FORBIDDEN: (Some(2), Some(Found(100))) — new source + stale cache.
+    //
+    // (The reverse-order framing — thread B plans, thread A replaces — is
+    // the same loom model under thread-spawn renaming. Loom permutes
+    // schedules already; we don't need a second test to express it.)
     #[test]
     fn loom_replacement_is_atomic_with_respect_to_planning() {
         loom::model(|| {
@@ -679,12 +718,14 @@ mod loom_tests {
             let t1 = thread::spawn(move || a1.plan(&K(1)));
 
             let a2 = adapter.clone();
-            let t2 = thread::spawn(move || {
-                assert!(a2.replace(2));
-            });
+            let t2 = thread::spawn(move || a2.replace(2));
 
             let (source_seen, cached_seen) = t1.join().unwrap();
-            t2.join().unwrap();
+            let replaced = t2.join().unwrap();
+            assert!(
+                replaced,
+                "stripe is idle (seed_cache finished); replace must succeed under every schedule"
+            );
 
             match (source_seen, cached_seen) {
                 (Some(1), Some(FactLoadResult::Found(100))) => {}
@@ -697,32 +738,82 @@ mod loom_tests {
         });
     }
 
-    // Model 6: idle replacement clears cache atomically.
-    // Same shape as model 5 but spelled out as "the cache is never a stale
-    // hit under the new source." Kept distinct so a regression to the
-    // clear_cache step is immediately attributable.
+    // Model 6: unrelated keys on different stripes do not interfere.
+    // Setup: K(0) and K(1) route to stripe 0 and stripe 1 respectively.
+    // Two threads concurrently claim+finish their key. After both join,
+    // each stripe contains exactly its own cached value — no cross-stripe
+    // state leak under any schedule.
     #[test]
-    fn loom_idle_replacement_clears_cache() {
+    fn loom_unrelated_stripes_are_independent() {
         loom::model(|| {
-            let adapter = Arc::new(LoomAdapter::new(Some(1)));
-            adapter.seed_cache(K(1), 200);
+            let adapter = Arc::new(LoomAdapter::new(None));
+            assert_ne!(
+                LoomAdapter::stripe_index(&K(0)),
+                LoomAdapter::stripe_index(&K(1)),
+                "test setup requires K(0) and K(1) on different stripes"
+            );
 
             let a1 = adapter.clone();
             let t1 = thread::spawn(move || {
-                assert!(a1.replace(2));
+                a1.lead(&K(0));
+                a1.finish_leader(K(0), 10);
             });
 
             let a2 = adapter.clone();
-            let t2 = thread::spawn(move || a2.plan(&K(1)));
+            let t2 = thread::spawn(move || {
+                a2.lead(&K(1));
+                a2.finish_leader(K(1), 20);
+            });
 
             t1.join().unwrap();
-            let (source_seen, cached_seen) = t2.join().unwrap();
+            t2.join().unwrap();
 
-            match (source_seen, cached_seen) {
-                (Some(2), None) => {}
-                (Some(1), Some(FactLoadResult::Found(200))) => {}
-                (Some(1), None) => {}
-                other => panic!("idle replacement broke atomicity: observed {other:?}"),
+            match adapter.plan(&K(0)).1 {
+                Some(FactLoadResult::Found(10)) => {}
+                other => panic!("K(0) cache: expected Found(10), got {other:?}"),
+            }
+            match adapter.plan(&K(1)).1 {
+                Some(FactLoadResult::Found(20)) => {}
+                other => panic!("K(1) cache: expected Found(20), got {other:?}"),
+            }
+        });
+    }
+
+    // Model 7: replacement is rejected while a leader is in flight.
+    // Setup: source = Some(1), K(1)'s stripe has a claimed-but-unfinished
+    // leader. Thread A finishes the leader; thread B tries replace.
+    // Legal observations:
+    //   * B saw in-flight (ran before A's finish): returned false, source
+    //     stays Some(1), K(1) cached at the finish value.
+    //   * B saw idle (ran after A's finish): returned true, source becomes
+    //     Some(2), cache cleared.
+    // FORBIDDEN: replace returned true AND K(1) is still cached at the
+    // old value — that would mean clear_cache was skipped, or replace
+    // succeeded while the leader's finish hadn't yet committed.
+    #[test]
+    fn loom_replacement_rejected_while_in_flight() {
+        loom::model(|| {
+            let adapter = Arc::new(LoomAdapter::new(Some(1)));
+            adapter.lead(&K(1));
+
+            let a1 = adapter.clone();
+            let t_finish = thread::spawn(move || a1.finish_leader(K(1), 77));
+
+            let a2 = adapter.clone();
+            let t_replace = thread::spawn(move || a2.replace(2));
+
+            t_finish.join().unwrap();
+            let replaced = t_replace.join().unwrap();
+            let (source, cached) = adapter.plan(&K(1));
+
+            match (replaced, source, cached) {
+                // B rejected: A's finish stands.
+                (false, Some(1), Some(FactLoadResult::Found(77))) => {}
+                // B succeeded after A's finish: cache cleared.
+                (true, Some(2), None) => {}
+                other => panic!(
+                    "in-flight replacement invariant violated: (replaced, source, cached) = {other:?}"
+                ),
             }
         });
     }
