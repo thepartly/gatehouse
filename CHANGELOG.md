@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `LookupSource` and `Hydrator` traits plus `PermissionChecker::lookup_authorized` and `lookup_authorized_page` for "what can this subject see?" list endpoints. The source enumerates a candidate superset; the hydrator resolves IDs to caller-owned resources (with explicit "no longer exists" via `Option<Resource>`); the full policy stack still authorizes each hydrated candidate. Cursor-progress is enforced (no infinite loops on stuck sources). See `examples/lookup_in_ram.rs`. (#24)
+
 ### Changed
 
 - Internal refactor: the per-stripe session state machine is now a private synchronous core (`FactStripeCore<K, W>`) with no async, no tracing, and a generic waiter type. `FactState<K>` remains the async adapter that owns locks, the source, and tracing. No public API change. (#28)
