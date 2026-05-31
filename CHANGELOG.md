@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Internal refactor: the per-stripe session state machine is now a private synchronous core (`FactStripeCore<K, W>`) with no async, no tracing, and a generic waiter type. `FactState<K>` remains the async adapter that owns locks, the source, and tracing. No public API change. (#28)
+
+### Tests
+
+- Loom permutation-test harness for the session fact-load state machine. Six models cover leader-election uniqueness, waiter wake-up, fail-closed cancellation, cache-write visibility, replacement atomicity, and idle cache clearing. Run under `RUSTFLAGS="--cfg loom" cargo test --lib --release` and as a separate CI job. (#29)
+
 ## [0.3.0-alpha.1] - 2026-05-27
 
 ### Breaking

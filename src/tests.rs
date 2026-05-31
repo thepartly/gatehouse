@@ -264,7 +264,41 @@ mod core_tests {
         }
     }
 
+    /// Permissive no-op global subscriber. Installed once on first use so the
+    /// process-wide tracing callsite cache locks in `Interest::sometimes` for
+    /// every callsite. Without this, a parallel test thread that hits a
+    /// tracing callsite before any subscriber is installed will poison the
+    /// cache with `Interest::never`, and later threads using
+    /// `with_default(...)` see zero events. This is the standard flake in
+    /// tracing tests under parallel execution.
+    struct PermissiveNoop;
+    impl Subscriber for PermissiveNoop {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn install_permissive_global() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // Ignore the result: another crate may have already installed a
+            // global. In that case the existing one is responsible for the
+            // callsite-cache behavior; if it is also permissive, all good.
+            let _ = tracing::subscriber::set_global_default(PermissiveNoop);
+        });
+    }
+
     fn with_recorded_events<T>(f: impl FnOnce() -> T) -> (T, Vec<RecordedEvent>) {
+        install_permissive_global();
         let recorder = EventRecorder::default();
         let events = recorder.events.clone();
         let subscriber = Registry::default().with(recorder);

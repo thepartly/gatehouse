@@ -168,11 +168,41 @@ impl Visit for FieldValues {
     }
 }
 
+/// Permissive no-op global subscriber. Installed once on first call to
+/// `capture_async` so the process-wide tracing callsite cache locks in
+/// `Interest::sometimes` for every callsite. Without this, a parallel test
+/// thread that hits a tracing callsite before any subscriber is installed
+/// will poison the cache with `Interest::never`, and later threads using
+/// `with_default(...)` see zero spans/events.
+struct PermissiveNoop;
+impl Subscriber for PermissiveNoop {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
+
+fn install_permissive_global() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(PermissiveNoop);
+    });
+}
+
 fn capture_async<F, Fut, T>(f: F) -> (T, Vec<CapturedSpan>)
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
+    install_permissive_global();
     let captured = CapturedSpans::default();
     let subscriber = Registry::default().with(CaptureLayer {
         spans: captured.clone(),

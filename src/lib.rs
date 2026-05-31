@@ -289,5 +289,10 @@ pub use policy::{BatchEvalCtx, EvalCtx, Policy, PolicyBatchItem};
 pub use results::{AccessEvaluation, CombineOp, EvalTrace, PolicyEvalResult};
 pub use session::{EvaluationSession, EvaluationSessionBuilder};
 
-#[cfg(test)]
+// The shared unit-test module pulls in tokio-based async tests via dev-deps
+// that are intentionally loom-incompatible (`tokio::net`, axum, hyper, etc.).
+// Gate it out under `cfg(loom)` so the loom build's minimal dependency graph
+// stays clean. The synchronous core's deterministic tests and the loom
+// permutation tests both live in `src/session/core.rs` and are unaffected.
+#[cfg(all(test, not(loom)))]
 mod tests;

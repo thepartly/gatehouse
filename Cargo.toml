@@ -12,7 +12,12 @@ uuid = {version="1", features = ["serde", "v4"]}
 async-trait = "0.1"
 futures-channel = "0.3"
 
-[dev-dependencies]
+# Regular dev-deps. Gated on `cfg(not(loom))` because several of them
+# (tokio's `net` module, anything that depends on it: actix-rt, axum, hyper,
+# tower, actix-web, tokio-test, tokio-postgres) are intentionally
+# loom-incompatible. Under `--cfg loom` the dependency graph collapses to
+# just the loom harness; under a normal build everything below is available.
+[target.'cfg(not(loom))'.dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
@@ -25,6 +30,12 @@ dashmap = "6"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+# Loom is a permutation-testing model checker for concurrent Rust. Pulled in
+# only when the loom cfg is set (RUSTFLAGS="--cfg loom") so it does not affect
+# the default test build. See the loom_tests module in src/session/core.rs.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
 
 [[bench]]
 name = "permission_checker"
@@ -44,3 +55,9 @@ cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 
 # We want to document all features.
 all-features = true
+
+[lints.rust]
+# `cfg(loom)` is set by `RUSTFLAGS="--cfg loom"` for the loom permutation-test
+# harness. It is not a feature, so register it with `check-cfg` so default
+# builds do not warn about an unexpected cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
