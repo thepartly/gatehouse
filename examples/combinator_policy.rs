@@ -59,15 +59,12 @@ impl Policy<User, Document, ViewAction, EmptyContext> for CountingPolicy {
         println!("Evaluating policy: {}", self.name);
 
         if self.allow {
-            PolicyEvalResult::Granted {
-                policy_type: self.policy_type().to_string(),
-                reason: Some(format!("{} grants access", self.name)),
-            }
+            PolicyEvalResult::granted(
+                self.policy_type(),
+                Some(format!("{} grants access", self.name)),
+            )
         } else {
-            PolicyEvalResult::Denied {
-                policy_type: self.policy_type().to_string(),
-                reason: format!("{} denies access", self.name),
-            }
+            PolicyEvalResult::denied(self.policy_type(), format!("{} denies access", self.name))
         }
     }
 
