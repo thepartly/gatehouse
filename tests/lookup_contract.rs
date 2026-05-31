@@ -313,6 +313,77 @@ async fn cursor_stuck_is_detected() {
 }
 
 #[tokio::test]
+async fn page_mode_cursor_stuck_is_detected() {
+    // A streaming caller drives `lookup_authorized_page` directly. The
+    // source echoes the input cursor back as `next_cursor`, so any
+    // "loop until next_cursor is None" caller would spin forever. The
+    // page primitive must catch this on the very first call after the
+    // initial advance, not leave detection to the collecting helper.
+    struct Echo;
+    #[async_trait]
+    impl LookupSource for Echo {
+        type Subject = User;
+        type Id = u32;
+        type Error = OwnerLookupError;
+
+        async fn lookup_page(
+            &self,
+            _: &User,
+            cursor: Option<&[u8]>,
+            _: NonZeroUsize,
+        ) -> Result<LookupPage<u32>, OwnerLookupError> {
+            // First call (cursor = None) advances; subsequent calls echo.
+            let next_cursor = Some(cursor.map(|c| c.to_vec()).unwrap_or_else(|| b"x".to_vec()));
+            Ok(LookupPage {
+                ids: vec![],
+                next_cursor,
+            })
+        }
+    }
+
+    let checker = PermissionChecker::<User, Doc, ReadAction, Ctx>::new();
+    let hydrate = CatalogHydrator::new(HashMap::new());
+    let session = EvaluationSession::empty();
+    let limit = page_size();
+
+    // First call: cursor None, source returns Some("x") -> legitimate advance.
+    let first = checker
+        .lookup_authorized_page(
+            &session,
+            &User { id: 1 },
+            &ReadAction,
+            &Ctx,
+            &Echo,
+            None,
+            limit,
+            &hydrate,
+        )
+        .await
+        .expect("first page legitimately advances");
+    let cursor = first
+        .next_cursor
+        .expect("first call must yield next_cursor");
+
+    // Second call: cursor Some("x"), source echoes Some("x") -> stuck.
+    let second = checker
+        .lookup_authorized_page(
+            &session,
+            &User { id: 1 },
+            &ReadAction,
+            &Ctx,
+            &Echo,
+            Some(&cursor),
+            limit,
+            &hydrate,
+        )
+        .await;
+    match second {
+        Err(LookupAuthorizedError::LookupCursorStuck) => {}
+        other => panic!("expected LookupCursorStuck from page primitive, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn duplicate_ids_across_pages_are_preserved() {
     // Same id appears in two pages; the contract is "source-defined order",
     // so duplicates pass through. Sources that want dedup should do it

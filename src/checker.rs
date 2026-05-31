@@ -528,6 +528,13 @@ where
     /// denied by the policy stack. Continue paging until `next_cursor`
     /// is `None`.
     ///
+    /// Cursor-progress is enforced here, not just in
+    /// [`Self::lookup_authorized`]: if the source returns a `next_cursor`
+    /// equal to the cursor that was just consumed, this method aborts
+    /// with [`LookupAuthorizedError::LookupCursorStuck`] rather than
+    /// returning a page that would lead a streaming caller into an
+    /// infinite loop.
+    ///
     /// See [`LookupSource`] for the completeness contract: the source
     /// must enumerate a superset of every resource that any policy in
     /// this checker could grant; lookup narrows the candidate set but
@@ -564,6 +571,15 @@ where
             .instrument(lookup_span)
             .await
             .map_err(LookupAuthorizedError::Lookup)?;
+
+        // Enforce the cursor-progress contract before anything else: if the
+        // source returned the same cursor that was just consumed, a caller
+        // following the "loop until next_cursor is None" guidance would
+        // spin. Catch it here (not just in the collecting loop) so the
+        // page-oriented streaming API is just as safe.
+        if cursor.is_some() && page.next_cursor.as_deref() == cursor {
+            return Err(LookupAuthorizedError::LookupCursorStuck);
+        }
 
         if page.ids.is_empty() {
             return Ok(LookupAuthorizedPage {
@@ -656,14 +672,11 @@ where
                 )
                 .await?;
             authorized.extend(page.resources);
+            // Cursor-progress is enforced inside `lookup_authorized_page`,
+            // so we just trust the returned `next_cursor` here.
             match page.next_cursor {
                 None => return Ok(authorized),
-                Some(next) => {
-                    if cursor.as_deref() == Some(next.as_slice()) {
-                        return Err(LookupAuthorizedError::LookupCursorStuck);
-                    }
-                    cursor = Some(next);
-                }
+                Some(next) => cursor = Some(next),
             }
         }
     }
