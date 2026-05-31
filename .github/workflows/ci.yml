@@ -34,6 +34,26 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features
 
+  loom-tests:
+    name: Loom permutation tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Cache cargo & target directories
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "loom-v1"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      # Loom-incompatible dev-deps are gated on `cfg(not(loom))` in Cargo.toml,
+      # so this build collapses to just the library + loom. The harness lives
+      # in `src/session/core.rs` (see #29).
+      - name: Run loom models
+        run: cargo test --lib --release
+        env:
+          RUSTFLAGS: "--cfg loom"
+
   release:
     name: Release
     needs: build-and-test
