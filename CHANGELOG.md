@@ -12,7 +12,7 @@
 
 ### Tests
 
-- Loom permutation-test harness for the session fact-load state machine. Six models cover leader-election uniqueness, waiter wake-up, fail-closed cancellation, cache-write visibility, replacement atomicity, and idle cache clearing. Run under `RUSTFLAGS="--cfg loom" cargo test --lib --release` and as a separate CI job. (#29)
+- Loom permutation-test harness for the session fact-load state machine. Seven models cover leader-election uniqueness, exactly-once waiter wake-up on finish, fail-closed cancellation, cache-write visibility, replacement atomicity w.r.t. planning, multi-stripe independence, and replacement rejection while a leader is in flight. Run under `RUSTFLAGS="--cfg loom" cargo test --lib --release` and as a separate CI job. (#29)
 
 ## [0.3.0-alpha.1] - 2026-05-27
 
