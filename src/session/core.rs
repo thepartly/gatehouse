@@ -333,11 +333,15 @@ mod tests {
 // invariant explicitly, and prefer `loom::sync::Arc<loom::sync::Mutex<_>>`
 // around the core over building a richer adapter.
 // =============================================================================
-#[cfg(loom)]
+// Gated on `cfg(all(test, loom))` because `loom` is a `cfg(loom)`-only
+// dev-dependency. Without the `test` gate, `cargo check --lib --cfg loom`
+// would fail to resolve `loom::*` since dev-deps are only linked into the
+// test build.
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use crate::FactLoadError;
-    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use loom::sync::{Arc, Mutex};
     use loom::thread;
 
@@ -350,23 +354,29 @@ mod loom_tests {
     }
 
     /// Loom-compatible waiter. The leader/canceller calls `signal` after the
-    /// cache is committed; waiters check `is_signaled` to observe wake-up.
+    /// cache is committed; waiters read `signal_count` to observe wake-up.
+    ///
+    /// Counts rather than flags so models can assert "exactly once" rather
+    /// than "at least once". A double-signal is detectable as count > 1.
     #[derive(Clone)]
     struct LoomWaiter {
-        flag: Arc<AtomicBool>,
+        count: Arc<AtomicUsize>,
     }
 
     impl LoomWaiter {
         fn new() -> Self {
             Self {
-                flag: Arc::new(AtomicBool::new(false)),
+                count: Arc::new(AtomicUsize::new(0)),
             }
         }
         fn signal(&self) {
-            self.flag.store(true, Ordering::Release);
+            self.count.fetch_add(1, Ordering::Release);
+        }
+        fn signal_count(&self) -> usize {
+            self.count.load(Ordering::Acquire)
         }
         fn is_signaled(&self) -> bool {
-            self.flag.load(Ordering::Acquire)
+            self.signal_count() > 0
         }
     }
 
@@ -421,13 +431,14 @@ mod loom_tests {
         });
     }
 
-    // Model 2: waiters are woken on finish.
+    // Model 2: waiters are woken exactly once on finish.
     // The main thread pre-claims leader so the waiter thread always sees
     // Joined or Cached (this isolates the wake-up invariant from leader
     // election, which model 1 covers). If the joiner registers before the
-    // finisher runs, finish must wake its waiter.
+    // finisher runs, finish must wake its waiter exactly once — counted
+    // via `LoomWaiter::signal_count` to detect both lost and double wakes.
     #[test]
-    fn loom_waiters_woken_on_finish() {
+    fn loom_waiters_woken_exactly_once_on_finish() {
         loom::model(|| {
             let stripe = new_stripe();
             {
@@ -466,11 +477,20 @@ mod loom_tests {
             t2.join().unwrap();
 
             if joined.load(Ordering::Acquire) {
-                assert!(
-                    waiter.is_signaled(),
-                    "a waiter that registered before finish must be signaled"
+                assert_eq!(
+                    waiter.signal_count(),
+                    1,
+                    "a waiter that registered before finish must be signaled exactly once \
+                     (lost wake -> 0, double wake -> >1)"
                 );
             } else {
+                // Joiner ran after finish: it saw Cached and was never
+                // stored as a waiter, so the signal count stays 0.
+                assert_eq!(
+                    waiter.signal_count(),
+                    0,
+                    "a joiner that saw Cached must never receive a signal"
+                );
                 // The joiner ran after finish: it saw Cached and was not
                 // stored as a waiter. The cache holds the value.
                 let cached = stripe
@@ -534,9 +554,16 @@ mod loom_tests {
             t2.join().unwrap();
 
             if joined.load(Ordering::Acquire) {
-                assert!(
-                    waiter.is_signaled(),
-                    "a waiter that joined before cancellation must be signaled"
+                assert_eq!(
+                    waiter.signal_count(),
+                    1,
+                    "a waiter that joined before cancellation must be signaled exactly once"
+                );
+            } else {
+                assert_eq!(
+                    waiter.signal_count(),
+                    0,
+                    "a joiner that saw Cached after cancellation must never receive a signal"
                 );
             }
             let cached = stripe

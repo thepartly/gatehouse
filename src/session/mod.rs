@@ -189,9 +189,19 @@ where
     /// fire after all stripe locks have been released, matching the prior
     /// behavior of separate `cache_loaded` + `finish_in_flight` calls.
     fn finish_keys(&self, keys: &[K], results: Vec<FactLoadResult<K::Value>>) {
-        debug_assert_eq!(keys.len(), results.len());
+        // assert (not debug_assert) so a release-mode mismatch can never
+        // strand waiters: if a caller passed unequal-length slices the
+        // shorter `zip` below would silently finish only the prefix while
+        // the caller's `InFlightGuard::mark_finished` cleared the whole
+        // chunk from `remaining`, leaving the unfinished tails as in-flight
+        // entries with no one to wake them.
+        assert_eq!(
+            keys.len(),
+            results.len(),
+            "finish_keys requires equal-length keys and results"
+        );
         let mut all_waiters = Vec::new();
-        for (key, result) in keys.iter().cloned().zip(results.into_iter()) {
+        for (key, result) in keys.iter().cloned().zip(results) {
             let stripe_index = self.stripe_index(&key);
             let waiters = {
                 let mut stripe = self.stripes[stripe_index]
