@@ -1,3 +1,11 @@
+//! Composing two custom policies (an org-admin shortcut and a per-permission
+//! staff check) into a single `PermissionChecker` and reading the per-policy
+//! reasons out of the evaluation trace.
+//!
+//! Demonstrates: custom `Policy` impls with the new
+//! `PolicyEvalResult::granted` / `denied` constructors, OR semantics across
+//! policies, and using `EvalTrace` to surface the reason chain.
+
 use async_trait::async_trait;
 use gatehouse::*;
 use uuid::Uuid;

@@ -79,7 +79,8 @@ async fn main() {
     let document = Document::new();
     let action = ViewAction;
     let context = EmptyContext;
-    let session = EvaluationSession::new();
+    // RBAC-only example: no fact sources, so the empty session is enough.
+    let session = EvaluationSession::empty();
 
     println!("=== AND Policy Short-Circuit Example ===");
     {
