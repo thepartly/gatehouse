@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-02
+
+First stable release of the v0.3 line. v0.3 consolidates around request-scoped fact loading: relationship data is loaded through an `EvaluationSession` registered with a `FactSource` instead of policy-owned `RelationshipResolver`s, list endpoints batch and deduplicate without leaking policy logic into the data layer, and the trait surface tightens around `Cow<'static, str>` policy names with `ctx.grant` / `ctx.deny` shortcuts.
+
+If you are upgrading from 0.2, the diff is substantial — start with `MIGRATION.md`, then read the `[0.3.0-alpha.1]`, `[0.3.0-alpha.2]`, and `[0.3.0-alpha.3]` sections below for the full breakdown of breaking changes that landed during the alpha cycle.
+
+The diff since `[0.3.0-alpha.3]` is small:
+
 ### Added
 
 - `examples/factsource_n_plus_one.rs` — contrastive teaching artifact pairing a "wrong" supplier policy that holds `Arc<HierarchyService>` and fires N redundant backend calls per batch against a "right" version that registers a `FactSource` and consumes via `ctx.session.get(...)`. The example reports actual backend call counts (25 vs 1 for a 25-invoice batch) so the N+1 lesson is visible at `cargo run --example`.
