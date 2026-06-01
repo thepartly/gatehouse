@@ -46,6 +46,66 @@ use tracing::Instrument;
 /// admin override, for example) can be implemented once as a generic
 /// `Policy<S, R, A, C>` and added to each per-resource checker, or be
 /// expressed as separate [`crate::DelegatingPolicy`] children.
+///
+/// # Modeling list/scope endpoints
+///
+/// The "one checker per resource type" recipe maps cleanly onto per-item
+/// authorization ("can this user view *this* invoice?"). List and scope
+/// endpoints ("can this user list invoices in *this org*?") push back:
+/// there is no single resource instance, and the authorization predicate
+/// often runs against a scope (an organization, a project, a tenant).
+///
+/// Resist the temptation to widen the per-item checker's `R` into an
+/// enum like `Resource { Item { id }, Listing { org_id } }` — that
+/// reintroduces the tag-dispatch smell inside every policy. The cleaner
+/// shape is **two checkers, one per concern**:
+///
+/// ```ignore
+/// // Scope/list authorization: "can this user list within this scope?"
+/// type InvoiceScopeChecker =
+///     PermissionChecker<User, OrgScope, ListInvoicesAction, RequestCtx>;
+///
+/// // Per-item authorization: "can this user view this specific invoice?"
+/// type InvoiceItemChecker =
+///     PermissionChecker<User, Invoice, ViewInvoiceAction, RequestCtx>;
+///
+/// async fn list_invoices(
+///     scope_checker: &InvoiceScopeChecker,
+///     item_checker: &InvoiceItemChecker,
+///     user: &User,
+///     org: &OrgScope,
+///     ctx: &RequestCtx,
+///     session: &EvaluationSession,
+///     lookup: &impl LookupSource<Subject = User, Id = InvoiceId>,
+///     hydrator: &impl Hydrator<InvoiceId, Resource = Invoice>,
+/// ) -> Result<Vec<Invoice>, ListError> {
+///     // 1. Coarse gate: may the user list anything in this scope at all?
+///     scope_checker
+///         .check(user, &ListInvoicesAction, org, ctx)
+///         .await
+///         .to_result(|reason| ListError::Forbidden(reason.into()))?;
+///
+///     // 2. Per-item enumeration: hydrate candidates, route through the
+///     //    item checker. Lookup is bounded by what its source enumerates,
+///     //    so the candidate set is already scoped; the item checker
+///     //    applies any remaining axes (sharing, admin override, etc).
+///     item_checker
+///         .lookup_authorized(
+///             session, user, &ViewInvoiceAction, ctx,
+///             lookup, page_size, hydrator,
+///         )
+///         .await
+///         .map_err(ListError::from)
+/// }
+/// ```
+///
+/// Two checkers, two clear concerns, no tag dispatch. The scope check is
+/// a single point evaluation (one row in the audit trail); the per-item
+/// pass produces one trace per visible item. If your scope predicate is
+/// trivial (everyone can list within their own org), you can drop the
+/// scope checker entirely and rely on the lookup source's `WHERE
+/// org_id = ?` filter — the per-item checker still validates each
+/// hydrated row, so authorization is not smeared into the data layer.
 #[derive(Clone)]
 pub struct PermissionChecker<S, R, A, C> {
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
