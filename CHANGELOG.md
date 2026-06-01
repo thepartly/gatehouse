@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0-alpha.3] - 2026-06-01
+
 ### Breaking
 
 - `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>`. Combined with the trait change below, static-name policies are **zero-allocation end-to-end** — direct constructor calls and the new `EvalCtx::grant` / `deny` shortcuts both go through `Cow::Borrowed`.
