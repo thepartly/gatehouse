@@ -541,7 +541,7 @@ where
                             outcome: true,
                         };
                         evaluations[index] = Some(AccessEvaluation::Granted {
-                            policy_type: std::borrow::Cow::Owned(policy_type.to_string()),
+                            policy_type: policy_type.clone(),
                             reason,
                             trace: EvalTrace::with_root(combined),
                         });
@@ -655,31 +655,6 @@ where
         .collect()
     }
 
-    /// Deprecated alias for [`Self::evaluate_batch_in_session_by_resource`].
-    #[deprecated(
-        since = "0.3.0-alpha.3",
-        note = "renamed to evaluate_batch_in_session_by_resource for naming symmetry \
-                with evaluate_batch_in_session_by (per-item (R, C))"
-    )]
-    pub async fn evaluate_batch_with_context_in_session_by<I, F>(
-        &self,
-        session: &EvaluationSession,
-        subject: &S,
-        action: &A,
-        items: I,
-        context: &C,
-        resource: F,
-    ) -> Vec<(I::Item, AccessEvaluation)>
-    where
-        I: IntoIterator,
-        F: for<'item> Fn(&'item I::Item) -> &'item R,
-    {
-        self.evaluate_batch_in_session_by_resource(
-            session, subject, action, items, context, resource,
-        )
-        .await
-    }
-
     /// Returns only authorized items with a shared context.
     ///
     /// Filter analogue of [`Self::evaluate_batch_in_session_by_resource`].
@@ -703,31 +678,6 @@ where
         .into_iter()
         .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
         .collect()
-    }
-
-    /// Deprecated alias for [`Self::filter_authorized_in_session_by_resource`].
-    #[deprecated(
-        since = "0.3.0-alpha.3",
-        note = "renamed to filter_authorized_in_session_by_resource for naming symmetry \
-                with filter_authorized_in_session_by (per-item (R, C))"
-    )]
-    pub async fn filter_authorized_with_context_in_session_by<I, F>(
-        &self,
-        session: &EvaluationSession,
-        subject: &S,
-        action: &A,
-        items: I,
-        context: &C,
-        resource: F,
-    ) -> Vec<I::Item>
-    where
-        I: IntoIterator,
-        F: for<'item> Fn(&'item I::Item) -> &'item R,
-    {
-        self.filter_authorized_in_session_by_resource(
-            session, subject, action, items, context, resource,
-        )
-        .await
     }
 
     /// Look up one page of candidate IDs from `lookup`, hydrate them via

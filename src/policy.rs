@@ -48,10 +48,17 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     /// Stored as [`Cow<'static, str>`] so the shortcut path is truly
     /// zero-allocation for policies that return `Cow::Borrowed("Name")`
     /// (every built-in policy, and any user policy with a static name).
-    /// Dynamic-name policies that return `Cow::Owned(...)` pay one
-    /// allocation when their `policy_type()` is called by the checker;
-    /// `ctx.grant`/`deny` only clone the Cow (cheap for `Borrowed`, has-
-    /// alloc for `Owned`) — the same per-call cost as today.
+    ///
+    /// Dynamic-name policies pay more on the helper path than a static-
+    /// name policy does. Per evaluation the checker calls
+    /// `policy.policy_type()` (alloc 1, the `String` inside the
+    /// `Cow::Owned`), clones that `Cow` into the `EvalCtx`
+    /// (alloc 2, since cloning a `Cow::Owned` clones the underlying
+    /// `String`), and then `ctx.grant` / `ctx.deny` clones it again
+    /// into the result (alloc 3). If that cost matters, either return a
+    /// `Cow::Borrowed` from a `'static` name table or hand-build the
+    /// `PolicyEvalResult` and move the name into it without going
+    /// through the shortcut.
     pub policy_type: Cow<'static, str>,
 }
 
