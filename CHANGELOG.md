@@ -4,9 +4,11 @@
 
 ### Breaking
 
-- `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>` so **call sites that pass a `&'static str` literal are zero-allocation**. Note that the new `EvalCtx::grant` / `deny` shortcuts (below) capture `ctx.policy_type` as `&str` and still allocate one `String` per call; for the zero-alloc path, call the constructor directly with the static literal name. Dynamic names work via `Cow::Owned` / `String`.
-- `EvalCtx` and `BatchEvalCtx` gain a `policy_type: &'a str` field. Tests and custom `Policy` impls that construct these directly need to populate it (the checker, combinators, and built-ins set it for you).
+- `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>`. Combined with the trait change below, static-name policies are **zero-allocation end-to-end** — direct constructor calls and the new `EvalCtx::grant` / `deny` shortcuts both go through `Cow::Borrowed`.
+- `Policy::policy_type` return type changed from `&str` to `Cow<'static, str>`. Built-in policies return `Cow::Borrowed("Name")` and pay zero allocations. Migrate downstream policies with one line per impl: `fn policy_type(&self) -> Cow<'static, str> { Cow::Borrowed("MyPolicy") }`. Dynamic-name policies return `Cow::Owned(self.name.clone())` — the same per-call allocation cost as before.
+- `EvalCtx` and `BatchEvalCtx` gain a `policy_type: Cow<'static, str>` field, captured once per evaluation by the checker (and by combinators when they fan out). Custom `Policy` impls and tests that build these directly need to populate it.
 - `PermissionChecker::evaluate_batch_with_context_in_session_by` renamed to `evaluate_batch_in_session_by_resource`; `filter_authorized_with_context_in_session_by` renamed to `filter_authorized_in_session_by_resource`. The new `_by_resource` suffix mirrors the existing `_by` (per-item `(R, C)`) and makes the distinguishing axis explicit. The old names remain as `#[deprecated(since = "0.3.0-alpha.3")]` thin delegates for one alpha cycle.
+- `DelegatingPolicy` constructor `policy_type` parameter changed from `impl Into<String>` to `impl Into<Cow<'static, str>>` to match the trait return type.
 
 ### Added
 
@@ -15,8 +17,8 @@
 
 ### Changed
 
-- Built-in `AbacPolicy` and `RbacPolicy` migrated to the new `ctx.grant` / `ctx.deny` shortcuts. Combinators populate the inner `EvalCtx` / `BatchEvalCtx` with the inner policy's name when dispatching, so `ctx.deny()` inside an inner policy correctly tags the result with the inner's name.
-- `PermissionChecker` docs gain a "One checker per resource type" recipe naming the idiomatic shape (per-resource-type checker) and the anti-pattern (tag-enum `R` with `if !matches!(ctx.resource, ::X)` at the top of every policy).
+- Built-in `AbacPolicy` and `RbacPolicy` migrated to the new `ctx.grant` / `ctx.deny` shortcuts. Combinators populate the inner `EvalCtx` / `BatchEvalCtx` with the inner policy's name when dispatching, including the `NotPolicy::evaluate_batch` path that previously forwarded the outer ctx unchanged (and would have tagged any wrapped policy's batch leaves as `NotPolicy`).
+- `PermissionChecker` docs gain a "One checker per resource type" recipe naming the idiomatic shape and the tag-enum anti-pattern, plus a sibling "Modeling list/scope endpoints" recipe showing how to compose a scope checker (`OrgScope` × `ListAction`) with a per-item checker driven by `lookup_authorized_*` without resorting to `enum Resource { Item, Listing }` discriminators.
 - Crate-level, `FactSource`, and `Hydrator` rustdoc now frame these traits as gatehouse's request-scoped DataLoader-style primitives, and call out that callers may invoke an existing DataLoader implementation (`async_graphql::dataloader` from the `async-graphql` crate, the `ultra-batch` crate, or a home-grown batcher) directly from inside `FactSource::load_many` or `Hydrator::hydrate`. Gatehouse owns the per-request fact graph; the underlying loader owns batching across the rest of the request and any longer-lived caching. The `Hydrator` docs also call out that gatehouse expects `Vec<Option<Resource>>` in input order, so a hydrator wrapping a map-returning DataLoader re-orders the loader's output back into the slice shape.
 - Examples polished for v0.3 idiom: `combinator_policy` uses `EvaluationSession::empty()` for its RBAC/ABAC-only setup; `groups_policy` gained a `//!` file header; the `axum` test helper formerly named `evaluate_access` was renamed `check_in_empty_session` to avoid evoking the pre-v0.3 API.
 
