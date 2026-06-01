@@ -225,6 +225,15 @@ where
     /// within each call. Implementations must return exactly one
     /// [`FactLoadResult`] per input key, in the same order. The session expands
     /// results back to caller-visible order, including duplicate keys.
+    ///
+    /// A wrong-length result is detected and surfaced as
+    /// [`FactLoadError::SourceContractViolation`]. **Order is the
+    /// implementor's responsibility**: the session has no way to detect a
+    /// result vector that has the right length but reorders entries — those
+    /// will be silently misattributed to the wrong keys. SQL implementations
+    /// should use `WITH ORDINALITY` (or an equivalent re-ordering step)
+    /// against the input slice; map-returning DataLoaders must re-index back
+    /// to the input order before returning.
     async fn load_many(&self, keys: &[K]) -> Vec<FactLoadResult<K::Value>>;
 
     /// Maximum number of keys this source wants to load in one call.

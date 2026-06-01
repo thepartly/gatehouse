@@ -119,6 +119,13 @@ let decision = checker
 
 `RelationshipResolver` has been removed. Use `RelationshipQuery` as the fact key, implement `FactSource`, and register the source in the request session.
 
+The `RebacPolicy::new` signature changes accordingly:
+
+- **The `resolver` first argument is gone.** The relationship source is now registered on the `EvaluationSession`, not on the policy.
+- **The relation argument shifts from `String` (or `impl Into<String>`) to a typed value** — typically a `Copy` enum like `Relation::Viewer`. The `FactSource` implementation is responsible for converting the typed value to whatever its backend uses (a SQL `text` column, a string-keyed lookup table, etc.).
+
+So a 0.2 call like `RebacPolicy::new(resolver, sid_fn, rid_fn, "viewer".to_string())` becomes a 0.3 call like `RebacPolicy::new(sid_fn, rid_fn, Relation::Viewer)`, plus a session-side `with_arc::<RelationshipQuery<Sid, Rid, Relation>>(source)` registration.
+
 ```rust
 // 0.2
 let policy = RebacPolicy::new(

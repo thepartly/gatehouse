@@ -183,7 +183,7 @@ The caller keeps ownership of resource loading and context construction. Gatehou
 
 If the item itself is the resource and the context type is `()`, use `evaluate_batch_resources_in_session` or `filter_authorized_resources_in_session`.
 
-Policies can override `Policy::evaluate_batch` to collapse backend work. `RebacPolicy` builds `RelationshipQuery` fact keys and loads them through the request-scoped `EvaluationSession`, so deduplication, chunking, caching, and fail-closed source errors live in one `FactSource` layer. Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner policies.
+Policies can override `Policy::evaluate_batch` to collapse backend work. `RebacPolicy` builds `RelationshipQuery` fact keys and loads them through the request-scoped `EvaluationSession`, so deduplication, chunking, caching, and fail-closed source errors live in one `FactSource` layer. Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner policies. `PolicyBuilder`-built policies additionally short-circuit the batch-shared axes (`.subjects()` / `.actions()`) once per batch instead of once per item — this is specific to `PolicyBuilder`'s generated `evaluate_batch`; a hand-written `Policy` impl that doesn't override `evaluate_batch` falls through to the serial-loop default and gets nothing for free.
 
 Checker and combinator batch evaluation remain sequential by design: they preserve policy order, per-item short-circuiting, and trace shape. Parallel work belongs inside policy implementations or fact sources today; any future checker-level parallel batch API should be explicit. `EvaluationSession` is safe to share across those parallel loaders, and unrelated fact keys do not contend on one global cache or in-flight lock.
 
@@ -262,6 +262,8 @@ Fact-backed ReBAC failures fail closed: missing sources, missing facts, source e
 When trace-level events are enabled, `PermissionChecker::evaluate_in_session` creates an instrumented span and every evaluated policy records a `trace!` event on the `gatehouse::security` target. Batch evaluation records checker-level aggregate fields and nested `gatehouse.batch_policy` spans with per-policy pending/granted/denied counts.
 
 Span, event target, and field names listed here are public observability API. Renaming or removing them is treated as a semver-major change.
+
+**Reason strings are emitted verbatim.** The `policy.result.reason` field and `FactProvenance.detail` rendered inside `EvalTrace::format` carry whatever the policy or fact source put there. Policies that interpolate subject- or context-derived data into reasons (`format!("user {} not in {}", subject.email, …)`) will expose that data to every tracing subscriber, including production log shippers. Treat reason strings as part of the public audit surface and keep credentials, tokens, raw PII, and other sensitive material out of them.
 
 Span and event names:
 

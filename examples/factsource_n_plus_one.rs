@@ -235,11 +235,14 @@ async fn main() {
         visible.len(),
         wrong_calls,
     );
-    assert_eq!(visible.len(), 25);
+    // Check the lesson (call count) before the bookkeeping (item count)
+    // so a regression in the dedup logic surfaces here, not in a
+    // confusing length mismatch.
     assert_eq!(
         wrong_calls, 25,
         "the wrong shape pays one hierarchy call per item",
     );
+    assert_eq!(visible.len(), 25);
 
     // ---- RIGHT ----
     let mut right_checker = PermissionChecker::<Supplier, Invoice, ViewAction, ()>::new();
@@ -267,9 +270,9 @@ async fn main() {
         visible.len(),
         right_calls,
     );
-    assert_eq!(visible.len(), 25);
     assert_eq!(
         right_calls, 1,
         "the session deduplicates: one supplier_org, one backend call",
     );
+    assert_eq!(visible.len(), 25);
 }
