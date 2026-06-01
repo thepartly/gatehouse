@@ -55,17 +55,17 @@ struct OwnerPolicy {
 impl Policy<User, Doc, ReadAction, Ctx> for OwnerPolicy {
     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Doc, ReadAction, Ctx>) -> PolicyEvalResult {
         match self.owns.get(&ctx.resource.id) {
-            Some(owner) if *owner == ctx.subject.id => PolicyEvalResult::Granted {
-                policy_type: self.policy_type().to_string(),
-                reason: Some(format!("user {} owns doc {}", owner, ctx.resource.id)),
-            },
-            _ => PolicyEvalResult::Denied {
-                policy_type: self.policy_type().to_string(),
-                reason: format!(
+            Some(owner) if *owner == ctx.subject.id => PolicyEvalResult::granted(
+                self.policy_type(),
+                Some(format!("user {} owns doc {}", owner, ctx.resource.id)),
+            ),
+            _ => PolicyEvalResult::denied(
+                self.policy_type(),
+                format!(
                     "user {} does not own doc {}",
                     ctx.subject.id, ctx.resource.id
                 ),
-            },
+            ),
         }
     }
     fn policy_type(&self) -> &str {
@@ -82,15 +82,9 @@ struct PublicDocPolicy;
 impl Policy<User, Doc, ReadAction, Ctx> for PublicDocPolicy {
     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Doc, ReadAction, Ctx>) -> PolicyEvalResult {
         if ctx.resource.public {
-            PolicyEvalResult::Granted {
-                policy_type: self.policy_type().to_string(),
-                reason: Some("public doc".into()),
-            }
+            PolicyEvalResult::granted(self.policy_type(), Some("public doc".into()))
         } else {
-            PolicyEvalResult::Denied {
-                policy_type: self.policy_type().to_string(),
-                reason: "doc is not public".into(),
-            }
+            PolicyEvalResult::denied(self.policy_type(), "doc is not public")
         }
     }
     fn policy_type(&self) -> &str {

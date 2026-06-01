@@ -17,19 +17,19 @@ fn delegated_evaluation_to_result(
         } => PolicyEvalResult::Combined {
             policy_type: policy_type.to_string(),
             operation: CombineOp::Delegate,
-            children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::Granted {
-                policy_type: child_policy_type,
-                reason,
-            })],
+            children: vec![trace
+                .root()
+                .cloned()
+                .unwrap_or(PolicyEvalResult::granted(child_policy_type, reason))],
             outcome: true,
         },
         AccessEvaluation::Denied { reason, trace } => PolicyEvalResult::Combined {
             policy_type: policy_type.to_string(),
             operation: CombineOp::Delegate,
-            children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::Denied {
-                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+            children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::denied(
+                PERMISSION_CHECKER_POLICY_TYPE,
                 reason,
-            })],
+            ))],
             outcome: false,
         },
     }
