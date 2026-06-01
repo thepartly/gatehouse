@@ -39,11 +39,20 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
     /// reason, but in practice grants almost always carry one, so the
     /// shortcut requires it; for the rare no-reason case call
     /// [`PolicyEvalResult::granted`] directly with `None`.
+    ///
+    /// **Performance note.** `ctx.policy_type` is a non-static `&str`
+    /// borrowed from the policy, so the shortcut allocates one `String`
+    /// per call to attach it to the result. For zero-allocation grants on
+    /// hot paths, call [`PolicyEvalResult::granted`] directly with a
+    /// `&'static str` literal — that path goes through
+    /// `Cow::Borrowed`.
     pub fn grant(&self, reason: impl Into<String>) -> PolicyEvalResult {
         PolicyEvalResult::granted(self.policy_type.to_string(), Some(reason.into()))
     }
 
     /// Shorthand for `PolicyEvalResult::denied(ctx.policy_type, reason)`.
+    ///
+    /// See [`Self::grant`] for the per-call allocation note.
     pub fn deny(&self, reason: impl Into<String>) -> PolicyEvalResult {
         PolicyEvalResult::denied(self.policy_type.to_string(), reason)
     }

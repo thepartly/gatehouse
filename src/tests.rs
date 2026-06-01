@@ -894,6 +894,86 @@ mod core_tests {
     }
 
     #[tokio::test]
+    async fn test_not_policy_batch_tags_inner_leaves_with_inner_name() {
+        // Regression test: NotPolicy::evaluate_batch must construct a fresh
+        // BatchEvalCtx with the inner policy's policy_type before
+        // forwarding, so any leaf the inner policy produces via
+        // `ctx.grant` / `ctx.deny` (or via the default evaluate_batch
+        // that fans out per-item EvalCtx) is tagged with the inner's
+        // name, not "NotPolicy".
+        //
+        // We pair NotPolicy with AbacPolicy, which builds its result via
+        // `ctx.deny(...)` — i.e. it reads ctx.policy_type. The inner
+        // leaf in the resulting trace tree must be tagged "AbacPolicy",
+        // not "NotPolicy".
+
+        struct OddResourcePolicy;
+        #[async_trait]
+        impl Policy<TestSubject, TestResource, TestAction, TestContext> for OddResourcePolicy {
+            async fn evaluate(
+                &self,
+                ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
+            ) -> PolicyEvalResult {
+                if ctx.resource.id.as_u128() % 2 == 1 {
+                    ctx.grant("odd id")
+                } else {
+                    ctx.deny("even id")
+                }
+            }
+            fn policy_type(&self) -> &str {
+                "OddResourcePolicy"
+            }
+        }
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let owned_items = (0..2)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let policy = NotPolicy::new(OddResourcePolicy);
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        // Drill into each Combined result, find the inner leaf, and
+        // assert it carries the inner policy's name.
+        for result in &results {
+            match result {
+                PolicyEvalResult::Combined { children, .. } => {
+                    assert_eq!(children.len(), 1, "NotPolicy wraps exactly one child");
+                    match &children[0] {
+                        PolicyEvalResult::Granted { policy_type, .. }
+                        | PolicyEvalResult::Denied { policy_type, .. } => {
+                            assert_eq!(
+                                policy_type.as_ref(),
+                                "OddResourcePolicy",
+                                "inner leaf must be tagged with the wrapped policy's name, \
+                                 not 'NotPolicy'"
+                            );
+                        }
+                        other => panic!("expected leaf child, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Combined NotPolicy result, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_not_policy_batch_fails_closed_on_inner_length_mismatch() {
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),

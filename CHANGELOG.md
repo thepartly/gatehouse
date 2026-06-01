@@ -4,7 +4,7 @@
 
 ### Breaking
 
-- `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>` so static literal call sites are zero-allocation; dynamic names still work via `Cow::Owned` / `String`.
+- `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>` so **call sites that pass a `&'static str` literal are zero-allocation**. Note that the new `EvalCtx::grant` / `deny` shortcuts (below) capture `ctx.policy_type` as `&str` and still allocate one `String` per call; for the zero-alloc path, call the constructor directly with the static literal name. Dynamic names work via `Cow::Owned` / `String`.
 - `EvalCtx` and `BatchEvalCtx` gain a `policy_type: &'a str` field. Tests and custom `Policy` impls that construct these directly need to populate it (the checker, combinators, and built-ins set it for you).
 - `PermissionChecker::evaluate_batch_with_context_in_session_by` renamed to `evaluate_batch_in_session_by_resource`; `filter_authorized_with_context_in_session_by` renamed to `filter_authorized_in_session_by_resource`. The new `_by_resource` suffix mirrors the existing `_by` (per-item `(R, C)`) and makes the distinguishing axis explicit. The old names remain as `#[deprecated(since = "0.3.0-alpha.3")]` thin delegates for one alpha cycle.
 

@@ -387,7 +387,19 @@ where
         &self,
         ctx: &BatchEvalCtx<'item, S, R, A, C>,
     ) -> Vec<PolicyEvalResult> {
-        let inner_results = self.policy.evaluate_batch(ctx).await;
+        // Rebuild the BatchEvalCtx with the inner policy's name so any
+        // result built via `ctx.grant`/`ctx.deny` (or the default
+        // evaluate_batch impl, which forwards through per-item EvalCtx)
+        // is tagged with the wrapped policy, not "NotPolicy". Matches the
+        // single-item path and the AndPolicy/OrPolicy batch paths.
+        let inner_ctx = BatchEvalCtx {
+            session: ctx.session,
+            subject: ctx.subject,
+            action: ctx.action,
+            items: ctx.items,
+            policy_type: self.policy.policy_type(),
+        };
+        let inner_results = self.policy.evaluate_batch(&inner_ctx).await;
 
         if inner_results.len() != ctx.items.len() {
             return ctx
