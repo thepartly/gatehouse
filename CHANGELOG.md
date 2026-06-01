@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-02
+
+First stable release of the v0.3 line. v0.3 consolidates around request-scoped fact loading: relationship data is loaded through an `EvaluationSession` registered with a `FactSource` instead of policy-owned `RelationshipResolver`s, list endpoints batch and deduplicate without leaking policy logic into the data layer, and the trait surface tightens around `Cow<'static, str>` policy names with `ctx.grant` / `ctx.deny` shortcuts.
+
+Beyond the request-scoped fact-loading model, three v0.3 capabilities are worth surfacing for adopters evaluating the release:
+
+- **Per-decision audit provenance.** Every `PolicyEvalResult` leaf carries a `Vec<FactProvenance>` recording the facts the policy consulted, the load outcome, and any backend error detail — rendered inline by `EvalTrace::format` and separate from the operational `gatehouse.fact_load` tracing span used for latencies and cache-hit telemetry.
+- **Multi-checker audit disambiguation.** `PermissionChecker::named(...)` records a `checker.name` field on the `evaluate_in_session` / `evaluate_batch_in_session_*` tracing spans, so audit pipelines running several checkers with overlapping policy names (an `Invoice` checker and a `Product` checker both reusing a shared `AdminOverride` policy, for example) can route by source.
+- **Loom-verified session state machine.** The per-stripe fact-load coordinator is a Sans-I/O synchronous core with a loom permutation-test harness covering leader-election uniqueness, exactly-once waiter wake-up, fail-closed cancellation, multi-stripe independence, and replacement-while-in-flight. Runs as a separate CI job under `RUSTFLAGS="--cfg loom"`.
+
+If you are upgrading from 0.2, the diff is substantial — start with `MIGRATION.md`, then read the `[0.3.0-alpha.1]`, `[0.3.0-alpha.2]`, and `[0.3.0-alpha.3]` sections below for the full breakdown of breaking changes that landed during the alpha cycle.
+
+The diff since `[0.3.0-alpha.3]` is small:
+
 ### Added
 
 - `examples/factsource_n_plus_one.rs` — contrastive teaching artifact pairing a "wrong" supplier policy that holds `Arc<HierarchyService>` and fires N redundant backend calls per batch against a "right" version that registers a `FactSource` and consumes via `ctx.session.get(...)`. The example reports actual backend call counts (25 vs 1 for a 25-invoice batch) so the N+1 lesson is visible at `cargo run --example`.
@@ -10,20 +24,29 @@
 ### Changed
 
 - `PolicyBuilder::when` rustdoc now telegraphs that it's the cross-axis escape hatch, not the default predicate setter. Calls out the batch-shortcut implication (axis-specific predicates participate in the subject/action once-per-batch shortcut; `.when()` always runs per-item) and offers a rule-of-thumb: if the closure ignores two or more of `(subject, action, resource, context)`, the corresponding axis-specific helper is the better fit. No API change.
+- `PolicyBuilder` rustdoc now explicitly names the dynamic-name allocation footnote: builder-built policies are dynamic-name policies under the trace-path accounting; the "zero-allocation end-to-end" framing applies to hand-written `impl Policy` with a `'static` literal name. `MIGRATION.md` gains the same note.
 - `PermissionChecker`'s "One checker per resource type" recipe gains a one-paragraph pointer acknowledging that downstream projects with many resource types typically wrap their per-resource checkers in a thin dispatching service trait or macro, and that gatehouse intentionally stays out of that organizational layer (downstream patterns vary widely; prescribing one shape would lock in a specific dispatching style).
+- `FactSource::load_many` rustdoc now names the silent-misattribution failure mode: a result vector with the right length but the wrong order has no detection path, since the session can't re-key against the inputs. Documents the standard fixes (`WITH ORDINALITY` for SQL, re-index for map-returning DataLoaders).
+- README's Tracing and Telemetry section warns that `policy.result.reason` and `FactProvenance.detail` are emitted verbatim to every subscriber; treat reason strings as part of the public audit surface and keep credentials, tokens, and unredacted PII out of them.
+- README's Batch Authorization section now names the `PolicyBuilder`-specific scope of the per-axis `.subjects()`/`.actions()` short-circuit win: hand-written `Policy::evaluate_batch` impls that don't override get nothing for free.
+- `examples/mfa_freshness_context.rs`'s `HighValueRequiresFreshMfa` carries a "DO NOT add this policy directly to a `PermissionChecker`" warning at the struct level and at the grant site. The "rule doesn't apply → grant" pattern is correct under `AndPolicy` (the example's intended composition) but would grant every below-threshold call under the checker's default OR semantics — a real footgun for an example file readers copy from.
+
+### Fixed
+
+- `impl<S, R, A, C> Policy<S, R, A, C> for Box<dyn Policy<S, R, A, C>>` had `Send + Sync` bounds on each type parameter, over-constraining relative to the trait declaration (`Sync` only). Adopters with `!Send` subject/resource/action/context types can now box their policies. No code change for the common case; the previous bounds were strictly stricter than the trait required.
 
 ## [0.3.0-alpha.3] - 2026-06-01
 
 API ergonomics + performance consolidation. The headline changes:
 
 - `PermissionChecker::check`, `PermissionChecker::named`, `EvalCtx::grant` / `deny` shortcuts, and trace-aware test helpers — adopters write less boilerplate in policy bodies and unit tests.
-- `Policy::policy_type` returns `Cow<'static, str>`; static-name policies are zero-allocation end-to-end. Dynamic-name policies pay one allocation per call (down from a `String` round trip in earlier alphas).
+- `Policy::policy_type` returns `Cow<'static, str>`; **static-name** policies (those that return `Cow::Borrowed("MyPolicy")` from a literal) are zero-allocation end-to-end on the helper path. Dynamic-name policies — including everything built via `PolicyBuilder::new(name)`, since the builder stores its name as an owned `String` — pay one allocation per call (down from a `String` round trip in earlier alphas).
 - `PolicyBuilder`-built policies short-circuit batch-shared axes (`.subjects()`, `.actions()`) once per batch — bench-measured 13–32% throughput improvement, growing with batch size.
 - The two `*_with_context_in_session_by` batch methods are renamed `*_in_session_by_resource`. Old names are removed (no deprecation alias).
 
 ### Breaking
 
-- `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>`. Combined with the trait change below, static-name policies are **zero-allocation end-to-end** — direct constructor calls and the new `EvalCtx::grant` / `deny` shortcuts both go through `Cow::Borrowed`.
+- `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>`. Combined with the trait change below, static-name policies are zero-allocation end-to-end (direct constructor calls and the new `EvalCtx::grant` / `deny` shortcuts both go through `Cow::Borrowed`). Dynamic-name policies still pay per call — see the next bullet and the `EvalCtx::policy_type` rustdoc for the full accounting.
 - `Policy::policy_type` return type changed from `&str` to `Cow<'static, str>`. Built-in policies return `Cow::Borrowed("Name")` and pay zero allocations. Migrate downstream policies with one line per impl: `fn policy_type(&self) -> Cow<'static, str> { Cow::Borrowed("MyPolicy") }`. Dynamic-name policies return `Cow::Owned(self.name.clone())` and pay one allocation per `policy_type()` call (where the previous `&str` API let them return `&self.name` without allocating), plus one more on the single-item `ctx.grant` / `ctx.deny` helper path. The batch path additionally clones the name into each `BatchEvalCtx` chunk. See the `EvalCtx::policy_type` rustdoc for the full accounting and prefer a `'static` name when you can.
 - `EvalCtx` and `BatchEvalCtx` gain a `policy_type: Cow<'static, str>` field, captured once per evaluation by the checker (and by combinators when they fan out). Custom `Policy` impls and tests that build these directly need to populate it.
 - `PermissionChecker::evaluate_batch_with_context_in_session_by` renamed to `evaluate_batch_in_session_by_resource`; `filter_authorized_with_context_in_session_by` renamed to `filter_authorized_in_session_by_resource`. The new `_by_resource` suffix mirrors the existing `_by` (per-item `(R, C)`) and makes the distinguishing axis explicit. Old names are removed; migrate with:

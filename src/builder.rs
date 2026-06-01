@@ -140,6 +140,18 @@ where
 /// treated as denied/non-applicable, and this does not introduce a global
 /// deny-overrides-allow rule when combined with other policies.
 ///
+/// # A note on allocation cost
+///
+/// `PolicyBuilder::new` takes the name as `impl Into<String>` and stores it
+/// owned. Every policy built by the builder therefore returns
+/// `Cow::Owned(self.name.clone())` from [`Policy::policy_type`] — these are
+/// *dynamic-name* policies in the accounting at [`crate::EvalCtx::policy_type`].
+/// The "static-name policies are zero-allocation end-to-end" framing in the
+/// crate-level docs applies to hand-written `Policy` impls that return
+/// `Cow::Borrowed("MyPolicy")` from a `'static` string literal — not to the
+/// builder output. If allocation cost on the trace path is a bottleneck for
+/// you, write a small `impl Policy<…>` by hand and return `Cow::Borrowed`.
+///
 /// # Example
 ///
 /// ```rust

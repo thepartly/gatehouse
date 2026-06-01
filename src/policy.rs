@@ -250,10 +250,10 @@ where
 #[async_trait]
 impl<S, R, A, C> Policy<S, R, A, C> for Box<dyn Policy<S, R, A, C>>
 where
-    S: Send + Sync,
-    R: Send + Sync,
-    A: Send + Sync,
-    C: Send + Sync,
+    S: Sync,
+    R: Sync,
+    A: Sync,
+    C: Sync,
 {
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
         (**self).evaluate(ctx).await

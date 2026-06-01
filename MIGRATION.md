@@ -2,6 +2,12 @@
 
 Gatehouse 0.3 is a breaking release. The main shift is that relationship data is now loaded through request-scoped `EvaluationSession` instances and typed `FactSource`s instead of policy-owned `RelationshipResolver`s.
 
+Three sentence-level changes apply across the codebase before you touch any specific section:
+
+- **`Policy::evaluate_access` is renamed to `Policy::evaluate`** and takes a single `EvalCtx<'_, S, R, A, C>` reference instead of four positional borrows. Every existing `impl Policy` will need this rewrite.
+- **`Subject`, `Resource`, `Action`, and `Context` must be `Sync`.** Batch evaluation borrows these across `.await` points. Types that hold `Rc`, `RefCell`, raw pointers, or other `!Sync` interior state will need to be reworked or wrapped (`Arc<Mutex<_>>` / `Arc<RwLock<_>>` if interior mutability is genuinely required).
+- **Construct `PolicyEvalResult` through the new constructors**, not struct literals. The `Granted` and `Denied` variants gained a `provenance: Vec<FactProvenance>` field, so any direct `PolicyEvalResult::Granted { … }` / `PolicyEvalResult::Denied { … }` literal stops compiling. Use `PolicyEvalResult::granted(name, Some(reason))` and `PolicyEvalResult::denied(name, reason)` (or the `_with_facts` variants when recording provenance) — or, in policy bodies, prefer `ctx.grant(reason)` / `ctx.deny(reason)`.
+
 ## Policy Implementations
 
 The `Policy` trait now receives an evaluation context rather than separate arguments. `policy_type` returns `Cow<'static, str>` so static names stay zero-allocation, and policies build results through the `ctx.grant` / `ctx.deny` shortcuts rather than struct literals.
@@ -87,6 +93,8 @@ impl Policy<User, Document, Read, RequestContext> for NamedPolicy {
 }
 ```
 
+A note on `PolicyBuilder`: `PolicyBuilder::new(name)` stores the name as an owned `String`, so every builder-built policy is a dynamic-name policy under the trace-path allocation accounting (one allocation per evaluation, plus another on the `ctx.grant`/`ctx.deny` helper path). If you're migrating a policy whose name is a `'static` string literal and you want the zero-allocation path, switch from `PolicyBuilder` to a small hand-written `impl Policy<…>` that returns `Cow::Borrowed("MyPolicy")`. The builder is the right tool for ergonomics and dynamic names; hand-written impls are the right tool for hot paths with fixed names.
+
 ## Checker Calls
 
 All checker evaluation now takes an explicit session. For RBAC/ABAC-only paths, the simplest migration is `PermissionChecker::check`, which wraps `evaluate_in_session(EvaluationSession::shared_empty(), …)`:
@@ -118,6 +126,13 @@ let decision = checker
 ## ReBAC
 
 `RelationshipResolver` has been removed. Use `RelationshipQuery` as the fact key, implement `FactSource`, and register the source in the request session.
+
+The `RebacPolicy::new` signature changes accordingly:
+
+- **The `resolver` first argument is gone.** The relationship source is now registered on the `EvaluationSession`, not on the policy.
+- **The relation argument shifts from `String` (or `impl Into<String>`) to a typed value** — typically a `Copy` enum like `Relation::Viewer`. The `FactSource` implementation is responsible for converting the typed value to whatever its backend uses (a SQL `text` column, a string-keyed lookup table, etc.).
+
+So a 0.2 call like `RebacPolicy::new(resolver, sid_fn, rid_fn, "viewer".to_string())` becomes a 0.3 call like `RebacPolicy::new(sid_fn, rid_fn, Relation::Viewer)`, plus a session-side `with_arc::<RelationshipQuery<Sid, Rid, Relation>>(source)` registration.
 
 ```rust
 // 0.2

@@ -85,6 +85,15 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for FinanceCanApprove
 /// "not a high-value refund" as granted (the rule doesn't apply), so
 /// pairing it with [`FinanceCanApproveRefunds`] under [`AndPolicy`]
 /// only adds the freshness check when it's relevant.
+///
+/// **DO NOT add this policy directly to a `PermissionChecker`** —
+/// the checker uses `OR` semantics, so the "rule doesn't apply"
+/// grant on every below-threshold call would grant *everyone* on
+/// every small refund, regardless of role. This shape is only safe
+/// inside an `AndPolicy` (or any `AND`-combining context) where the
+/// sibling policies enforce the actual access decision. The pattern
+/// is "augment an existing grant with an additional gate," not
+/// "decide on its own."
 struct HighValueRequiresFreshMfa {
     threshold_cents: u64,
     max_age: Duration,
@@ -96,7 +105,8 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequires
         &self,
         ctx: &EvalCtx<'_, User, RefundRequest, Approve, ApprovalContext>,
     ) -> PolicyEvalResult {
-        // Rule doesn't apply below the threshold — grant.
+        // Rule doesn't apply below the threshold — grant. NOTE: this
+        // only behaves correctly under AND. See the struct's docstring.
         if ctx.resource.amount_cents < self.threshold_cents {
             return ctx.grant("amount below high-value threshold");
         }
