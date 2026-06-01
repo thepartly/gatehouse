@@ -58,9 +58,15 @@ impl Policy<User, Document, View, RequestCtx> for AdminPolicy {
         ctx: &EvalCtx<'_, User, Document, View, RequestCtx>,
     ) -> PolicyEvalResult {
         if ctx.subject.is_admin {
-            PolicyEvalResult::granted(self.policy_type(), Some("admin override".into()))
+            PolicyEvalResult::Granted {
+                policy_type: self.policy_type().to_string(),
+                reason: Some("admin override".into()),
+            }
         } else {
-            PolicyEvalResult::denied(self.policy_type(), "not admin")
+            PolicyEvalResult::Denied {
+                policy_type: self.policy_type().to_string(),
+                reason: "not admin".into(),
+            }
         }
     }
     fn policy_type(&self) -> &str {
@@ -86,9 +92,15 @@ impl Policy<User, Document, View, RequestCtx> for ViewerPolicy {
             .map(|users| users.contains(&ctx.subject.id))
             .unwrap_or(false);
         if granted {
-            PolicyEvalResult::granted(self.policy_type(), Some("viewer relation".into()))
+            PolicyEvalResult::Granted {
+                policy_type: self.policy_type().to_string(),
+                reason: Some("viewer relation".into()),
+            }
         } else {
-            PolicyEvalResult::denied(self.policy_type(), "no viewer relation")
+            PolicyEvalResult::Denied {
+                policy_type: self.policy_type().to_string(),
+                reason: "no viewer relation".into(),
+            }
         }
     }
     fn policy_type(&self) -> &str {

@@ -345,7 +345,10 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::granted(self.policy_type(), Some("Always allow policy".to_string()))
+            PolicyEvalResult::Granted {
+                policy_type: self.policy_type().to_string(),
+                reason: Some("Always allow policy".to_string()),
+            }
         }
 
         fn policy_type(&self) -> &str {
@@ -362,7 +365,10 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::denied(self.policy_type(), self.0)
+            PolicyEvalResult::Denied {
+                policy_type: self.policy_type().to_string(),
+                reason: self.0.to_string(),
+            }
         }
 
         fn policy_type(&self) -> &str {
@@ -383,9 +389,15 @@ mod core_tests {
         ) -> PolicyEvalResult {
             self.single_calls.fetch_add(1, Ordering::SeqCst);
             if ctx.resource.id.as_u128().is_multiple_of(2) {
-                PolicyEvalResult::granted(self.policy_type(), Some("even resource".to_string()))
+                PolicyEvalResult::Granted {
+                    policy_type: self.policy_type().to_string(),
+                    reason: Some("even resource".to_string()),
+                }
             } else {
-                PolicyEvalResult::denied(self.policy_type(), "odd resource")
+                PolicyEvalResult::Denied {
+                    policy_type: self.policy_type().to_string(),
+                    reason: "odd resource".to_string(),
+                }
             }
         }
 
@@ -421,7 +433,10 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::granted(self.policy_type(), Some("single item fallback".to_string()))
+            PolicyEvalResult::Granted {
+                policy_type: self.policy_type().to_string(),
+                reason: Some("single item fallback".to_string()),
+            }
         }
 
         async fn evaluate_batch<'item>(
@@ -431,11 +446,9 @@ mod core_tests {
             ctx.items
                 .iter()
                 .skip(1)
-                .map(|_| {
-                    PolicyEvalResult::granted(
-                        self.policy_type(),
-                        Some("wrong batch length".to_string()),
-                    )
+                .map(|_| PolicyEvalResult::Granted {
+                    policy_type: self.policy_type().to_string(),
+                    reason: Some("wrong batch length".to_string()),
                 })
                 .collect()
         }
@@ -453,7 +466,10 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::denied(self.policy_type(), "Blocked by custom rule")
+            PolicyEvalResult::Denied {
+                policy_type: self.policy_type().to_string(),
+                reason: "Blocked by custom rule".to_string(),
+            }
         }
 
         fn policy_type(&self) -> &str {
@@ -1350,45 +1366,6 @@ mod core_tests {
         let result = policy.evaluate(&ctx).await;
 
         assert!(result.is_granted());
-        // A fact-backed grant records the consulted relationship as provenance.
-        let provenance = result.provenance();
-        assert_eq!(provenance.len(), 1);
-        assert_eq!(provenance[0].fact_name, "relationship");
-        assert_eq!(provenance[0].outcome, FactOutcome::Found);
-        assert!(provenance[0].detail.is_none());
-        // The rendered trace surfaces the fact inline.
-        assert!(result.format(0).contains("↳ fact relationship [found]"));
-    }
-
-    #[tokio::test]
-    async fn test_rebac_policy_records_provenance_on_load_error() {
-        let policy = relationship_policy("manager".to_string());
-        let subject = TestSubject {
-            id: uuid::Uuid::new_v4(),
-        };
-        let resource = TestResource {
-            id: uuid::Uuid::new_v4(),
-        };
-        let session = EvaluationSession::new();
-        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
-            ErrorRelationshipSource,
-        );
-        let ctx = EvalCtx {
-            session: &session,
-            subject: &subject,
-            action: &TestAction,
-            resource: &resource,
-            context: &TestContext,
-        };
-
-        let result = policy.evaluate(&ctx).await;
-
-        assert!(!result.is_granted());
-        let provenance = result.provenance();
-        assert_eq!(provenance.len(), 1);
-        assert_eq!(provenance[0].outcome, FactOutcome::Error);
-        // The backend error message is carried as provenance detail.
-        assert!(provenance[0].detail.is_some());
     }
 
     #[tokio::test]
@@ -1873,12 +1850,15 @@ mod core_tests {
             ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, FeatureFlagContext>,
         ) -> PolicyEvalResult {
             if ctx.context.feature_enabled {
-                PolicyEvalResult::granted(
-                    self.policy_type(),
-                    Some("Feature flag enabled".to_string()),
-                )
+                PolicyEvalResult::Granted {
+                    policy_type: self.policy_type().to_string(),
+                    reason: Some("Feature flag enabled".to_string()),
+                }
             } else {
-                PolicyEvalResult::denied(self.policy_type(), "Feature flag disabled")
+                PolicyEvalResult::Denied {
+                    policy_type: self.policy_type().to_string(),
+                    reason: "Feature flag disabled".to_string(),
+                }
             }
         }
 
@@ -1973,7 +1953,6 @@ mod core_tests {
             PolicyEvalResult::Denied {
                 policy_type,
                 reason,
-                ..
             } => {
                 assert_eq!(policy_type, "AbacPolicy");
                 assert!(reason.contains("false"));
@@ -2102,7 +2081,6 @@ mod core_tests {
             PolicyEvalResult::Denied {
                 policy_type,
                 reason,
-                ..
             } => {
                 assert_eq!(policy_type, "RbacPolicy");
                 assert!(reason.contains("doesn't have required role"));
@@ -2245,12 +2223,15 @@ mod core_tests {
                 self.counter.fetch_add(1, Ordering::SeqCst);
 
                 if self.result {
-                    PolicyEvalResult::granted(
-                        self.policy_type(),
-                        Some("Counting policy granted".to_string()),
-                    )
+                    PolicyEvalResult::Granted {
+                        policy_type: self.policy_type().to_string(),
+                        reason: Some("Counting policy granted".to_string()),
+                    }
                 } else {
-                    PolicyEvalResult::denied(self.policy_type(), "Counting policy denied")
+                    PolicyEvalResult::Denied {
+                        policy_type: self.policy_type().to_string(),
+                        reason: "Counting policy denied".to_string(),
+                    }
                 }
             }
 
@@ -2492,7 +2473,10 @@ mod core_tests {
 
     #[test]
     fn test_eval_trace_with_root() {
-        let result = PolicyEvalResult::granted("TestPolicy", Some("Test reason".to_string()));
+        let result = PolicyEvalResult::Granted {
+            policy_type: "TestPolicy".to_string(),
+            reason: Some("Test reason".to_string()),
+        };
         let trace = EvalTrace::with_root(result);
 
         assert!(trace.root().is_some(), "Trace with root should have a root");
@@ -2512,7 +2496,10 @@ mod core_tests {
         let mut trace = EvalTrace::new();
         assert!(trace.root().is_none());
 
-        let result = PolicyEvalResult::denied("DenyPolicy", "Denied for testing");
+        let result = PolicyEvalResult::Denied {
+            policy_type: "DenyPolicy".to_string(),
+            reason: "Denied for testing".to_string(),
+        };
         trace.set_root(result);
 
         assert!(
@@ -2534,17 +2521,26 @@ mod core_tests {
 
     #[test]
     fn test_policy_eval_result_reason_granted() {
-        let result = PolicyEvalResult::granted("TestPolicy", Some("Grant reason".to_string()));
+        let result = PolicyEvalResult::Granted {
+            policy_type: "TestPolicy".to_string(),
+            reason: Some("Grant reason".to_string()),
+        };
         assert_eq!(result.reason(), Some("Grant reason".to_string()));
 
         // Test with None reason
-        let result_no_reason = PolicyEvalResult::granted("TestPolicy", None);
+        let result_no_reason = PolicyEvalResult::Granted {
+            policy_type: "TestPolicy".to_string(),
+            reason: None,
+        };
         assert_eq!(result_no_reason.reason(), None);
     }
 
     #[test]
     fn test_policy_eval_result_reason_denied() {
-        let result = PolicyEvalResult::denied("TestPolicy", "Deny reason");
+        let result = PolicyEvalResult::Denied {
+            policy_type: "TestPolicy".to_string(),
+            reason: "Deny reason".to_string(),
+        };
         assert_eq!(result.reason(), Some("Deny reason".to_string()));
     }
 
@@ -2565,7 +2561,10 @@ mod core_tests {
 
     #[test]
     fn test_policy_eval_result_format_indentation() {
-        let result = PolicyEvalResult::granted("TestPolicy", Some("Test".to_string()));
+        let result = PolicyEvalResult::Granted {
+            policy_type: "TestPolicy".to_string(),
+            reason: Some("Test".to_string()),
+        };
 
         let formatted_0 = result.format(0);
         let formatted_4 = result.format(4);
@@ -2582,7 +2581,10 @@ mod core_tests {
 
     #[test]
     fn test_policy_eval_result_display() {
-        let result = PolicyEvalResult::denied("TestPolicy", "Test denial");
+        let result = PolicyEvalResult::Denied {
+            policy_type: "TestPolicy".to_string(),
+            reason: "Test denial".to_string(),
+        };
 
         let display_str = format!("{}", result);
         assert!(display_str.contains("TestPolicy"));

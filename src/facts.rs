@@ -7,15 +7,12 @@ use std::sync::Arc;
 /// A typed fact key that can be loaded through an [`crate::EvaluationSession`].
 ///
 /// Keys are flat, cloneable, and hashable so the session can deduplicate and
-/// cache fact loads for the lifetime of a single [`crate::EvaluationSession`].
+/// cache fact loads for the lifetime of one authorization request.
 ///
-/// Caching is scoped to that session, not the process. Gatehouse has no
-/// built-in notion of a "request"; the caller decides how long a session lives
-/// and, by convention, scopes it to one authorization pass (for an HTTP
-/// service, typically one inbound request). Cached facts and cached errors are
-/// dropped when the session is dropped, so permission revocations or backend
-/// changes are observed by the next session rather than being held in a
-/// process-global cache.
+/// Session caching is deliberately request-scoped. Cached facts and cached
+/// errors are dropped with the [`crate::EvaluationSession`], so permission revocations
+/// or backend changes are observed by the next request's session rather than
+/// being held in a process-global cache.
 pub trait FactKey: Eq + Hash + Clone + Send + Sync + 'static {
     /// The value returned by a [`FactSource`] for this key.
     type Value: Clone + Send + Sync + 'static;
@@ -27,8 +24,6 @@ pub trait FactKey: Eq + Hash + Clone + Send + Sync + 'static {
     const NAME: &'static str;
 }
 
-/// Private error type backing [`FactLoadError::backend_message`], so callers
-/// can wrap a human-readable message without defining their own error type.
 #[derive(Debug)]
 struct MessageError(String);
 
@@ -57,16 +52,13 @@ pub enum FactLoadError {
         /// Number of results returned by the source.
         actual: usize,
     },
-    /// The future driving a fact load was dropped before the load completed.
+    /// The leader task for a fact load was cancelled before it completed.
     ///
-    /// When several evaluations await the same key, one of them drives the load
-    /// and the others wait on its result. If that driving future is cancelled —
-    /// for example, the surrounding request times out and its future is
-    /// dropped — the load is reported as cancelled. The session caches this
-    /// error for the affected keys and wakes any waiters, so the evaluation
-    /// fails closed and the next session retries from scratch. For this reason a
-    /// fact-loaded session should not be shared across independent requests: a
-    /// cancellation in one would surface here for the others.
+    /// The session caches this error for the affected keys and wakes any
+    /// waiters. This is correct for request-scoped sessions: the request fails
+    /// closed and the next request builds a fresh session. Do not share a
+    /// fact-loaded session across independent requests, because cancellation in
+    /// one request would cache this error for the others.
     LoaderCancelled {
         /// Diagnostic fact name from [`FactKey::NAME`].
         fact_name: &'static str,
@@ -116,14 +108,6 @@ impl fmt::Display for FactLoadError {
 impl std::error::Error for FactLoadError {}
 
 /// Result of loading one fact.
-///
-/// This is shaped like `Result<Option<V>, FactLoadError>` — `Found`, `Missing`,
-/// and `Error` map onto `Ok(Some)`, `Ok(None)`, and `Err`. A dedicated enum is
-/// used instead so the three outcomes read as domain concepts at policy call
-/// sites (`FactLoadResult::Missing` rather than `Ok(None)`), so "the fact does
-/// not exist" is never visually conflated with "the load failed" — a
-/// distinction that matters for fail-closed authorization — and so the type can
-/// gain variants later without breaking a `Result` alias callers rely on.
 #[derive(Debug, Clone)]
 pub enum FactLoadResult<V> {
     /// The fact exists and has the given value.
@@ -199,43 +183,7 @@ impl fmt::Display for FactSourceRegistrationError {
 
 impl std::error::Error for FactSourceRegistrationError {}
 
-/// Canonical fact key for relationship (ReBAC) lookups.
-///
-/// A `RelationshipQuery` encodes one yes/no question: does `subject_id` have
-/// `relation` to `resource_id`? It is the [`FactKey`] used by the built-in
-/// [`crate::RebacPolicy`], with [`FactKey::Value`] = `bool` — a registered
-/// [`FactSource`] answers `true` when the relationship exists and `false`
-/// otherwise.
-///
-/// The three identifier types are generic so callers can use their own
-/// strongly-typed ids and relation enums rather than stringly-typed keys.
-/// Because the session registry is keyed by the concrete Rust type (see
-/// [`crate::EvaluationSession`]), two logically distinct relationship graphs
-/// that share the same `RelationshipQuery<…>` instantiation resolve to the same
-/// source; give them distinct id or relation types if they must be backed
-/// separately.
-///
-/// For relationships that carry a payload (a rank, weight, or scope set) rather
-/// than a plain boolean, define a custom [`FactKey`] with `Value =
-/// YourPayload` instead of using this type.
-///
-/// # Example
-///
-/// ```rust
-/// # use gatehouse::RelationshipQuery;
-/// #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-/// enum Relation {
-///     Owner,
-///     Viewer,
-/// }
-///
-/// let query = RelationshipQuery {
-///     subject_id: "user:42".to_string(),
-///     resource_id: "doc:7".to_string(),
-///     relation: Relation::Owner,
-/// };
-/// assert_eq!(query.relation, Relation::Owner);
-/// ```
+/// Canonical ReBAC fact key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RelationshipQuery<SubjectId, ResourceId, Relation> {
     /// Subject identifier.
