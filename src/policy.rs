@@ -48,10 +48,18 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     /// Stored as [`Cow<'static, str>`] so the shortcut path is truly
     /// zero-allocation for policies that return `Cow::Borrowed("Name")`
     /// (every built-in policy, and any user policy with a static name).
-    /// Dynamic-name policies that return `Cow::Owned(...)` pay one
-    /// allocation when their `policy_type()` is called by the checker;
-    /// `ctx.grant`/`deny` only clone the Cow (cheap for `Borrowed`, has-
-    /// alloc for `Owned`) — the same per-call cost as today.
+    ///
+    /// Dynamic-name policies pay more on the helper path than a static-
+    /// name policy does. Per evaluation the checker calls
+    /// `policy.policy_type()` (alloc 1, the `String` inside the
+    /// `Cow::Owned`), clones that `Cow` into the `EvalCtx`
+    /// (alloc 2, since cloning a `Cow::Owned` clones the underlying
+    /// `String`), and then `ctx.grant` / `ctx.deny` clones it again
+    /// into the result (alloc 3). The shortcut path cannot avoid these
+    /// — `ctx.policy_type` is behind a shared `&EvalCtx` reference and
+    /// cannot be moved out. If allocation cost matters, return a
+    /// `Cow::Borrowed` from a `'static` name table so the whole chain
+    /// stays zero-allocation.
     pub policy_type: Cow<'static, str>,
 }
 
@@ -182,10 +190,17 @@ where
     /// (`Cow::Borrowed("MyPolicy")`) is zero-allocation end-to-end —
     /// the checker captures this once per evaluation into
     /// [`EvalCtx::policy_type`], and [`EvalCtx::grant`] / [`EvalCtx::deny`]
-    /// clone the [`Cow`] (which is a no-op for `Borrowed`). Dynamic-name
-    /// policies return `Cow::Owned(self.name.clone())` and pay one
-    /// allocation per call, the same cost the trait had before this
-    /// change.
+    /// clone the [`Cow`] (which is a no-op for `Borrowed`).
+    ///
+    /// Dynamic-name policies return `Cow::Owned(self.name.clone())`
+    /// and pay one allocation here, plus two more on the
+    /// `ctx.grant` / `ctx.deny` helper path — see
+    /// [`EvalCtx::policy_type`] for the full accounting. This is a
+    /// regression from the pre-`Cow` trait shape where
+    /// `policy_type(&self) -> &str` let dynamic names return
+    /// `&self.name` without allocating. Prefer a `'static` name table
+    /// when you can; the dynamic case still works correctly, just at
+    /// extra cost.
     fn policy_type(&self) -> Cow<'static, str>;
 
     /// Metadata describing the security rule that backs this policy.

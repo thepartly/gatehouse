@@ -5,9 +5,14 @@
 ### Breaking
 
 - `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>`. Combined with the trait change below, static-name policies are **zero-allocation end-to-end** — direct constructor calls and the new `EvalCtx::grant` / `deny` shortcuts both go through `Cow::Borrowed`.
-- `Policy::policy_type` return type changed from `&str` to `Cow<'static, str>`. Built-in policies return `Cow::Borrowed("Name")` and pay zero allocations. Migrate downstream policies with one line per impl: `fn policy_type(&self) -> Cow<'static, str> { Cow::Borrowed("MyPolicy") }`. Dynamic-name policies return `Cow::Owned(self.name.clone())` — the same per-call allocation cost as before.
+- `Policy::policy_type` return type changed from `&str` to `Cow<'static, str>`. Built-in policies return `Cow::Borrowed("Name")` and pay zero allocations. Migrate downstream policies with one line per impl: `fn policy_type(&self) -> Cow<'static, str> { Cow::Borrowed("MyPolicy") }`. Dynamic-name policies return `Cow::Owned(self.name.clone())` and pay one allocation per `policy_type()` call (where the previous `&str` API let them return `&self.name` without allocating), plus two more on the `ctx.grant` / `ctx.deny` helper path. See the `EvalCtx::policy_type` rustdoc for the full accounting and prefer a `'static` name when you can.
 - `EvalCtx` and `BatchEvalCtx` gain a `policy_type: Cow<'static, str>` field, captured once per evaluation by the checker (and by combinators when they fan out). Custom `Policy` impls and tests that build these directly need to populate it.
-- `PermissionChecker::evaluate_batch_with_context_in_session_by` renamed to `evaluate_batch_in_session_by_resource`; `filter_authorized_with_context_in_session_by` renamed to `filter_authorized_in_session_by_resource`. The new `_by_resource` suffix mirrors the existing `_by` (per-item `(R, C)`) and makes the distinguishing axis explicit. The old names remain as `#[deprecated(since = "0.3.0-alpha.3")]` thin delegates for one alpha cycle.
+- `PermissionChecker::evaluate_batch_with_context_in_session_by` renamed to `evaluate_batch_in_session_by_resource`; `filter_authorized_with_context_in_session_by` renamed to `filter_authorized_in_session_by_resource`. The new `_by_resource` suffix mirrors the existing `_by` (per-item `(R, C)`) and makes the distinguishing axis explicit. Old names are removed; migrate with:
+
+  ```
+  s/evaluate_batch_with_context_in_session_by/evaluate_batch_in_session_by_resource/g
+  s/filter_authorized_with_context_in_session_by/filter_authorized_in_session_by_resource/g
+  ```
 - `DelegatingPolicy` constructor `policy_type` parameter changed from `impl Into<String>` to `impl Into<Cow<'static, str>>` to match the trait return type.
 
 ### Added
@@ -17,7 +22,6 @@
 - `EvalCtx::grant` / `deny` / `grant_with_facts` / `deny_with_facts` shortcut methods that build a `PolicyEvalResult` tagged with `ctx.policy_type`, so policy bodies no longer have to re-pass `self.policy_type()`. Both `grant` and `deny` take the reason as `impl Into<String>` for symmetry; the rare no-reason grant case can still use `PolicyEvalResult::granted(name, None)` directly.
 - `AccessEvaluation` test helpers: `assert_granted_by`, `assert_denied`, `assert_denied_with_reason_containing`, plus non-panicking `granted_policy_type()` and `denied_reason()` accessors. Cuts the boilerplate of pattern-matching the evaluation in policy unit tests.
 - Trace-aware test helpers `AccessEvaluation::assert_denied_by(policy_type)` (symmetric with `assert_granted_by`) and `assert_trace_contains(needle)`. `assert_denied_with_reason_containing` matches only the top-level summary reason — which is hardcoded to `"All policies denied access"` when no policy granted, so per-policy denial reasons live only in the trace tree. The new helpers walk the trace and substring-match `display_trace()` respectively for the multi-policy case.
-- `examples/list_scope_two_checkers.rs` demonstrating the "two checker pattern" — separate `PermissionChecker::named` instances for list-scope vs view-detail authorization, sharing the same `R`/`S` types but with distinct policy sets so audit telemetry can disambiguate which scope produced each decision.
 
 ### Changed
 
