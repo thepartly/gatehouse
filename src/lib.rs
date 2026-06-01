@@ -44,6 +44,67 @@
 //! evaluated. Because [`PermissionChecker`], [`AndPolicy`], and [`OrPolicy`]
 //! short-circuit, the trace tree does not include policies that were never run.
 //!
+//! ## When to populate the Context type
+//!
+//! `Context` carries **request-scoped inputs the decision depends on but
+//! that don't belong on the subject or resource and aren't fact-loadable
+//! relationships**. The current wall-clock time, the MFA freshness on
+//! the auth session, the caller's network zone, the request's tenant
+//! config — all properties of the *call*, not of the user or the thing
+//! being authorized. A few shapes show up repeatedly:
+//!
+//! - **Time-of-day / business hours.** "Finance approvers can issue refunds
+//!   between 09:00 and 17:00 in the company timezone, except admins."
+//!   The current wall-clock time isn't a property of the user or the
+//!   invoice — it's a property of the *call*. Put a `current_time: SystemTime`
+//!   (or `OffsetDateTime`, or a `Clock` trait object for testability) on
+//!   `Context` and have the policy compare against the resource's
+//!   business-hours window. The `examples/actix_web.rs` `RequestContext`
+//!   uses exactly this shape for the draft-recency policy.
+//!
+//! - **Authentication / MFA freshness.** "Approving a payment over $10k
+//!   requires an MFA assertion within the last 5 minutes." MFA freshness
+//!   lives on the request (the session token records when MFA was last
+//!   reasserted), not on the user record. A `mfa_verified_at:
+//!   Option<SystemTime>` on `Context` lets the high-value policy short-
+//!   circuit deny when freshness has lapsed without forcing every policy
+//!   to plumb the auth-session through their own arguments. See
+//!   `examples/mfa_freshness_context.rs` for the full end-to-end shape.
+//!
+//! - **Device / network trust posture.** "Production database access
+//!   requires the request to come from a managed device on the corporate
+//!   VPN." `device_trust_score: u8`, `network_zone: NetworkZone`, or
+//!   `client_ip: IpAddr` on `Context` are the typical shape. Policies
+//!   that don't care about posture simply ignore the field.
+//!
+//! - **Request intent / parameters that aren't part of the resource.**
+//!   Sometimes the action carries an attribute the resource doesn't know
+//!   about — for example `ExportAction { format: ExportFormat }` where
+//!   `format` affects whether the export is allowed. Either inline it on
+//!   the action enum (preferred when there are few variants) or carry it
+//!   on `Context` (preferred when many actions share the same parameter,
+//!   e.g. a request-wide `export_destination: ExportDestination`).
+//!
+//! - **Tenant / feature-flag overrides.** A `tenant_config:
+//!   &'a TenantPolicyConfig` reference lets policies read tenant-level
+//!   toggles ("this tenant has BYOK enabled", "this tenant requires
+//!   approval for refunds over $X") without each policy looking the
+//!   tenant up itself. Distinct from [`FactSource`]-loaded facts: those
+//!   are looked up by key during evaluation; the tenant config is
+//!   already resolved at request entry.
+//!
+//! When `Context = ()` is enough. RBAC-only systems where every decision
+//! is "does the subject have role X" don't need a richer `Context`. Use
+//! `()` and a [`PermissionChecker::check`]-driven path. Reach for a real
+//! `Context` struct as soon as a policy needs to compare against
+//! something time-varying or per-request that isn't a property of the
+//! subject, the resource, or a fact-loadable relationship.
+//!
+//! `Context` is **not** the place for relationship data ("who has
+//! viewer access on this document"). That lives behind a
+//! [`FactSource`] and gets loaded through the [`EvaluationSession`] so
+//! batch evaluation can deduplicate and coalesce.
+//!
 //! ## Fact-Loaded Authorization
 //!
 //! Gatehouse treats non-trivial authorization as computation over facts loaded
