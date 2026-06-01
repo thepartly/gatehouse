@@ -42,8 +42,8 @@ where
             PolicyEvalResult::denied(self.name.clone(), "Policy predicate did not match")
         }
     }
-    fn policy_type(&self) -> &str {
-        &self.name
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Owned(self.name.clone())
     }
 }
 
@@ -103,6 +103,119 @@ where
 /// assert!(!checker.evaluate_in_session(&session, &user, &Action("delete".into()), &doc, &Ctx).await.is_granted());
 /// # });
 /// ```
+///
+/// # Type-inference notes
+///
+/// `PolicyBuilder::new` is generic over `<S, R, A, C>`. Rust can usually
+/// infer all four type parameters from the surrounding context, but a
+/// few patterns need a little help. Listed in order from cheapest fix to
+/// most explicit:
+///
+/// 1. **Anchor through closure argument types.** The single most reliable
+///    inference signal is an explicit type annotation on each predicate
+///    closure's argument:
+///    ```rust
+///    # use gatehouse::*;
+///    # struct User; struct Doc; struct Read; struct Ctx;
+///    # fn make() -> Box<dyn Policy<User, Doc, Read, Ctx>> {
+///    PolicyBuilder::new("AdminOnly")
+///        .subjects(|_user: &User| true)
+///        .resources(|_doc: &Doc| true)
+///        .actions(|_action: &Read| true)
+///        .context(|_ctx: &Ctx| true)
+///        .build()
+///    # }
+///    ```
+///    With every closure typed, the four generics are fully constrained
+///    without any turbofish.
+///
+///    **Every closure in the chain needs at least one typed arg.** Each
+///    predicate setter introduces its own closure, and each closure's
+///    bare `_` parameters trigger E0282 independently of the others —
+///    typing one arg in `.when()` does not rescue an earlier
+///    `.subjects(|_| ...)` from the same diagnostic. For a chain that
+///    mixes `.subjects()`, `.actions()`, `.resources()`, and `.when()`,
+///    that's four annotations; at that point pattern #3 (one turbofish
+///    on `::new`) tends to win on noise grounds.
+///
+/// 2. **Anchor through the bind site.** If only some of the predicates
+///    use typed closures (or if you use `.effect()` and `.build()` with
+///    no predicates), give the bind site or the return type a concrete
+///    `PolicyBuilder<S, R, A, C>` annotation:
+///    ```rust
+///    # use gatehouse::*;
+///    # struct User; struct Doc; struct Read; struct Ctx;
+///    let b: PolicyBuilder<User, Doc, Read, Ctx> = PolicyBuilder::new("X");
+///    let _policy = b.effect(Effect::Deny).build();
+///    ```
+///
+/// 3. **Reach for the turbofish.** When neither of the above applies —
+///    typically in factory functions that return
+///    `Box<dyn Policy<...>>` with no other anchor — name the type
+///    parameters explicitly on `::new`:
+///    ```rust
+///    # use gatehouse::*;
+///    # struct User; struct Doc; struct Read; struct Ctx;
+///    # fn make() -> Box<dyn Policy<User, Doc, Read, Ctx>> {
+///    PolicyBuilder::<User, Doc, Read, Ctx>::new("AdminOnly")
+///        .effect(Effect::Deny)
+///        .build()
+///    # }
+///    ```
+///
+/// If you see the compiler complain about needing type annotations on
+/// `&_` inside one of the predicate closures, the missing piece is on
+/// `PolicyBuilder::new` itself — the closure error is a red herring. Use
+/// one of the three patterns above to anchor `<S, R, A, C>` and the
+/// closure error goes away on its own.
+///
+/// ## The specific failure that needs the turbofish
+///
+/// The case where pattern #1 (typed closure args) is not enough on its
+/// own combines three ingredients:
+///
+/// ```ignore
+/// fn factory() -> Box<dyn Policy<MySubject, MyResource, MyAction, ()>> {
+///     PolicyBuilder::new("Name")          // <- no anchor yet
+///         .when(move |subject, _, _, _| {  // <- placeholder closure args
+///             subject.method_on_subject()  // <- method needs known type
+///         })
+///         .build()
+/// }
+/// ```
+///
+/// 1. The return type is `Box<dyn Policy<…>>`. The dyn coercion carries
+///    the trait but doesn't propagate the generic params back through
+///    `.build()` early enough.
+/// 2. The predicate closure uses `_` placeholders, so the closure-arg
+///    types remain unbound during the first inference pass.
+/// 3. The closure body calls a method that only resolves once the
+///    subject's type is known.
+///
+/// Rust checks the closure body before it processes the surrounding
+/// return-type constraint, so it emits `E0282: type annotations needed
+/// for &_` pointing at the closure parameter — misleading: the fix is
+/// on the builder, not the closure.
+///
+/// In this shape, two practical fixes:
+///
+/// ```ignore
+/// // a) Annotate every closure arg concretely. `&_` placeholders are
+/// //    not enough — each unbound `_` still needs to be resolved
+/// //    before the return-type constraint propagates.
+/// .when(move |subject: &MySubject, _action: &MyAction,
+///             _resource: &MyResource, _ctx: &MyCtx| { … })
+///
+/// // b) Reach for the turbofish (pattern #3) and skip the closure
+/// //    annotations entirely. For a chain that mixes .subjects(),
+/// //    .actions(), .resources(), and .when() — each its own closure
+/// //    — one turbofish is less visual noise than per-closure
+/// //    annotations.
+/// ```
+///
+/// Returning `impl Policy<…>` instead of `Box<dyn Policy<…>>` also
+/// anchors inference (the concrete return type propagates back), but
+/// loses the trait-object addability that the boxed `dyn` provides.
 pub struct PolicyBuilder<S, R, A, C>
 where
     S: Send + Sync + 'static,

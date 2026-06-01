@@ -57,12 +57,14 @@ mod core_tests {
         ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
+                let policy_type = self.policy_type();
                 let ctx = EvalCtx {
                     session: &session,
                     subject,
                     action,
                     resource,
                     context,
+                    policy_type,
                 };
                 self.evaluate(&ctx).await
             })
@@ -76,11 +78,13 @@ mod core_tests {
         ) -> Pin<Box<dyn Future<Output = Vec<PolicyEvalResult>> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
+                let policy_type = self.policy_type();
                 let ctx = BatchEvalCtx {
                     session: &session,
                     subject,
                     action,
                     items,
+                    policy_type,
                 };
                 self.evaluate_batch(&ctx).await
             })
@@ -345,11 +349,14 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::granted(self.policy_type(), Some("Always allow policy".to_string()))
+            PolicyEvalResult::granted(
+                self.policy_type().to_string(),
+                Some("Always allow policy".to_string()),
+            )
         }
 
-        fn policy_type(&self) -> &str {
-            "AlwaysAllowPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("AlwaysAllowPolicy")
         }
     }
 
@@ -362,11 +369,11 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::denied(self.policy_type(), self.0)
+            PolicyEvalResult::denied(self.policy_type().to_string(), self.0)
         }
 
-        fn policy_type(&self) -> &str {
-            "AlwaysDenyPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("AlwaysDenyPolicy")
         }
     }
 
@@ -383,9 +390,12 @@ mod core_tests {
         ) -> PolicyEvalResult {
             self.single_calls.fetch_add(1, Ordering::SeqCst);
             if ctx.resource.id.as_u128().is_multiple_of(2) {
-                PolicyEvalResult::granted(self.policy_type(), Some("even resource".to_string()))
+                PolicyEvalResult::granted(
+                    self.policy_type().to_string(),
+                    Some("even resource".to_string()),
+                )
             } else {
-                PolicyEvalResult::denied(self.policy_type(), "odd resource")
+                PolicyEvalResult::denied(self.policy_type().to_string(), "odd resource")
             }
         }
 
@@ -402,14 +412,15 @@ mod core_tests {
                     action: ctx.action,
                     resource: item.resource,
                     context: item.context,
+                    policy_type: ctx.policy_type.clone(),
                 };
                 results.push(self.evaluate(&item_ctx).await);
             }
             results
         }
 
-        fn policy_type(&self) -> &str {
-            "EvenResourceBatchPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("EvenResourceBatchPolicy")
         }
     }
 
@@ -421,7 +432,10 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::granted(self.policy_type(), Some("single item fallback".to_string()))
+            PolicyEvalResult::granted(
+                self.policy_type().to_string(),
+                Some("single item fallback".to_string()),
+            )
         }
 
         async fn evaluate_batch<'item>(
@@ -433,15 +447,15 @@ mod core_tests {
                 .skip(1)
                 .map(|_| {
                     PolicyEvalResult::granted(
-                        self.policy_type(),
+                        self.policy_type().to_string(),
                         Some("wrong batch length".to_string()),
                     )
                 })
                 .collect()
         }
 
-        fn policy_type(&self) -> &str {
-            "MismatchedBatchPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("MismatchedBatchPolicy")
         }
     }
 
@@ -453,11 +467,11 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::denied(self.policy_type(), "Blocked by custom rule")
+            PolicyEvalResult::denied(self.policy_type().to_string(), "Blocked by custom rule")
         }
 
-        fn policy_type(&self) -> &str {
-            "CustomMetadataDenyPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("CustomMetadataDenyPolicy")
         }
 
         fn security_rule(&self) -> SecurityRuleMetadata {
@@ -877,6 +891,86 @@ mod core_tests {
         assert_eq!(authorized.len(), 2);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
         assert_eq!(single_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_not_policy_batch_tags_inner_leaves_with_inner_name() {
+        // Regression test: NotPolicy::evaluate_batch must construct a fresh
+        // BatchEvalCtx with the inner policy's policy_type before
+        // forwarding, so any leaf the inner policy produces via
+        // `ctx.grant` / `ctx.deny` (or via the default evaluate_batch
+        // that fans out per-item EvalCtx) is tagged with the inner's
+        // name, not "NotPolicy".
+        //
+        // We pair NotPolicy with AbacPolicy, which builds its result via
+        // `ctx.deny(...)` — i.e. it reads ctx.policy_type. The inner
+        // leaf in the resulting trace tree must be tagged "AbacPolicy",
+        // not "NotPolicy".
+
+        struct OddResourcePolicy;
+        #[async_trait]
+        impl Policy<TestSubject, TestResource, TestAction, TestContext> for OddResourcePolicy {
+            async fn evaluate(
+                &self,
+                ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
+            ) -> PolicyEvalResult {
+                if ctx.resource.id.as_u128() % 2 == 1 {
+                    ctx.grant("odd id")
+                } else {
+                    ctx.deny("even id")
+                }
+            }
+            fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed("OddResourcePolicy")
+            }
+        }
+
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let owned_items = (0..2)
+            .map(|value| {
+                (
+                    TestResource {
+                        id: uuid::Uuid::from_u128(value),
+                    },
+                    TestContext,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_items = owned_items
+            .iter()
+            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .collect::<Vec<_>>();
+        let policy = NotPolicy::new(OddResourcePolicy);
+
+        let results = policy
+            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        // Drill into each Combined result, find the inner leaf, and
+        // assert it carries the inner policy's name.
+        for result in &results {
+            match result {
+                PolicyEvalResult::Combined { children, .. } => {
+                    assert_eq!(children.len(), 1, "NotPolicy wraps exactly one child");
+                    match &children[0] {
+                        PolicyEvalResult::Granted { policy_type, .. }
+                        | PolicyEvalResult::Denied { policy_type, .. } => {
+                            assert_eq!(
+                                policy_type.as_ref(),
+                                "OddResourcePolicy",
+                                "inner leaf must be tagged with the wrapped policy's name, \
+                                 not 'NotPolicy'"
+                            );
+                        }
+                        other => panic!("expected leaf child, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Combined NotPolicy result, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1346,6 +1440,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
+            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
         };
         let result = policy.evaluate(&ctx).await;
 
@@ -1379,6 +1474,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
+            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
         };
 
         let result = policy.evaluate(&ctx).await;
@@ -1407,6 +1503,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
+            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
         };
 
         let result = policy.evaluate(&ctx).await;
@@ -1464,6 +1561,7 @@ mod core_tests {
             subject: &subject,
             action: &TestAction,
             items: &batch_items,
+            policy_type: policy.policy_type(),
         };
 
         let results = policy.evaluate_batch(&ctx).await;
@@ -1557,6 +1655,7 @@ mod core_tests {
                 action: &TestAction,
                 resource: &resource,
                 context: &TestContext,
+                policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
             };
             let result = policy.evaluate(&ctx).await;
             assert!(!result.is_granted());
@@ -1634,6 +1733,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
+            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
         };
         let result = policy.evaluate(&ctx).await;
         assert!(
@@ -1874,16 +1974,16 @@ mod core_tests {
         ) -> PolicyEvalResult {
             if ctx.context.feature_enabled {
                 PolicyEvalResult::granted(
-                    self.policy_type(),
+                    self.policy_type().to_string(),
                     Some("Feature flag enabled".to_string()),
                 )
             } else {
-                PolicyEvalResult::denied(self.policy_type(), "Feature flag disabled")
+                PolicyEvalResult::denied(self.policy_type().to_string(), "Feature flag disabled")
             }
         }
 
-        fn policy_type(&self) -> &str {
-            "FeatureFlagPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("FeatureFlagPolicy")
         }
     }
 
@@ -2246,16 +2346,19 @@ mod core_tests {
 
                 if self.result {
                     PolicyEvalResult::granted(
-                        self.policy_type(),
+                        self.policy_type().to_string(),
                         Some("Counting policy granted".to_string()),
                     )
                 } else {
-                    PolicyEvalResult::denied(self.policy_type(), "Counting policy denied")
+                    PolicyEvalResult::denied(
+                        self.policy_type().to_string(),
+                        "Counting policy denied",
+                    )
                 }
             }
 
-            fn policy_type(&self) -> &str {
-                "CountingPolicy"
+            fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed("CountingPolicy")
             }
         }
 
@@ -2551,7 +2654,7 @@ mod core_tests {
     #[test]
     fn test_policy_eval_result_reason_combined() {
         let result = PolicyEvalResult::Combined {
-            policy_type: "CombinedPolicy".to_string(),
+            policy_type: std::borrow::Cow::Borrowed("CombinedPolicy"),
             operation: CombineOp::And,
             children: vec![],
             outcome: true,
@@ -2690,6 +2793,165 @@ mod core_tests {
         assert_eq!(copied.0, "Test");
         assert_eq!(cloned.0, "Test");
     }
+
+    // --- AccessEvaluation test helpers ----------------------------------
+
+    fn allow_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext> {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysAllowPolicy);
+        checker
+    }
+
+    fn deny_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext> {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("always denied"));
+        checker
+    }
+
+    fn test_subject() -> TestSubject {
+        TestSubject {
+            id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    fn test_resource() -> TestResource {
+        TestResource {
+            id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    #[tokio::test]
+    async fn assert_granted_by_passes_on_matching_grant() {
+        let evaluation = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_granted_by("AlwaysAllowPolicy");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected grant by policy `Other`")]
+    async fn assert_granted_by_panics_on_wrong_grantor() {
+        let evaluation = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_granted_by("Other");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "but access was denied")]
+    async fn assert_granted_by_panics_on_denial() {
+        let evaluation = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_granted_by("AlwaysAllowPolicy");
+    }
+
+    #[tokio::test]
+    async fn assert_denied_with_reason_containing_substring_match() {
+        let evaluation = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        // Checker's summary is "All policies denied access".
+        evaluation.assert_denied_with_reason_containing("denied");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected denial containing")]
+    async fn assert_denied_with_reason_containing_panics_on_grant() {
+        let evaluation = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_denied_with_reason_containing("anything");
+    }
+
+    #[tokio::test]
+    async fn granted_policy_type_and_denied_reason_accessors() {
+        let grant = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        assert_eq!(grant.granted_policy_type(), Some("AlwaysAllowPolicy"));
+        assert_eq!(grant.denied_reason(), None);
+
+        let deny = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        assert_eq!(deny.granted_policy_type(), None);
+        assert!(
+            deny.denied_reason().is_some_and(|r| r.contains("denied")),
+            "denied_reason should return the summary reason"
+        );
+    }
+
+    // --- Trace-aware helpers (assert_denied_by / assert_trace_contains) -
+
+    /// Checker with two denying policies so we can assert against a
+    /// specific one in the trace tree (the top-level summary won't
+    /// distinguish them).
+    fn multi_deny_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext>
+    {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("first denial reason"));
+        // A second denying policy with the same `policy_type()` but a
+        // different reason, since AlwaysDenyPolicy is a tuple struct.
+        // (The tree-walker checks policy_type, not reason — what we're
+        // pinning is that it finds *any* matching leaf.)
+        let custom = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
+            "SupplierBlock",
+        )
+        .effect(Effect::Deny)
+        .build();
+        checker.add_policy(custom);
+        checker
+    }
+
+    #[tokio::test]
+    async fn assert_denied_by_finds_specific_leaf_in_multi_policy_trace() {
+        let evaluation = multi_deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        // Both child policies denied; either name should match.
+        evaluation.assert_denied_by("AlwaysDenyPolicy");
+        evaluation.assert_denied_by("SupplierBlock");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected a denying leaf for policy `NeverConsulted`")]
+    async fn assert_denied_by_panics_when_no_matching_leaf() {
+        let evaluation = multi_deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_denied_by("NeverConsulted");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "but access was granted")]
+    async fn assert_denied_by_panics_on_grant() {
+        let evaluation = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_denied_by("AlwaysDenyPolicy");
+    }
+
+    #[tokio::test]
+    async fn assert_trace_contains_matches_per_policy_reason() {
+        // The summary reason is "All policies denied access"; the
+        // per-policy reason "always denied" lives only in the trace
+        // tree. `assert_trace_contains` is the right hammer for that
+        // assertion.
+        let evaluation = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_trace_contains("always denied");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected evaluation trace to contain")]
+    async fn assert_trace_contains_panics_when_substring_absent() {
+        let evaluation = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_trace_contains("this string is not in the trace");
+    }
 }
 
 mod policy_builder_tests {
@@ -2730,12 +2992,14 @@ mod policy_builder_tests {
         ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
+                let policy_type = self.policy_type();
                 let ctx = EvalCtx {
                     session: &session,
                     subject,
                     action,
                     resource,
                     context,
+                    policy_type,
                 };
                 self.evaluate(&ctx).await
             })

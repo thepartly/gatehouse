@@ -192,11 +192,8 @@ async fn test_access(
 ) {
     let context = EmptyContext;
     let action = ReadAction;
-    let session = EvaluationSession::empty();
 
-    let result = checker
-        .evaluate_in_session(&session, user, &action, doc, &context)
-        .await;
+    let result = checker.check(user, &action, doc, &context).await;
 
     println!(
         "{} accessing {}: {}",

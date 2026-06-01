@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 fn delegated_evaluation_to_result(
-    policy_type: &str,
+    policy_type: std::borrow::Cow<'static, str>,
     evaluation: AccessEvaluation,
 ) -> PolicyEvalResult {
     match evaluation {
@@ -15,7 +15,7 @@ fn delegated_evaluation_to_result(
             reason,
             trace,
         } => PolicyEvalResult::Combined {
-            policy_type: policy_type.to_string(),
+            policy_type,
             operation: CombineOp::Delegate,
             children: vec![trace
                 .root()
@@ -24,7 +24,7 @@ fn delegated_evaluation_to_result(
             outcome: true,
         },
         AccessEvaluation::Denied { reason, trace } => PolicyEvalResult::Combined {
-            policy_type: policy_type.to_string(),
+            policy_type,
             operation: CombineOp::Delegate,
             children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::denied(
                 PERMISSION_CHECKER_POLICY_TYPE,
@@ -50,7 +50,7 @@ fn delegated_evaluation_to_result(
 /// `DelegatingPolicy` does not detect cycles or self-delegation; avoid wiring a
 /// child checker that can delegate back into the same decision path.
 pub struct DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext> {
-    policy_type: String,
+    policy_type: std::borrow::Cow<'static, str>,
     security_rule: SecurityRuleMetadata,
     checker: PermissionChecker<ChildSubject, ChildResource, ChildAction, ChildContext>,
     subject: Arc<dyn Fn(&S) -> ChildSubject + Send + Sync>,
@@ -64,7 +64,7 @@ impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
 {
     /// Creates a delegating policy from a child checker and mapping functions.
     pub fn new<SubjectFn, ActionFn, ResourceFn, ContextFn>(
-        policy_type: impl Into<String>,
+        policy_type: impl Into<std::borrow::Cow<'static, str>>,
         checker: PermissionChecker<ChildSubject, ChildResource, ChildAction, ChildContext>,
         subject: SubjectFn,
         action: ActionFn,
@@ -124,7 +124,7 @@ where
             )
             .await;
 
-        delegated_evaluation_to_result(&self.policy_type, evaluation)
+        delegated_evaluation_to_result(self.policy_type.clone(), evaluation)
     }
 
     async fn evaluate_batch<'item>(
@@ -155,13 +155,13 @@ where
             .await
             .into_iter()
             .map(|(_item, evaluation)| {
-                delegated_evaluation_to_result(&self.policy_type, evaluation)
+                delegated_evaluation_to_result(self.policy_type.clone(), evaluation)
             })
             .collect()
     }
 
-    fn policy_type(&self) -> &str {
-        &self.policy_type
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        self.policy_type.clone()
     }
 
     fn security_rule(&self) -> SecurityRuleMetadata {

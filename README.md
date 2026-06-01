@@ -60,10 +60,9 @@ let user = User {
 };
 let document = Document { owner_id: 1 };
 
-let session = EvaluationSession::empty();
-let evaluation = checker
-    .evaluate_in_session(&session, &user, &Action, &document, &Context)
-    .await;
+// `check` is the everyday call for RBAC/ABAC-only checkers. Reach for
+// `evaluate_in_session` when the checker has any fact-backed policy.
+let evaluation = checker.check(&user, &Action, &document, &Context).await;
 
 assert!(evaluation.is_granted());
 println!("{}", evaluation.display_trace());
@@ -72,6 +71,11 @@ let outcome: Result<(), String> = evaluation.to_result(|reason| reason.to_string
 assert!(outcome.is_ok());
 # });
 ```
+
+For checkers with any fact-backed policy (ReBAC, lookup, or custom
+`FactSource`-using policy), build an `EvaluationSession` per request
+and call `checker.evaluate_in_session(&session, …)` so the session
+can carry the registered sources.
 
 ## Why v0.3 Matters
 
@@ -102,6 +106,7 @@ The foundation of the authorization system:
 
 ```rust
 use async_trait::async_trait;
+use std::borrow::Cow;
 use gatehouse::{BatchEvalCtx, EvalCtx, Policy, PolicyEvalResult, SecurityRuleMetadata};
 
 #[async_trait]
@@ -114,13 +119,18 @@ trait Policy<Subject, Resource, Action, Context>: Send + Sync {
         ctx: &BatchEvalCtx<'item, Subject, Resource, Action, Context>,
     ) -> Vec<PolicyEvalResult>;
 
-    fn policy_type(&self) -> &str;
+    fn policy_type(&self) -> Cow<'static, str>;
 
     fn security_rule(&self) -> SecurityRuleMetadata {
         SecurityRuleMetadata::default()
     }
 }
 ```
+
+Within `evaluate`, prefer `ctx.grant("reason")` / `ctx.deny("reason")`
+(and the `*_with_facts` variants) to build the `PolicyEvalResult`
+instead of re-passing `self.policy_type()` — the checker captures the
+policy name on `EvalCtx` once per evaluation.
 
 ### `PermissionChecker`
 
@@ -131,11 +141,10 @@ let mut checker = PermissionChecker::new();
 checker.add_policy(rbac_policy);
 checker.add_policy(owner_policy);
 
-// Check if access is granted
-let session = EvaluationSession::empty();
-let evaluation = checker
-    .evaluate_in_session(&session, &user, &action, &resource, &context)
-    .await;
+// RBAC/ABAC-only path: no fact sources, so `check` is the
+// idiomatic call. For fact-backed checkers (ReBAC, lookup), build
+// an EvaluationSession per request and use evaluate_in_session.
+let evaluation = checker.check(&user, &action, &resource, &context).await;
 if evaluation.is_granted() {
     // Access allowed
 } else {
@@ -145,14 +154,21 @@ if evaluation.is_granted() {
 println!("{}", evaluation.display_trace());
 ```
 
+For multi-checker applications where the same policy name might
+appear in several checkers (an `Invoice` checker and a `Product`
+checker both reusing a `PartlyStaffAdmin` policy), construct each
+checker with `PermissionChecker::named("InvoiceChecker")`. The name
+surfaces on the `gatehouse::security` tracing span as
+`checker.name`, so audit pipelines can disambiguate the source.
+
 ### Batch Authorization
 
-List and subscription endpoints often need to answer "which of these resources can this subject access?" Use `evaluate_batch_in_session_by` when you need the decision for every input item, or `filter_authorized_in_session_by` when you only need the authorized subset.
+List and subscription endpoints often need to answer "which of these resources can this subject access?" Use `evaluate_batch_in_session_by` (per-item `(R, C)` via closure) when you need the decision for every input item, or `filter_authorized_in_session_by_resource` (shared context, per-item `R` via closure) when only the authorized subset matters and the context is the same across the page.
 
 ```rust
 let session = EvaluationSession::empty();
 let visible_posts = checker
-    .filter_authorized_with_context_in_session_by(
+    .filter_authorized_in_session_by_resource(
         &session,
         &user,
         &Action::View,
@@ -334,7 +350,7 @@ your policy definitions.
 
 The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source itself is hot and in-process; it is not a benchmark for network or database latency. The `latency_fact_source` group injects a fixed async delay per source call so the benchmarks also show the intended shape under backend latency: N per-item sessions versus one batched session, and independent repeated loads versus shared-session in-flight coalescing.
 
-The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_with_context_in_session_by`:
+The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_in_session_by_resource`:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \

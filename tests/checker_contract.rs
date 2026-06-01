@@ -59,8 +59,8 @@ impl Policy<Subject, Resource, Action, Ctx> for BatchGrantPolicy {
             .collect()
     }
 
-    fn policy_type(&self) -> &str {
-        self.name
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(self.name)
     }
 }
 
@@ -99,8 +99,8 @@ impl Policy<Subject, Resource, Action, Ctx> for RandomStackPolicy {
             .collect()
     }
 
-    fn policy_type(&self) -> &str {
-        &self.name
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Owned(self.name.clone())
     }
 }
 
@@ -126,7 +126,7 @@ impl Policy<Subject, Resource, Action, Ctx> for NeverConsultedPolicy {
         _ctx: &EvalCtx<'_, Subject, Resource, Action, Ctx>,
     ) -> PolicyEvalResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        PolicyEvalResult::denied(self.policy_type(), "single called")
+        PolicyEvalResult::denied(self.policy_type().to_string(), "single called")
     }
 
     async fn evaluate_batch<'item>(
@@ -137,8 +137,8 @@ impl Policy<Subject, Resource, Action, Ctx> for NeverConsultedPolicy {
         Vec::new()
     }
 
-    fn policy_type(&self) -> &str {
-        "NeverConsultedPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("NeverConsultedPolicy")
     }
 }
 
@@ -267,7 +267,7 @@ async fn delegating_policy_preserves_child_batch_evaluation() {
 
     let session = EvaluationSession::empty();
     let results = checker
-        .evaluate_batch_with_context_in_session_by(
+        .evaluate_batch_in_session_by_resource(
             &session,
             &Subject,
             &Action,
@@ -362,6 +362,7 @@ async fn boxed_dyn_policy_dispatches_evaluate_batch_override() {
             subject: &Subject,
             action: &Action,
             items: &batch_items,
+            policy_type: boxed.policy_type(),
         })
         .await;
 

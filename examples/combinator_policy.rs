@@ -52,24 +52,21 @@ struct CountingPolicy {
 impl Policy<User, Document, ViewAction, EmptyContext> for CountingPolicy {
     async fn evaluate(
         &self,
-        _ctx: &EvalCtx<'_, User, Document, ViewAction, EmptyContext>,
+        ctx: &EvalCtx<'_, User, Document, ViewAction, EmptyContext>,
     ) -> PolicyEvalResult {
         // Increment evaluation counter
         self.counter.fetch_add(1, Ordering::SeqCst);
         println!("Evaluating policy: {}", self.name);
 
         if self.allow {
-            PolicyEvalResult::granted(
-                self.policy_type(),
-                Some(format!("{} grants access", self.name)),
-            )
+            ctx.grant(format!("{} grants access", self.name))
         } else {
-            PolicyEvalResult::denied(self.policy_type(), format!("{} denies access", self.name))
+            ctx.deny(format!("{} denies access", self.name))
         }
     }
 
-    fn policy_type(&self) -> &str {
-        &self.name
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Owned(self.name.clone())
     }
 }
 
@@ -109,6 +106,7 @@ async fn main() {
                 action: &action,
                 resource: &document,
                 context: &context,
+                policy_type: and_policy.policy_type(),
             })
             .await;
         println!(
@@ -153,6 +151,7 @@ async fn main() {
                 action: &action,
                 resource: &document,
                 context: &context,
+                policy_type: or_policy.policy_type(),
             })
             .await;
         println!(
@@ -207,6 +206,7 @@ async fn main() {
                 action: &action,
                 resource: &document,
                 context: &context,
+                policy_type: complex_policy.policy_type(),
             })
             .await;
         println!(

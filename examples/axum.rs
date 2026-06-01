@@ -1,8 +1,5 @@
 // Axum service that authorizes multiple resource types (Invoices, Payments)
-// using a single PermissionChecker. Demonstrates multiple policies and
-// actions, app-state-owned fact sources, and per-request
-// [`EvaluationSession`] construction via
-// [`EvaluationSession::builder`].
+// using a single PermissionChecker. Demonstrates multiple policies and actions.
 
 use async_trait::async_trait;
 use axum::{
@@ -551,7 +548,7 @@ pub async fn list_invoices_handler(
     // registers it, and the batch authorization call uses it for all invoices.
     let visible = state
         .checker
-        .filter_authorized_with_context_in_session_by(
+        .filter_authorized_in_session_by_resource(
             &session,
             &user,
             &action,
@@ -664,8 +661,6 @@ async fn main() {
 mod tests {
     use super::*;
     use gatehouse::AccessEvaluation;
-    use std::future::Future;
-    use std::pin::Pin;
     use std::time::{Duration, SystemTime};
 
     // Helper to quickly build an invoice with desired properties
@@ -695,32 +690,6 @@ mod tests {
         }
     }
 
-    trait TestCheckerExt {
-        fn check_in_empty_session<'a>(
-            &'a self,
-            user: &'a User,
-            action: &'a Action,
-            resource: &'a Resource,
-            context: &'a RequestContext,
-        ) -> Pin<Box<dyn Future<Output = AccessEvaluation> + Send + 'a>>;
-    }
-
-    impl TestCheckerExt for PermissionChecker<User, Resource, Action, RequestContext> {
-        fn check_in_empty_session<'a>(
-            &'a self,
-            user: &'a User,
-            action: &'a Action,
-            resource: &'a Resource,
-            context: &'a RequestContext,
-        ) -> Pin<Box<dyn Future<Output = AccessEvaluation> + Send + 'a>> {
-            Box::pin(async move {
-                let session = EvaluationSession::empty();
-                self.evaluate_in_session(&session, user, action, resource, context)
-                    .await
-            })
-        }
-    }
-
     #[tokio::test]
     async fn test_admin_override() {
         let checker = build_permission_checker();
@@ -738,7 +707,7 @@ mod tests {
         let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .check_in_empty_session(&admin_user, &Action::Edit, &resource, &context_now())
+            .check(&admin_user, &Action::Edit, &resource, &context_now())
             .await;
 
         assert!(
@@ -769,7 +738,7 @@ mod tests {
 
         // The user is the owner, the invoice is unlocked, <30 days old => should be granted
         let result = checker
-            .check_in_empty_session(&user, &Action::Edit, &resource, &context_now())
+            .check(&user, &Action::Edit, &resource, &context_now())
             .await;
 
         assert!(
@@ -792,7 +761,7 @@ mod tests {
         let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .check_in_empty_session(&user, &Action::Edit, &resource, &context_now())
+            .check(&user, &Action::Edit, &resource, &context_now())
             .await;
 
         assert!(
@@ -830,7 +799,7 @@ mod tests {
         let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .check_in_empty_session(&user, &Action::Edit, &resource, &context_now())
+            .check(&user, &Action::Edit, &resource, &context_now())
             .await;
 
         assert!(
@@ -861,7 +830,7 @@ mod tests {
         let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .check_in_empty_session(&user, &Action::Edit, &resource, &context_now())
+            .check(&user, &Action::Edit, &resource, &context_now())
             .await;
         assert!(
             !result.is_granted(),
@@ -886,7 +855,7 @@ mod tests {
         let resource = Resource::Payment(payment);
 
         let result = checker
-            .check_in_empty_session(&user, &Action::ApprovePayment, &resource, &context_now())
+            .check(&user, &Action::ApprovePayment, &resource, &context_now())
             .await;
 
         assert!(
@@ -911,7 +880,7 @@ mod tests {
         let resource = Resource::Payment(payment);
 
         let result = checker
-            .check_in_empty_session(&user, &Action::ApprovePayment, &resource, &context_now())
+            .check(&user, &Action::ApprovePayment, &resource, &context_now())
             .await;
 
         assert!(
@@ -933,7 +902,7 @@ mod tests {
 
         // Not finance_manager or admin => deny
         let result = checker
-            .check_in_empty_session(&user, &Action::ApprovePayment, &resource, &context_now())
+            .check(&user, &Action::ApprovePayment, &resource, &context_now())
             .await;
         assert!(
             !result.is_granted(),
@@ -959,7 +928,7 @@ mod tests {
 
         // 1) finance_manager can refund
         let res1 = checker
-            .check_in_empty_session(
+            .check(
                 &user_finance,
                 &Action::RefundPayment,
                 &resource,
@@ -970,7 +939,7 @@ mod tests {
 
         // 2) refund_specialist can refund
         let res2 = checker
-            .check_in_empty_session(
+            .check(
                 &user_refund_specialist,
                 &Action::RefundPayment,
                 &resource,
@@ -993,7 +962,7 @@ mod tests {
 
         // Should be denied
         let result = checker
-            .check_in_empty_session(&user, &Action::RefundPayment, &resource, &context_now())
+            .check(&user, &Action::RefundPayment, &resource, &context_now())
             .await;
         assert!(!result.is_granted(), "Regular user can't refund payment");
     }

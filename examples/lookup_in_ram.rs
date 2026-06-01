@@ -58,13 +58,13 @@ impl Policy<User, Document, View, RequestCtx> for AdminPolicy {
         ctx: &EvalCtx<'_, User, Document, View, RequestCtx>,
     ) -> PolicyEvalResult {
         if ctx.subject.is_admin {
-            PolicyEvalResult::granted(self.policy_type(), Some("admin override".into()))
+            ctx.grant("admin override")
         } else {
-            PolicyEvalResult::denied(self.policy_type(), "not admin")
+            ctx.deny("not admin")
         }
     }
-    fn policy_type(&self) -> &str {
-        "AdminPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("AdminPolicy")
     }
 }
 
@@ -86,13 +86,13 @@ impl Policy<User, Document, View, RequestCtx> for ViewerPolicy {
             .map(|users| users.contains(&ctx.subject.id))
             .unwrap_or(false);
         if granted {
-            PolicyEvalResult::granted(self.policy_type(), Some("viewer relation".into()))
+            ctx.grant("viewer relation")
         } else {
-            PolicyEvalResult::denied(self.policy_type(), "no viewer relation")
+            ctx.deny("no viewer relation")
         }
     }
-    fn policy_type(&self) -> &str {
-        "ViewerPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ViewerPolicy")
     }
 }
 

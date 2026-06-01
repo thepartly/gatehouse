@@ -78,19 +78,13 @@ where
         let has_role = required_roles.iter().any(|role| user_roles.contains(role));
 
         if has_role {
-            PolicyEvalResult::granted(
-                Policy::<S, R, A, C>::policy_type(self),
-                Some("User has required role".to_string()),
-            )
+            ctx.grant("User has required role")
         } else {
-            PolicyEvalResult::denied(
-                Policy::<S, R, A, C>::policy_type(self),
-                "User doesn't have required role",
-            )
+            ctx.deny("User doesn't have required role")
         }
     }
 
-    fn policy_type(&self) -> &str {
-        "RbacPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("RbacPolicy")
     }
 }

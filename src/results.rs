@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 /// The type of boolean combining operation a policy might represent.
@@ -132,7 +133,11 @@ pub enum PolicyEvalResult {
     /// Access granted. Contains the policy type and an optional reason.
     Granted {
         /// The name of the policy that granted access.
-        policy_type: String,
+        ///
+        /// `Cow<'static, str>` so static policy names (the common case)
+        /// pass through with zero allocation; dynamic names still work via
+        /// `Cow::Owned`.
+        policy_type: Cow<'static, str>,
         /// An optional human-readable reason for the grant.
         reason: Option<String>,
         /// Facts the policy consulted to reach this decision. Empty for
@@ -142,7 +147,7 @@ pub enum PolicyEvalResult {
     /// Access denied. Contains the policy type and a reason.
     Denied {
         /// The name of the policy that denied access.
-        policy_type: String,
+        policy_type: Cow<'static, str>,
         /// A human-readable reason for the denial.
         reason: String,
         /// Facts the policy consulted to reach this decision. Empty for
@@ -154,7 +159,7 @@ pub enum PolicyEvalResult {
     /// a list of child evaluation results, and the overall outcome.
     Combined {
         /// The name of the combinator policy (e.g. `"AndPolicy"`).
-        policy_type: String,
+        policy_type: Cow<'static, str>,
         /// The boolean operation used to combine child results.
         operation: CombineOp,
         /// The individual results from each child policy.
@@ -211,8 +216,10 @@ pub enum PolicyEvalResult {
 pub enum AccessEvaluation {
     /// Access was granted.
     Granted {
-        /// The policy that granted access
-        policy_type: String,
+        /// The policy that granted access. `Cow<'static, str>` for the
+        /// same reason as on [`PolicyEvalResult`]: static names pass
+        /// through with zero allocation.
+        policy_type: Cow<'static, str>,
         /// Optional reason for granting
         reason: Option<String>,
         /// Full evaluation trace including any rejected policies
@@ -227,10 +234,193 @@ pub enum AccessEvaluation {
     },
 }
 
+/// Walks a [`PolicyEvalResult`] tree looking for a `Denied` leaf whose
+/// `policy_type` equals `expected`. Used by
+/// [`AccessEvaluation::assert_denied_by`].
+fn leaf_denial_matches(node: &PolicyEvalResult, expected: &str) -> bool {
+    match node {
+        PolicyEvalResult::Denied { policy_type, .. } => policy_type.as_ref() == expected,
+        PolicyEvalResult::Granted { .. } => false,
+        PolicyEvalResult::Combined { children, .. } => children
+            .iter()
+            .any(|child| leaf_denial_matches(child, expected)),
+    }
+}
+
 impl AccessEvaluation {
     /// Whether access was granted
     pub fn is_granted(&self) -> bool {
         matches!(self, Self::Granted { .. })
+    }
+
+    /// Returns the granting policy's name when the evaluation was a grant.
+    ///
+    /// Useful for non-panicking inspection in tests and in production code
+    /// that branches on which policy made the decision.
+    pub fn granted_policy_type(&self) -> Option<&str> {
+        match self {
+            Self::Granted { policy_type, .. } => Some(policy_type),
+            Self::Denied { .. } => None,
+        }
+    }
+
+    /// Returns the summary denial reason when the evaluation was a denial.
+    ///
+    /// Mirrors [`Self::granted_policy_type`] for the denied case.
+    pub fn denied_reason(&self) -> Option<&str> {
+        match self {
+            Self::Denied { reason, .. } => Some(reason),
+            Self::Granted { .. } => None,
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is `Granted` and the
+    /// granting policy's name matches `expected`.
+    ///
+    /// Intended for policy unit tests that would otherwise hand-roll a
+    /// pattern match over the evaluation. Prefer this over destructuring
+    /// when the test's only assertion is "policy X granted access."
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # tokio_test::block_on(async {
+    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
+    /// # checker.add_policy(PolicyBuilder::<(), (), (), ()>::new("AllowAll").build());
+    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// evaluation.assert_granted_by("AllowAll");
+    /// # });
+    /// ```
+    #[track_caller]
+    pub fn assert_granted_by(&self, expected: &str) {
+        match self {
+            Self::Granted { policy_type, .. } => {
+                assert_eq!(
+                    policy_type.as_ref(),
+                    expected,
+                    "expected grant by policy `{expected}`, but the grant came from `{policy_type}`"
+                );
+            }
+            Self::Denied { reason, .. } => {
+                panic!("expected grant by policy `{expected}`, but access was denied: {reason}");
+            }
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is `Denied`.
+    ///
+    /// Use [`Self::assert_denied_with_reason_containing`] when you also
+    /// need to assert on the denial reason.
+    #[track_caller]
+    pub fn assert_denied(&self) {
+        if let Self::Granted {
+            policy_type,
+            reason,
+            ..
+        } = self
+        {
+            panic!(
+                "expected denial, but access was granted by `{policy_type}`{}",
+                reason
+                    .as_ref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is `Denied` and the
+    /// **top-level summary** denial reason contains `needle`.
+    ///
+    /// `needle` is matched against the single string on
+    /// [`AccessEvaluation::Denied`] — a summary like
+    /// `"All policies denied access"`, not the per-policy reasons
+    /// inside the trace tree. For a multi-policy checker, asserting
+    /// on a specific policy's reason needs [`Self::assert_trace_contains`]
+    /// or [`Self::assert_denied_by`].
+    ///
+    /// Substring match keeps tests resilient to minor reason-string
+    /// rewording. For exact-match assertions, inspect
+    /// [`Self::denied_reason`] directly.
+    #[track_caller]
+    pub fn assert_denied_with_reason_containing(&self, needle: &str) {
+        match self {
+            Self::Denied { reason, .. } => {
+                assert!(
+                    reason.contains(needle),
+                    "expected summary denial reason to contain `{needle}`, got `{reason}`"
+                );
+            }
+            Self::Granted { policy_type, .. } => {
+                panic!(
+                    "expected denial containing `{needle}`, but access was granted by `{policy_type}`"
+                );
+            }
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is `Denied` and some
+    /// `Denied` leaf in the trace tree was produced by a policy whose
+    /// name matches `expected`.
+    ///
+    /// Symmetric with [`Self::assert_granted_by`] but walks the trace
+    /// rather than checking the top-level decision, because a denial
+    /// has no single denying policy: every policy in the checker has
+    /// to deny for the overall result to be `Denied`. Use this to
+    /// assert that policy `expected` actually fired and denied.
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # tokio_test::block_on(async {
+    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
+    /// # checker.add_policy(
+    /// #     PolicyBuilder::<(), (), (), ()>::new("StaffOnly")
+    /// #         .effect(Effect::Deny)
+    /// #         .build(),
+    /// # );
+    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// evaluation.assert_denied_by("StaffOnly");
+    /// # });
+    /// ```
+    #[track_caller]
+    pub fn assert_denied_by(&self, expected: &str) {
+        match self {
+            Self::Granted { policy_type, .. } => {
+                panic!(
+                    "expected denial by policy `{expected}`, but access was granted by `{policy_type}`"
+                );
+            }
+            Self::Denied { trace, .. } => {
+                let Some(root) = trace.root() else {
+                    panic!("expected denial by `{expected}`, but the trace is empty");
+                };
+                if !leaf_denial_matches(root, expected) {
+                    panic!(
+                        "expected a denying leaf for policy `{expected}` in the trace; \
+                         got:\n{}",
+                        trace.format()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test helper: panic unless `needle` appears anywhere in the
+    /// formatted evaluation trace.
+    ///
+    /// Substring match against the string produced by
+    /// [`Self::display_trace`], which includes every per-policy
+    /// reason (granted and denied) the checker actually evaluated.
+    /// Use this when the assertion is "some policy in the trace
+    /// produced this specific reason" — the per-policy reasons live
+    /// in the trace, not on the top-level summary that
+    /// [`Self::assert_denied_with_reason_containing`] inspects.
+    #[track_caller]
+    pub fn assert_trace_contains(&self, needle: &str) {
+        let rendered = self.display_trace();
+        assert!(
+            rendered.contains(needle),
+            "expected evaluation trace to contain `{needle}`; got:\n{rendered}"
+        );
     }
 
     /// Converts the evaluation into a `Result`, mapping a denial into an error.
@@ -388,7 +578,10 @@ impl PolicyEvalResult {
     ///
     /// Prefer this over constructing [`PolicyEvalResult::Granted`] directly; use
     /// [`Self::granted_with_facts`] when the decision was informed by facts.
-    pub fn granted(policy_type: impl Into<String>, reason: Option<String>) -> Self {
+    ///
+    /// `policy_type` accepts `&'static str` (zero-allocation, the common
+    /// case), `String`, or any [`Cow<'static, str>`] convertible value.
+    pub fn granted(policy_type: impl Into<Cow<'static, str>>, reason: Option<String>) -> Self {
         Self::Granted {
             policy_type: policy_type.into(),
             reason,
@@ -400,7 +593,7 @@ impl PolicyEvalResult {
     ///
     /// Prefer this over constructing [`PolicyEvalResult::Denied`] directly; use
     /// [`Self::denied_with_facts`] when the decision was informed by facts.
-    pub fn denied(policy_type: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn denied(policy_type: impl Into<Cow<'static, str>>, reason: impl Into<String>) -> Self {
         Self::Denied {
             policy_type: policy_type.into(),
             reason: reason.into(),
@@ -410,7 +603,7 @@ impl PolicyEvalResult {
 
     /// Builds a granted leaf result carrying the facts that informed it.
     pub fn granted_with_facts(
-        policy_type: impl Into<String>,
+        policy_type: impl Into<Cow<'static, str>>,
         reason: Option<String>,
         provenance: Vec<FactProvenance>,
     ) -> Self {
@@ -423,7 +616,7 @@ impl PolicyEvalResult {
 
     /// Builds a denied leaf result carrying the facts that informed it.
     pub fn denied_with_facts(
-        policy_type: impl Into<String>,
+        policy_type: impl Into<Cow<'static, str>>,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
     ) -> Self {

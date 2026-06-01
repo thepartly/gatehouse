@@ -44,6 +44,66 @@
 //! evaluated. Because [`PermissionChecker`], [`AndPolicy`], and [`OrPolicy`]
 //! short-circuit, the trace tree does not include policies that were never run.
 //!
+//! ## When to populate the Context type
+//!
+//! `Context` carries **request-scoped inputs the decision depends on but
+//! that don't belong on the subject or resource and aren't fact-loadable
+//! relationships**. The current wall-clock time, the MFA freshness on
+//! the auth session, the caller's network zone, the request's tenant
+//! config — all properties of the *call*, not of the user or the thing
+//! being authorized. A few shapes show up repeatedly:
+//!
+//! - **Time-of-day / business hours.** "Finance approvers can issue refunds
+//!   between 09:00 and 17:00 in the company timezone, except admins."
+//!   The current wall-clock time isn't a property of the user or the
+//!   invoice — it's a property of the *call*. Put a `current_time: SystemTime`
+//!   (or `OffsetDateTime`, or a `Clock` trait object for testability) on
+//!   `Context` and have the policy compare against the resource's
+//!   business-hours window. The `examples/actix_web.rs` `RequestContext`
+//!   uses exactly this shape for the draft-recency policy.
+//!
+//! - **Authentication / MFA freshness.** "Approving a payment over $10k
+//!   requires an MFA assertion within the last 5 minutes." MFA freshness
+//!   lives on the request (the session token records when MFA was last
+//!   reasserted), not on the user record. A `mfa_verified_at:
+//!   Option<SystemTime>` on `Context` lets the high-value policy short-
+//!   circuit deny when freshness has lapsed without forcing every policy
+//!   to plumb the auth-session through their own arguments. See
+//!   `examples/mfa_freshness_context.rs` for the full end-to-end shape.
+//!
+//! - **Device / network trust posture.** "Production database access
+//!   requires the request to come from a managed device on the corporate
+//!   VPN." `device_trust_score: u8`, `network_zone: NetworkZone`, or
+//!   `client_ip: IpAddr` on `Context` are the typical shape. Policies
+//!   that don't care about posture simply ignore the field.
+//!
+//! - **Request-wide parameters shared across actions.** When the same
+//!   per-request input shapes the decision for many different actions
+//!   — `export_destination: ExportDestination`, `purpose: AccessPurpose`,
+//!   `client_app_version: SemVer` — `Context` is the right home for it.
+//!   Per-action attributes that only one action cares about belong on
+//!   the action enum instead.
+//!
+//! - **Tenant / feature-flag overrides.** A `tenant_config:
+//!   &'a TenantPolicyConfig` reference lets policies read tenant-level
+//!   toggles ("this tenant has BYOK enabled", "this tenant requires
+//!   approval for refunds over $X") without each policy looking the
+//!   tenant up itself. Distinct from [`FactSource`]-loaded facts: those
+//!   are looked up by key during evaluation; the tenant config is
+//!   already resolved at request entry.
+//!
+//! `Context = ()` is the right call when every decision boils down to
+//! "does the subject have role X" — pure RBAC, no time, no posture,
+//! no per-request flags. Reach for a real `Context` struct as soon as
+//! a policy needs to compare against something time-varying or
+//! per-request that isn't a property of the subject, the resource, or
+//! a fact-loadable relationship.
+//!
+//! `Context` is **not** the place for relationship data ("who has
+//! viewer access on this document"). That lives behind a
+//! [`FactSource`] and gets loaded through the [`EvaluationSession`] so
+//! batch evaluation can deduplicate and coalesce.
+//!
 //! ## Fact-Loaded Authorization
 //!
 //! Gatehouse treats non-trivial authorization as computation over facts loaded
@@ -92,14 +152,19 @@
 //! checker.add_policy(policy);
 //!
 //! # tokio_test::block_on(async {
-//! let session = EvaluationSession::empty();
 //! let admin = User { roles: vec!["admin".into()] };
-//! assert!(checker.evaluate_in_session(&session, &admin, &ReadAction, &Document, &AppContext).await.is_granted());
+//! assert!(checker.check(&admin, &ReadAction, &Document, &AppContext).await.is_granted());
 //!
 //! let guest = User { roles: vec!["guest".into()] };
-//! assert!(!checker.evaluate_in_session(&session, &guest, &ReadAction, &Document, &AppContext).await.is_granted());
+//! assert!(!checker.check(&guest, &ReadAction, &Document, &AppContext).await.is_granted());
 //! # });
 //! ```
+//!
+//! `check` is the everyday entry point for policies that don't need
+//! [`FactSource`]-loaded relationship data. For fact-backed checkers
+//! (RBAC/ABAC alongside [`RebacPolicy`], or any policy reading from an
+//! [`EvaluationSession`]), use [`PermissionChecker::evaluate_in_session`]
+//! and pass a session loaded for the request.
 //!
 //! ## Built-in Policies
 //!
@@ -146,12 +211,14 @@
 //! impl Policy<User, Document, ReadAction, EmptyContext> for AdminPolicy {
 //!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
 //!         if ctx.subject.roles.contains(&"admin".to_string()) {
-//!             PolicyEvalResult::granted(self.policy_type(), Some("User is admin".to_string()))
+//!             ctx.grant("User is admin")
 //!         } else {
-//!             PolicyEvalResult::denied(self.policy_type(), "User is not admin")
+//!             ctx.deny("User is not admin")
 //!         }
 //!     }
-//!     fn policy_type(&self) -> &str { "AdminPolicy" }
+//!     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+//!         std::borrow::Cow::Borrowed("AdminPolicy")
+//!     }
 //! }
 //!
 //! // An ABAC policy: grant access if the user is the owner of the document.
@@ -161,13 +228,13 @@
 //! impl Policy<User, Document, ReadAction, EmptyContext> for OwnerPolicy {
 //!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
 //!         if ctx.subject.id == ctx.resource.owner_id {
-//!             PolicyEvalResult::granted(self.policy_type(), Some("User is the owner".to_string()))
+//!             ctx.grant("User is the owner")
 //!         } else {
-//!             PolicyEvalResult::denied(self.policy_type(), "User is not the owner")
+//!             ctx.deny("User is not the owner")
 //!         }
 //!     }
-//!     fn policy_type(&self) -> &str {
-//!         "OwnerPolicy"
+//!     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+//!         std::borrow::Cow::Borrowed("OwnerPolicy")
 //!     }
 //! }
 //!
@@ -196,20 +263,19 @@
 //! };
 //!
 //! let checker = create_document_checker();
-//! let session = EvaluationSession::empty();
 //!
 //! // An admin should have access.
-//! assert!(checker.evaluate_in_session(&session, &admin_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(checker.check(&admin_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //!
 //! // The owner should have access.
-//! assert!(checker.evaluate_in_session(&session, &owner_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(checker.check(&owner_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //!
 //! // A random user should be denied access.
 //! let random_user = User {
 //!     id: Uuid::new_v4(),
 //!     roles: vec!["user".into()],
 //! };
-//! assert!(!checker.evaluate_in_session(&session, &random_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(!checker.check(&random_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //! # });
 //! ```
 //!

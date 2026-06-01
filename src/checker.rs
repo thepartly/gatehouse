@@ -9,10 +9,106 @@ use tracing::Instrument;
 
 /// A container for multiple policies, applied in an "OR" fashion.
 /// (If any policy returns Ok, access is granted)
-/// **Important**:
-/// If no policies are added, access is always denied.
+///
+/// **Important**: if no policies are added, access is always denied.
+///
+/// # One checker per resource type
+///
+/// `PermissionChecker` is parameterised by `Resource` (the `R` generic).
+/// Every policy in the checker sees the same `R`, so the idiomatic shape is
+/// **one checker per resource type**: a `PermissionChecker<User, Document,
+/// ReadAction, Ctx>` for documents, a separate `PermissionChecker<User,
+/// Invoice, InvoiceAction, Ctx>` for invoices, and so on.
+///
+/// The anti-pattern is a single mega-checker whose `R` is a tag enum:
+///
+/// ```ignore
+/// // Don't do this:
+/// enum BillingResource { Event, Invoice, Product }
+///
+/// async fn evaluate(&self, ctx: &EvalCtx<'_, _, BillingResource, _, _>) -> PolicyEvalResult {
+///     if !matches!(ctx.resource, BillingResource::Event) {
+///         return ctx.deny("resource mismatch");   // tag dispatch in every policy
+///     }
+///     // ... real per-event logic, with the actual event data fished out of `ctx.context`
+/// }
+/// ```
+///
+/// That shape forces every policy to start with a tag discriminator and
+/// pushes the per-instance data into `Context`, which makes
+/// `LookupSource` / `Hydrator` and batch APIs awkward — the hydrator can
+/// only produce tag values, not the real resources. If you find a policy
+/// opening with `if !matches!(ctx.resource, ::X)`, the type system is
+/// asking to do that dispatch for you: split into per-resource checkers
+/// and let `R` carry the instance data.
+///
+/// Cross-cutting policies that apply to multiple resource types (a global
+/// admin override, for example) can be implemented once as a generic
+/// `Policy<S, R, A, C>` and added to each per-resource checker, or be
+/// expressed as separate [`crate::DelegatingPolicy`] children.
+///
+/// # Modeling list/scope endpoints
+///
+/// The "one checker per resource type" recipe maps cleanly onto per-item
+/// authorization ("can this user view *this* invoice?"). List and scope
+/// endpoints ("can this user list invoices in *this org*?") push back:
+/// there is no single resource instance, and the authorization predicate
+/// often runs against a scope (an organization, a project, a tenant).
+///
+/// Resist the temptation to widen the per-item checker's `R` into an
+/// enum like `Resource { Item { id }, Listing { org_id } }` — that
+/// reintroduces the tag-dispatch smell inside every policy. The cleaner
+/// shape is **two checkers, one per concern**:
+///
+/// ```ignore
+/// // Scope/list authorization: "can this user list within this scope?"
+/// type InvoiceScopeChecker =
+///     PermissionChecker<User, OrgScope, ListInvoicesAction, RequestCtx>;
+///
+/// // Per-item authorization: "can this user view this specific invoice?"
+/// type InvoiceItemChecker =
+///     PermissionChecker<User, Invoice, ViewInvoiceAction, RequestCtx>;
+///
+/// async fn list_invoices(
+///     scope_checker: &InvoiceScopeChecker,
+///     item_checker: &InvoiceItemChecker,
+///     user: &User,
+///     org: &OrgScope,
+///     ctx: &RequestCtx,
+///     session: &EvaluationSession,
+///     lookup: &impl LookupSource<Subject = User, Id = InvoiceId>,
+///     hydrator: &impl Hydrator<InvoiceId, Resource = Invoice>,
+/// ) -> Result<Vec<Invoice>, ListError> {
+///     // 1. Coarse gate: may the user list anything in this scope at all?
+///     scope_checker
+///         .check(user, &ListInvoicesAction, org, ctx)
+///         .await
+///         .to_result(|reason| ListError::Forbidden(reason.into()))?;
+///
+///     // 2. Per-item enumeration: hydrate candidates, route through the
+///     //    item checker. Lookup is bounded by what its source enumerates,
+///     //    so the candidate set is already scoped; the item checker
+///     //    applies any remaining axes (sharing, admin override, etc).
+///     item_checker
+///         .lookup_authorized(
+///             session, user, &ViewInvoiceAction, ctx,
+///             lookup, page_size, hydrator,
+///         )
+///         .await
+///         .map_err(ListError::from)
+/// }
+/// ```
+///
+/// Two checkers, two clear concerns, no tag dispatch. The scope check is
+/// a single point evaluation (one row in the audit trail); the per-item
+/// pass produces one trace per visible item. If your scope predicate is
+/// trivial (everyone can list within their own org), you can drop the
+/// scope checker entirely and rely on the lookup source's `WHERE
+/// org_id = ?` filter — the per-item checker still validates each
+/// hydrated row, so authorization is not smeared into the data layer.
 #[derive(Clone)]
 pub struct PermissionChecker<S, R, A, C> {
+    name: Option<std::borrow::Cow<'static, str>>,
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
     max_batch_size: Option<NonZeroUsize>,
 }
@@ -36,12 +132,36 @@ where
     A: Sync,
     C: Sync,
 {
-    /// Creates a new `PermissionChecker` with no policies.
+    /// Creates a new `PermissionChecker` with no policies and no name.
     pub fn new() -> Self {
         Self {
+            name: None,
             policies: Vec::new(),
             max_batch_size: None,
         }
+    }
+
+    /// Creates a new `PermissionChecker` tagged with a name.
+    ///
+    /// The name is recorded on the `evaluate_in_session` /
+    /// `evaluate_batch_in_session_*` tracing spans as `checker.name`, so
+    /// audit pipelines that route to multiple checkers (an `InvoiceChecker`
+    /// alongside a `ProductChecker`, for example) can disambiguate which
+    /// checker produced each evaluation when policy names are shared.
+    ///
+    /// `name` accepts `&'static str` (zero-allocation), `String`, or any
+    /// `Cow<'static, str>`-convertible value.
+    pub fn named(name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self {
+            name: Some(name.into()),
+            policies: Vec::new(),
+            max_batch_size: None,
+        }
+    }
+
+    /// Returns the checker's name if one was set via [`Self::named`].
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Sets the maximum number of pending items passed to a policy batch call.
@@ -63,6 +183,42 @@ where
         self.policies.push(Arc::new(policy));
     }
 
+    /// Convenience for RBAC/ABAC-only callers: evaluates against the
+    /// process-wide [`EvaluationSession::shared_empty`] session.
+    ///
+    /// Equivalent to:
+    ///
+    /// ```ignore
+    /// checker.evaluate_in_session(
+    ///     EvaluationSession::shared_empty(),
+    ///     subject, action, resource, context,
+    /// ).await
+    /// ```
+    ///
+    /// Use this when no policy in the checker reads fact-backed state.
+    /// **For checkers with any fact-backed policy (ReBAC, custom
+    /// `FactSource`-using policies)**, call [`Self::evaluate_in_session`]
+    /// directly so the session can carry the registered `FactSource`s.
+    /// The shared empty session has no fact sources registered, so any
+    /// fact load would fail closed with
+    /// [`crate::FactLoadError::SourceNotRegistered`].
+    pub async fn check(
+        &self,
+        subject: &S,
+        action: &A,
+        resource: &R,
+        context: &C,
+    ) -> AccessEvaluation {
+        self.evaluate_in_session(
+            crate::EvaluationSession::shared_empty(),
+            subject,
+            action,
+            resource,
+            context,
+        )
+        .await
+    }
+
     /// Evaluates all policies against the given parameters using a caller-owned
     /// request session.
     ///
@@ -74,7 +230,7 @@ where
     /// If every policy denies access, the top-level denial reason is the
     /// summary string `"All policies denied access"`. Inspect the trace for
     /// individual policy reasons.
-    #[tracing::instrument(skip_all, fields(policy_count = self.policies.len(), outcome = tracing::field::Empty, policy.type = tracing::field::Empty))]
+    #[tracing::instrument(skip_all, fields(checker.name = tracing::field::Empty, policy_count = self.policies.len(), outcome = tracing::field::Empty, policy.type = tracing::field::Empty))]
     pub async fn evaluate_in_session(
         &self,
         session: &EvaluationSession,
@@ -83,6 +239,9 @@ where
         resource: &R,
         context: &C,
     ) -> AccessEvaluation {
+        if let Some(name) = self.name.as_deref() {
+            tracing::Span::current().record("checker.name", name);
+        }
         if self.policies.is_empty() {
             tracing::Span::current().record("outcome", "denied");
             tracing::debug!("No policies configured");
@@ -100,19 +259,20 @@ where
 
         // Evaluate each policy
         for policy in &self.policies {
+            let policy_type = policy.policy_type();
             let ctx = EvalCtx {
                 session,
                 subject,
                 action,
                 resource,
                 context,
+                policy_type: policy_type.clone(),
             };
             let result = policy.evaluate(&ctx).await;
             let result_passes = result.is_granted();
 
             // Extract metadata for tracing (always needed for security audit)
-            let policy_type = policy.policy_type();
-            let policy_type_str = policy_type;
+            let policy_type_str: &str = policy_type.as_ref();
             let metadata = policy.security_rule();
             let reason = result.reason();
             let reason_str = reason.as_deref();
@@ -148,16 +308,16 @@ where
             // If any policy allows access, return immediately
             if result_passes {
                 tracing::Span::current().record("outcome", "granted");
-                tracing::Span::current().record("policy.type", policy_type);
+                tracing::Span::current().record("policy.type", policy_type_str);
                 let combined = PolicyEvalResult::Combined {
-                    policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                    policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                     operation: CombineOp::Or,
                     children: policy_results,
                     outcome: true,
                 };
 
                 return AccessEvaluation::Granted {
-                    policy_type: policy_type.to_string(),
+                    policy_type,
                     reason,
                     trace: EvalTrace::with_root(combined),
                 };
@@ -168,7 +328,7 @@ where
         tracing::Span::current().record("outcome", "denied");
         tracing::trace!("No policies allowed access, returning Forbidden");
         let combined = PolicyEvalResult::Combined {
-            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
             operation: CombineOp::Or,
             children: policy_results,
             outcome: false,
@@ -227,7 +387,7 @@ where
     /// ));
     ///
     /// let visible = checker
-    ///     .filter_authorized_with_context_in_session_by(&session, &user, &Read, documents, &context, |document| {
+    ///     .filter_authorized_in_session_by_resource(&session, &user, &Read, documents, &context, |document| {
     ///         document
     ///     })
     ///     .await;
@@ -235,7 +395,7 @@ where
     /// assert_eq!(visible.len(), 1);
     /// # });
     /// ```
-    #[tracing::instrument(skip_all, fields(item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
+    #[tracing::instrument(skip_all, fields(checker.name = tracing::field::Empty, item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
     pub async fn evaluate_batch_in_session_by<I, F>(
         &self,
         session: &EvaluationSession,
@@ -250,6 +410,9 @@ where
     {
         let items: Vec<I::Item> = items.into_iter().collect();
         let item_count = items.len();
+        if let Some(name) = self.name.as_deref() {
+            tracing::Span::current().record("checker.name", name);
+        }
         tracing::Span::current().record("item_count", item_count);
         if let Some(max_batch_size) = self.max_batch_size {
             tracing::Span::current().record("max_batch_size", max_batch_size.get());
@@ -298,6 +461,7 @@ where
             }
 
             let policy_type = policy.policy_type();
+            let policy_type_str: &str = policy_type.as_ref();
             let mut still_pending = Vec::new();
             let chunk_size = self
                 .max_batch_size
@@ -308,7 +472,7 @@ where
             for (chunk_index, pending_chunk) in pending.chunks(chunk_size).enumerate() {
                 let policy_span = tracing::debug_span!(
                     "gatehouse.batch_policy",
-                    policy.type = policy_type,
+                    policy.type = policy_type_str,
                     policy.pending_count = pending_chunk.len(),
                     policy.chunk_index = chunk_index,
                     policy.chunk_count = chunk_count,
@@ -330,6 +494,7 @@ where
                     subject,
                     action,
                     items: &batch_items,
+                    policy_type: policy_type.clone(),
                 };
                 let policy_results = policy
                     .evaluate_batch(&batch_ctx)
@@ -340,12 +505,12 @@ where
                     for &index in pending_chunk {
                         policy_denied_count += 1;
                         let policy_result = PolicyEvalResult::denied(
-                            policy_type,
+                            policy_type.clone(),
                             "Policy batch result count did not match input count",
                         );
                         traces[index].push(policy_result);
                         let combined = PolicyEvalResult::Combined {
-                            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                             operation: CombineOp::Or,
                             children: std::mem::take(&mut traces[index]),
                             outcome: false,
@@ -370,13 +535,13 @@ where
                     if result_passes {
                         policy_granted_count += 1;
                         let combined = PolicyEvalResult::Combined {
-                            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                             operation: CombineOp::Or,
                             children: std::mem::take(&mut traces[index]),
                             outcome: true,
                         };
                         evaluations[index] = Some(AccessEvaluation::Granted {
-                            policy_type: policy_type.to_string(),
+                            policy_type: std::borrow::Cow::Owned(policy_type.to_string()),
                             reason,
                             trace: EvalTrace::with_root(combined),
                         });
@@ -393,7 +558,7 @@ where
 
         for index in pending {
             let combined = PolicyEvalResult::Combined {
-                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                 operation: CombineOp::Or,
                 children: std::mem::take(&mut traces[index]),
                 outcome: false,
@@ -453,9 +618,13 @@ where
             .collect()
     }
 
-    /// Evaluates caller-owned items that all share one context value, using a
-    /// caller-owned session.
-    pub async fn evaluate_batch_with_context_in_session_by<I, F>(
+    /// Evaluates caller-owned items that all share one context value.
+    ///
+    /// `resource` extracts `&R` from each item; the same `context` is used
+    /// for every evaluation. Compare with
+    /// [`Self::evaluate_batch_in_session_by`], which extracts both
+    /// `(&R, &C)` per item.
+    pub async fn evaluate_batch_in_session_by_resource<I, F>(
         &self,
         session: &EvaluationSession,
         subject: &S,
@@ -486,7 +655,62 @@ where
         .collect()
     }
 
-    /// Returns only authorized items with a shared context and caller-owned session.
+    /// Deprecated alias for [`Self::evaluate_batch_in_session_by_resource`].
+    #[deprecated(
+        since = "0.3.0-alpha.3",
+        note = "renamed to evaluate_batch_in_session_by_resource for naming symmetry \
+                with evaluate_batch_in_session_by (per-item (R, C))"
+    )]
+    pub async fn evaluate_batch_with_context_in_session_by<I, F>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        items: I,
+        context: &C,
+        resource: F,
+    ) -> Vec<(I::Item, AccessEvaluation)>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item R,
+    {
+        self.evaluate_batch_in_session_by_resource(
+            session, subject, action, items, context, resource,
+        )
+        .await
+    }
+
+    /// Returns only authorized items with a shared context.
+    ///
+    /// Filter analogue of [`Self::evaluate_batch_in_session_by_resource`].
+    pub async fn filter_authorized_in_session_by_resource<I, F>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        items: I,
+        context: &C,
+        resource: F,
+    ) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item R,
+    {
+        self.evaluate_batch_in_session_by_resource(
+            session, subject, action, items, context, resource,
+        )
+        .await
+        .into_iter()
+        .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
+        .collect()
+    }
+
+    /// Deprecated alias for [`Self::filter_authorized_in_session_by_resource`].
+    #[deprecated(
+        since = "0.3.0-alpha.3",
+        note = "renamed to filter_authorized_in_session_by_resource for naming symmetry \
+                with filter_authorized_in_session_by (per-item (R, C))"
+    )]
     pub async fn filter_authorized_with_context_in_session_by<I, F>(
         &self,
         session: &EvaluationSession,
@@ -500,13 +724,10 @@ where
         I: IntoIterator,
         F: for<'item> Fn(&'item I::Item) -> &'item R,
     {
-        self.evaluate_batch_with_context_in_session_by(
+        self.filter_authorized_in_session_by_resource(
             session, subject, action, items, context, resource,
         )
         .await
-        .into_iter()
-        .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
-        .collect()
     }
 
     /// Look up one page of candidate IDs from `lookup`, hydrate them via
@@ -604,7 +825,7 @@ where
 
         let resources: Vec<R> = hydrated.into_iter().flatten().collect();
         let authorized = self
-            .filter_authorized_with_context_in_session_by(
+            .filter_authorized_in_session_by_resource(
                 session,
                 subject,
                 action,
@@ -700,7 +921,7 @@ where
     where
         I: IntoIterator<Item = R>,
     {
-        self.evaluate_batch_with_context_in_session_by(
+        self.evaluate_batch_in_session_by_resource(
             session,
             subject,
             action,

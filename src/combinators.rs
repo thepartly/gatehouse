@@ -42,22 +42,30 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> &str {
-        "AndPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("AndPolicy")
     }
 
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
-            let result = policy.evaluate(ctx).await;
+            let inner_ctx = EvalCtx {
+                session: ctx.session,
+                subject: ctx.subject,
+                action: ctx.action,
+                resource: ctx.resource,
+                context: ctx.context,
+                policy_type: policy.policy_type(),
+            };
+            let result = policy.evaluate(&inner_ctx).await;
             let is_granted = result.is_granted();
             children_results.push(result);
 
             // Short-circuit on first denial
             if !is_granted {
                 return PolicyEvalResult::Combined {
-                    policy_type: self.policy_type().to_string(),
+                    policy_type: self.policy_type(),
                     operation: CombineOp::And,
                     children: children_results,
                     outcome: false,
@@ -67,7 +75,7 @@ where
 
         // All policies granted access
         PolicyEvalResult::Combined {
-            policy_type: self.policy_type().to_string(),
+            policy_type: self.policy_type(),
             operation: CombineOp::And,
             children: children_results,
             outcome: true,
@@ -99,6 +107,7 @@ where
                 subject: ctx.subject,
                 action: ctx.action,
                 items: &batch_items,
+                policy_type: policy.policy_type(),
             };
             let child_results = policy.evaluate_batch(&batch_ctx).await;
 
@@ -109,7 +118,7 @@ where
                         "Policy batch result count did not match input count",
                     ));
                     results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: self.policy_type().to_string(),
+                        policy_type: self.policy_type(),
                         operation: CombineOp::And,
                         children: std::mem::take(&mut children_by_item[index]),
                         outcome: false,
@@ -127,7 +136,7 @@ where
                     still_pending.push(index);
                 } else {
                     results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: self.policy_type().to_string(),
+                        policy_type: self.policy_type(),
                         operation: CombineOp::And,
                         children: std::mem::take(&mut children_by_item[index]),
                         outcome: false,
@@ -139,7 +148,7 @@ where
 
         for index in pending {
             results[index] = Some(PolicyEvalResult::Combined {
-                policy_type: self.policy_type().to_string(),
+                policy_type: self.policy_type(),
                 operation: CombineOp::And,
                 children: std::mem::take(&mut children_by_item[index]),
                 outcome: true,
@@ -187,21 +196,29 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> &str {
-        "OrPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("OrPolicy")
     }
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
-            let result = policy.evaluate(ctx).await;
+            let inner_ctx = EvalCtx {
+                session: ctx.session,
+                subject: ctx.subject,
+                action: ctx.action,
+                resource: ctx.resource,
+                context: ctx.context,
+                policy_type: policy.policy_type(),
+            };
+            let result = policy.evaluate(&inner_ctx).await;
             let is_granted = result.is_granted();
             children_results.push(result);
 
             // Short-circuit on first success
             if is_granted {
                 return PolicyEvalResult::Combined {
-                    policy_type: self.policy_type().to_string(),
+                    policy_type: self.policy_type(),
                     operation: CombineOp::Or,
                     children: children_results,
                     outcome: true,
@@ -211,7 +228,7 @@ where
 
         // All policies denied access
         PolicyEvalResult::Combined {
-            policy_type: self.policy_type().to_string(),
+            policy_type: self.policy_type(),
             operation: CombineOp::Or,
             children: children_results,
             outcome: false,
@@ -243,6 +260,7 @@ where
                 subject: ctx.subject,
                 action: ctx.action,
                 items: &batch_items,
+                policy_type: policy.policy_type(),
             };
             let child_results = policy.evaluate_batch(&batch_ctx).await;
 
@@ -253,7 +271,7 @@ where
                         "Policy batch result count did not match input count",
                     ));
                     results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: self.policy_type().to_string(),
+                        policy_type: self.policy_type(),
                         operation: CombineOp::Or,
                         children: std::mem::take(&mut children_by_item[index]),
                         outcome: false,
@@ -269,7 +287,7 @@ where
 
                 if is_granted {
                     results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: self.policy_type().to_string(),
+                        policy_type: self.policy_type(),
                         operation: CombineOp::Or,
                         children: std::mem::take(&mut children_by_item[index]),
                         outcome: true,
@@ -283,7 +301,7 @@ where
 
         for index in pending {
             results[index] = Some(PolicyEvalResult::Combined {
-                policy_type: self.policy_type().to_string(),
+                policy_type: self.policy_type(),
                 operation: CombineOp::Or,
                 children: std::mem::take(&mut children_by_item[index]),
                 outcome: false,
@@ -333,16 +351,24 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> &str {
-        "NotPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("NotPolicy")
     }
 
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
-        let inner_result = self.policy.evaluate(ctx).await;
+        let inner_ctx = EvalCtx {
+            session: ctx.session,
+            subject: ctx.subject,
+            action: ctx.action,
+            resource: ctx.resource,
+            context: ctx.context,
+            policy_type: self.policy.policy_type(),
+        };
+        let inner_result = self.policy.evaluate(&inner_ctx).await;
         let is_granted = inner_result.is_granted();
 
         PolicyEvalResult::Combined {
-            policy_type: Policy::<S, R, A, C>::policy_type(self).to_string(),
+            policy_type: Policy::<S, R, A, C>::policy_type(self),
             operation: CombineOp::Not,
             children: vec![inner_result],
             outcome: !is_granted,
@@ -353,7 +379,19 @@ where
         &self,
         ctx: &BatchEvalCtx<'item, S, R, A, C>,
     ) -> Vec<PolicyEvalResult> {
-        let inner_results = self.policy.evaluate_batch(ctx).await;
+        // Rebuild the BatchEvalCtx with the inner policy's name so any
+        // result built via `ctx.grant`/`ctx.deny` (or the default
+        // evaluate_batch impl, which forwards through per-item EvalCtx)
+        // is tagged with the wrapped policy, not "NotPolicy". Matches the
+        // single-item path and the AndPolicy/OrPolicy batch paths.
+        let inner_ctx = BatchEvalCtx {
+            session: ctx.session,
+            subject: ctx.subject,
+            action: ctx.action,
+            items: ctx.items,
+            policy_type: self.policy.policy_type(),
+        };
+        let inner_results = self.policy.evaluate_batch(&inner_ctx).await;
 
         if inner_results.len() != ctx.items.len() {
             return ctx
@@ -373,7 +411,7 @@ where
             .map(|inner_result| {
                 let is_granted = inner_result.is_granted();
                 PolicyEvalResult::Combined {
-                    policy_type: self.policy_type().to_string(),
+                    policy_type: self.policy_type(),
                     operation: CombineOp::Not,
                     children: vec![inner_result],
                     outcome: !is_granted,

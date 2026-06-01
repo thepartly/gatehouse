@@ -95,16 +95,13 @@ where
         let condition_met = (self.condition)(ctx.subject, ctx.resource, ctx.action, ctx.context);
 
         if condition_met {
-            PolicyEvalResult::granted(
-                self.policy_type(),
-                Some("Condition evaluated to true".to_string()),
-            )
+            ctx.grant("Condition evaluated to true")
         } else {
-            PolicyEvalResult::denied(self.policy_type(), "Condition evaluated to false")
+            ctx.deny("Condition evaluated to false")
         }
     }
 
-    fn policy_type(&self) -> &str {
-        "AbacPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("AbacPolicy")
     }
 }

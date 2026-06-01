@@ -118,7 +118,7 @@ async fn main() {
 
     let first_request = request_session(&relationships);
     let visible = checker
-        .filter_authorized_with_context_in_session_by(
+        .filter_authorized_in_session_by_resource(
             &first_request,
             &user,
             &View,
@@ -152,7 +152,7 @@ async fn main() {
                 let session = request_session(&relationships);
                 let context = RequestContext;
                 checker
-                    .filter_authorized_with_context_in_session_by(
+                    .filter_authorized_in_session_by_resource(
                         &session,
                         &user,
                         &View,

@@ -49,8 +49,8 @@ impl Policy<Subject, Resource, Action, Ctx> for TracePolicy {
             .collect()
     }
 
-    fn policy_type(&self) -> &str {
-        "TracePolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("TracePolicy")
     }
 }
 
@@ -456,4 +456,74 @@ fn tracing_fields_are_recorded_for_empty_policy_decisions() {
     assert_value(batch, "granted_count", "0");
     assert_value(batch, "denied_count", "1");
     assert_value(batch, "max_batch_size", "2");
+}
+
+#[test]
+fn named_checker_records_name_on_evaluate_span() {
+    let mut checker =
+        PermissionChecker::<Subject, Resource, Action, Ctx>::named("InvoiceItemChecker");
+    checker.add_policy(TracePolicy);
+    let session = EvaluationSession::empty();
+    let (_result, spans) = capture_async(|| async {
+        checker
+            .evaluate_in_session(
+                &session,
+                &Subject,
+                &Action,
+                &Resource { allowed: true },
+                &Ctx,
+            )
+            .await
+    });
+
+    let single = span(&spans, "evaluate_in_session");
+    assert_value(single, "checker.name", "InvoiceItemChecker");
+}
+
+#[test]
+fn unnamed_checker_omits_checker_name_field() {
+    let checker = checker_with_policy();
+    let session = EvaluationSession::empty();
+    let (_result, spans) = capture_async(|| async {
+        checker
+            .evaluate_in_session(
+                &session,
+                &Subject,
+                &Action,
+                &Resource { allowed: true },
+                &Ctx,
+            )
+            .await
+    });
+
+    let single = span(&spans, "evaluate_in_session");
+    // Span declares the field but does not record a value when the checker
+    // has no name.
+    assert!(
+        !single.values.contains_key("checker.name"),
+        "checker.name should be unrecorded on an unnamed checker; values: {:?}",
+        single.values
+    );
+}
+
+#[test]
+fn named_checker_records_name_on_batch_span() {
+    let mut checker =
+        PermissionChecker::<Subject, Resource, Action, Ctx>::named("InvoiceItemChecker");
+    checker.add_policy(TracePolicy);
+    let session = EvaluationSession::empty();
+    let (_result, spans) = capture_async(|| async {
+        checker
+            .evaluate_batch_in_session_by(
+                &session,
+                &Subject,
+                &Action,
+                vec![(Resource { allowed: true }, Ctx)],
+                |item| (&item.0, &item.1),
+            )
+            .await
+    });
+
+    let batch = span(&spans, "evaluate_batch_in_session_by");
+    assert_value(batch, "checker.name", "InvoiceItemChecker");
 }

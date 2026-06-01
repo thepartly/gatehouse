@@ -49,17 +49,14 @@ impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for OrgAdminP
         ctx: &EvalCtx<'_, SubjectV2, Group, GroupManagementAction, EmptyContext>,
     ) -> PolicyEvalResult {
         if ctx.subject.authorization_details.is_org_admin {
-            PolicyEvalResult::granted(
-                self.policy_type(),
-                Some("User is organization admin".to_string()),
-            )
+            ctx.grant("User is organization admin")
         } else {
-            PolicyEvalResult::denied(self.policy_type(), "User is not organization admin")
+            ctx.deny("User is not organization admin")
         }
     }
 
-    fn policy_type(&self) -> &str {
-        "OrgAdminPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("OrgAdminPolicy")
     }
 }
 
@@ -79,17 +76,14 @@ impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for StaffPoli
             .iter()
             .any(|p| p.scope == "staff")
         {
-            PolicyEvalResult::granted(
-                self.policy_type(),
-                Some("User has staff permission".to_string()),
-            )
+            ctx.grant("User has staff permission")
         } else {
-            PolicyEvalResult::denied(self.policy_type(), "User lacks staff permission")
+            ctx.deny("User lacks staff permission")
         }
     }
 
-    fn policy_type(&self) -> &str {
-        "StaffPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("StaffPolicy")
     }
 }
 
@@ -121,10 +115,7 @@ async fn main() {
     let context = EmptyContext;
 
     let checker = create_group_management_checker();
-    let session = EvaluationSession::empty();
-    let result = checker
-        .evaluate_in_session(&session, &subject, &action, &group, &context)
-        .await;
+    let result = checker.check(&subject, &action, &group, &context).await;
     assert!(result.is_granted());
     println!(
         "Evaluating subject {} with org id {} and group {}",
