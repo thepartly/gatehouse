@@ -60,8 +60,8 @@ let user = User {
 };
 let document = Document { owner_id: 1 };
 
-// RBAC/ABAC-only checkers can use `check`, which wraps
-// `evaluate_in_session(EvaluationSession::shared_empty(), …)`.
+// `check` is the everyday call for RBAC/ABAC-only checkers. Reach for
+// `evaluate_in_session` when the checker has any fact-backed policy.
 let evaluation = checker.check(&user, &Action, &document, &Context).await;
 
 assert!(evaluation.is_granted());

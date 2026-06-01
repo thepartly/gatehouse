@@ -77,13 +77,12 @@
 //!   `client_ip: IpAddr` on `Context` are the typical shape. Policies
 //!   that don't care about posture simply ignore the field.
 //!
-//! - **Request intent / parameters that aren't part of the resource.**
-//!   Sometimes the action carries an attribute the resource doesn't know
-//!   about — for example `ExportAction { format: ExportFormat }` where
-//!   `format` affects whether the export is allowed. Either inline it on
-//!   the action enum (preferred when there are few variants) or carry it
-//!   on `Context` (preferred when many actions share the same parameter,
-//!   e.g. a request-wide `export_destination: ExportDestination`).
+//! - **Request-wide parameters shared across actions.** When the same
+//!   per-request input shapes the decision for many different actions
+//!   — `export_destination: ExportDestination`, `purpose: AccessPurpose`,
+//!   `client_app_version: SemVer` — `Context` is the right home for it.
+//!   Per-action attributes that only one action cares about belong on
+//!   the action enum instead.
 //!
 //! - **Tenant / feature-flag overrides.** A `tenant_config:
 //!   &'a TenantPolicyConfig` reference lets policies read tenant-level
@@ -93,12 +92,12 @@
 //!   are looked up by key during evaluation; the tenant config is
 //!   already resolved at request entry.
 //!
-//! When `Context = ()` is enough. RBAC-only systems where every decision
-//! is "does the subject have role X" don't need a richer `Context`. Use
-//! `()` and a [`PermissionChecker::check`]-driven path. Reach for a real
-//! `Context` struct as soon as a policy needs to compare against
-//! something time-varying or per-request that isn't a property of the
-//! subject, the resource, or a fact-loadable relationship.
+//! `Context = ()` is the right call when every decision boils down to
+//! "does the subject have role X" — pure RBAC, no time, no posture,
+//! no per-request flags. Reach for a real `Context` struct as soon as
+//! a policy needs to compare against something time-varying or
+//! per-request that isn't a property of the subject, the resource, or
+//! a fact-loadable relationship.
 //!
 //! `Context` is **not** the place for relationship data ("who has
 //! viewer access on this document"). That lives behind a

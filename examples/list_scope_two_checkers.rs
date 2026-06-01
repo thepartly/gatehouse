@@ -21,10 +21,11 @@
 //! checker is the OR of "is admin" / "is owner" / "is shared with".
 //!
 //! Why two checkers rather than two actions on one checker:
-//! - The policies often differ in shape (list scope rarely needs to
-//!   load full per-item facts; detail check does). Sharing a single
-//!   checker forces every policy to handle both actions correctly, and
-//!   the trace gets noisy.
+//! - The policy sets are genuinely different. The list checker
+//!   doesn't load per-item share-list facts; the detail checker
+//!   does. Sharing one checker forces every policy to handle both
+//!   actions and clutters the trace with `match action { ... }`
+//!   no-op arms.
 //! - Naming each checker means audit telemetry can route list-page
 //!   evaluations and view-detail evaluations to different alerts. A
 //!   spike of `DocumentDetailChecker` denials is a very different

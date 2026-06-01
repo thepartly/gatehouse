@@ -16,8 +16,6 @@
 //! high-value policy short-circuits deny when MFA freshness has lapsed;
 //! the role policy ignores the field entirely. Same subject, same
 //! resource, different calls → different decisions.
-//!
-//! Run with `cargo run --example mfa_freshness_context`.
 
 use async_trait::async_trait;
 use gatehouse::{EvalCtx, PermissionChecker, Policy, PolicyEvalResult};

@@ -331,13 +331,12 @@ impl AccessEvaluation {
     /// Test helper: panic unless the evaluation is `Denied` and the
     /// **top-level summary** denial reason contains `needle`.
     ///
-    /// This matches the single string on [`AccessEvaluation::Denied`],
-    /// which is a summary like `"All policies denied access"` — *not*
-    /// the per-policy reasons inside the trace tree. For a typical
-    /// multi-policy checker, this means individual policy reasons such
-    /// as `"Suppliers cannot approve credit notes"` won't match here;
-    /// reach for [`Self::assert_trace_contains`] or [`Self::assert_denied_by`]
-    /// to inspect specific policies' denial reasons.
+    /// `needle` is matched against the single string on
+    /// [`AccessEvaluation::Denied`] — a summary like
+    /// `"All policies denied access"`, not the per-policy reasons
+    /// inside the trace tree. For a multi-policy checker, asserting
+    /// on a specific policy's reason needs [`Self::assert_trace_contains`]
+    /// or [`Self::assert_denied_by`].
     ///
     /// Substring match keeps tests resilient to minor reason-string
     /// rewording. For exact-match assertions, inspect
@@ -366,9 +365,8 @@ impl AccessEvaluation {
     /// Symmetric with [`Self::assert_granted_by`] but walks the trace
     /// rather than checking the top-level decision, because a denial
     /// has no single denying policy: every policy in the checker has
-    /// to deny for the overall result to be `Denied`. Use this when you
-    /// want to assert "policy X actually fired and denied", regardless
-    /// of which other policies were consulted.
+    /// to deny for the overall result to be `Denied`. Use this to
+    /// assert that policy `expected` actually fired and denied.
     ///
     /// ```rust
     /// # use gatehouse::*;
@@ -409,11 +407,13 @@ impl AccessEvaluation {
     /// Test helper: panic unless `needle` appears anywhere in the
     /// formatted evaluation trace.
     ///
-    /// This is the "any policy reason" assertion: a denial's per-policy
-    /// reasons live in the trace, not on the top-level summary, so
-    /// matching against the formatted trace is how a test can claim
-    /// "some policy denied with this specific reason". Substring match
-    /// against the same string [`Self::display_trace`] produces.
+    /// Substring match against the string produced by
+    /// [`Self::display_trace`], which includes every per-policy
+    /// reason (granted and denied) the checker actually evaluated.
+    /// Use this when the assertion is "some policy in the trace
+    /// produced this specific reason" — the per-policy reasons live
+    /// in the trace, not on the top-level summary that
+    /// [`Self::assert_denied_with_reason_containing`] inspects.
     #[track_caller]
     pub fn assert_trace_contains(&self, needle: &str) {
         let rendered = self.display_trace();
