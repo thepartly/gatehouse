@@ -9,8 +9,43 @@ use tracing::Instrument;
 
 /// A container for multiple policies, applied in an "OR" fashion.
 /// (If any policy returns Ok, access is granted)
-/// **Important**:
-/// If no policies are added, access is always denied.
+///
+/// **Important**: if no policies are added, access is always denied.
+///
+/// # One checker per resource type
+///
+/// `PermissionChecker` is parameterised by `Resource` (the `R` generic).
+/// Every policy in the checker sees the same `R`, so the idiomatic shape is
+/// **one checker per resource type**: a `PermissionChecker<User, Document,
+/// ReadAction, Ctx>` for documents, a separate `PermissionChecker<User,
+/// Invoice, InvoiceAction, Ctx>` for invoices, and so on.
+///
+/// The anti-pattern is a single mega-checker whose `R` is a tag enum:
+///
+/// ```ignore
+/// // Don't do this:
+/// enum BillingResource { Event, Invoice, Product }
+///
+/// async fn evaluate(&self, ctx: &EvalCtx<'_, _, BillingResource, _, _>) -> PolicyEvalResult {
+///     if !matches!(ctx.resource, BillingResource::Event) {
+///         return ctx.deny("resource mismatch");   // tag dispatch in every policy
+///     }
+///     // ... real per-event logic, with the actual event data fished out of `ctx.context`
+/// }
+/// ```
+///
+/// That shape forces every policy to start with a tag discriminator and
+/// pushes the per-instance data into `Context`, which makes
+/// `LookupSource` / `Hydrator` and batch APIs awkward — the hydrator can
+/// only produce tag values, not the real resources. If you find a policy
+/// opening with `if !matches!(ctx.resource, ::X)`, the type system is
+/// asking to do that dispatch for you: split into per-resource checkers
+/// and let `R` carry the instance data.
+///
+/// Cross-cutting policies that apply to multiple resource types (a global
+/// admin override, for example) can be implemented once as a generic
+/// `Policy<S, R, A, C>` and added to each per-resource checker, or be
+/// expressed as separate [`crate::DelegatingPolicy`] children.
 #[derive(Clone)]
 pub struct PermissionChecker<S, R, A, C> {
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
