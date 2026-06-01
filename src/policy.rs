@@ -190,10 +190,17 @@ where
     /// (`Cow::Borrowed("MyPolicy")`) is zero-allocation end-to-end —
     /// the checker captures this once per evaluation into
     /// [`EvalCtx::policy_type`], and [`EvalCtx::grant`] / [`EvalCtx::deny`]
-    /// clone the [`Cow`] (which is a no-op for `Borrowed`). Dynamic-name
-    /// policies return `Cow::Owned(self.name.clone())` and pay one
-    /// allocation per call, the same cost the trait had before this
-    /// change.
+    /// clone the [`Cow`] (which is a no-op for `Borrowed`).
+    ///
+    /// Dynamic-name policies return `Cow::Owned(self.name.clone())`
+    /// and pay one allocation here, plus two more on the
+    /// `ctx.grant` / `ctx.deny` helper path — see
+    /// [`EvalCtx::policy_type`] for the full accounting. This is a
+    /// regression from the pre-`Cow` trait shape where
+    /// `policy_type(&self) -> &str` let dynamic names return
+    /// `&self.name` without allocating. Prefer a `'static` name table
+    /// when you can; the dynamic case still works correctly, just at
+    /// extra cost.
     fn policy_type(&self) -> Cow<'static, str>;
 
     /// Metadata describing the security rule that backs this policy.
