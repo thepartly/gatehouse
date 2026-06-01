@@ -20,19 +20,30 @@
 //! list checker is the OR of "is admin" / "is in workspace"; the detail
 //! checker is the OR of "is admin" / "is owner" / "is shared with".
 //!
-//! Why two checkers rather than two actions on one checker:
-//! - The policy sets are genuinely different. The list checker
-//!   doesn't load per-item share-list facts; the detail checker
-//!   does. Sharing one checker forces every policy to handle both
-//!   actions and clutters the trace with `match action { ... }`
-//!   no-op arms.
-//! - Naming each checker means audit telemetry can route list-page
-//!   evaluations and view-detail evaluations to different alerts. A
-//!   spike of `DocumentDetailChecker` denials is a very different
-//!   signal from a spike of `DocumentListChecker` denials.
-//! - The `R` and `A` generics stay tight: each checker has one resource
-//!   type and one action type, so policies don't need to branch on a
-//!   `match action { ... }` arm.
+//! Why two checkers rather than one checker with an
+//! `enum Action { List, ViewDetail }`:
+//!
+//! The load-bearing reason is that the policy *sets* are genuinely
+//! different. The list checker doesn't load per-item share-list
+//! facts; the detail checker does. Sharing one checker forces every
+//! policy to handle both actions and clutters the trace with
+//! `match action { ... }` no-op arms. As soon as one variant adds a
+//! policy the other doesn't need, "one checker, many actions" stops
+//! paying for itself.
+//!
+//! Two more benefits — both achievable with a single `named()`
+//! checker over a scope-discriminating action enum, so they don't on
+//! their own justify splitting, but they compound the first reason:
+//!
+//! - Audit telemetry can route list-page evaluations and view-detail
+//!   evaluations to different alerts. A spike of
+//!   `DocumentDetailChecker` denials is a very different signal from
+//!   a spike of `DocumentListChecker` denials. (Achievable with one
+//!   `named()` checker + an action field on the span, but separate
+//!   checkers make the routing key-of-the-trace, not key-of-a-field.)
+//! - The `R` and `A` generics stay tight: each checker has one
+//!   resource type and one action type, so policies don't need to
+//!   branch on a `match action { ... }` arm.
 
 use async_trait::async_trait;
 use gatehouse::{AccessEvaluation, EvalCtx, PermissionChecker, Policy, PolicyEvalResult};

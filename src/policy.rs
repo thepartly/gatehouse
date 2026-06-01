@@ -23,7 +23,22 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     pub action: &'a Action,
     /// Target resource.
     pub resource: &'a Resource,
-    /// Additional evaluation context.
+    /// Additional per-request evaluation context.
+    ///
+    /// Carries request-scoped inputs that aren't properties of the
+    /// subject or resource: the current wall-clock time, the MFA
+    /// freshness on the auth session, the caller's network zone,
+    /// tenant-level overrides. Rule of thumb: if **same subject, same
+    /// resource, different calls → different decisions**, the
+    /// distinguishing input belongs on `Context`. If the decision is
+    /// fully determined by the subject and resource, `Context = ()`
+    /// is fine.
+    ///
+    /// `Context` is **not** the place for relationship data — that
+    /// loads through a [`FactSource`](crate::FactSource) on the
+    /// [`EvaluationSession`](crate::EvaluationSession). See the
+    /// crate-level "When to populate the Context type" section and
+    /// `examples/mfa_freshness_context.rs` for fuller treatment.
     pub context: &'a Context,
     /// The current policy's [`Policy::policy_type`], captured once by the
     /// checker before dispatch. Used by [`Self::grant`] / [`Self::deny`] so
