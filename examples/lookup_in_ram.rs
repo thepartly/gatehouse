@@ -66,8 +66,8 @@ impl Policy<User, Document, View, RequestCtx> for AdminPolicy {
             PolicyEvalResult::denied(self.policy_type().to_string(), "not admin")
         }
     }
-    fn policy_type(&self) -> &str {
-        "AdminPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("AdminPolicy")
     }
 }
 
@@ -97,8 +97,8 @@ impl Policy<User, Document, View, RequestCtx> for ViewerPolicy {
             PolicyEvalResult::denied(self.policy_type().to_string(), "no viewer relation")
         }
     }
-    fn policy_type(&self) -> &str {
-        "ViewerPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ViewerPolicy")
     }
 }
 

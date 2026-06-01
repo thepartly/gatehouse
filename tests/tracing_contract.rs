@@ -49,8 +49,8 @@ impl Policy<Subject, Resource, Action, Ctx> for TracePolicy {
             .collect()
     }
 
-    fn policy_type(&self) -> &str {
-        "TracePolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("TracePolicy")
     }
 }
 

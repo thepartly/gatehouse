@@ -101,7 +101,7 @@ where
         }
     }
 
-    fn policy_type(&self) -> &str {
-        "AbacPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("AbacPolicy")
     }
 }

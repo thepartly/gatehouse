@@ -151,7 +151,9 @@
 //!             PolicyEvalResult::denied(self.policy_type(), "User is not admin")
 //!         }
 //!     }
-//!     fn policy_type(&self) -> &str { "AdminPolicy" }
+//!     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+//!         std::borrow::Cow::Borrowed("AdminPolicy")
+//!     }
 //! }
 //!
 //! // An ABAC policy: grant access if the user is the owner of the document.
@@ -166,8 +168,8 @@
 //!             PolicyEvalResult::denied(self.policy_type(), "User is not the owner")
 //!         }
 //!     }
-//!     fn policy_type(&self) -> &str {
-//!         "OwnerPolicy"
+//!     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+//!         std::borrow::Cow::Borrowed("OwnerPolicy")
 //!     }
 //! }
 //!

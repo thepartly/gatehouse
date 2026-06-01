@@ -71,8 +71,8 @@ impl Policy<User, Document, ViewAction, EmptyContext> for CountingPolicy {
         }
     }
 
-    fn policy_type(&self) -> &str {
-        &self.name
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Owned(self.name.clone())
     }
 }
 

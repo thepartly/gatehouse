@@ -68,8 +68,8 @@ impl Policy<User, Doc, ReadAction, Ctx> for OwnerPolicy {
             ),
         }
     }
-    fn policy_type(&self) -> &str {
-        "OwnerPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("OwnerPolicy")
     }
 }
 
@@ -87,8 +87,8 @@ impl Policy<User, Doc, ReadAction, Ctx> for PublicDocPolicy {
             PolicyEvalResult::denied(self.policy_type().to_string(), "doc is not public")
         }
     }
-    fn policy_type(&self) -> &str {
-        "PublicDocPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("PublicDocPolicy")
     }
 }
 

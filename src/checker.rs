@@ -178,13 +178,13 @@ where
                 action,
                 resource,
                 context,
-                policy_type,
+                policy_type: policy_type.clone(),
             };
             let result = policy.evaluate(&ctx).await;
             let result_passes = result.is_granted();
 
             // Extract metadata for tracing (always needed for security audit)
-            let policy_type_str = policy_type;
+            let policy_type_str: &str = policy_type.as_ref();
             let metadata = policy.security_rule();
             let reason = result.reason();
             let reason_str = reason.as_deref();
@@ -220,7 +220,7 @@ where
             // If any policy allows access, return immediately
             if result_passes {
                 tracing::Span::current().record("outcome", "granted");
-                tracing::Span::current().record("policy.type", policy_type);
+                tracing::Span::current().record("policy.type", policy_type_str);
                 let combined = PolicyEvalResult::Combined {
                     policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                     operation: CombineOp::Or,
@@ -229,7 +229,7 @@ where
                 };
 
                 return AccessEvaluation::Granted {
-                    policy_type: std::borrow::Cow::Owned(policy_type.to_string()),
+                    policy_type,
                     reason,
                     trace: EvalTrace::with_root(combined),
                 };
@@ -370,6 +370,7 @@ where
             }
 
             let policy_type = policy.policy_type();
+            let policy_type_str: &str = policy_type.as_ref();
             let mut still_pending = Vec::new();
             let chunk_size = self
                 .max_batch_size
@@ -380,7 +381,7 @@ where
             for (chunk_index, pending_chunk) in pending.chunks(chunk_size).enumerate() {
                 let policy_span = tracing::debug_span!(
                     "gatehouse.batch_policy",
-                    policy.type = policy_type,
+                    policy.type = policy_type_str,
                     policy.pending_count = pending_chunk.len(),
                     policy.chunk_index = chunk_index,
                     policy.chunk_count = chunk_count,
@@ -402,7 +403,7 @@ where
                     subject,
                     action,
                     items: &batch_items,
-                    policy_type,
+                    policy_type: policy_type.clone(),
                 };
                 let policy_results = policy
                     .evaluate_batch(&batch_ctx)
@@ -413,7 +414,7 @@ where
                     for &index in pending_chunk {
                         policy_denied_count += 1;
                         let policy_result = PolicyEvalResult::denied(
-                            policy_type.to_string(),
+                            policy_type.clone(),
                             "Policy batch result count did not match input count",
                         );
                         traces[index].push(policy_result);

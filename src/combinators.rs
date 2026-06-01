@@ -42,8 +42,8 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> &str {
-        "AndPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("AndPolicy")
     }
 
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
@@ -199,8 +199,8 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> &str {
-        "OrPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("OrPolicy")
     }
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
@@ -357,8 +357,8 @@ where
     C: Sync + Send,
 {
     // Override the default policy_type implementation
-    fn policy_type(&self) -> &str {
-        "NotPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("NotPolicy")
     }
 
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {

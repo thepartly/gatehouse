@@ -1,5 +1,6 @@
 use crate::{EvaluationSession, FactProvenance, PolicyEvalResult, SecurityRuleMetadata};
 use async_trait::async_trait;
+use std::borrow::Cow;
 
 /// A borrowed resource/context pair passed to batch policy evaluators.
 ///
@@ -28,7 +29,15 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     /// checker before dispatch. Used by [`Self::grant`] / [`Self::deny`] so
     /// policy bodies don't need to re-pass `self.policy_type()` on every
     /// result.
-    pub policy_type: &'a str,
+    ///
+    /// Stored as [`Cow<'static, str>`] so the shortcut path is truly
+    /// zero-allocation for policies that return `Cow::Borrowed("Name")`
+    /// (every built-in policy, and any user policy with a static name).
+    /// Dynamic-name policies that return `Cow::Owned(...)` pay one
+    /// allocation when their `policy_type()` is called by the checker;
+    /// `ctx.grant`/`deny` only clone the Cow (cheap for `Borrowed`, has-
+    /// alloc for `Owned`) — the same per-call cost as today.
+    pub policy_type: Cow<'static, str>,
 }
 
 impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
@@ -39,22 +48,13 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
     /// reason, but in practice grants almost always carry one, so the
     /// shortcut requires it; for the rare no-reason case call
     /// [`PolicyEvalResult::granted`] directly with `None`.
-    ///
-    /// **Performance note.** `ctx.policy_type` is a non-static `&str`
-    /// borrowed from the policy, so the shortcut allocates one `String`
-    /// per call to attach it to the result. For zero-allocation grants on
-    /// hot paths, call [`PolicyEvalResult::granted`] directly with a
-    /// `&'static str` literal — that path goes through
-    /// `Cow::Borrowed`.
     pub fn grant(&self, reason: impl Into<String>) -> PolicyEvalResult {
-        PolicyEvalResult::granted(self.policy_type.to_string(), Some(reason.into()))
+        PolicyEvalResult::granted(self.policy_type.clone(), Some(reason.into()))
     }
 
     /// Shorthand for `PolicyEvalResult::denied(ctx.policy_type, reason)`.
-    ///
-    /// See [`Self::grant`] for the per-call allocation note.
     pub fn deny(&self, reason: impl Into<String>) -> PolicyEvalResult {
-        PolicyEvalResult::denied(self.policy_type.to_string(), reason)
+        PolicyEvalResult::denied(self.policy_type.clone(), reason)
     }
 
     /// Shorthand for [`PolicyEvalResult::granted_with_facts`] tagged with
@@ -66,7 +66,7 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
         provenance: Vec<FactProvenance>,
     ) -> PolicyEvalResult {
         PolicyEvalResult::granted_with_facts(
-            self.policy_type.to_string(),
+            self.policy_type.clone(),
             Some(reason.into()),
             provenance,
         )
@@ -79,7 +79,7 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
     ) -> PolicyEvalResult {
-        PolicyEvalResult::denied_with_facts(self.policy_type.to_string(), reason, provenance)
+        PolicyEvalResult::denied_with_facts(self.policy_type.clone(), reason, provenance)
     }
 }
 
@@ -108,7 +108,7 @@ pub struct BatchEvalCtx<'a, Subject, Resource, Action, Context> {
     /// The current policy's [`Policy::policy_type`]. Same field as on
     /// [`EvalCtx`]; propagated to per-item `EvalCtx`s by the default
     /// `evaluate_batch` impl and by combinators when they fan out.
-    pub policy_type: &'a str,
+    pub policy_type: Cow<'static, str>,
 }
 
 /// A generic async trait representing a single authorization policy.
@@ -154,7 +154,7 @@ where
                 action: ctx.action,
                 resource: item.resource,
                 context: item.context,
-                policy_type: ctx.policy_type,
+                policy_type: ctx.policy_type.clone(),
             };
             results.push(self.evaluate(&item_ctx).await);
         }
@@ -162,7 +162,16 @@ where
     }
 
     /// Policy name for debugging, trace trees, and telemetry fallbacks.
-    fn policy_type(&self) -> &str;
+    ///
+    /// Returns [`Cow<'static, str>`] so the common static-name case
+    /// (`Cow::Borrowed("MyPolicy")`) is zero-allocation end-to-end —
+    /// the checker captures this once per evaluation into
+    /// [`EvalCtx::policy_type`], and [`EvalCtx::grant`] / [`EvalCtx::deny`]
+    /// clone the [`Cow`] (which is a no-op for `Borrowed`). Dynamic-name
+    /// policies return `Cow::Owned(self.name.clone())` and pay one
+    /// allocation per call, the same cost the trait had before this
+    /// change.
+    fn policy_type(&self) -> Cow<'static, str>;
 
     /// Metadata describing the security rule that backs this policy.
     ///
@@ -195,7 +204,7 @@ where
         (**self).evaluate_batch(ctx).await
     }
 
-    fn policy_type(&self) -> &str {
+    fn policy_type(&self) -> Cow<'static, str> {
         (**self).policy_type()
     }
 

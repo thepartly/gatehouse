@@ -201,8 +201,8 @@ where
             .collect()
     }
 
-    fn policy_type(&self) -> &str {
-        "RebacPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("RebacPolicy")
     }
 }
 

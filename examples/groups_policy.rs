@@ -61,8 +61,8 @@ impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for OrgAdminP
         }
     }
 
-    fn policy_type(&self) -> &str {
-        "OrgAdminPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("OrgAdminPolicy")
     }
 }
 
@@ -94,8 +94,8 @@ impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for StaffPoli
         }
     }
 
-    fn policy_type(&self) -> &str {
-        "StaffPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("StaffPolicy")
     }
 }
 

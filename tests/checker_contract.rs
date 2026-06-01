@@ -59,8 +59,8 @@ impl Policy<Subject, Resource, Action, Ctx> for BatchGrantPolicy {
             .collect()
     }
 
-    fn policy_type(&self) -> &str {
-        self.name
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(self.name)
     }
 }
 
@@ -99,8 +99,8 @@ impl Policy<Subject, Resource, Action, Ctx> for RandomStackPolicy {
             .collect()
     }
 
-    fn policy_type(&self) -> &str {
-        &self.name
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Owned(self.name.clone())
     }
 }
 
@@ -137,8 +137,8 @@ impl Policy<Subject, Resource, Action, Ctx> for NeverConsultedPolicy {
         Vec::new()
     }
 
-    fn policy_type(&self) -> &str {
-        "NeverConsultedPolicy"
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("NeverConsultedPolicy")
     }
 }
 

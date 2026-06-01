@@ -355,8 +355,8 @@ mod core_tests {
             )
         }
 
-        fn policy_type(&self) -> &str {
-            "AlwaysAllowPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("AlwaysAllowPolicy")
         }
     }
 
@@ -372,8 +372,8 @@ mod core_tests {
             PolicyEvalResult::denied(self.policy_type().to_string(), self.0)
         }
 
-        fn policy_type(&self) -> &str {
-            "AlwaysDenyPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("AlwaysDenyPolicy")
         }
     }
 
@@ -412,15 +412,15 @@ mod core_tests {
                     action: ctx.action,
                     resource: item.resource,
                     context: item.context,
-                    policy_type: ctx.policy_type,
+                    policy_type: ctx.policy_type.clone(),
                 };
                 results.push(self.evaluate(&item_ctx).await);
             }
             results
         }
 
-        fn policy_type(&self) -> &str {
-            "EvenResourceBatchPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("EvenResourceBatchPolicy")
         }
     }
 
@@ -454,8 +454,8 @@ mod core_tests {
                 .collect()
         }
 
-        fn policy_type(&self) -> &str {
-            "MismatchedBatchPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("MismatchedBatchPolicy")
         }
     }
 
@@ -470,8 +470,8 @@ mod core_tests {
             PolicyEvalResult::denied(self.policy_type().to_string(), "Blocked by custom rule")
         }
 
-        fn policy_type(&self) -> &str {
-            "CustomMetadataDenyPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("CustomMetadataDenyPolicy")
         }
 
         fn security_rule(&self) -> SecurityRuleMetadata {
@@ -920,8 +920,8 @@ mod core_tests {
                     ctx.deny("even id")
                 }
             }
-            fn policy_type(&self) -> &str {
-                "OddResourcePolicy"
+            fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed("OddResourcePolicy")
             }
         }
 
@@ -1440,7 +1440,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
-            policy_type: "TestPolicy",
+            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
         };
         let result = policy.evaluate(&ctx).await;
 
@@ -1474,7 +1474,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
-            policy_type: "TestPolicy",
+            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
         };
 
         let result = policy.evaluate(&ctx).await;
@@ -1503,7 +1503,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
-            policy_type: "TestPolicy",
+            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
         };
 
         let result = policy.evaluate(&ctx).await;
@@ -1655,7 +1655,7 @@ mod core_tests {
                 action: &TestAction,
                 resource: &resource,
                 context: &TestContext,
-                policy_type: "TestPolicy",
+                policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
             };
             let result = policy.evaluate(&ctx).await;
             assert!(!result.is_granted());
@@ -1733,7 +1733,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
-            policy_type: "TestPolicy",
+            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
         };
         let result = policy.evaluate(&ctx).await;
         assert!(
@@ -1982,8 +1982,8 @@ mod core_tests {
             }
         }
 
-        fn policy_type(&self) -> &str {
-            "FeatureFlagPolicy"
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed("FeatureFlagPolicy")
         }
     }
 
@@ -2357,8 +2357,8 @@ mod core_tests {
                 }
             }
 
-            fn policy_type(&self) -> &str {
-                "CountingPolicy"
+            fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed("CountingPolicy")
             }
         }
 
