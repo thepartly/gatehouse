@@ -55,10 +55,11 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     /// `Cow::Owned`), clones that `Cow` into the `EvalCtx`
     /// (alloc 2, since cloning a `Cow::Owned` clones the underlying
     /// `String`), and then `ctx.grant` / `ctx.deny` clones it again
-    /// into the result (alloc 3). If that cost matters, either return a
-    /// `Cow::Borrowed` from a `'static` name table or hand-build the
-    /// `PolicyEvalResult` and move the name into it without going
-    /// through the shortcut.
+    /// into the result (alloc 3). The shortcut path cannot avoid these
+    /// — `ctx.policy_type` is behind a shared `&EvalCtx` reference and
+    /// cannot be moved out. If allocation cost matters, return a
+    /// `Cow::Borrowed` from a `'static` name table so the whole chain
+    /// stays zero-allocation.
     pub policy_type: Cow<'static, str>,
 }
 
