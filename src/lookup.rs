@@ -109,12 +109,15 @@ pub struct LookupPage<Id> {
 /// Returning `Err` aborts the consuming pipeline.
 ///
 /// Like [`crate::FactSource`], a `Hydrator` is a natural place to call an
-/// existing DataLoader-style batch loader (`async-graphql::dataloader`,
-/// `ultra-batch`, or a home-grown batcher). The hydrator receives a
-/// candidate-page slice of IDs and returns one `Option<Resource>` per ID —
-/// exactly the shape a DataLoader's `load_many` returns. Gatehouse
-/// authorizes the resolved subset through the existing policy stack; the
-/// underlying loader owns request-wide batching and caching.
+/// existing DataLoader-style batch loader (`async_graphql::dataloader`
+/// from the `async-graphql` crate, the `ultra-batch` crate, or a
+/// home-grown batcher). Gatehouse hands the hydrator a candidate-page
+/// slice of IDs and expects `Vec<Option<Resource>>` *in input order*;
+/// most DataLoader APIs instead return a `HashMap<Id, Resource>`, so the
+/// hydrator implementation re-orders the loader's output into the slice
+/// shape gatehouse needs (with `None` for IDs that no longer resolve).
+/// Gatehouse authorizes the resolved subset through the existing policy
+/// stack; the underlying loader owns request-wide batching and caching.
 #[async_trait]
 pub trait Hydrator<Id>: Send + Sync {
     /// The resource type produced by the hydrator.

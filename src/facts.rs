@@ -142,11 +142,13 @@ pub enum FactLoadResult<V> {
 ///
 /// `FactSource` is gatehouse's request-scoped DataLoader-style primitive:
 /// the session deduplicates inputs, holds a per-session cache, and joins
-/// concurrent in-flight loads for the same key, then hands a unique slice
-/// to [`Self::load_many`]. If your application already runs a DataLoader
-/// implementation — `async-graphql::dataloader`, `ultra-batch`, or any
-/// home-grown batcher — call it directly from inside `load_many`. The two
-/// layers compose: gatehouse owns the per-request fact graph for one
+/// concurrent in-flight loads for the same key, then hands one or more
+/// unique-key slices to [`Self::load_many`] (chunked by
+/// [`Self::max_batch_size`]). If your application already runs a
+/// DataLoader implementation — `async_graphql::dataloader` (from the
+/// `async-graphql` crate), the `ultra-batch` crate, or any home-grown
+/// batcher — call it directly from inside `load_many`. The two layers
+/// compose: gatehouse owns the per-request fact graph for one
 /// authorization pass; the underlying loader owns batching across the rest
 /// of the request, request coalescing across many concurrent passes, and
 /// any longer-lived caching.
