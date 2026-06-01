@@ -41,15 +41,12 @@ impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for OrgAdminP
         ctx: &EvalCtx<'_, SubjectV2, Group, GroupManagementAction, EmptyContext>,
     ) -> PolicyEvalResult {
         if ctx.subject.authorization_details.is_org_admin {
-            PolicyEvalResult::Granted {
-                policy_type: self.policy_type().to_string(),
-                reason: Some("User is organization admin".to_string()),
-            }
+            PolicyEvalResult::granted(
+                self.policy_type(),
+                Some("User is organization admin".to_string()),
+            )
         } else {
-            PolicyEvalResult::Denied {
-                policy_type: self.policy_type().to_string(),
-                reason: "User is not organization admin".to_string(),
-            }
+            PolicyEvalResult::denied(self.policy_type(), "User is not organization admin")
         }
     }
 
@@ -74,15 +71,12 @@ impl Policy<SubjectV2, Group, GroupManagementAction, EmptyContext> for StaffPoli
             .iter()
             .any(|p| p.scope == "staff")
         {
-            PolicyEvalResult::Granted {
-                policy_type: self.policy_type().to_string(),
-                reason: Some("User has staff permission".to_string()),
-            }
+            PolicyEvalResult::granted(
+                self.policy_type(),
+                Some("User has staff permission".to_string()),
+            )
         } else {
-            PolicyEvalResult::Denied {
-                policy_type: self.policy_type().to_string(),
-                reason: "User lacks staff permission".to_string(),
-            }
+            PolicyEvalResult::denied(self.policy_type(), "User lacks staff permission")
         }
     }
 

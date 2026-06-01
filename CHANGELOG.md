@@ -2,13 +2,21 @@
 
 ## [0.3.0-alpha.2] - 2026-06-01
 
+### Breaking
+
+- `PolicyEvalResult::Granted` and `PolicyEvalResult::Denied` gain a `provenance: Vec<FactProvenance>` field recording the facts a policy consulted to reach its decision. Construct results via the new `PolicyEvalResult::granted`/`denied` (or `granted_with_facts`/`denied_with_facts`) constructors instead of struct literals.
+- `RebacPolicy` now requires its subject and resource ID types to implement `Debug` so the consulted relationship can be rendered into decision provenance.
+
 ### Added
 
 - `LookupSource` and `Hydrator` traits plus `PermissionChecker::lookup_authorized` and `lookup_authorized_page` for "what can this subject see?" list endpoints. The source enumerates a candidate superset; the hydrator resolves IDs to caller-owned resources (with explicit "no longer exists" via `Option<Resource>`); the full policy stack still authorizes each hydrated candidate. Cursor-progress is enforced (no infinite loops on stuck sources). See `examples/lookup_in_ram.rs`. (#24)
+- `FactProvenance` and `FactOutcome`: per-decision fact provenance attached to `PolicyEvalResult` leaf nodes and rendered inline by `EvalTrace::format`. `RebacPolicy` records the relationship it consulted, the load outcome, and any backend error detail. Operational fact-load telemetry remains on the `gatehouse.fact_load` tracing span.
+- `PolicyEvalResult::granted`, `denied`, `granted_with_facts`, and `denied_with_facts` constructors and a `provenance()` accessor.
 
 ### Changed
 
 - Internal refactor: the per-stripe session state machine is now a private synchronous core (`FactStripeCore<K, W>`) with no async, no tracing, and a generic waiter type. `FactState<K>` remains the async adapter that owns locks, the source, and tracing. No public API change. (#28)
+- Expanded and clarified docs: `RelationshipQuery`, `FactLoadResult` (rationale vs `Result<Option<V>, FactLoadError>`), `BatchEvalCtx` single-action design and escape hatches, `EvaluationSession` (no TTL; layer longer-lived caching inside a `FactSource`), the `shared_empty`/`register` panic rationale, and the `LoaderCancelled` error.
 
 ### Tests
 

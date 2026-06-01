@@ -104,10 +104,10 @@ where
 
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
-                    children_by_item[index].push(PolicyEvalResult::Denied {
-                        policy_type: policy.policy_type().to_string(),
-                        reason: "Policy batch result count did not match input count".to_string(),
-                    });
+                    children_by_item[index].push(PolicyEvalResult::denied(
+                        policy.policy_type(),
+                        "Policy batch result count did not match input count",
+                    ));
                     results[index] = Some(PolicyEvalResult::Combined {
                         policy_type: self.policy_type().to_string(),
                         operation: CombineOp::And,
@@ -149,9 +149,8 @@ where
         results
             .into_iter()
             .map(|result| {
-                result.unwrap_or_else(|| PolicyEvalResult::Denied {
-                    policy_type: self.policy_type().to_string(),
-                    reason: "Batch item was not evaluated".to_string(),
+                result.unwrap_or_else(|| {
+                    PolicyEvalResult::denied(self.policy_type(), "Batch item was not evaluated")
                 })
             })
             .collect()
@@ -249,10 +248,10 @@ where
 
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
-                    children_by_item[index].push(PolicyEvalResult::Denied {
-                        policy_type: policy.policy_type().to_string(),
-                        reason: "Policy batch result count did not match input count".to_string(),
-                    });
+                    children_by_item[index].push(PolicyEvalResult::denied(
+                        policy.policy_type(),
+                        "Policy batch result count did not match input count",
+                    ));
                     results[index] = Some(PolicyEvalResult::Combined {
                         policy_type: self.policy_type().to_string(),
                         operation: CombineOp::Or,
@@ -294,9 +293,8 @@ where
         results
             .into_iter()
             .map(|result| {
-                result.unwrap_or_else(|| PolicyEvalResult::Denied {
-                    policy_type: self.policy_type().to_string(),
-                    reason: "Batch item was not evaluated".to_string(),
+                result.unwrap_or_else(|| {
+                    PolicyEvalResult::denied(self.policy_type(), "Batch item was not evaluated")
                 })
             })
             .collect()
@@ -361,9 +359,11 @@ where
             return ctx
                 .items
                 .iter()
-                .map(|_| PolicyEvalResult::Denied {
-                    policy_type: self.policy_type().to_string(),
-                    reason: "Policy batch result count did not match input count".to_string(),
+                .map(|_| {
+                    PolicyEvalResult::denied(
+                        self.policy_type(),
+                        "Policy batch result count did not match input count",
+                    )
                 })
                 .collect();
         }

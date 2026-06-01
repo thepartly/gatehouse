@@ -95,15 +95,12 @@ where
         let condition_met = (self.condition)(ctx.subject, ctx.resource, ctx.action, ctx.context);
 
         if condition_met {
-            PolicyEvalResult::Granted {
-                policy_type: self.policy_type().to_string(),
-                reason: Some("Condition evaluated to true".to_string()),
-            }
+            PolicyEvalResult::granted(
+                self.policy_type(),
+                Some("Condition evaluated to true".to_string()),
+            )
         } else {
-            PolicyEvalResult::Denied {
-                policy_type: self.policy_type().to_string(),
-                reason: "Condition evaluated to false".to_string(),
-            }
+            PolicyEvalResult::denied(self.policy_type(), "Condition evaluated to false")
         }
     }
 

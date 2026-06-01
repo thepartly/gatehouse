@@ -27,12 +27,24 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
 }
 
 /// Batch policy evaluation context.
+///
+/// A batch holds one `subject` and one `action` evaluated against many
+/// `(resource, context)` items — it answers "can this subject perform this
+/// action on each of these resources?". This matches the dominant batch shape
+/// (filtering a list of resources by a single verb, or authorizing a fan-out of
+/// frames that share an action) and is what lets set-oriented backends load the
+/// facts for every item in one round trip: the shared `(subject, action)` is
+/// the stable axis the prefetch keys on.
+///
+/// If items need different actions, either group them and run one batch per
+/// action, or carry the per-item action inside `Context` and have the policy
+/// read it from there.
 pub struct BatchEvalCtx<'a, Subject, Resource, Action, Context> {
     /// Request-scoped fact session.
     pub session: &'a EvaluationSession,
     /// Entity requesting access.
     pub subject: &'a Subject,
-    /// Action being performed.
+    /// Action being performed, shared across every item in the batch.
     pub action: &'a Action,
     /// Borrowed resource/context pairs.
     pub items: &'a [PolicyBatchItem<'a, Resource, Context>],
