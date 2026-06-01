@@ -7,7 +7,12 @@
 - `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>`. Combined with the trait change below, static-name policies are **zero-allocation end-to-end** — direct constructor calls and the new `EvalCtx::grant` / `deny` shortcuts both go through `Cow::Borrowed`.
 - `Policy::policy_type` return type changed from `&str` to `Cow<'static, str>`. Built-in policies return `Cow::Borrowed("Name")` and pay zero allocations. Migrate downstream policies with one line per impl: `fn policy_type(&self) -> Cow<'static, str> { Cow::Borrowed("MyPolicy") }`. Dynamic-name policies return `Cow::Owned(self.name.clone())` — the same per-call allocation cost as before.
 - `EvalCtx` and `BatchEvalCtx` gain a `policy_type: Cow<'static, str>` field, captured once per evaluation by the checker (and by combinators when they fan out). Custom `Policy` impls and tests that build these directly need to populate it.
-- `PermissionChecker::evaluate_batch_with_context_in_session_by` renamed to `evaluate_batch_in_session_by_resource`; `filter_authorized_with_context_in_session_by` renamed to `filter_authorized_in_session_by_resource`. The new `_by_resource` suffix mirrors the existing `_by` (per-item `(R, C)`) and makes the distinguishing axis explicit. No deprecation aliases — pre-1.0, the rename is a clean break.
+- `PermissionChecker::evaluate_batch_with_context_in_session_by` renamed to `evaluate_batch_in_session_by_resource`; `filter_authorized_with_context_in_session_by` renamed to `filter_authorized_in_session_by_resource`. The new `_by_resource` suffix mirrors the existing `_by` (per-item `(R, C)`) and makes the distinguishing axis explicit. Old names are removed; migrate with:
+
+  ```
+  s/evaluate_batch_with_context_in_session_by/evaluate_batch_in_session_by_resource/g
+  s/filter_authorized_with_context_in_session_by/filter_authorized_in_session_by_resource/g
+  ```
 - `DelegatingPolicy` constructor `policy_type` parameter changed from `impl Into<String>` to `impl Into<Cow<'static, str>>` to match the trait return type.
 
 ### Added
