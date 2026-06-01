@@ -103,6 +103,63 @@ where
 /// assert!(!checker.evaluate_in_session(&session, &user, &Action("delete".into()), &doc, &Ctx).await.is_granted());
 /// # });
 /// ```
+///
+/// # Type-inference notes
+///
+/// `PolicyBuilder::new` is generic over `<S, R, A, C>`. Rust can usually
+/// infer all four type parameters from the surrounding context, but a
+/// few patterns need a little help. Listed in order from cheapest fix to
+/// most explicit:
+///
+/// 1. **Anchor through closure argument types.** The single most reliable
+///    inference signal is an explicit type annotation on each predicate
+///    closure's argument:
+///    ```rust
+///    # use gatehouse::*;
+///    # struct User; struct Doc; struct Read; struct Ctx;
+///    # fn make() -> Box<dyn Policy<User, Doc, Read, Ctx>> {
+///    PolicyBuilder::new("AdminOnly")
+///        .subjects(|_user: &User| true)
+///        .resources(|_doc: &Doc| true)
+///        .actions(|_action: &Read| true)
+///        .context(|_ctx: &Ctx| true)
+///        .build()
+///    # }
+///    ```
+///    With every closure typed, the four generics are fully constrained
+///    without any turbofish. Replace any closure with `|_: &User| ...`
+///    rather than `|_| ...` if the compiler complains.
+///
+/// 2. **Anchor through the bind site.** If only some of the predicates
+///    use typed closures (or if you use `.effect()` and `.build()` with
+///    no predicates), give the bind site or the return type a concrete
+///    `PolicyBuilder<S, R, A, C>` annotation:
+///    ```rust
+///    # use gatehouse::*;
+///    # struct User; struct Doc; struct Read; struct Ctx;
+///    let b: PolicyBuilder<User, Doc, Read, Ctx> = PolicyBuilder::new("X");
+///    let _policy = b.effect(Effect::Deny).build();
+///    ```
+///
+/// 3. **Reach for the turbofish.** When neither of the above applies —
+///    typically in factory functions that return
+///    `Box<dyn Policy<...>>` with no other anchor — name the type
+///    parameters explicitly on `::new`:
+///    ```rust
+///    # use gatehouse::*;
+///    # struct User; struct Doc; struct Read; struct Ctx;
+///    # fn make() -> Box<dyn Policy<User, Doc, Read, Ctx>> {
+///    PolicyBuilder::<User, Doc, Read, Ctx>::new("AdminOnly")
+///        .effect(Effect::Deny)
+///        .build()
+///    # }
+///    ```
+///
+/// If you see the compiler complain about needing type annotations on
+/// `&_` inside one of the predicate closures, the missing piece is on
+/// `PolicyBuilder::new` itself — the closure error is a red herring. Use
+/// one of the three patterns above to anchor `<S, R, A, C>` and the
+/// closure error goes away on its own.
 pub struct PolicyBuilder<S, R, A, C>
 where
     S: Send + Sync + 'static,
