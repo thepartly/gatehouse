@@ -2,7 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- `examples/factsource_n_plus_one.rs` — contrastive teaching artifact pairing a "wrong" supplier policy that holds `Arc<HierarchyService>` and fires N redundant backend calls per batch against a "right" version that registers a `FactSource` and consumes via `ctx.session.get(...)`. The example reports actual backend call counts (25 vs 1 for a 25-invoice batch) so the N+1 lesson is visible at `cargo run --example`.
+- `benches/README.md` cataloguing what each Criterion bench protects, with explicit callouts for the `naive_per_item_sessions` vs `checker_batch_one_session` pair (the N+1 → batched regression test) and the `policy_builder_subject_only_batch` group (per-axis shortcut throughput numbers).
+
+### Changed
+
+- `PolicyBuilder::when` rustdoc now telegraphs that it's the cross-axis escape hatch, not the default predicate setter. Calls out the batch-shortcut implication (axis-specific predicates participate in the subject/action once-per-batch shortcut; `.when()` always runs per-item) and offers a rule-of-thumb: if the closure ignores two or more of `(subject, action, resource, context)`, the corresponding axis-specific helper is the better fit. No API change.
+- `PermissionChecker`'s "One checker per resource type" recipe gains a one-paragraph pointer acknowledging that downstream projects with many resource types typically wrap their per-resource checkers in a thin dispatching service trait or macro, and that gatehouse intentionally stays out of that organizational layer (downstream patterns vary widely; prescribing one shape would lock in a specific dispatching style).
+
 ## [0.3.0-alpha.3] - 2026-06-01
+
+API ergonomics + performance consolidation. The headline changes:
+
+- `PermissionChecker::check`, `PermissionChecker::named`, `EvalCtx::grant` / `deny` shortcuts, and trace-aware test helpers — adopters write less boilerplate in policy bodies and unit tests.
+- `Policy::policy_type` returns `Cow<'static, str>`; static-name policies are zero-allocation end-to-end. Dynamic-name policies pay one allocation per call (down from a `String` round trip in earlier alphas).
+- `PolicyBuilder`-built policies short-circuit batch-shared axes (`.subjects()`, `.actions()`) once per batch — bench-measured 13–32% throughput improvement, growing with batch size.
+- The two `*_with_context_in_session_by` batch methods are renamed `*_in_session_by_resource`. Old names are removed (no deprecation alias).
 
 ### Breaking
 
@@ -28,12 +45,17 @@
 ### Changed
 
 - Built-in `AbacPolicy` and `RbacPolicy` migrated to the new `ctx.grant` / `ctx.deny` shortcuts. Combinators populate the inner `EvalCtx` / `BatchEvalCtx` with the inner policy's name when dispatching, including the `NotPolicy::evaluate_batch` path that previously forwarded the outer ctx unchanged (and would have tagged any wrapped policy's batch leaves as `NotPolicy`).
-- README, lib.rs Quick Start/Custom Policies doctests, and the RBAC/ABAC-only examples (`rbac_policy`, `policy_builder`, `groups_policy`, `actix_web`) migrated to `checker.check(...)`; custom-policy examples (`groups_policy`, `combinator_policy`, `lookup_in_ram`) migrated to `ctx.grant`/`ctx.deny`. The `axum` example's `TestCheckerExt` test helper is deleted in favor of `check` directly. Combinator implementations drop the redundant `Cow::Owned(self.policy_type().to_string())` wrapping now that `policy_type()` already returns `Cow<'static, str>`.
+- README, lib.rs Quick Start/Custom Policies doctests, and the RBAC/ABAC-only examples (`rbac_policy`, `policy_builder`, `groups_policy`, `actix_web`) migrated to `checker.check(...)` for the everyday RBAC/ABAC path.
+- Custom-policy examples (`groups_policy`, `combinator_policy`, `lookup_in_ram`) migrated to the `ctx.grant` / `ctx.deny` shortcuts.
+- `axum` example's `TestCheckerExt` test helper deleted now that `PermissionChecker::check` is the supported entry point.
+- Combinator implementations drop the redundant `Cow::Owned(self.policy_type().to_string())` wrapping now that `policy_type()` already returns `Cow<'static, str>`.
 - `PermissionChecker` docs gain a "One checker per resource type" recipe naming the idiomatic shape and the tag-enum anti-pattern, plus a sibling "Modeling list/scope endpoints" recipe showing how to compose a scope checker (`OrgScope` × `ListAction`) with a per-item checker driven by `lookup_authorized_*` without resorting to `enum Resource { Item, Listing }` discriminators.
 - `PolicyBuilder` docs gain a "Type-inference notes" section listing the three patterns that anchor `<S, R, A, C>` (typed predicate closures, bind-site annotation, turbofish) and calling out the misleading "type annotations needed for `&_`" closure error that actually points at `::new`.
 - Crate-level, `FactSource`, and `Hydrator` rustdoc now frame these traits as gatehouse's request-scoped DataLoader-style primitives, and call out that callers may invoke an existing DataLoader implementation (`async_graphql::dataloader` from the `async-graphql` crate, the `ultra-batch` crate, or a home-grown batcher) directly from inside `FactSource::load_many` or `Hydrator::hydrate`. Gatehouse owns the per-request fact graph; the underlying loader owns batching across the rest of the request and any longer-lived caching. The `Hydrator` docs also call out that gatehouse expects `Vec<Option<Resource>>` in input order, so a hydrator wrapping a map-returning DataLoader re-orders the loader's output back into the slice shape.
 - Examples polished for v0.3 idiom: `combinator_policy` uses `EvaluationSession::empty()` for its RBAC/ABAC-only setup; `groups_policy` gained a `//!` file header. (The `axum` test helper formerly named `evaluate_access` was subsequently removed entirely — see the migration bullet above — once `PermissionChecker::check` landed.)
-- `PolicyBuilder`-built policies now override `Policy::evaluate_batch` to short-circuit the batch-shared axes once: the `.subjects()` and `.actions()` predicates are evaluated at most once per batch rather than once per item, and the closures are skipped entirely if an earlier axis short-circuits the batch. Per-item axes (`.resources()`, `.context()`, `.when()`) still run per item, since they can vary across the batch. The win is two-fold: (a) reduced trace volume in `PermissionChecker::evaluate_batch_in_session_by` for policies whose discriminator is subject- or action-only (the per-item `gatehouse::security` events collapse to one outcome), and (b) measurable throughput, growing with batch size — Criterion benches show the optimized PolicyBuilder path is **13% faster at N=1, 18% at N=10, 32% at N=100** compared to a hand-written dynamic-name policy using the serial-loop default. Static-name hand-written policies still beat both; adopters who can use a `'static` name table should.
+- `PolicyBuilder`-built policies override `Policy::evaluate_batch` to short-circuit the batch-shared axes. The `.subjects()` and `.actions()` predicates are evaluated at most once per batch instead of once per item; per-item axes (`.resources()`, `.context()`, `.when()`) still run per item. Two wins:
+  - **Reduced trace volume** in `PermissionChecker::evaluate_batch_in_session_by` for policies whose discriminator is subject- or action-only — the per-item `gatehouse::security` events collapse to one outcome for the batch.
+  - **Measurable throughput**, growing with batch size. Criterion benches show 13% faster at N=1, 18% at N=10, 32% at N=100 vs the same shape through the serial-loop default. Static-name hand-written policies still beat both; prefer a `'static` name table when you can.
 - `PermissionChecker::evaluate_in_session` (single-item path) now moves the policy's `policy_type` straight into the constructed `EvalCtx` instead of cloning, and destructures it back out on the grant branch. Static-name policies are unchanged (the clone was already free for `Cow::Borrowed`); dynamic-name policies pay one allocation per evaluation here instead of two.
 - `Policy::evaluate` rustdoc now signposts the "register a `FactSource` instead of calling the backing service directly" pattern for I/O whose result depends on subject-derived data but not resource. `FactSource` rustdoc gains a `(subject, scope) → resolved-id` example showing that the trait isn't limited to relationship-shaped facts.
 - `Policy::evaluate_batch` rustdoc now names the design intent: serial-by-default because the trait can't know your concurrency budget, with explicit guidance on the override shapes (`join_all`, `FuturesUnordered`, semaphore-bounded) for callers who can.

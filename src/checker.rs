@@ -47,6 +47,16 @@ use tracing::Instrument;
 /// `Policy<S, R, A, C>` and added to each per-resource checker, or be
 /// expressed as separate [`crate::DelegatingPolicy`] children.
 ///
+/// Projects with many resource types typically end up wrapping their
+/// per-resource checkers in a thin dispatching service trait or macro —
+/// `MyAuthz::check::<R, A>(subject, action, resource, ctx)` style — so
+/// call sites don't have to thread the right checker through manually.
+/// That organizational layer is intentionally out of scope for gatehouse:
+/// downstream patterns vary widely (typed-state, trait-object registries,
+/// proc-macro builders) and prescribing one shape would lock in a
+/// concrete dispatching style for every consumer. Build it in your own
+/// codebase against gatehouse's primitives.
+///
 /// # Modeling list/scope endpoints
 ///
 /// The "one checker per resource type" recipe maps cleanly onto per-item
