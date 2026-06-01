@@ -156,9 +156,9 @@ println!("{}", evaluation.display_trace());
 
 For multi-checker applications where the same policy name might
 appear in several checkers (an `Invoice` checker and a `Product`
-checker both reusing a `PartlyStaffAdmin` policy), construct each
-checker with `PermissionChecker::named("InvoiceChecker")`. The name
-surfaces on the `gatehouse::security` tracing span as
+checker both reusing a shared `AdminOverride` policy), construct
+each checker with `PermissionChecker::named("InvoiceChecker")`. The
+name surfaces on the `gatehouse::security` tracing span as
 `checker.name`, so audit pipelines can disambiguate the source.
 
 ### Batch Authorization
@@ -323,18 +323,28 @@ Fallback behavior when `security_rule()` is not overridden:
 
 ## Examples
 
-See the `examples` directory for complete demonstrations of:
-- Role-based access control (`rbac_policy`)
-- Attribute-style custom policies with `PolicyBuilder` (`policy_builder`)
-- Relationship-based access control with request-scoped fact sources (`rebac_policy`)
-- In-RAM relationship facts shared across request sessions (`in_ram_rebac`)
-- PostgreSQL-backed batched relationship facts for list endpoints (`pg18_bulk_rebac`)
-- Group authorization with trace output (`groups_policy`)
-- Policy combinators (`combinator_policy`)
-- Axum integration with shared policies, app state, request-scoped sessions, and a bulk invoice listing endpoint (`axum`)
-- Actix Web integration with shared policies (`actix_web`)
+See the `examples` directory for complete demonstrations.
 
-For the v0.3 request-scoped design, start with `rebac_policy`, then read `in_ram_rebac` for a small list endpoint and `pg18_bulk_rebac` for the same boundary backed by SQL.
+**Start here, in order:**
+
+- `rbac_policy` — basic role-based access control with `PermissionChecker`.
+- `policy_builder` — attribute-style custom policies via `PolicyBuilder`.
+- `combinator_policy` — combining policies with `AndPolicy` / `OrPolicy` / `NotPolicy`.
+- `mfa_freshness_context` — when (and when not) to populate the `Context` generic. Grounds the concept in a high-value-refund / MFA-freshness decision.
+
+**Request-scoped fact loading (the v0.3 design):**
+
+- `rebac_policy` — relationship-based access control through a registered `FactSource`.
+- `in_ram_rebac` — `FactSource` shared across sessions, with in-RAM relationship facts.
+- `pg18_bulk_rebac` — the same boundary backed by PostgreSQL, with one batched `WITH ORDINALITY` query per request.
+- `factsource_n_plus_one` — contrastive teaching artifact: the obvious "hold an `Arc<Backend>` on the policy and call it directly" shape pays N redundant backend calls per batch; registering the lookup as a `FactSource` collapses it to one. Prints actual call counts so the lesson is visible.
+- `lookup_in_ram` — `LookupSource` + `Hydrator` for "what can this subject see?" list endpoints.
+
+**Composition and integrations:**
+
+- `groups_policy` — multiple policies composed for group-management authorization, with trace output.
+- `axum` — Axum integration with shared policies, app state, request-scoped sessions, and a bulk invoice listing endpoint.
+- `actix_web` — Actix Web integration with shared policies.
 
 Run with:
 
