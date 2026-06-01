@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 /// The type of boolean combining operation a policy might represent.
@@ -132,7 +133,11 @@ pub enum PolicyEvalResult {
     /// Access granted. Contains the policy type and an optional reason.
     Granted {
         /// The name of the policy that granted access.
-        policy_type: String,
+        ///
+        /// `Cow<'static, str>` so static policy names (the common case)
+        /// pass through with zero allocation; dynamic names still work via
+        /// `Cow::Owned`.
+        policy_type: Cow<'static, str>,
         /// An optional human-readable reason for the grant.
         reason: Option<String>,
         /// Facts the policy consulted to reach this decision. Empty for
@@ -142,7 +147,7 @@ pub enum PolicyEvalResult {
     /// Access denied. Contains the policy type and a reason.
     Denied {
         /// The name of the policy that denied access.
-        policy_type: String,
+        policy_type: Cow<'static, str>,
         /// A human-readable reason for the denial.
         reason: String,
         /// Facts the policy consulted to reach this decision. Empty for
@@ -154,7 +159,7 @@ pub enum PolicyEvalResult {
     /// a list of child evaluation results, and the overall outcome.
     Combined {
         /// The name of the combinator policy (e.g. `"AndPolicy"`).
-        policy_type: String,
+        policy_type: Cow<'static, str>,
         /// The boolean operation used to combine child results.
         operation: CombineOp,
         /// The individual results from each child policy.
@@ -211,8 +216,10 @@ pub enum PolicyEvalResult {
 pub enum AccessEvaluation {
     /// Access was granted.
     Granted {
-        /// The policy that granted access
-        policy_type: String,
+        /// The policy that granted access. `Cow<'static, str>` for the
+        /// same reason as on [`PolicyEvalResult`]: static names pass
+        /// through with zero allocation.
+        policy_type: Cow<'static, str>,
         /// Optional reason for granting
         reason: Option<String>,
         /// Full evaluation trace including any rejected policies
@@ -388,7 +395,10 @@ impl PolicyEvalResult {
     ///
     /// Prefer this over constructing [`PolicyEvalResult::Granted`] directly; use
     /// [`Self::granted_with_facts`] when the decision was informed by facts.
-    pub fn granted(policy_type: impl Into<String>, reason: Option<String>) -> Self {
+    ///
+    /// `policy_type` accepts `&'static str` (zero-allocation, the common
+    /// case), `String`, or any [`Cow<'static, str>`] convertible value.
+    pub fn granted(policy_type: impl Into<Cow<'static, str>>, reason: Option<String>) -> Self {
         Self::Granted {
             policy_type: policy_type.into(),
             reason,
@@ -400,7 +410,7 @@ impl PolicyEvalResult {
     ///
     /// Prefer this over constructing [`PolicyEvalResult::Denied`] directly; use
     /// [`Self::denied_with_facts`] when the decision was informed by facts.
-    pub fn denied(policy_type: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn denied(policy_type: impl Into<Cow<'static, str>>, reason: impl Into<String>) -> Self {
         Self::Denied {
             policy_type: policy_type.into(),
             reason: reason.into(),
@@ -410,7 +420,7 @@ impl PolicyEvalResult {
 
     /// Builds a granted leaf result carrying the facts that informed it.
     pub fn granted_with_facts(
-        policy_type: impl Into<String>,
+        policy_type: impl Into<Cow<'static, str>>,
         reason: Option<String>,
         provenance: Vec<FactProvenance>,
     ) -> Self {
@@ -423,7 +433,7 @@ impl PolicyEvalResult {
 
     /// Builds a denied leaf result carrying the facts that informed it.
     pub fn denied_with_facts(
-        policy_type: impl Into<String>,
+        policy_type: impl Into<Cow<'static, str>>,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
     ) -> Self {

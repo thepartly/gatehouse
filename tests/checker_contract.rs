@@ -126,7 +126,7 @@ impl Policy<Subject, Resource, Action, Ctx> for NeverConsultedPolicy {
         _ctx: &EvalCtx<'_, Subject, Resource, Action, Ctx>,
     ) -> PolicyEvalResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        PolicyEvalResult::denied(self.policy_type(), "single called")
+        PolicyEvalResult::denied(self.policy_type().to_string(), "single called")
     }
 
     async fn evaluate_batch<'item>(

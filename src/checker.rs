@@ -150,14 +150,14 @@ where
                 tracing::Span::current().record("outcome", "granted");
                 tracing::Span::current().record("policy.type", policy_type);
                 let combined = PolicyEvalResult::Combined {
-                    policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                    policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                     operation: CombineOp::Or,
                     children: policy_results,
                     outcome: true,
                 };
 
                 return AccessEvaluation::Granted {
-                    policy_type: policy_type.to_string(),
+                    policy_type: std::borrow::Cow::Owned(policy_type.to_string()),
                     reason,
                     trace: EvalTrace::with_root(combined),
                 };
@@ -168,7 +168,7 @@ where
         tracing::Span::current().record("outcome", "denied");
         tracing::trace!("No policies allowed access, returning Forbidden");
         let combined = PolicyEvalResult::Combined {
-            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
             operation: CombineOp::Or,
             children: policy_results,
             outcome: false,
@@ -340,12 +340,12 @@ where
                     for &index in pending_chunk {
                         policy_denied_count += 1;
                         let policy_result = PolicyEvalResult::denied(
-                            policy_type,
+                            policy_type.to_string(),
                             "Policy batch result count did not match input count",
                         );
                         traces[index].push(policy_result);
                         let combined = PolicyEvalResult::Combined {
-                            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                             operation: CombineOp::Or,
                             children: std::mem::take(&mut traces[index]),
                             outcome: false,
@@ -370,13 +370,13 @@ where
                     if result_passes {
                         policy_granted_count += 1;
                         let combined = PolicyEvalResult::Combined {
-                            policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                             operation: CombineOp::Or,
                             children: std::mem::take(&mut traces[index]),
                             outcome: true,
                         };
                         evaluations[index] = Some(AccessEvaluation::Granted {
-                            policy_type: policy_type.to_string(),
+                            policy_type: std::borrow::Cow::Owned(policy_type.to_string()),
                             reason,
                             trace: EvalTrace::with_root(combined),
                         });
@@ -393,7 +393,7 @@ where
 
         for index in pending {
             let combined = PolicyEvalResult::Combined {
-                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
                 operation: CombineOp::Or,
                 children: std::mem::take(&mut traces[index]),
                 outcome: false,

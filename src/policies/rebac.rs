@@ -188,7 +188,7 @@ where
                 .iter()
                 .map(|_| {
                     PolicyEvalResult::denied(
-                        self.policy_type(),
+                        self.policy_type().to_string(),
                         "Relationship fact source returned the wrong number of results",
                     )
                 })

@@ -15,7 +15,7 @@ fn delegated_evaluation_to_result(
             reason,
             trace,
         } => PolicyEvalResult::Combined {
-            policy_type: policy_type.to_string(),
+            policy_type: std::borrow::Cow::Owned(policy_type.to_string()),
             operation: CombineOp::Delegate,
             children: vec![trace
                 .root()
@@ -24,7 +24,7 @@ fn delegated_evaluation_to_result(
             outcome: true,
         },
         AccessEvaluation::Denied { reason, trace } => PolicyEvalResult::Combined {
-            policy_type: policy_type.to_string(),
+            policy_type: std::borrow::Cow::Owned(policy_type.to_string()),
             operation: CombineOp::Delegate,
             children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::denied(
                 PERMISSION_CHECKER_POLICY_TYPE,

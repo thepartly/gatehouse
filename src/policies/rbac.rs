@@ -79,12 +79,12 @@ where
 
         if has_role {
             PolicyEvalResult::granted(
-                Policy::<S, R, A, C>::policy_type(self),
+                Policy::<S, R, A, C>::policy_type(self).to_string(),
                 Some("User has required role".to_string()),
             )
         } else {
             PolicyEvalResult::denied(
-                Policy::<S, R, A, C>::policy_type(self),
+                Policy::<S, R, A, C>::policy_type(self).to_string(),
                 "User doesn't have required role",
             )
         }

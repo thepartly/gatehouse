@@ -345,10 +345,7 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::granted(
-                self.policy_type().to_string(),
-                Some("Always allow policy".to_string()),
-            )
+            PolicyEvalResult::granted(self.policy_type(), Some("Always allow policy".to_string()))
         }
 
         fn policy_type(&self) -> &str {
@@ -365,7 +362,7 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::denied(self.policy_type().to_string(), self.0)
+            PolicyEvalResult::denied(self.policy_type(), self.0)
         }
 
         fn policy_type(&self) -> &str {
@@ -386,12 +383,9 @@ mod core_tests {
         ) -> PolicyEvalResult {
             self.single_calls.fetch_add(1, Ordering::SeqCst);
             if ctx.resource.id.as_u128().is_multiple_of(2) {
-                PolicyEvalResult::granted(
-                    self.policy_type().to_string(),
-                    Some("even resource".to_string()),
-                )
+                PolicyEvalResult::granted(self.policy_type(), Some("even resource".to_string()))
             } else {
-                PolicyEvalResult::denied(self.policy_type().to_string(), "odd resource")
+                PolicyEvalResult::denied(self.policy_type(), "odd resource")
             }
         }
 
@@ -427,10 +421,7 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::granted(
-                self.policy_type().to_string(),
-                Some("single item fallback".to_string()),
-            )
+            PolicyEvalResult::granted(self.policy_type(), Some("single item fallback".to_string()))
         }
 
         async fn evaluate_batch<'item>(
@@ -442,7 +433,7 @@ mod core_tests {
                 .skip(1)
                 .map(|_| {
                     PolicyEvalResult::granted(
-                        self.policy_type().to_string(),
+                        self.policy_type(),
                         Some("wrong batch length".to_string()),
                     )
                 })
@@ -462,7 +453,7 @@ mod core_tests {
             &self,
             _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
-            PolicyEvalResult::denied(self.policy_type().to_string(), "Blocked by custom rule")
+            PolicyEvalResult::denied(self.policy_type(), "Blocked by custom rule")
         }
 
         fn policy_type(&self) -> &str {
@@ -1883,11 +1874,11 @@ mod core_tests {
         ) -> PolicyEvalResult {
             if ctx.context.feature_enabled {
                 PolicyEvalResult::granted(
-                    self.policy_type().to_string(),
+                    self.policy_type(),
                     Some("Feature flag enabled".to_string()),
                 )
             } else {
-                PolicyEvalResult::denied(self.policy_type().to_string(), "Feature flag disabled")
+                PolicyEvalResult::denied(self.policy_type(), "Feature flag disabled")
             }
         }
 
@@ -2255,14 +2246,11 @@ mod core_tests {
 
                 if self.result {
                     PolicyEvalResult::granted(
-                        self.policy_type().to_string(),
+                        self.policy_type(),
                         Some("Counting policy granted".to_string()),
                     )
                 } else {
-                    PolicyEvalResult::denied(
-                        self.policy_type().to_string(),
-                        "Counting policy denied",
-                    )
+                    PolicyEvalResult::denied(self.policy_type(), "Counting policy denied")
                 }
             }
 
@@ -2563,7 +2551,7 @@ mod core_tests {
     #[test]
     fn test_policy_eval_result_reason_combined() {
         let result = PolicyEvalResult::Combined {
-            policy_type: std::borrow::Cow::Borrowed("CombinedPolicy"),
+            policy_type: "CombinedPolicy".to_string(),
             operation: CombineOp::And,
             children: vec![],
             outcome: true,

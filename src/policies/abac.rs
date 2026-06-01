@@ -96,11 +96,14 @@ where
 
         if condition_met {
             PolicyEvalResult::granted(
-                self.policy_type(),
+                self.policy_type().to_string(),
                 Some("Condition evaluated to true".to_string()),
             )
         } else {
-            PolicyEvalResult::denied(self.policy_type(), "Condition evaluated to false")
+            PolicyEvalResult::denied(
+                self.policy_type().to_string(),
+                "Condition evaluated to false",
+            )
         }
     }
 
