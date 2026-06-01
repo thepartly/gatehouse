@@ -63,6 +63,42 @@ where
         self.policies.push(Arc::new(policy));
     }
 
+    /// Convenience for RBAC/ABAC-only callers: evaluates against the
+    /// process-wide [`EvaluationSession::shared_empty`] session.
+    ///
+    /// Equivalent to:
+    ///
+    /// ```ignore
+    /// checker.evaluate_in_session(
+    ///     EvaluationSession::shared_empty(),
+    ///     subject, action, resource, context,
+    /// ).await
+    /// ```
+    ///
+    /// Use this when no policy in the checker reads fact-backed state.
+    /// **For checkers with any fact-backed policy (ReBAC, custom
+    /// `FactSource`-using policies)**, call [`Self::evaluate_in_session`]
+    /// directly so the session can carry the registered `FactSource`s.
+    /// The shared empty session has no fact sources registered, so any
+    /// fact load would fail closed with
+    /// [`crate::FactLoadError::SourceNotRegistered`].
+    pub async fn check(
+        &self,
+        subject: &S,
+        action: &A,
+        resource: &R,
+        context: &C,
+    ) -> AccessEvaluation {
+        self.evaluate_in_session(
+            crate::EvaluationSession::shared_empty(),
+            subject,
+            action,
+            resource,
+            context,
+        )
+        .await
+    }
+
     /// Evaluates all policies against the given parameters using a caller-owned
     /// request session.
     ///
