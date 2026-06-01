@@ -127,8 +127,16 @@ where
 ///    # }
 ///    ```
 ///    With every closure typed, the four generics are fully constrained
-///    without any turbofish. Replace any closure with `|_: &User| ...`
-///    rather than `|_| ...` if the compiler complains.
+///    without any turbofish.
+///
+///    **Every closure in the chain needs at least one typed arg.** Each
+///    predicate setter introduces its own closure, and each closure's
+///    bare `_` parameters trigger E0282 independently of the others —
+///    typing one arg in `.when()` does not rescue an earlier
+///    `.subjects(|_| ...)` from the same diagnostic. For a chain that
+///    mixes `.subjects()`, `.actions()`, `.resources()`, and `.when()`,
+///    that's four annotations; at that point pattern #3 (one turbofish
+///    on `::new`) tends to win on noise grounds.
 ///
 /// 2. **Anchor through the bind site.** If only some of the predicates
 ///    use typed closures (or if you use `.effect()` and `.build()` with
@@ -189,23 +197,25 @@ where
 /// for &_` pointing at the closure parameter — misleading: the fix is
 /// on the builder, not the closure.
 ///
-/// In this shape, prefer pattern #1 with at least one **concretely
-/// typed** closure param — the cheapest fix:
+/// In this shape, two practical fixes:
 ///
 /// ```ignore
-/// // Typing one arg concretely is enough to anchor inference:
-/// .when(move |subject: &MySubject, _, _, _| { … })
+/// // a) Annotate every closure arg concretely. `&_` placeholders are
+/// //    not enough — each unbound `_` still needs to be resolved
+/// //    before the return-type constraint propagates.
+/// .when(move |subject: &MySubject, _action: &MyAction,
+///             _resource: &MyResource, _ctx: &MyCtx| { … })
 ///
-/// // …but `&_` placeholders are *not* enough; the compiler still
-/// // can't pick a type, so the same E0282 fires:
-/// .when(move |subject: &_, _, _, _| { … })   // still fails
+/// // b) Reach for the turbofish (pattern #3) and skip the closure
+/// //    annotations entirely. For a chain that mixes .subjects(),
+/// //    .actions(), .resources(), and .when() — each its own closure
+/// //    — one turbofish is less visual noise than per-closure
+/// //    annotations.
 /// ```
 ///
-/// Reach for the turbofish (pattern #3) if you'd rather state the
-/// types once on `::new` than on a closure arg. Returning
-/// `impl Policy<…>` instead of `Box<dyn Policy<…>>` also anchors
-/// inference, but loses the trait-object addability that the boxed
-/// `dyn` provides.
+/// Returning `impl Policy<…>` instead of `Box<dyn Policy<…>>` also
+/// anchors inference (the concrete return type propagates back), but
+/// loses the trait-object addability that the boxed `dyn` provides.
 pub struct PolicyBuilder<S, R, A, C>
 where
     S: Send + Sync + 'static,
