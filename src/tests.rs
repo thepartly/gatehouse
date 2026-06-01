@@ -57,12 +57,14 @@ mod core_tests {
         ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
+                let policy_type = self.policy_type();
                 let ctx = EvalCtx {
                     session: &session,
                     subject,
                     action,
                     resource,
                     context,
+                    policy_type,
                 };
                 self.evaluate(&ctx).await
             })
@@ -76,11 +78,13 @@ mod core_tests {
         ) -> Pin<Box<dyn Future<Output = Vec<PolicyEvalResult>> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
+                let policy_type = self.policy_type();
                 let ctx = BatchEvalCtx {
                     session: &session,
                     subject,
                     action,
                     items,
+                    policy_type,
                 };
                 self.evaluate_batch(&ctx).await
             })
@@ -408,6 +412,7 @@ mod core_tests {
                     action: ctx.action,
                     resource: item.resource,
                     context: item.context,
+                    policy_type: ctx.policy_type,
                 };
                 results.push(self.evaluate(&item_ctx).await);
             }
@@ -1355,6 +1360,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
+            policy_type: "TestPolicy",
         };
         let result = policy.evaluate(&ctx).await;
 
@@ -1388,6 +1394,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
+            policy_type: "TestPolicy",
         };
 
         let result = policy.evaluate(&ctx).await;
@@ -1416,6 +1423,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
+            policy_type: "TestPolicy",
         };
 
         let result = policy.evaluate(&ctx).await;
@@ -1473,6 +1481,7 @@ mod core_tests {
             subject: &subject,
             action: &TestAction,
             items: &batch_items,
+            policy_type: policy.policy_type(),
         };
 
         let results = policy.evaluate_batch(&ctx).await;
@@ -1566,6 +1575,7 @@ mod core_tests {
                 action: &TestAction,
                 resource: &resource,
                 context: &TestContext,
+                policy_type: "TestPolicy",
             };
             let result = policy.evaluate(&ctx).await;
             assert!(!result.is_granted());
@@ -1643,6 +1653,7 @@ mod core_tests {
             action: &TestAction,
             resource: &resource,
             context: &TestContext,
+            policy_type: "TestPolicy",
         };
         let result = policy.evaluate(&ctx).await;
         assert!(
@@ -2742,12 +2753,14 @@ mod policy_builder_tests {
         ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
+                let policy_type = self.policy_type();
                 let ctx = EvalCtx {
                     session: &session,
                     subject,
                     action,
                     resource,
                     context,
+                    policy_type,
                 };
                 self.evaluate(&ctx).await
             })

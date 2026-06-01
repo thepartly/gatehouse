@@ -50,7 +50,15 @@ where
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
-            let result = policy.evaluate(ctx).await;
+            let inner_ctx = EvalCtx {
+                session: ctx.session,
+                subject: ctx.subject,
+                action: ctx.action,
+                resource: ctx.resource,
+                context: ctx.context,
+                policy_type: policy.policy_type(),
+            };
+            let result = policy.evaluate(&inner_ctx).await;
             let is_granted = result.is_granted();
             children_results.push(result);
 
@@ -99,6 +107,7 @@ where
                 subject: ctx.subject,
                 action: ctx.action,
                 items: &batch_items,
+                policy_type: policy.policy_type(),
             };
             let child_results = policy.evaluate_batch(&batch_ctx).await;
 
@@ -197,7 +206,15 @@ where
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
-            let result = policy.evaluate(ctx).await;
+            let inner_ctx = EvalCtx {
+                session: ctx.session,
+                subject: ctx.subject,
+                action: ctx.action,
+                resource: ctx.resource,
+                context: ctx.context,
+                policy_type: policy.policy_type(),
+            };
+            let result = policy.evaluate(&inner_ctx).await;
             let is_granted = result.is_granted();
             children_results.push(result);
 
@@ -246,6 +263,7 @@ where
                 subject: ctx.subject,
                 action: ctx.action,
                 items: &batch_items,
+                policy_type: policy.policy_type(),
             };
             let child_results = policy.evaluate_batch(&batch_ctx).await;
 
@@ -344,7 +362,15 @@ where
     }
 
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
-        let inner_result = self.policy.evaluate(ctx).await;
+        let inner_ctx = EvalCtx {
+            session: ctx.session,
+            subject: ctx.subject,
+            action: ctx.action,
+            resource: ctx.resource,
+            context: ctx.context,
+            policy_type: self.policy.policy_type(),
+        };
+        let inner_result = self.policy.evaluate(&inner_ctx).await;
         let is_granted = inner_result.is_granted();
 
         PolicyEvalResult::Combined {

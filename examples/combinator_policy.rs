@@ -112,6 +112,7 @@ async fn main() {
                 action: &action,
                 resource: &document,
                 context: &context,
+                policy_type: and_policy.policy_type(),
             })
             .await;
         println!(
@@ -156,6 +157,7 @@ async fn main() {
                 action: &action,
                 resource: &document,
                 context: &context,
+                policy_type: or_policy.policy_type(),
             })
             .await;
         println!(
@@ -210,6 +212,7 @@ async fn main() {
                 action: &action,
                 resource: &document,
                 context: &context,
+                policy_type: complex_policy.policy_type(),
             })
             .await;
         println!(

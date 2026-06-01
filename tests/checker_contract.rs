@@ -362,6 +362,7 @@ async fn boxed_dyn_policy_dispatches_evaluate_batch_override() {
             subject: &Subject,
             action: &Action,
             items: &batch_items,
+            policy_type: boxed.policy_type(),
         })
         .await;
 

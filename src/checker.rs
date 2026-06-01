@@ -100,18 +100,19 @@ where
 
         // Evaluate each policy
         for policy in &self.policies {
+            let policy_type = policy.policy_type();
             let ctx = EvalCtx {
                 session,
                 subject,
                 action,
                 resource,
                 context,
+                policy_type,
             };
             let result = policy.evaluate(&ctx).await;
             let result_passes = result.is_granted();
 
             // Extract metadata for tracing (always needed for security audit)
-            let policy_type = policy.policy_type();
             let policy_type_str = policy_type;
             let metadata = policy.security_rule();
             let reason = result.reason();
@@ -330,6 +331,7 @@ where
                     subject,
                     action,
                     items: &batch_items,
+                    policy_type,
                 };
                 let policy_results = policy
                     .evaluate_batch(&batch_ctx)
