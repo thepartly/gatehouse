@@ -2,8 +2,21 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- `PolicyEvalResult::Granted` / `Denied` / `Combined` (and `AccessEvaluation::Granted`) now store `policy_type` as `Cow<'static, str>` instead of `String`. The `granted` / `denied` / `granted_with_facts` / `denied_with_facts` constructors accept `impl Into<Cow<'static, str>>` so static literal call sites are zero-allocation; dynamic names still work via `Cow::Owned` / `String`.
+- `EvalCtx` and `BatchEvalCtx` gain a `policy_type: &'a str` field. Tests and custom `Policy` impls that construct these directly need to populate it (the checker, combinators, and built-ins set it for you).
+- `PermissionChecker::evaluate_batch_with_context_in_session_by` renamed to `evaluate_batch_in_session_by_resource`; `filter_authorized_with_context_in_session_by` renamed to `filter_authorized_in_session_by_resource`. The new `_by_resource` suffix mirrors the existing `_by` (per-item `(R, C)`) and makes the distinguishing axis explicit. The old names remain as `#[deprecated(since = "0.3.0-alpha.3")]` thin delegates for one alpha cycle.
+
+### Added
+
+- `PermissionChecker::check(subject, action, resource, context)` — convenience wrapper for RBAC/ABAC-only callers that internally uses `EvaluationSession::shared_empty()`. For checkers with any fact-backed policy, call `evaluate_in_session` directly so the session can carry registered `FactSource`s.
+- `EvalCtx::grant` / `deny` / `grant_with_facts` / `deny_with_facts` shortcut methods that build a `PolicyEvalResult` tagged with `ctx.policy_type`, so policy bodies no longer have to re-pass `self.policy_type()`. Both `grant` and `deny` take the reason as `impl Into<String>` for symmetry; the rare no-reason grant case can still use `PolicyEvalResult::granted(name, None)` directly.
+
 ### Changed
 
+- Built-in `AbacPolicy` and `RbacPolicy` migrated to the new `ctx.grant` / `ctx.deny` shortcuts. Combinators populate the inner `EvalCtx` / `BatchEvalCtx` with the inner policy's name when dispatching, so `ctx.deny()` inside an inner policy correctly tags the result with the inner's name.
+- `PermissionChecker` docs gain a "One checker per resource type" recipe naming the idiomatic shape (per-resource-type checker) and the anti-pattern (tag-enum `R` with `if !matches!(ctx.resource, ::X)` at the top of every policy).
 - Crate-level, `FactSource`, and `Hydrator` rustdoc now frame these traits as gatehouse's request-scoped DataLoader-style primitives, and call out that callers may invoke an existing DataLoader implementation (`async_graphql::dataloader` from the `async-graphql` crate, the `ultra-batch` crate, or a home-grown batcher) directly from inside `FactSource::load_many` or `Hydrator::hydrate`. Gatehouse owns the per-request fact graph; the underlying loader owns batching across the rest of the request and any longer-lived caching. The `Hydrator` docs also call out that gatehouse expects `Vec<Option<Resource>>` in input order, so a hydrator wrapping a map-returning DataLoader re-orders the loader's output back into the slice shape.
 - Examples polished for v0.3 idiom: `combinator_policy` uses `EvaluationSession::empty()` for its RBAC/ABAC-only setup; `groups_policy` gained a `//!` file header; the `axum` test helper formerly named `evaluate_access` was renamed `check_in_empty_session` to avoid evoking the pre-v0.3 API.
 
