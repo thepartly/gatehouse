@@ -379,7 +379,24 @@ where
         self
     }
 
-    /// Add a condition that considers all four inputs.
+    /// Add a condition that needs to see more than one input axis.
+    ///
+    /// **Reach for `.when()` only when the condition genuinely needs
+    /// multiple inputs.** Single-axis checks belong on
+    /// [`Self::subjects`], [`Self::actions`], [`Self::resources`], or
+    /// [`Self::context`] — those participate in the per-axis batch
+    /// shortcut (the subject and action predicates are evaluated once
+    /// for the whole batch in [`Policy::evaluate_batch`]), while
+    /// `.when()` always runs per-item regardless of which arguments it
+    /// inspects.
+    ///
+    /// Rule of thumb: if the closure body ignores two or more of the
+    /// four arguments (`|s, _, _, _|`, `|s, a, _, _|`, etc.), the
+    /// corresponding axis-specific helper is the better fit. Use
+    /// `.when()` for the genuine cross-axis case — owner-of-document
+    /// checks, time-of-day-vs-resource-window checks, anything that
+    /// reads two or more of `(subject, action, resource, context)` in
+    /// the same predicate.
     pub fn when<F>(mut self, pred: F) -> Self
     where
         F: Fn(&Subject, &Action, &Resource, &Context) -> bool + Send + Sync + 'static,

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- `examples/factsource_n_plus_one.rs` — contrastive teaching artifact pairing a "wrong" supplier policy that holds `Arc<HierarchyService>` and fires N redundant backend calls per batch against a "right" version that registers a `FactSource` and consumes via `ctx.session.get(...)`. The example reports actual backend call counts (25 vs 1 for a 25-invoice batch) so the N+1 lesson is visible at `cargo run --example`.
+- `benches/README.md` cataloguing what each Criterion bench protects, with explicit callouts for the `naive_per_item_sessions` vs `checker_batch_one_session` pair (the N+1 → batched regression test) and the `policy_builder_subject_only_batch` group (per-axis shortcut throughput numbers).
+
+### Changed
+
+- `PolicyBuilder::when` rustdoc now telegraphs that it's the cross-axis escape hatch, not the default predicate setter. Calls out the batch-shortcut implication (axis-specific predicates participate in the subject/action once-per-batch shortcut; `.when()` always runs per-item) and offers a rule-of-thumb: if the closure ignores two or more of `(subject, action, resource, context)`, the corresponding axis-specific helper is the better fit. No API change.
+- `PermissionChecker`'s "One checker per resource type" recipe gains a one-paragraph pointer acknowledging that downstream projects with many resource types typically wrap their per-resource checkers in a thin dispatching service trait or macro, and that gatehouse intentionally stays out of that organizational layer (downstream patterns vary widely; prescribing one shape would lock in a specific dispatching style).
+
 ## [0.3.0-alpha.3] - 2026-06-01
 
 ### Breaking
