@@ -2793,6 +2793,94 @@ mod core_tests {
         assert_eq!(copied.0, "Test");
         assert_eq!(cloned.0, "Test");
     }
+
+    // --- AccessEvaluation test helpers ----------------------------------
+
+    fn allow_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext> {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysAllowPolicy);
+        checker
+    }
+
+    fn deny_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext> {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("always denied"));
+        checker
+    }
+
+    fn test_subject() -> TestSubject {
+        TestSubject {
+            id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    fn test_resource() -> TestResource {
+        TestResource {
+            id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    #[tokio::test]
+    async fn assert_granted_by_passes_on_matching_grant() {
+        let evaluation = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_granted_by("AlwaysAllowPolicy");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected grant by policy `Other`")]
+    async fn assert_granted_by_panics_on_wrong_grantor() {
+        let evaluation = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_granted_by("Other");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "but access was denied")]
+    async fn assert_granted_by_panics_on_denial() {
+        let evaluation = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_granted_by("AlwaysAllowPolicy");
+    }
+
+    #[tokio::test]
+    async fn assert_denied_with_reason_containing_substring_match() {
+        let evaluation = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        // Checker's summary is "All policies denied access".
+        evaluation.assert_denied_with_reason_containing("denied");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected denial containing")]
+    async fn assert_denied_with_reason_containing_panics_on_grant() {
+        let evaluation = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_denied_with_reason_containing("anything");
+    }
+
+    #[tokio::test]
+    async fn granted_policy_type_and_denied_reason_accessors() {
+        let grant = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        assert_eq!(grant.granted_policy_type(), Some("AlwaysAllowPolicy"));
+        assert_eq!(grant.denied_reason(), None);
+
+        let deny = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        assert_eq!(deny.granted_policy_type(), None);
+        assert!(
+            deny.denied_reason().is_some_and(|r| r.contains("denied")),
+            "denied_reason should return the summary reason"
+        );
+    }
 }
 
 mod policy_builder_tests {

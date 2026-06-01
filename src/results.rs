@@ -240,6 +240,104 @@ impl AccessEvaluation {
         matches!(self, Self::Granted { .. })
     }
 
+    /// Returns the granting policy's name when the evaluation was a grant.
+    ///
+    /// Useful for non-panicking inspection in tests and in production code
+    /// that branches on which policy made the decision.
+    pub fn granted_policy_type(&self) -> Option<&str> {
+        match self {
+            Self::Granted { policy_type, .. } => Some(policy_type),
+            Self::Denied { .. } => None,
+        }
+    }
+
+    /// Returns the summary denial reason when the evaluation was a denial.
+    ///
+    /// Mirrors [`Self::granted_policy_type`] for the denied case.
+    pub fn denied_reason(&self) -> Option<&str> {
+        match self {
+            Self::Denied { reason, .. } => Some(reason),
+            Self::Granted { .. } => None,
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is `Granted` and the
+    /// granting policy's name matches `expected`.
+    ///
+    /// Intended for policy unit tests that would otherwise hand-roll a
+    /// pattern match over the evaluation. Prefer this over destructuring
+    /// when the test's only assertion is "policy X granted access."
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # tokio_test::block_on(async {
+    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
+    /// # checker.add_policy(PolicyBuilder::<(), (), (), ()>::new("AllowAll").build());
+    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// evaluation.assert_granted_by("AllowAll");
+    /// # });
+    /// ```
+    #[track_caller]
+    pub fn assert_granted_by(&self, expected: &str) {
+        match self {
+            Self::Granted { policy_type, .. } => {
+                assert_eq!(
+                    policy_type.as_ref(),
+                    expected,
+                    "expected grant by policy `{expected}`, but the grant came from `{policy_type}`"
+                );
+            }
+            Self::Denied { reason, .. } => {
+                panic!("expected grant by policy `{expected}`, but access was denied: {reason}");
+            }
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is `Denied`.
+    ///
+    /// Use [`Self::assert_denied_with_reason_containing`] when you also
+    /// need to assert on the denial reason.
+    #[track_caller]
+    pub fn assert_denied(&self) {
+        if let Self::Granted {
+            policy_type,
+            reason,
+            ..
+        } = self
+        {
+            panic!(
+                "expected denial, but access was granted by `{policy_type}`{}",
+                reason
+                    .as_ref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is `Denied` and the
+    /// summary denial reason contains `needle`.
+    ///
+    /// Substring match keeps tests resilient to minor reason-string
+    /// rewording. For exact-match assertions, inspect
+    /// [`Self::denied_reason`] directly.
+    #[track_caller]
+    pub fn assert_denied_with_reason_containing(&self, needle: &str) {
+        match self {
+            Self::Denied { reason, .. } => {
+                assert!(
+                    reason.contains(needle),
+                    "expected denial reason to contain `{needle}`, got `{reason}`"
+                );
+            }
+            Self::Granted { policy_type, .. } => {
+                panic!(
+                    "expected denial containing `{needle}`, but access was granted by `{policy_type}`"
+                );
+            }
+        }
+    }
+
     /// Converts the evaluation into a `Result`, mapping a denial into an error.
     ///
     /// `error_fn` receives the denial reason string and should return your
