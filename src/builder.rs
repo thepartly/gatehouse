@@ -160,6 +160,52 @@ where
 /// `PolicyBuilder::new` itself — the closure error is a red herring. Use
 /// one of the three patterns above to anchor `<S, R, A, C>` and the
 /// closure error goes away on its own.
+///
+/// ## The specific failure that needs the turbofish
+///
+/// The case where pattern #1 (typed closure args) is not enough on its
+/// own combines three ingredients:
+///
+/// ```ignore
+/// fn factory() -> Box<dyn Policy<MySubject, MyResource, MyAction, ()>> {
+///     PolicyBuilder::new("Name")          // <- no anchor yet
+///         .when(move |subject, _, _, _| {  // <- placeholder closure args
+///             subject.method_on_subject()  // <- method needs known type
+///         })
+///         .build()
+/// }
+/// ```
+///
+/// 1. The return type is `Box<dyn Policy<…>>`. The dyn coercion carries
+///    the trait but doesn't propagate the generic params back through
+///    `.build()` early enough.
+/// 2. The predicate closure uses `_` placeholders, so the closure-arg
+///    types remain unbound during the first inference pass.
+/// 3. The closure body calls a method that only resolves once the
+///    subject's type is known.
+///
+/// Rust checks the closure body before it processes the surrounding
+/// return-type constraint, so it emits `E0282: type annotations needed
+/// for &_` pointing at the closure parameter — misleading: the fix is
+/// on the builder, not the closure.
+///
+/// In this shape, prefer pattern #1 with at least one **concretely
+/// typed** closure param — the cheapest fix:
+///
+/// ```ignore
+/// // Typing one arg concretely is enough to anchor inference:
+/// .when(move |subject: &MySubject, _, _, _| { … })
+///
+/// // …but `&_` placeholders are *not* enough; the compiler still
+/// // can't pick a type, so the same E0282 fires:
+/// .when(move |subject: &_, _, _, _| { … })   // still fails
+/// ```
+///
+/// Reach for the turbofish (pattern #3) if you'd rather state the
+/// types once on `::new` than on a closure arg. Returning
+/// `impl Policy<…>` instead of `Box<dyn Policy<…>>` also anchors
+/// inference, but loses the trait-object addability that the boxed
+/// `dyn` provides.
 pub struct PolicyBuilder<S, R, A, C>
 where
     S: Send + Sync + 'static,
