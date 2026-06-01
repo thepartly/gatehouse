@@ -264,7 +264,7 @@ where
     /// ));
     ///
     /// let visible = checker
-    ///     .filter_authorized_with_context_in_session_by(&session, &user, &Read, documents, &context, |document| {
+    ///     .filter_authorized_in_session_by_resource(&session, &user, &Read, documents, &context, |document| {
     ///         document
     ///     })
     ///     .await;
@@ -491,9 +491,13 @@ where
             .collect()
     }
 
-    /// Evaluates caller-owned items that all share one context value, using a
-    /// caller-owned session.
-    pub async fn evaluate_batch_with_context_in_session_by<I, F>(
+    /// Evaluates caller-owned items that all share one context value.
+    ///
+    /// `resource` extracts `&R` from each item; the same `context` is used
+    /// for every evaluation. Compare with
+    /// [`Self::evaluate_batch_in_session_by`], which extracts both
+    /// `(&R, &C)` per item.
+    pub async fn evaluate_batch_in_session_by_resource<I, F>(
         &self,
         session: &EvaluationSession,
         subject: &S,
@@ -524,7 +528,62 @@ where
         .collect()
     }
 
-    /// Returns only authorized items with a shared context and caller-owned session.
+    /// Deprecated alias for [`Self::evaluate_batch_in_session_by_resource`].
+    #[deprecated(
+        since = "0.3.0-alpha.3",
+        note = "renamed to evaluate_batch_in_session_by_resource for naming symmetry \
+                with evaluate_batch_in_session_by (per-item (R, C))"
+    )]
+    pub async fn evaluate_batch_with_context_in_session_by<I, F>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        items: I,
+        context: &C,
+        resource: F,
+    ) -> Vec<(I::Item, AccessEvaluation)>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item R,
+    {
+        self.evaluate_batch_in_session_by_resource(
+            session, subject, action, items, context, resource,
+        )
+        .await
+    }
+
+    /// Returns only authorized items with a shared context.
+    ///
+    /// Filter analogue of [`Self::evaluate_batch_in_session_by_resource`].
+    pub async fn filter_authorized_in_session_by_resource<I, F>(
+        &self,
+        session: &EvaluationSession,
+        subject: &S,
+        action: &A,
+        items: I,
+        context: &C,
+        resource: F,
+    ) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item R,
+    {
+        self.evaluate_batch_in_session_by_resource(
+            session, subject, action, items, context, resource,
+        )
+        .await
+        .into_iter()
+        .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
+        .collect()
+    }
+
+    /// Deprecated alias for [`Self::filter_authorized_in_session_by_resource`].
+    #[deprecated(
+        since = "0.3.0-alpha.3",
+        note = "renamed to filter_authorized_in_session_by_resource for naming symmetry \
+                with filter_authorized_in_session_by (per-item (R, C))"
+    )]
     pub async fn filter_authorized_with_context_in_session_by<I, F>(
         &self,
         session: &EvaluationSession,
@@ -538,13 +597,10 @@ where
         I: IntoIterator,
         F: for<'item> Fn(&'item I::Item) -> &'item R,
     {
-        self.evaluate_batch_with_context_in_session_by(
+        self.filter_authorized_in_session_by_resource(
             session, subject, action, items, context, resource,
         )
         .await
-        .into_iter()
-        .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
-        .collect()
     }
 
     /// Look up one page of candidate IDs from `lookup`, hydrate them via
@@ -642,7 +698,7 @@ where
 
         let resources: Vec<R> = hydrated.into_iter().flatten().collect();
         let authorized = self
-            .filter_authorized_with_context_in_session_by(
+            .filter_authorized_in_session_by_resource(
                 session,
                 subject,
                 action,
@@ -738,7 +794,7 @@ where
     where
         I: IntoIterator<Item = R>,
     {
-        self.evaluate_batch_with_context_in_session_by(
+        self.evaluate_batch_in_session_by_resource(
             session,
             subject,
             action,

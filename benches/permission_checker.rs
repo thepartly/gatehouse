@@ -275,7 +275,7 @@ fn bench_in_ram_fact_source(c: &mut Criterion) {
                         .with_arc::<BenchRelationship>(Arc::clone(&source))
                         .build();
                     let result =
-                        runtime.block_on(checker.filter_authorized_with_context_in_session_by(
+                        runtime.block_on(checker.filter_authorized_in_session_by_resource(
                             &session,
                             &subject,
                             &action,
@@ -333,7 +333,7 @@ fn bench_latency_fact_source(c: &mut Criterion) {
                                 .with_arc::<BenchRelationship>(Arc::clone(&batch_source))
                                 .build();
                             let mut visible = checker
-                                .filter_authorized_with_context_in_session_by(
+                                .filter_authorized_in_session_by_resource(
                                     &session,
                                     &subject,
                                     &action,
@@ -360,7 +360,7 @@ fn bench_latency_fact_source(c: &mut Criterion) {
                         .with_arc::<BenchRelationship>(Arc::clone(&batch_source))
                         .build();
                     let result =
-                        runtime.block_on(checker.filter_authorized_with_context_in_session_by(
+                        runtime.block_on(checker.filter_authorized_in_session_by_resource(
                             &session,
                             &subject,
                             &action,

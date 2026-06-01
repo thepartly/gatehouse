@@ -551,7 +551,7 @@ pub async fn list_invoices_handler(
     // registers it, and the batch authorization call uses it for all invoices.
     let visible = state
         .checker
-        .filter_authorized_with_context_in_session_by(
+        .filter_authorized_in_session_by_resource(
             &session,
             &user,
             &action,

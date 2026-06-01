@@ -323,7 +323,7 @@ async fn main() {
         let bulk = measure(|| async {
             let session = session_with(&source);
             checker
-                .filter_authorized_with_context_in_session_by(
+                .filter_authorized_in_session_by_resource(
                     &session,
                     &subject,
                     &View,

@@ -267,7 +267,7 @@ async fn delegating_policy_preserves_child_batch_evaluation() {
 
     let session = EvaluationSession::empty();
     let results = checker
-        .evaluate_batch_with_context_in_session_by(
+        .evaluate_batch_in_session_by_resource(
             &session,
             &Subject,
             &Action,

@@ -1,7 +1,7 @@
 //! Lookup-style enumeration for "what can this subject see?" authorization.
 //!
 //! The point-check API (`evaluate_in_session`) and the batch filter
-//! (`filter_authorized_with_context_in_session_by`) both require the caller
+//! (`filter_authorized_in_session_by_resource`) both require the caller
 //! to already hold every candidate resource. That breaks down for list and
 //! scope endpoints where the candidate population may be millions of rows
 //! and the visible subset is tiny.
