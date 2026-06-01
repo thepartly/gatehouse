@@ -92,14 +92,19 @@
 //! checker.add_policy(policy);
 //!
 //! # tokio_test::block_on(async {
-//! let session = EvaluationSession::empty();
 //! let admin = User { roles: vec!["admin".into()] };
-//! assert!(checker.evaluate_in_session(&session, &admin, &ReadAction, &Document, &AppContext).await.is_granted());
+//! assert!(checker.check(&admin, &ReadAction, &Document, &AppContext).await.is_granted());
 //!
 //! let guest = User { roles: vec!["guest".into()] };
-//! assert!(!checker.evaluate_in_session(&session, &guest, &ReadAction, &Document, &AppContext).await.is_granted());
+//! assert!(!checker.check(&guest, &ReadAction, &Document, &AppContext).await.is_granted());
 //! # });
 //! ```
+//!
+//! `check` is the everyday entry point for policies that don't need
+//! [`FactSource`]-loaded relationship data. For fact-backed checkers
+//! (RBAC/ABAC alongside [`RebacPolicy`], or any policy reading from an
+//! [`EvaluationSession`]), use [`PermissionChecker::evaluate_in_session`]
+//! and pass a session loaded for the request.
 //!
 //! ## Built-in Policies
 //!
@@ -146,9 +151,9 @@
 //! impl Policy<User, Document, ReadAction, EmptyContext> for AdminPolicy {
 //!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
 //!         if ctx.subject.roles.contains(&"admin".to_string()) {
-//!             PolicyEvalResult::granted(self.policy_type(), Some("User is admin".to_string()))
+//!             ctx.grant("User is admin")
 //!         } else {
-//!             PolicyEvalResult::denied(self.policy_type(), "User is not admin")
+//!             ctx.deny("User is not admin")
 //!         }
 //!     }
 //!     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -163,9 +168,9 @@
 //! impl Policy<User, Document, ReadAction, EmptyContext> for OwnerPolicy {
 //!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
 //!         if ctx.subject.id == ctx.resource.owner_id {
-//!             PolicyEvalResult::granted(self.policy_type(), Some("User is the owner".to_string()))
+//!             ctx.grant("User is the owner")
 //!         } else {
-//!             PolicyEvalResult::denied(self.policy_type(), "User is not the owner")
+//!             ctx.deny("User is not the owner")
 //!         }
 //!     }
 //!     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -198,20 +203,19 @@
 //! };
 //!
 //! let checker = create_document_checker();
-//! let session = EvaluationSession::empty();
 //!
 //! // An admin should have access.
-//! assert!(checker.evaluate_in_session(&session, &admin_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(checker.check(&admin_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //!
 //! // The owner should have access.
-//! assert!(checker.evaluate_in_session(&session, &owner_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(checker.check(&owner_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //!
 //! // A random user should be denied access.
 //! let random_user = User {
 //!     id: Uuid::new_v4(),
 //!     roles: vec!["user".into()],
 //! };
-//! assert!(!checker.evaluate_in_session(&session, &random_user, &ReadAction, &document, &EmptyContext).await.is_granted());
+//! assert!(!checker.check(&random_user, &ReadAction, &document, &EmptyContext).await.is_granted());
 //! # });
 //! ```
 //!

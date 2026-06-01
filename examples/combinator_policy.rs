@@ -52,22 +52,16 @@ struct CountingPolicy {
 impl Policy<User, Document, ViewAction, EmptyContext> for CountingPolicy {
     async fn evaluate(
         &self,
-        _ctx: &EvalCtx<'_, User, Document, ViewAction, EmptyContext>,
+        ctx: &EvalCtx<'_, User, Document, ViewAction, EmptyContext>,
     ) -> PolicyEvalResult {
         // Increment evaluation counter
         self.counter.fetch_add(1, Ordering::SeqCst);
         println!("Evaluating policy: {}", self.name);
 
         if self.allow {
-            PolicyEvalResult::granted(
-                self.policy_type().to_string(),
-                Some(format!("{} grants access", self.name)),
-            )
+            ctx.grant(format!("{} grants access", self.name))
         } else {
-            PolicyEvalResult::denied(
-                self.policy_type().to_string(),
-                format!("{} denies access", self.name),
-            )
+            ctx.deny(format!("{} denies access", self.name))
         }
     }
 

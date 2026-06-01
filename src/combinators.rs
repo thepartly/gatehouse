@@ -65,7 +65,7 @@ where
             // Short-circuit on first denial
             if !is_granted {
                 return PolicyEvalResult::Combined {
-                    policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                    policy_type: self.policy_type(),
                     operation: CombineOp::And,
                     children: children_results,
                     outcome: false,
@@ -75,7 +75,7 @@ where
 
         // All policies granted access
         PolicyEvalResult::Combined {
-            policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+            policy_type: self.policy_type(),
             operation: CombineOp::And,
             children: children_results,
             outcome: true,
@@ -114,11 +114,11 @@ where
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
                     children_by_item[index].push(PolicyEvalResult::denied(
-                        policy.policy_type().to_string(),
+                        policy.policy_type(),
                         "Policy batch result count did not match input count",
                     ));
                     results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                        policy_type: self.policy_type(),
                         operation: CombineOp::And,
                         children: std::mem::take(&mut children_by_item[index]),
                         outcome: false,
@@ -136,7 +136,7 @@ where
                     still_pending.push(index);
                 } else {
                     results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                        policy_type: self.policy_type(),
                         operation: CombineOp::And,
                         children: std::mem::take(&mut children_by_item[index]),
                         outcome: false,
@@ -148,7 +148,7 @@ where
 
         for index in pending {
             results[index] = Some(PolicyEvalResult::Combined {
-                policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                policy_type: self.policy_type(),
                 operation: CombineOp::And,
                 children: std::mem::take(&mut children_by_item[index]),
                 outcome: true,
@@ -159,10 +159,7 @@ where
             .into_iter()
             .map(|result| {
                 result.unwrap_or_else(|| {
-                    PolicyEvalResult::denied(
-                        self.policy_type().to_string(),
-                        "Batch item was not evaluated",
-                    )
+                    PolicyEvalResult::denied(self.policy_type(), "Batch item was not evaluated")
                 })
             })
             .collect()
@@ -221,7 +218,7 @@ where
             // Short-circuit on first success
             if is_granted {
                 return PolicyEvalResult::Combined {
-                    policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                    policy_type: self.policy_type(),
                     operation: CombineOp::Or,
                     children: children_results,
                     outcome: true,
@@ -231,7 +228,7 @@ where
 
         // All policies denied access
         PolicyEvalResult::Combined {
-            policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+            policy_type: self.policy_type(),
             operation: CombineOp::Or,
             children: children_results,
             outcome: false,
@@ -270,11 +267,11 @@ where
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
                     children_by_item[index].push(PolicyEvalResult::denied(
-                        policy.policy_type().to_string(),
+                        policy.policy_type(),
                         "Policy batch result count did not match input count",
                     ));
                     results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                        policy_type: self.policy_type(),
                         operation: CombineOp::Or,
                         children: std::mem::take(&mut children_by_item[index]),
                         outcome: false,
@@ -290,7 +287,7 @@ where
 
                 if is_granted {
                     results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                        policy_type: self.policy_type(),
                         operation: CombineOp::Or,
                         children: std::mem::take(&mut children_by_item[index]),
                         outcome: true,
@@ -304,7 +301,7 @@ where
 
         for index in pending {
             results[index] = Some(PolicyEvalResult::Combined {
-                policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                policy_type: self.policy_type(),
                 operation: CombineOp::Or,
                 children: std::mem::take(&mut children_by_item[index]),
                 outcome: false,
@@ -315,10 +312,7 @@ where
             .into_iter()
             .map(|result| {
                 result.unwrap_or_else(|| {
-                    PolicyEvalResult::denied(
-                        self.policy_type().to_string(),
-                        "Batch item was not evaluated",
-                    )
+                    PolicyEvalResult::denied(self.policy_type(), "Batch item was not evaluated")
                 })
             })
             .collect()
@@ -374,9 +368,7 @@ where
         let is_granted = inner_result.is_granted();
 
         PolicyEvalResult::Combined {
-            policy_type: std::borrow::Cow::Owned(
-                Policy::<S, R, A, C>::policy_type(self).to_string(),
-            ),
+            policy_type: Policy::<S, R, A, C>::policy_type(self),
             operation: CombineOp::Not,
             children: vec![inner_result],
             outcome: !is_granted,
@@ -407,7 +399,7 @@ where
                 .iter()
                 .map(|_| {
                     PolicyEvalResult::denied(
-                        self.policy_type().to_string(),
+                        self.policy_type(),
                         "Policy batch result count did not match input count",
                     )
                 })
@@ -419,7 +411,7 @@ where
             .map(|inner_result| {
                 let is_granted = inner_result.is_granted();
                 PolicyEvalResult::Combined {
-                    policy_type: std::borrow::Cow::Owned(self.policy_type().to_string()),
+                    policy_type: self.policy_type(),
                     operation: CombineOp::Not,
                     children: vec![inner_result],
                     outcome: !is_granted,
