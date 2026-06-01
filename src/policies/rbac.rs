@@ -78,15 +78,15 @@ where
         let has_role = required_roles.iter().any(|role| user_roles.contains(role));
 
         if has_role {
-            PolicyEvalResult::granted(
-                Policy::<S, R, A, C>::policy_type(self),
-                Some("User has required role".to_string()),
-            )
+            PolicyEvalResult::Granted {
+                policy_type: Policy::<S, R, A, C>::policy_type(self).to_string(),
+                reason: Some("User has required role".to_string()),
+            }
         } else {
-            PolicyEvalResult::denied(
-                Policy::<S, R, A, C>::policy_type(self),
-                "User doesn't have required role",
-            )
+            PolicyEvalResult::Denied {
+                policy_type: Policy::<S, R, A, C>::policy_type(self).to_string(),
+                reason: "User doesn't have required role".to_string(),
+            }
         }
     }
 

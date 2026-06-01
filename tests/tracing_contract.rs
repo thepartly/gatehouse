@@ -56,9 +56,15 @@ impl Policy<Subject, Resource, Action, Ctx> for TracePolicy {
 
 fn result_for(allowed: bool) -> PolicyEvalResult {
     if allowed {
-        PolicyEvalResult::granted("TracePolicy", Some("allowed".to_string()))
+        PolicyEvalResult::Granted {
+            policy_type: "TracePolicy".to_string(),
+            reason: Some("allowed".to_string()),
+        }
     } else {
-        PolicyEvalResult::denied("TracePolicy", "denied")
+        PolicyEvalResult::Denied {
+            policy_type: "TracePolicy".to_string(),
+            reason: "denied".to_string(),
+        }
     }
 }
 

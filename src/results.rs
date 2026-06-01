@@ -24,101 +24,6 @@ impl fmt::Display for CombineOp {
     }
 }
 
-/// How a fact load that informed a policy decision resolved.
-///
-/// This mirrors [`crate::FactLoadResult`] without its value type, so it can be
-/// recorded on the non-generic [`PolicyEvalResult`] tree and serialized into
-/// audit logs. The concrete value (for example the `bool` of a relationship
-/// check) is reflected by the grant/deny outcome and the node's reason, not by
-/// this enum.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FactOutcome {
-    /// The fact existed.
-    Found,
-    /// The fact source was reached, but had no value for the key.
-    Missing,
-    /// The fact load failed.
-    Error,
-}
-
-impl FactOutcome {
-    /// Classifies a [`crate::FactLoadResult`] into the value-erased outcome.
-    pub fn from_load_result<V>(result: &crate::FactLoadResult<V>) -> Self {
-        match result {
-            crate::FactLoadResult::Found(_) => Self::Found,
-            crate::FactLoadResult::Missing => Self::Missing,
-            crate::FactLoadResult::Error(_) => Self::Error,
-        }
-    }
-}
-
-impl fmt::Display for FactOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Found => write!(f, "found"),
-            Self::Missing => write!(f, "missing"),
-            Self::Error => write!(f, "error"),
-        }
-    }
-}
-
-/// A record that a policy consulted a fact while reaching its decision.
-///
-/// Fact-backed policies (such as [`crate::RebacPolicy`]) attach one of these per
-/// fact lookup to their [`PolicyEvalResult::Granted`] or
-/// [`PolicyEvalResult::Denied`] node, so a decision's *inputs* are explained
-/// alongside its outcome. Provenance is intentionally type-erased — a fact
-/// name, a rendered key, an outcome, and optional detail — rather than the
-/// typed [`crate::FactKey`], so it lives on the non-generic result tree and is
-/// straightforward to log.
-///
-/// Operational fact-load telemetry (latencies, batch fan-out, cache hits) is a
-/// separate concern surfaced through `tracing` spans (`gatehouse.fact_load`);
-/// this type is for per-decision explanation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FactProvenance {
-    /// The [`crate::FactKey::NAME`] of the consulted fact (e.g. `"relationship"`).
-    pub fact_name: &'static str,
-    /// A human-readable rendering of the fact key that was looked up.
-    pub key: String,
-    /// How the load resolved.
-    pub outcome: FactOutcome,
-    /// Optional extra detail, such as the backend error message when
-    /// `outcome` is [`FactOutcome::Error`].
-    pub detail: Option<String>,
-}
-
-impl FactProvenance {
-    /// Records a consulted fact.
-    pub fn new(
-        fact_name: &'static str,
-        key: impl Into<String>,
-        outcome: FactOutcome,
-        detail: Option<String>,
-    ) -> Self {
-        Self {
-            fact_name,
-            key: key.into(),
-            outcome,
-            detail,
-        }
-    }
-}
-
-impl fmt::Display for FactProvenance {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "fact {} [{}]: {}",
-            self.fact_name, self.outcome, self.key
-        )?;
-        if let Some(detail) = &self.detail {
-            write!(f, " ({detail})")?;
-        }
-        Ok(())
-    }
-}
-
 /// The result of evaluating a single policy (or a combination).
 ///
 /// This enum is used both by individual policies and by combinators to represent the
@@ -135,9 +40,6 @@ pub enum PolicyEvalResult {
         policy_type: String,
         /// An optional human-readable reason for the grant.
         reason: Option<String>,
-        /// Facts the policy consulted to reach this decision. Empty for
-        /// policies that are not fact-backed (RBAC, ABAC, combinators).
-        provenance: Vec<FactProvenance>,
     },
     /// Access denied. Contains the policy type and a reason.
     Denied {
@@ -145,9 +47,6 @@ pub enum PolicyEvalResult {
         policy_type: String,
         /// A human-readable reason for the denial.
         reason: String,
-        /// Facts the policy consulted to reach this decision. Empty for
-        /// policies that are not fact-backed (RBAC, ABAC, combinators).
-        provenance: Vec<FactProvenance>,
     },
     /// Combined result from multiple policy evaluations.
     /// Contains the policy type, the combining operation ([`CombineOp`]),
@@ -323,13 +222,6 @@ impl fmt::Display for AccessEvaluation {
 /// Returned as part of [`AccessEvaluation`]. Use [`EvalTrace::format`] to render
 /// a human-readable tree, useful for debugging and audit logging.
 ///
-/// The tree records policy *decisions*. The *inputs* that informed a decision —
-/// the facts a fact-backed policy consulted — are attached to the individual
-/// [`PolicyEvalResult`] nodes as [`FactProvenance`] and rendered inline by
-/// [`EvalTrace::format`]. Operational fact-load telemetry (latency, batch
-/// fan-out, cache hits) is a separate concern surfaced through `tracing` spans
-/// (`gatehouse.fact_load`), not through this tree.
-///
 /// # Example
 ///
 /// ```rust
@@ -339,10 +231,10 @@ impl fmt::Display for AccessEvaluation {
 /// assert_eq!(empty.format(), "No evaluation trace available");
 ///
 /// // A trace built from a policy result renders a decision tree:
-/// let trace = EvalTrace::with_root(PolicyEvalResult::granted(
-///     "AdminPolicy",
-///     Some("User is admin".into()),
-/// ));
+/// let trace = EvalTrace::with_root(PolicyEvalResult::Granted {
+///     policy_type: "AdminPolicy".into(),
+///     reason: Some("User is admin".into()),
+/// });
 /// assert!(trace.format().contains("AdminPolicy GRANTED"));
 /// ```
 #[derive(Debug, Clone, Default)]
@@ -384,56 +276,6 @@ impl EvalTrace {
 }
 
 impl PolicyEvalResult {
-    /// Builds a granted leaf result with no fact provenance.
-    ///
-    /// Prefer this over constructing [`PolicyEvalResult::Granted`] directly; use
-    /// [`Self::granted_with_facts`] when the decision was informed by facts.
-    pub fn granted(policy_type: impl Into<String>, reason: Option<String>) -> Self {
-        Self::Granted {
-            policy_type: policy_type.into(),
-            reason,
-            provenance: Vec::new(),
-        }
-    }
-
-    /// Builds a denied leaf result with no fact provenance.
-    ///
-    /// Prefer this over constructing [`PolicyEvalResult::Denied`] directly; use
-    /// [`Self::denied_with_facts`] when the decision was informed by facts.
-    pub fn denied(policy_type: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::Denied {
-            policy_type: policy_type.into(),
-            reason: reason.into(),
-            provenance: Vec::new(),
-        }
-    }
-
-    /// Builds a granted leaf result carrying the facts that informed it.
-    pub fn granted_with_facts(
-        policy_type: impl Into<String>,
-        reason: Option<String>,
-        provenance: Vec<FactProvenance>,
-    ) -> Self {
-        Self::Granted {
-            policy_type: policy_type.into(),
-            reason,
-            provenance,
-        }
-    }
-
-    /// Builds a denied leaf result carrying the facts that informed it.
-    pub fn denied_with_facts(
-        policy_type: impl Into<String>,
-        reason: impl Into<String>,
-        provenance: Vec<FactProvenance>,
-    ) -> Self {
-        Self::Denied {
-            policy_type: policy_type.into(),
-            reason: reason.into(),
-            provenance,
-        }
-    }
-
     /// Returns whether this evaluation resulted in access being granted
     pub fn is_granted(&self) -> bool {
         match self {
@@ -452,16 +294,6 @@ impl PolicyEvalResult {
         }
     }
 
-    /// Returns the facts the policy consulted to reach this decision.
-    ///
-    /// Empty for combinators and for policies that are not fact-backed.
-    pub fn provenance(&self) -> &[FactProvenance] {
-        match self {
-            Self::Granted { provenance, .. } | Self::Denied { provenance, .. } => provenance,
-            Self::Combined { .. } => &[],
-        }
-    }
-
     /// Formats the evaluation tree with indentation for readability
     pub fn format(&self, indent: usize) -> String {
         let indent_str = " ".repeat(indent);
@@ -470,21 +302,17 @@ impl PolicyEvalResult {
             Self::Granted {
                 policy_type,
                 reason,
-                provenance,
             } => {
                 let reason_text = reason
                     .as_ref()
                     .map_or("".to_string(), |r| format!(": {}", r));
-                let headline = format!("{}✔ {} GRANTED{}", indent_str, policy_type, reason_text);
-                Self::append_provenance(headline, &indent_str, provenance)
+                format!("{}✔ {} GRANTED{}", indent_str, policy_type, reason_text)
             }
             Self::Denied {
                 policy_type,
                 reason,
-                provenance,
             } => {
-                let headline = format!("{}✘ {} DENIED: {}", indent_str, policy_type, reason);
-                Self::append_provenance(headline, &indent_str, provenance)
+                format!("{}✘ {} DENIED: {}", indent_str, policy_type, reason)
             }
             Self::Combined {
                 policy_type,
@@ -504,19 +332,6 @@ impl PolicyEvalResult {
                 result
             }
         }
-    }
-
-    /// Appends one indented `↳ fact …` line per consulted fact under a leaf node.
-    fn append_provenance(
-        headline: String,
-        indent_str: &str,
-        provenance: &[FactProvenance],
-    ) -> String {
-        let mut result = headline;
-        for fact in provenance {
-            result.push_str(&format!("\n{indent_str}  ↳ {fact}"));
-        }
-        result
     }
 }
 

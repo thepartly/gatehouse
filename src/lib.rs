@@ -133,9 +133,15 @@
 //! impl Policy<User, Document, ReadAction, EmptyContext> for AdminPolicy {
 //!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
 //!         if ctx.subject.roles.contains(&"admin".to_string()) {
-//!             PolicyEvalResult::granted(self.policy_type(), Some("User is admin".to_string()))
+//!             PolicyEvalResult::Granted {
+//!                 policy_type: self.policy_type().to_string(),
+//!                 reason: Some("User is admin".to_string()),
+//!             }
 //!         } else {
-//!             PolicyEvalResult::denied(self.policy_type(), "User is not admin")
+//!             PolicyEvalResult::Denied {
+//!                 policy_type: self.policy_type().to_string(),
+//!                 reason: "User is not admin".to_string(),
+//!             }
 //!         }
 //!     }
 //!     fn policy_type(&self) -> &str { "AdminPolicy" }
@@ -148,9 +154,15 @@
 //! impl Policy<User, Document, ReadAction, EmptyContext> for OwnerPolicy {
 //!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
 //!         if ctx.subject.id == ctx.resource.owner_id {
-//!             PolicyEvalResult::granted(self.policy_type(), Some("User is the owner".to_string()))
+//!             PolicyEvalResult::Granted {
+//!                 policy_type: self.policy_type().to_string(),
+//!                 reason: Some("User is the owner".to_string()),
+//!             }
 //!         } else {
-//!             PolicyEvalResult::denied(self.policy_type(), "User is not the owner")
+//!             PolicyEvalResult::Denied {
+//!                policy_type: self.policy_type().to_string(),
+//!                reason: "User is not the owner".to_string(),
+//!            }
 //!         }
 //!     }
 //!     fn policy_type(&self) -> &str {
@@ -276,9 +288,7 @@ pub use metadata::SecurityRuleMetadata;
 pub(crate) use metadata::{DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE};
 pub use policies::{AbacPolicy, DelegatingPolicy, RbacPolicy, RebacPolicy};
 pub use policy::{BatchEvalCtx, EvalCtx, Policy, PolicyBatchItem};
-pub use results::{
-    AccessEvaluation, CombineOp, EvalTrace, FactOutcome, FactProvenance, PolicyEvalResult,
-};
+pub use results::{AccessEvaluation, CombineOp, EvalTrace, PolicyEvalResult};
 pub use session::{EvaluationSession, EvaluationSessionBuilder};
 
 // The shared unit-test module pulls in tokio-based async tests via dev-deps

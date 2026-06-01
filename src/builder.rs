@@ -31,15 +31,21 @@ where
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
         if (self.predicate)(ctx.subject, ctx.action, ctx.resource, ctx.context) {
             match self.effect {
-                Effect::Allow => PolicyEvalResult::granted(
-                    self.name.clone(),
-                    Some("Policy allowed access".into()),
-                ),
-                Effect::Deny => PolicyEvalResult::denied(self.name.clone(), "Policy denied access"),
+                Effect::Allow => PolicyEvalResult::Granted {
+                    policy_type: self.name.clone(),
+                    reason: Some("Policy allowed access".into()),
+                },
+                Effect::Deny => PolicyEvalResult::Denied {
+                    policy_type: self.name.clone(),
+                    reason: "Policy denied access".into(),
+                },
             }
         } else {
             // Predicate didn't match – treat as non-applicable (denied).
-            PolicyEvalResult::denied(self.name.clone(), "Policy predicate did not match")
+            PolicyEvalResult::Denied {
+                policy_type: self.name.clone(),
+                reason: "Policy predicate did not match".into(),
+            }
         }
     }
     fn policy_type(&self) -> &str {

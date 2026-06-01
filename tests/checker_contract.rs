@@ -67,9 +67,15 @@ impl Policy<Subject, Resource, Action, Ctx> for BatchGrantPolicy {
 impl BatchGrantPolicy {
     fn result_for(&self, resource_id: u8) -> PolicyEvalResult {
         if (self.grant)(resource_id) {
-            PolicyEvalResult::granted(self.name, Some(format!("{resource_id} granted")))
+            PolicyEvalResult::Granted {
+                policy_type: self.name.to_string(),
+                reason: Some(format!("{resource_id} granted")),
+            }
         } else {
-            PolicyEvalResult::denied(self.name, format!("{resource_id} denied"))
+            PolicyEvalResult::Denied {
+                policy_type: self.name.to_string(),
+                reason: format!("{resource_id} denied"),
+            }
         }
     }
 }
@@ -108,9 +114,15 @@ impl RandomStackPolicy {
     fn result_for(&self, resource_id: u8) -> PolicyEvalResult {
         let score = ((resource_id as u16 * 37) ^ self.salt).wrapping_add(self.salt / 3) % 100;
         if score < self.grant_percent as u16 {
-            PolicyEvalResult::granted(self.name.clone(), Some(format!("{resource_id} granted")))
+            PolicyEvalResult::Granted {
+                policy_type: self.name.clone(),
+                reason: Some(format!("{resource_id} granted")),
+            }
         } else {
-            PolicyEvalResult::denied(self.name.clone(), format!("{resource_id} denied"))
+            PolicyEvalResult::Denied {
+                policy_type: self.name.clone(),
+                reason: format!("{resource_id} denied"),
+            }
         }
     }
 }
@@ -126,7 +138,10 @@ impl Policy<Subject, Resource, Action, Ctx> for NeverConsultedPolicy {
         _ctx: &EvalCtx<'_, Subject, Resource, Action, Ctx>,
     ) -> PolicyEvalResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        PolicyEvalResult::denied(self.policy_type(), "single called")
+        PolicyEvalResult::Denied {
+            policy_type: self.policy_type().to_string(),
+            reason: "single called".to_string(),
+        }
     }
 
     async fn evaluate_batch<'item>(

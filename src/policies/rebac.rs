@@ -1,7 +1,4 @@
-use crate::{
-    BatchEvalCtx, EvalCtx, FactKey, FactLoadResult, FactOutcome, FactProvenance, Policy,
-    PolicyEvalResult, RelationshipQuery,
-};
+use crate::{BatchEvalCtx, EvalCtx, FactLoadResult, Policy, PolicyEvalResult, RelationshipQuery};
 use async_trait::async_trait;
 use std::fmt;
 use std::hash::Hash;
@@ -32,22 +29,10 @@ use std::sync::Arc;
 /// a custom [`crate::FactKey`] with `Value = YourPayload` and write a [`crate::Policy`] that
 /// interprets the loaded value.
 ///
-/// `Relation` must implement [`fmt::Display`] so Gatehouse can produce
-/// human-readable denial reasons and traces. The subject and resource ID types
-/// must implement [`fmt::Debug`] so the consulted relationship can be rendered
-/// into the [`crate::FactProvenance`] attached to each decision; common ID
-/// types (`Uuid`, `String`, integers) already satisfy this, but a custom ID
-/// newtype must `#[derive(Debug)]` or it will fail to satisfy the `Policy`
-/// bound. Backend serialization should live in the [`crate::FactSource`], not
-/// in the `Debug`/`Display` output, unless that is explicitly your storage
-/// format.
-///
-/// **Provenance/log safety.** The rendered relationship inside
-/// [`crate::FactProvenance::key`] uses the `Debug` output of your ID types
-/// verbatim. If those IDs carry fields that should not be written to audit
-/// logs (e.g. a token, a tenant secret), implement `Debug` manually to
-/// redact them before this policy is used in a checker whose decisions are
-/// persisted.
+/// `Relation` must implement [`fmt::Display`] only so Gatehouse can produce
+/// human-readable denial reasons and traces. Backend serialization should live
+/// in the [`crate::FactSource`], not in the display string unless that is explicitly
+/// your storage format.
 ///
 /// ```rust
 /// use async_trait::async_trait;
@@ -148,28 +133,23 @@ where
     R: Sync + Send,
     A: Sync + Send,
     C: Sync + Send,
-    SubjectId: Eq + Hash + Clone + Send + Sync + fmt::Debug + 'static,
-    ResourceId: Eq + Hash + Clone + Send + Sync + fmt::Debug + 'static,
+    SubjectId: Eq + Hash + Clone + Send + Sync + 'static,
+    ResourceId: Eq + Hash + Clone + Send + Sync + 'static,
     Relation: Eq + Hash + Clone + Send + Sync + fmt::Display + 'static,
 {
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
-        // Capture the FactKey::NAME here so `result_from_fact` does not need
-        // to carry the full FactKey trait bound on its impl block.
-        let fact_name = <RelationshipQuery<SubjectId, ResourceId, Relation> as FactKey>::NAME;
         let key = RelationshipQuery {
             subject_id: (self.subject_id)(ctx.subject),
             resource_id: (self.resource_id)(ctx.resource),
             relation: self.relation.clone(),
         };
-        let key_repr = Self::render_key(&key);
-        self.result_from_fact(fact_name, &key_repr, ctx.session.get(key).await)
+        self.result_from_fact(ctx.session.get(key).await)
     }
 
     async fn evaluate_batch<'item>(
         &self,
         ctx: &BatchEvalCtx<'item, S, R, A, C>,
     ) -> Vec<PolicyEvalResult> {
-        let fact_name = <RelationshipQuery<SubjectId, ResourceId, Relation> as FactKey>::NAME;
         let subject_id = (self.subject_id)(ctx.subject);
         let keys = ctx
             .items
@@ -186,18 +166,17 @@ where
             return ctx
                 .items
                 .iter()
-                .map(|_| {
-                    PolicyEvalResult::denied(
-                        self.policy_type(),
-                        "Relationship fact source returned the wrong number of results",
-                    )
+                .map(|_| PolicyEvalResult::Denied {
+                    policy_type: self.policy_type().to_string(),
+                    reason: "Relationship fact source returned the wrong number of results"
+                        .to_string(),
                 })
                 .collect();
         }
 
-        keys.iter()
-            .zip(facts)
-            .map(|(key, fact)| self.result_from_fact(fact_name, &Self::render_key(key), fact))
+        facts
+            .into_iter()
+            .map(|fact| self.result_from_fact(fact))
             .collect()
     }
 
@@ -209,63 +188,32 @@ where
 impl<S, R, A, C, SubjectId, ResourceId, Relation>
     RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation>
 where
-    SubjectId: fmt::Debug,
-    ResourceId: fmt::Debug,
     Relation: fmt::Display,
 {
-    /// Renders a relationship key for the [`FactProvenance`] attached to a
-    /// decision node, e.g. `User(42) -[owner]-> Doc(7)`.
-    fn render_key(key: &RelationshipQuery<SubjectId, ResourceId, Relation>) -> String {
-        format!(
-            "{:?} -[{}]-> {:?}",
-            key.subject_id, key.relation, key.resource_id
-        )
-    }
-
-    fn result_from_fact(
-        &self,
-        fact_name: &'static str,
-        key_repr: &str,
-        fact: FactLoadResult<bool>,
-    ) -> PolicyEvalResult {
-        let outcome = FactOutcome::from_load_result(&fact);
-        let detail = match &fact {
-            FactLoadResult::Error(error) => Some(error.to_string()),
-            _ => None,
-        };
-        // `fact_name` is captured from `<RelationshipQuery as FactKey>::NAME`
-        // at the Policy impl call site, so the provenance label tracks the
-        // typed key rather than a hardcoded literal that could silently
-        // drift if `RelationshipQuery::NAME` ever changes.
-        let provenance = vec![FactProvenance::new(fact_name, key_repr, outcome, detail)];
-
+    fn result_from_fact(&self, fact: FactLoadResult<bool>) -> PolicyEvalResult {
         match fact {
-            FactLoadResult::Found(true) => PolicyEvalResult::granted_with_facts(
-                "RebacPolicy",
-                Some(format!(
+            FactLoadResult::Found(true) => PolicyEvalResult::Granted {
+                policy_type: "RebacPolicy".to_string(),
+                reason: Some(format!(
                     "Subject has '{}' relationship with resource",
                     self.relation
                 )),
-                provenance,
-            ),
-            FactLoadResult::Found(false) => PolicyEvalResult::denied_with_facts(
-                "RebacPolicy",
-                format!(
+            },
+            FactLoadResult::Found(false) => PolicyEvalResult::Denied {
+                policy_type: "RebacPolicy".to_string(),
+                reason: format!(
                     "Subject does not have '{}' relationship with resource",
                     self.relation
                 ),
-                provenance,
-            ),
-            FactLoadResult::Missing => PolicyEvalResult::denied_with_facts(
-                "RebacPolicy",
-                format!("Relationship '{}' fact is missing", self.relation),
-                provenance,
-            ),
-            FactLoadResult::Error(error) => PolicyEvalResult::denied_with_facts(
-                "RebacPolicy",
-                format!("Relationship '{}' fact load failed: {error}", self.relation),
-                provenance,
-            ),
+            },
+            FactLoadResult::Missing => PolicyEvalResult::Denied {
+                policy_type: "RebacPolicy".to_string(),
+                reason: format!("Relationship '{}' fact is missing", self.relation),
+            },
+            FactLoadResult::Error(error) => PolicyEvalResult::Denied {
+                policy_type: "RebacPolicy".to_string(),
+                reason: format!("Relationship '{}' fact load failed: {error}", self.relation),
+            },
         }
     }
 }

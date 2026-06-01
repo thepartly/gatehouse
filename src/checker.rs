@@ -86,8 +86,10 @@ where
         if self.policies.is_empty() {
             tracing::Span::current().record("outcome", "denied");
             tracing::debug!("No policies configured");
-            let result =
-                PolicyEvalResult::denied(PERMISSION_CHECKER_POLICY_TYPE, "No policies configured");
+            let result = PolicyEvalResult::Denied {
+                policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                reason: "No policies configured".to_string(),
+            };
 
             return AccessEvaluation::Denied {
                 trace: EvalTrace::with_root(result),
@@ -264,10 +266,10 @@ where
                 .into_iter()
                 .map(|item| {
                     denied_count += 1;
-                    let result = PolicyEvalResult::denied(
-                        PERMISSION_CHECKER_POLICY_TYPE,
-                        "No policies configured",
-                    );
+                    let result = PolicyEvalResult::Denied {
+                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                        reason: "No policies configured".to_string(),
+                    };
                     (
                         item,
                         AccessEvaluation::Denied {
@@ -339,10 +341,11 @@ where
                 if policy_results.len() != pending_chunk.len() {
                     for &index in pending_chunk {
                         policy_denied_count += 1;
-                        let policy_result = PolicyEvalResult::denied(
-                            policy_type,
-                            "Policy batch result count did not match input count",
-                        );
+                        let policy_result = PolicyEvalResult::Denied {
+                            policy_type: policy_type.to_string(),
+                            reason: "Policy batch result count did not match input count"
+                                .to_string(),
+                        };
                         traces[index].push(policy_result);
                         let combined = PolicyEvalResult::Combined {
                             policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
@@ -412,10 +415,10 @@ where
             .zip(evaluations.into_iter())
             .map(|(item, evaluation)| {
                 let evaluation = evaluation.unwrap_or_else(|| {
-                    let result = PolicyEvalResult::denied(
-                        PERMISSION_CHECKER_POLICY_TYPE,
-                        "Batch item was not evaluated",
-                    );
+                    let result = PolicyEvalResult::Denied {
+                        policy_type: PERMISSION_CHECKER_POLICY_TYPE.to_string(),
+                        reason: "Batch item was not evaluated".to_string(),
+                    };
                     AccessEvaluation::Denied {
                         trace: EvalTrace::with_root(result),
                         reason: "Batch item was not evaluated".to_string(),
