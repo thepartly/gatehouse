@@ -3469,4 +3469,223 @@ mod policy_builder_tests {
             .await;
         assert!(!result.is_granted(), "Policy should deny wrong context");
     }
+
+    // ----- per-axis batch shortcut --------------------------------------
+
+    use crate::{BatchEvalCtx, PolicyBatchItem};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Debug, Clone)]
+    struct BatchSubject {
+        role: String,
+    }
+    #[derive(Debug, Clone)]
+    struct BatchAction;
+    #[derive(Debug, Clone)]
+    struct BatchResource {
+        category: String,
+    }
+    #[derive(Debug, Clone)]
+    struct BatchContext;
+
+    fn make_items<'a>(
+        resources: &'a [BatchResource],
+        ctx: &'a BatchContext,
+    ) -> Vec<PolicyBatchItem<'a, BatchResource, BatchContext>> {
+        resources
+            .iter()
+            .map(|r| PolicyBatchItem {
+                resource: r,
+                context: ctx,
+            })
+            .collect()
+    }
+
+    fn batch_ctx<'a>(
+        session: &'a EvaluationSession,
+        subject: &'a BatchSubject,
+        action: &'a BatchAction,
+        items: &'a [PolicyBatchItem<'a, BatchResource, BatchContext>],
+    ) -> BatchEvalCtx<'a, BatchSubject, BatchResource, BatchAction, BatchContext> {
+        BatchEvalCtx {
+            session,
+            subject,
+            action,
+            items,
+            policy_type: std::borrow::Cow::Borrowed("test"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_only_policy_evaluates_subject_predicate_once_per_batch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = Arc::clone(&calls);
+
+        let policy = PolicyBuilder::<BatchSubject, BatchResource, BatchAction, BatchContext>::new(
+            "StaffOnly",
+        )
+        .subjects(move |s: &BatchSubject| {
+            calls_inner.fetch_add(1, Ordering::SeqCst);
+            s.role == "staff"
+        })
+        .build();
+
+        let staff = BatchSubject {
+            role: "staff".into(),
+        };
+        let action = BatchAction;
+        let resources: Vec<BatchResource> = (0..25)
+            .map(|i| BatchResource {
+                category: format!("doc-{i}"),
+            })
+            .collect();
+        let ctx = BatchContext;
+        let items = make_items(&resources, &ctx);
+
+        let session = EvaluationSession::new();
+        let bctx = batch_ctx(&session, &staff, &action, &items);
+        let results = policy.evaluate_batch(&bctx).await;
+
+        assert_eq!(results.len(), 25, "one result per batch item");
+        assert!(
+            results.iter().all(|r| r.is_granted()),
+            "subject passes => all items granted",
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "subject-only predicate runs once per batch, not per item",
+        );
+    }
+
+    #[tokio::test]
+    async fn subject_only_denial_broadcasts_without_running_per_item_predicates() {
+        let subject_calls = Arc::new(AtomicUsize::new(0));
+        let resource_calls = Arc::new(AtomicUsize::new(0));
+        let subject_inner = Arc::clone(&subject_calls);
+        let resource_inner = Arc::clone(&resource_calls);
+
+        let policy = PolicyBuilder::<BatchSubject, BatchResource, BatchAction, BatchContext>::new(
+            "StaffOnly",
+        )
+        .subjects(move |s: &BatchSubject| {
+            subject_inner.fetch_add(1, Ordering::SeqCst);
+            s.role == "staff"
+        })
+        .resources(move |_r: &BatchResource| {
+            resource_inner.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .build();
+
+        let guest = BatchSubject {
+            role: "guest".into(),
+        };
+        let action = BatchAction;
+        let resources: Vec<BatchResource> = (0..10)
+            .map(|i| BatchResource {
+                category: format!("doc-{i}"),
+            })
+            .collect();
+        let ctx = BatchContext;
+        let items = make_items(&resources, &ctx);
+
+        let session = EvaluationSession::new();
+        let bctx = batch_ctx(&session, &guest, &action, &items);
+        let results = policy.evaluate_batch(&bctx).await;
+
+        assert_eq!(results.len(), 10);
+        assert!(
+            results.iter().all(|r| !r.is_granted()),
+            "subject denial broadcasts to every item",
+        );
+        assert_eq!(
+            subject_calls.load(Ordering::SeqCst),
+            1,
+            "subject predicate runs once even though there are per-item predicates",
+        );
+        assert_eq!(
+            resource_calls.load(Ordering::SeqCst),
+            0,
+            "resource predicate is skipped when subject already denied the batch",
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_axis_policy_still_runs_resource_per_item() {
+        let subject_calls = Arc::new(AtomicUsize::new(0));
+        let resource_calls = Arc::new(AtomicUsize::new(0));
+        let subject_inner = Arc::clone(&subject_calls);
+        let resource_inner = Arc::clone(&resource_calls);
+
+        let policy = PolicyBuilder::<BatchSubject, BatchResource, BatchAction, BatchContext>::new(
+            "StaffOnDocuments",
+        )
+        .subjects(move |s: &BatchSubject| {
+            subject_inner.fetch_add(1, Ordering::SeqCst);
+            s.role == "staff"
+        })
+        .resources(move |r: &BatchResource| {
+            resource_inner.fetch_add(1, Ordering::SeqCst);
+            r.category.starts_with("doc")
+        })
+        .build();
+
+        let staff = BatchSubject {
+            role: "staff".into(),
+        };
+        let action = BatchAction;
+        // Half "doc-N" (will pass resource check), half "img-N" (will fail).
+        let resources: Vec<BatchResource> = (0..10)
+            .map(|i| BatchResource {
+                category: if i % 2 == 0 {
+                    format!("doc-{i}")
+                } else {
+                    format!("img-{i}")
+                },
+            })
+            .collect();
+        let ctx = BatchContext;
+        let items = make_items(&resources, &ctx);
+
+        let session = EvaluationSession::new();
+        let bctx = batch_ctx(&session, &staff, &action, &items);
+        let results = policy.evaluate_batch(&bctx).await;
+
+        assert_eq!(results.len(), 10);
+        let granted = results.iter().filter(|r| r.is_granted()).count();
+        assert_eq!(granted, 5, "half the items pass the resource check");
+        assert_eq!(
+            subject_calls.load(Ordering::SeqCst),
+            1,
+            "subject predicate batched to one call",
+        );
+        assert_eq!(
+            resource_calls.load(Ordering::SeqCst),
+            10,
+            "resource predicate runs per item",
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_batch_returns_empty_results() {
+        let policy = PolicyBuilder::<BatchSubject, BatchResource, BatchAction, BatchContext>::new(
+            "AnyStaff",
+        )
+        .subjects(|s: &BatchSubject| s.role == "staff")
+        .build();
+
+        let staff = BatchSubject {
+            role: "staff".into(),
+        };
+        let action = BatchAction;
+        let items: Vec<PolicyBatchItem<'_, BatchResource, BatchContext>> = Vec::new();
+
+        let session = EvaluationSession::new();
+        let bctx = batch_ctx(&session, &staff, &action, &items);
+        let results = policy.evaluate_batch(&bctx).await;
+
+        assert!(results.is_empty());
+    }
 }
