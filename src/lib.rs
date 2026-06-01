@@ -52,6 +52,15 @@
 //! caller inputs, preserves caller order, caches results for the request, and
 //! joins concurrent in-flight loads for the same key.
 //!
+//! [`FactSource`] is Gatehouse's **request-scoped DataLoader-style primitive**:
+//! the session deduplicates and caches keys, and the source receives one
+//! batched call per unique key set. If your application already uses a
+//! DataLoader implementation (for example `async-graphql::dataloader` or
+//! `ultra-batch`), call it directly from inside [`FactSource::load_many`] —
+//! gatehouse does not need its own batching layer for the data fetch, only
+//! for the per-request fact graph. The same composition pattern applies to
+//! the [`Hydrator`] used by lookup-style listings (`Hydrator::hydrate`).
+//!
 //! [`RebacPolicy`] is the first built-in policy backed by this model. It
 //! extracts flat subject/resource IDs, builds [`RelationshipQuery`] keys, and
 //! asks the session for relationship facts.

@@ -107,6 +107,14 @@ pub struct LookupPage<Id> {
 /// Returning a vector of length other than `ids.len()` is a contract
 /// violation and is reported by gatehouse as a hydrator contract error.
 /// Returning `Err` aborts the consuming pipeline.
+///
+/// Like [`crate::FactSource`], a `Hydrator` is a natural place to call an
+/// existing DataLoader-style batch loader (`async-graphql::dataloader`,
+/// `ultra-batch`, or a home-grown batcher). The hydrator receives a
+/// candidate-page slice of IDs and returns one `Option<Resource>` per ID —
+/// exactly the shape a DataLoader's `load_many` returns. Gatehouse
+/// authorizes the resolved subset through the existing policy stack; the
+/// underlying loader owns request-wide batching and caching.
 #[async_trait]
 pub trait Hydrator<Id>: Send + Sync {
     /// The resource type produced by the hydrator.

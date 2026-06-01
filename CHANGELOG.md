@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Crate-level, `FactSource`, and `Hydrator` rustdoc now frame these traits as gatehouse's request-scoped DataLoader-style primitives, and call out that callers may invoke an existing DataLoader implementation (`async-graphql::dataloader`, `ultra-batch`, or a home-grown batcher) directly from inside `FactSource::load_many` or `Hydrator::hydrate`. Gatehouse owns the per-request fact graph; the underlying loader owns batching across the rest of the request and any longer-lived caching.
+- Examples polished for v0.3 idiom: `combinator_policy` uses `EvaluationSession::empty()` for its RBAC/ABAC-only setup; `groups_policy` gained a `//!` file header; the `axum` test helper formerly named `evaluate_access` was renamed `check_in_empty_session` to avoid evoking the pre-v0.3 API.
+
 ## [0.3.0-alpha.2] - 2026-06-01
 
 ### Breaking

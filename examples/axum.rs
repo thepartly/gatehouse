@@ -1,5 +1,8 @@
 // Axum service that authorizes multiple resource types (Invoices, Payments)
-// using a single PermissionChecker. Demonstrates multiple policies and actions.
+// using a single PermissionChecker. Demonstrates multiple policies and
+// actions, app-state-owned fact sources, and per-request
+// [`EvaluationSession`] construction via
+// [`EvaluationSession::builder`].
 
 use async_trait::async_trait;
 use axum::{
@@ -693,7 +696,7 @@ mod tests {
     }
 
     trait TestCheckerExt {
-        fn evaluate_access<'a>(
+        fn check_in_empty_session<'a>(
             &'a self,
             user: &'a User,
             action: &'a Action,
@@ -703,7 +706,7 @@ mod tests {
     }
 
     impl TestCheckerExt for PermissionChecker<User, Resource, Action, RequestContext> {
-        fn evaluate_access<'a>(
+        fn check_in_empty_session<'a>(
             &'a self,
             user: &'a User,
             action: &'a Action,
@@ -735,7 +738,7 @@ mod tests {
         let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .evaluate_access(&admin_user, &Action::Edit, &resource, &context_now())
+            .check_in_empty_session(&admin_user, &Action::Edit, &resource, &context_now())
             .await;
 
         assert!(
@@ -766,7 +769,7 @@ mod tests {
 
         // The user is the owner, the invoice is unlocked, <30 days old => should be granted
         let result = checker
-            .evaluate_access(&user, &Action::Edit, &resource, &context_now())
+            .check_in_empty_session(&user, &Action::Edit, &resource, &context_now())
             .await;
 
         assert!(
@@ -789,7 +792,7 @@ mod tests {
         let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .evaluate_access(&user, &Action::Edit, &resource, &context_now())
+            .check_in_empty_session(&user, &Action::Edit, &resource, &context_now())
             .await;
 
         assert!(
@@ -827,7 +830,7 @@ mod tests {
         let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .evaluate_access(&user, &Action::Edit, &resource, &context_now())
+            .check_in_empty_session(&user, &Action::Edit, &resource, &context_now())
             .await;
 
         assert!(
@@ -858,7 +861,7 @@ mod tests {
         let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .evaluate_access(&user, &Action::Edit, &resource, &context_now())
+            .check_in_empty_session(&user, &Action::Edit, &resource, &context_now())
             .await;
         assert!(
             !result.is_granted(),
@@ -883,7 +886,7 @@ mod tests {
         let resource = Resource::Payment(payment);
 
         let result = checker
-            .evaluate_access(&user, &Action::ApprovePayment, &resource, &context_now())
+            .check_in_empty_session(&user, &Action::ApprovePayment, &resource, &context_now())
             .await;
 
         assert!(
@@ -908,7 +911,7 @@ mod tests {
         let resource = Resource::Payment(payment);
 
         let result = checker
-            .evaluate_access(&user, &Action::ApprovePayment, &resource, &context_now())
+            .check_in_empty_session(&user, &Action::ApprovePayment, &resource, &context_now())
             .await;
 
         assert!(
@@ -930,7 +933,7 @@ mod tests {
 
         // Not finance_manager or admin => deny
         let result = checker
-            .evaluate_access(&user, &Action::ApprovePayment, &resource, &context_now())
+            .check_in_empty_session(&user, &Action::ApprovePayment, &resource, &context_now())
             .await;
         assert!(
             !result.is_granted(),
@@ -956,7 +959,7 @@ mod tests {
 
         // 1) finance_manager can refund
         let res1 = checker
-            .evaluate_access(
+            .check_in_empty_session(
                 &user_finance,
                 &Action::RefundPayment,
                 &resource,
@@ -967,7 +970,7 @@ mod tests {
 
         // 2) refund_specialist can refund
         let res2 = checker
-            .evaluate_access(
+            .check_in_empty_session(
                 &user_refund_specialist,
                 &Action::RefundPayment,
                 &resource,
@@ -990,7 +993,7 @@ mod tests {
 
         // Should be denied
         let result = checker
-            .evaluate_access(&user, &Action::RefundPayment, &resource, &context_now())
+            .check_in_empty_session(&user, &Action::RefundPayment, &resource, &context_now())
             .await;
         assert!(!result.is_granted(), "Regular user can't refund payment");
     }
