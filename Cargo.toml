@@ -2,6 +2,11 @@
 name = "gatehouse"
 version = "0.3.0-alpha.2"
 edition = "2021"
+# 1.82 is required for `Option::is_none_or` (stabilized 2024-10-17), used
+# in the builder's per-axis predicate evaluation. Other dependencies on
+# stable stdlib features (OnceLock, is_some_and, let-else) are older and
+# not binding.
+rust-version = "1.82"
 license = "MIT"
 repository = "https://github.com/thepartly/gatehouse"
 description = "An in-process authorization engine for Rust with composable policies and request-scoped fact loading."

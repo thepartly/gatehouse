@@ -389,7 +389,7 @@ mod core_tests {
             ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
         ) -> PolicyEvalResult {
             self.single_calls.fetch_add(1, Ordering::SeqCst);
-            if ctx.resource.id.as_u128().is_multiple_of(2) {
+            if ctx.resource.id.as_u128() % 2 == 0 {
                 PolicyEvalResult::granted(
                     self.policy_type().to_string(),
                     Some("even resource".to_string()),
@@ -1529,7 +1529,7 @@ mod core_tests {
             .collect::<Vec<_>>();
         let grants = resources
             .iter()
-            .filter(|resource| resource.id.as_u128().is_multiple_of(2))
+            .filter(|resource| resource.id.as_u128() % 2 == 0)
             .map(|resource| RelationshipQuery {
                 subject_id: subject.id,
                 resource_id: resource.id,

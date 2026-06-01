@@ -40,10 +40,15 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     /// crate-level "When to populate the Context type" section and
     /// `examples/mfa_freshness_context.rs` for fuller treatment.
     pub context: &'a Context,
-    /// The current policy's [`Policy::policy_type`], captured once by the
-    /// checker before dispatch. Used by [`Self::grant`] / [`Self::deny`] so
-    /// policy bodies don't need to re-pass `self.policy_type()` on every
-    /// result.
+    /// The current policy's [`Policy::policy_type`], captured by the
+    /// checker before dispatch. On the single-item path
+    /// ([`crate::PermissionChecker::evaluate_in_session`]) the checker
+    /// captures it exactly once and moves it into this field; on the
+    /// batch path ([`crate::PermissionChecker::evaluate_batch_in_session_by`]
+    /// and siblings) the checker captures it once per policy and clones
+    /// it into each `BatchEvalCtx` chunk. Used by [`Self::grant`] /
+    /// [`Self::deny`] so policy bodies don't need to re-pass
+    /// `self.policy_type()` on every result.
     ///
     /// Stored as [`Cow<'static, str>`] so the shortcut path is truly
     /// zero-allocation for policies that return `Cow::Borrowed("Name")`
@@ -219,8 +224,9 @@ where
     /// clone the [`Cow`] (which is a no-op for `Borrowed`).
     ///
     /// Dynamic-name policies return `Cow::Owned(self.name.clone())`
-    /// and pay one allocation here, plus two more on the
-    /// `ctx.grant` / `ctx.deny` helper path — see
+    /// and pay one allocation here, plus one more on the single-item
+    /// `ctx.grant` / `ctx.deny` helper path (the batch path also clones
+    /// into each `BatchEvalCtx` chunk) — see
     /// [`EvalCtx::policy_type`] for the full accounting. This is a
     /// regression from the pre-`Cow` trait shape where
     /// `policy_type(&self) -> &str` let dynamic names return

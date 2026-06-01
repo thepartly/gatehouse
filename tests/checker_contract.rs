@@ -199,7 +199,7 @@ async fn resource_batch_shortcut_uses_unit_context() {
     let mut checker = PermissionChecker::<Subject, Resource, Action, ()>::new();
     checker.add_policy(
         PolicyBuilder::<Subject, Resource, Action, ()>::new("even-resource")
-            .resources(|resource: &Resource| resource.id.is_multiple_of(2))
+            .resources(|resource: &Resource| resource.id % 2 == 0)
             .build(),
     );
 
