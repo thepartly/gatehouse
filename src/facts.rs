@@ -152,6 +152,68 @@ pub enum FactLoadResult<V> {
 /// authorization pass; the underlying loader owns batching across the rest
 /// of the request, request coalescing across many concurrent passes, and
 /// any longer-lived caching.
+///
+/// # Beyond relationship facts: `(subject, scope) → resolved-id` lookups
+///
+/// `FactSource` is not relationship-shaped. Any per-request lookup whose
+/// answer is fixed for the request — "what customer does this org map to",
+/// "what tenant config applies to this caller", "what billing plan is in
+/// force right now" — can be a fact key. Define a [`FactKey`] for the
+/// question, register a source that resolves it, and have the policy ask
+/// the session instead of calling the backing service directly. The session
+/// then guarantees one round trip per unique key per request, regardless of
+/// how many policies or items in a list endpoint consult it.
+///
+/// ```rust,ignore
+/// use async_trait::async_trait;
+/// use gatehouse::{FactKey, FactLoadResult, FactSource};
+///
+/// /// "Which customer is this org billed under?" — same answer for every
+/// /// item in a list-of-invoices request.
+/// #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+/// struct CustomerForOrg(uuid::Uuid);
+///
+/// impl FactKey for CustomerForOrg {
+///     const NAME: &'static str = "customer_for_org";
+///     type Value = Option<uuid::Uuid>;
+/// }
+///
+/// struct HierarchyFacts(/* Arc<dyn HierarchyService> */);
+///
+/// #[async_trait]
+/// impl FactSource<CustomerForOrg> for HierarchyFacts {
+///     async fn load_many(
+///         &self,
+///         keys: &[CustomerForOrg],
+///     ) -> Vec<FactLoadResult<Option<uuid::Uuid>>> {
+///         // One backend call covering every unique org in the batch.
+///         // Return one result per input key, in input order.
+///         keys.iter()
+///             .map(|_| FactLoadResult::Found(None))  // resolve from backend
+///             .collect()
+///     }
+/// }
+/// ```
+///
+/// Inside the policy, the canonical pattern is:
+///
+/// ```rust,ignore
+/// async fn evaluate(
+///     &self,
+///     ctx: &EvalCtx<'_, OrgAuth, Invoice, Read, ()>,
+/// ) -> PolicyEvalResult {
+///     match ctx.session.get(CustomerForOrg(ctx.subject.org_id)).await {
+///         FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
+///             ctx.grant("subject's org bills under the invoice's customer")
+///         }
+///         _ => ctx.deny("not the billing customer"),
+///     }
+/// }
+/// ```
+///
+/// The built-in [`RebacPolicy`](crate::RebacPolicy) generalises this idiom
+/// for relationship-shaped facts; the same plumbing handles arbitrary
+/// `(subject, scope) → value` lookups when you define your own key.
 #[async_trait]
 pub trait FactSource<K>: Send + Sync
 where

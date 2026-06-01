@@ -527,11 +527,217 @@ fn bench_parallel_fact_state(c: &mut Criterion) {
     group.finish();
 }
 
+// -----------------------------------------------------------------------
+// PolicyBuilder per-axis batch shortcut: measure the gain vs the serial
+// default. `BuilderSubjectOnly` is a PolicyBuilder-produced policy whose
+// only predicate is on the subject; it overrides `evaluate_batch` to
+// short-circuit subject/action axes once. `ManualSubjectOnly` is the
+// equivalent hand-written Policy with no `evaluate_batch` override, so
+// it falls through to the default serial loop and runs the predicate
+// per item. Same predicate body in both, same batch size, isolated
+// from the rest of the checker.
+// -----------------------------------------------------------------------
+
+#[derive(Clone)]
+struct SubjectOnlyUser {
+    is_staff: bool,
+}
+
+#[derive(Clone)]
+struct SubjectOnlyResource;
+
+struct SubjectOnlyAction;
+
+#[derive(Clone)]
+struct SubjectOnlyContext;
+
+/// Mirrors the PolicyBuilder shape — dynamic name in `name: String`,
+/// no `evaluate_batch` override, so it falls through to the trait's
+/// serial-loop default. Makes the comparison with the overridden
+/// builder path apples-to-apples (both pay the dynamic-name per-item
+/// allocation cost; only the trace-event count differs).
+struct ManualSubjectOnlyDynamic {
+    name: String,
+}
+
+#[async_trait]
+impl gatehouse::Policy<SubjectOnlyUser, SubjectOnlyResource, SubjectOnlyAction, SubjectOnlyContext>
+    for ManualSubjectOnlyDynamic
+{
+    async fn evaluate(
+        &self,
+        ctx: &gatehouse::EvalCtx<
+            '_,
+            SubjectOnlyUser,
+            SubjectOnlyResource,
+            SubjectOnlyAction,
+            SubjectOnlyContext,
+        >,
+    ) -> gatehouse::PolicyEvalResult {
+        if ctx.subject.is_staff {
+            ctx.grant("staff")
+        } else {
+            ctx.deny("not staff")
+        }
+    }
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Owned(self.name.clone())
+    }
+}
+
+/// Same logic but with a static name. Lets the bench show the
+/// gap between PolicyBuilder (which has to use dynamic names because
+/// its builder API takes `impl Into<String>`) and a hand-written
+/// static-name policy.
+struct ManualSubjectOnlyStatic;
+
+#[async_trait]
+impl gatehouse::Policy<SubjectOnlyUser, SubjectOnlyResource, SubjectOnlyAction, SubjectOnlyContext>
+    for ManualSubjectOnlyStatic
+{
+    async fn evaluate(
+        &self,
+        ctx: &gatehouse::EvalCtx<
+            '_,
+            SubjectOnlyUser,
+            SubjectOnlyResource,
+            SubjectOnlyAction,
+            SubjectOnlyContext,
+        >,
+    ) -> gatehouse::PolicyEvalResult {
+        if ctx.subject.is_staff {
+            ctx.grant("staff")
+        } else {
+            ctx.deny("not staff")
+        }
+    }
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ManualSubjectOnlyStatic")
+    }
+}
+
+fn bench_subject_only_batch(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("failed to create Tokio runtime");
+    let mut group = c.benchmark_group("policy_builder_subject_only_batch");
+
+    let subject = SubjectOnlyUser { is_staff: true };
+    let action = SubjectOnlyAction;
+    let ctx = SubjectOnlyContext;
+
+    for &item_count in &[1usize, 10, 25, 100] {
+        let resources: Vec<SubjectOnlyResource> =
+            (0..item_count).map(|_| SubjectOnlyResource).collect();
+
+        let mut builder_checker = PermissionChecker::<
+            SubjectOnlyUser,
+            SubjectOnlyResource,
+            SubjectOnlyAction,
+            SubjectOnlyContext,
+        >::new();
+        builder_checker.add_policy(
+            PolicyBuilder::<
+                SubjectOnlyUser,
+                SubjectOnlyResource,
+                SubjectOnlyAction,
+                SubjectOnlyContext,
+            >::new("BuilderSubjectOnly")
+            .subjects(|u: &SubjectOnlyUser| u.is_staff)
+            .build(),
+        );
+
+        let mut manual_dynamic_checker = PermissionChecker::<
+            SubjectOnlyUser,
+            SubjectOnlyResource,
+            SubjectOnlyAction,
+            SubjectOnlyContext,
+        >::new();
+        manual_dynamic_checker.add_policy(ManualSubjectOnlyDynamic {
+            name: "BuilderSubjectOnly".into(),
+        });
+
+        let mut manual_static_checker = PermissionChecker::<
+            SubjectOnlyUser,
+            SubjectOnlyResource,
+            SubjectOnlyAction,
+            SubjectOnlyContext,
+        >::new();
+        manual_static_checker.add_policy(ManualSubjectOnlyStatic);
+
+        // PolicyBuilder path — overrides evaluate_batch to broadcast.
+        group.bench_with_input(
+            BenchmarkId::new("builder_overridden", item_count),
+            &builder_checker,
+            |b, checker| {
+                b.iter(|| {
+                    let session = EvaluationSession::empty();
+                    let result = runtime.block_on(checker.evaluate_batch_in_session_by_resource(
+                        &session,
+                        &subject,
+                        &action,
+                        resources.clone(),
+                        &ctx,
+                        |r| r,
+                    ));
+                    black_box(result)
+                });
+            },
+        );
+
+        // Hand-written Policy with a dynamic name — apples-to-apples
+        // with the builder shape, both pay the per-item dynamic-name
+        // allocation cost. Should isolate the cost/savings of the
+        // batch override itself.
+        group.bench_with_input(
+            BenchmarkId::new("manual_dynamic_serial_default", item_count),
+            &manual_dynamic_checker,
+            |b, checker| {
+                b.iter(|| {
+                    let session = EvaluationSession::empty();
+                    let result = runtime.block_on(checker.evaluate_batch_in_session_by_resource(
+                        &session,
+                        &subject,
+                        &action,
+                        resources.clone(),
+                        &ctx,
+                        |r| r,
+                    ));
+                    black_box(result)
+                });
+            },
+        );
+
+        // Hand-written Policy with a static name — sets the floor for
+        // what's achievable when the user can avoid the dynamic-name
+        // path entirely.
+        group.bench_with_input(
+            BenchmarkId::new("manual_static_serial_default", item_count),
+            &manual_static_checker,
+            |b, checker| {
+                b.iter(|| {
+                    let session = EvaluationSession::empty();
+                    let result = runtime.block_on(checker.evaluate_batch_in_session_by_resource(
+                        &session,
+                        &subject,
+                        &action,
+                        resources.clone(),
+                        &ctx,
+                        |r| r,
+                    ));
+                    black_box(result)
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_permission_checker,
     bench_in_ram_fact_source,
     bench_latency_fact_source,
-    bench_parallel_fact_state
+    bench_parallel_fact_state,
+    bench_subject_only_batch
 );
 criterion_main!(benches);

@@ -1,4 +1,4 @@
-use crate::{EvalCtx, Policy, PolicyEvalResult};
+use crate::{BatchEvalCtx, EvalCtx, Policy, PolicyEvalResult};
 use async_trait::async_trait;
 
 /// Represents the intended effect of a policy.
@@ -13,11 +13,37 @@ pub enum Effect {
 }
 
 /// An internal policy type (not exposed to API users) that is constructed via the builder.
+///
+/// Per-axis predicates are retained separately rather than collapsed into a
+/// single closure so [`Policy::evaluate_batch`] can short-circuit the batch-
+/// shared axes (subject and action) once instead of once per item. See the
+/// `evaluate_batch` impl below.
 struct InternalPolicy<S, R, A, C> {
     name: String,
     effect: Effect,
-    // The predicate returns true if all conditions pass.
-    predicate: Box<dyn Fn(&S, &A, &R, &C) -> bool + Send + Sync>,
+    subject_pred: Option<Box<dyn Fn(&S) -> bool + Send + Sync>>,
+    action_pred: Option<Box<dyn Fn(&A) -> bool + Send + Sync>>,
+    resource_pred: Option<Box<dyn Fn(&R) -> bool + Send + Sync>>,
+    context_pred: Option<Box<dyn Fn(&C) -> bool + Send + Sync>>,
+    when_pred: Option<Box<dyn Fn(&S, &A, &R, &C) -> bool + Send + Sync>>,
+}
+
+impl<S, R, A, C> InternalPolicy<S, R, A, C> {
+    /// Build the result a single evaluation would emit given the
+    /// combined predicate outcome.
+    fn build_result(&self, all_axes_pass: bool) -> PolicyEvalResult {
+        if all_axes_pass {
+            match self.effect {
+                Effect::Allow => PolicyEvalResult::granted(
+                    self.name.clone(),
+                    Some("Policy allowed access".into()),
+                ),
+                Effect::Deny => PolicyEvalResult::denied(self.name.clone(), "Policy denied access"),
+            }
+        } else {
+            PolicyEvalResult::denied(self.name.clone(), "Policy predicate did not match")
+        }
+    }
 }
 
 #[async_trait]
@@ -29,19 +55,70 @@ where
     C: Send + Sync,
 {
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
-        if (self.predicate)(ctx.subject, ctx.action, ctx.resource, ctx.context) {
-            match self.effect {
-                Effect::Allow => PolicyEvalResult::granted(
-                    self.name.clone(),
-                    Some("Policy allowed access".into()),
-                ),
-                Effect::Deny => PolicyEvalResult::denied(self.name.clone(), "Policy denied access"),
-            }
-        } else {
-            // Predicate didn't match – treat as non-applicable (denied).
-            PolicyEvalResult::denied(self.name.clone(), "Policy predicate did not match")
-        }
+        let pass = self.subject_pred.as_ref().is_none_or(|f| f(ctx.subject))
+            && self.action_pred.as_ref().is_none_or(|f| f(ctx.action))
+            && self.resource_pred.as_ref().is_none_or(|f| f(ctx.resource))
+            && self.context_pred.as_ref().is_none_or(|f| f(ctx.context))
+            && self
+                .when_pred
+                .as_ref()
+                .is_none_or(|f| f(ctx.subject, ctx.action, ctx.resource, ctx.context));
+        self.build_result(pass)
     }
+
+    /// Per-axis batch shortcut.
+    ///
+    /// [`BatchEvalCtx`] holds one subject and one action shared across every
+    /// item, so the `.subjects()` and `.actions()` predicates can be
+    /// evaluated once for the whole batch — if either rejects, the policy
+    /// cannot grant for any item, and we broadcast that single result
+    /// rather than re-running the closures `N` times. The win is the
+    /// reduced trace volume in [`PermissionChecker::evaluate_batch_in_session_by`]:
+    /// per-item `gatehouse::security` events collapse to one outcome for
+    /// the batch when the discriminating axis is subject- or action-only.
+    ///
+    /// Per-item axes (`.resources()`, `.context()`, `.when()`) still run
+    /// once per item, since they can vary across the batch.
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+    ) -> Vec<PolicyEvalResult> {
+        let n = ctx.items.len();
+
+        let subject_ok = self.subject_pred.as_ref().is_none_or(|f| f(ctx.subject));
+        let action_ok = self.action_pred.as_ref().is_none_or(|f| f(ctx.action));
+
+        if !subject_ok || !action_ok {
+            // Subject- or action-axis short-circuited. All items get the
+            // same predicate-mismatch denial; cloning the result is cheaper
+            // than re-running closures N times and avoids N trace leaves.
+            let result = self.build_result(false);
+            return std::iter::repeat_with(|| result.clone()).take(n).collect();
+        }
+
+        if self.resource_pred.is_none() && self.context_pred.is_none() && self.when_pred.is_none() {
+            // Nothing left to check per-item; subject+action passing is
+            // the whole predicate. Broadcast the grant/deny result.
+            let result = self.build_result(true);
+            return std::iter::repeat_with(|| result.clone()).take(n).collect();
+        }
+
+        // At least one per-item axis is configured; loop and apply only
+        // the remaining predicates (subject/action are known to pass).
+        ctx.items
+            .iter()
+            .map(|item| {
+                let resource_ok = self.resource_pred.as_ref().is_none_or(|f| f(item.resource));
+                let context_ok = self.context_pred.as_ref().is_none_or(|f| f(item.context));
+                let when_ok = self
+                    .when_pred
+                    .as_ref()
+                    .is_none_or(|f| f(ctx.subject, ctx.action, item.resource, item.context));
+                self.build_result(resource_ok && context_ok && when_ok)
+            })
+            .collect()
+    }
+
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Owned(self.name.clone())
     }
@@ -312,26 +389,20 @@ where
     }
 
     /// Build the policy. Returns a boxed policy that can be added to a PermissionChecker.
+    ///
+    /// Per-axis predicates are forwarded to the internal policy individually
+    /// so that [`Policy::evaluate_batch`] can short-circuit subject- and
+    /// action-axis checks once for the batch rather than re-evaluating them
+    /// per item.
     pub fn build(self) -> Box<dyn Policy<Subject, Resource, Action, Context>> {
-        let effect = self.effect;
-        let subject_pred = self.subject_pred;
-        let action_pred = self.action_pred;
-        let resource_pred = self.resource_pred;
-        let context_pred = self.context_pred;
-        let extra_condition = self.extra_condition;
-
-        let predicate = Box::new(move |s: &Subject, a: &Action, r: &Resource, c: &Context| {
-            subject_pred.as_ref().is_none_or(|f| f(s))
-                && action_pred.as_ref().is_none_or(|f| f(a))
-                && resource_pred.as_ref().is_none_or(|f| f(r))
-                && context_pred.as_ref().is_none_or(|f| f(c))
-                && extra_condition.as_ref().is_none_or(|f| f(s, a, r, c))
-        });
-
         Box::new(InternalPolicy {
             name: self.name,
-            effect,
-            predicate,
+            effect: self.effect,
+            subject_pred: self.subject_pred,
+            action_pred: self.action_pred,
+            resource_pred: self.resource_pred,
+            context_pred: self.context_pred,
+            when_pred: self.extra_condition,
         })
     }
 }

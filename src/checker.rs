@@ -259,20 +259,25 @@ where
 
         // Evaluate each policy
         for policy in &self.policies {
-            let policy_type = policy.policy_type();
+            // Move the policy's name straight into the EvalCtx rather than
+            // cloning, since for dynamic-name (`Cow::Owned`) policies the
+            // clone is a fresh `String` allocation we don't need: the same
+            // value is reachable through `ctx.policy_type` for telemetry,
+            // and the eventual `AccessEvaluation::Granted` consumes `ctx`
+            // by destructure on the grant branch.
             let ctx = EvalCtx {
                 session,
                 subject,
                 action,
                 resource,
                 context,
-                policy_type: policy_type.clone(),
+                policy_type: policy.policy_type(),
             };
             let result = policy.evaluate(&ctx).await;
             let result_passes = result.is_granted();
 
             // Extract metadata for tracing (always needed for security audit)
-            let policy_type_str: &str = policy_type.as_ref();
+            let policy_type_str: &str = ctx.policy_type.as_ref();
             let metadata = policy.security_rule();
             let reason = result.reason();
             let reason_str = reason.as_deref();
@@ -316,6 +321,9 @@ where
                     outcome: true,
                 };
 
+                // Destructure to move policy_type out of the EvalCtx
+                // without an extra clone.
+                let EvalCtx { policy_type, .. } = ctx;
                 return AccessEvaluation::Granted {
                     policy_type,
                     reason,

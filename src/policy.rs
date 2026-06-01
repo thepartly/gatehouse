@@ -40,26 +40,34 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     /// crate-level "When to populate the Context type" section and
     /// `examples/mfa_freshness_context.rs` for fuller treatment.
     pub context: &'a Context,
-    /// The current policy's [`Policy::policy_type`], captured once by the
-    /// checker before dispatch. Used by [`Self::grant`] / [`Self::deny`] so
-    /// policy bodies don't need to re-pass `self.policy_type()` on every
-    /// result.
+    /// The current policy's [`Policy::policy_type`], captured by the
+    /// checker before dispatch. On the single-item path
+    /// ([`crate::PermissionChecker::evaluate_in_session`]) the checker
+    /// captures it exactly once and moves it into this field; on the
+    /// batch path ([`crate::PermissionChecker::evaluate_batch_in_session_by`]
+    /// and siblings) the checker captures it once per policy and clones
+    /// it into each `BatchEvalCtx` chunk. Used by [`Self::grant`] /
+    /// [`Self::deny`] so policy bodies don't need to re-pass
+    /// `self.policy_type()` on every result.
     ///
     /// Stored as [`Cow<'static, str>`] so the shortcut path is truly
     /// zero-allocation for policies that return `Cow::Borrowed("Name")`
     /// (every built-in policy, and any user policy with a static name).
     ///
     /// Dynamic-name policies pay more on the helper path than a static-
-    /// name policy does. Per evaluation the checker calls
+    /// name policy does. On the single-item path the checker calls
     /// `policy.policy_type()` (alloc 1, the `String` inside the
-    /// `Cow::Owned`), clones that `Cow` into the `EvalCtx`
-    /// (alloc 2, since cloning a `Cow::Owned` clones the underlying
-    /// `String`), and then `ctx.grant` / `ctx.deny` clones it again
-    /// into the result (alloc 3). The shortcut path cannot avoid these
-    /// — `ctx.policy_type` is behind a shared `&EvalCtx` reference and
-    /// cannot be moved out. If allocation cost matters, return a
-    /// `Cow::Borrowed` from a `'static` name table so the whole chain
-    /// stays zero-allocation.
+    /// `Cow::Owned`) and moves the `Cow` straight into the `EvalCtx`,
+    /// and then `ctx.grant` / `ctx.deny` clones it into the result
+    /// (alloc 2). On the batch path the checker keeps the local
+    /// `Cow` alive across chunks and clones it into each
+    /// `BatchEvalCtx`, so the cost rises further with the number of
+    /// chunks the policy fans out over. The shortcut path cannot
+    /// avoid these — `ctx.policy_type` is behind a shared
+    /// `&EvalCtx` / `&BatchEvalCtx` reference and cannot be moved out
+    /// from inside the policy body. If allocation cost matters, return
+    /// a `Cow::Borrowed` from a `'static` name table so the whole
+    /// chain stays zero-allocation.
     pub policy_type: Cow<'static, str>,
 }
 
@@ -149,6 +157,19 @@ where
     Context: Sync,
 {
     /// Evaluates whether access should be granted.
+    ///
+    /// If the body does I/O whose result depends on subject- or
+    /// action-derived inputs but **not** on the resource (looking up
+    /// the subject's tenant, resolving an org → customer mapping, etc.),
+    /// don't call the backing service directly from inside `evaluate`
+    /// — every item in a list endpoint will repeat the same lookup.
+    /// Register a [`FactSource`](crate::FactSource) and consume it via
+    /// `ctx.session.get(key).await` so the request-scoped session
+    /// deduplicates and caches the result for the whole batch. See the
+    /// [`FactSource`](crate::FactSource) rustdoc for the
+    /// `(subject, scope) → resolved-id` pattern, which the built-in
+    /// [`RebacPolicy`](crate::RebacPolicy) generalises to relationship
+    /// facts.
     async fn evaluate(
         &self,
         ctx: &EvalCtx<'_, Subject, Resource, Action, Context>,
@@ -160,6 +181,16 @@ where
     /// each item sequentially. Policies with set-oriented backends can override
     /// this method to reduce round trips while returning one result per input
     /// item in the same order.
+    ///
+    /// **The serial default is intentional.** The trait cannot know your
+    /// concurrency budget, and `N` policies × `M` items run through
+    /// `join_all` can easily exhaust the connection pools your `FactSource`s
+    /// and downstream services depend on. If your batch work is genuinely
+    /// concurrent-safe, override `evaluate_batch` with the concurrency
+    /// shape your downstream limits allow: `futures::future::join_all` for
+    /// small fixed fan-outs, `FuturesUnordered` for streaming, a
+    /// semaphore-bounded variant for connection-pool-aware throughput.
+    /// Don't expect gatehouse to choose for you.
     ///
     /// The checker still evaluates policies in policy order, so batched
     /// evaluation can differ from a naive item-outer loop when later policies
@@ -193,8 +224,9 @@ where
     /// clone the [`Cow`] (which is a no-op for `Borrowed`).
     ///
     /// Dynamic-name policies return `Cow::Owned(self.name.clone())`
-    /// and pay one allocation here, plus two more on the
-    /// `ctx.grant` / `ctx.deny` helper path — see
+    /// and pay one allocation here, plus one more on the single-item
+    /// `ctx.grant` / `ctx.deny` helper path (the batch path also clones
+    /// into each `BatchEvalCtx` chunk) — see
     /// [`EvalCtx::policy_type`] for the full accounting. This is a
     /// regression from the pre-`Cow` trait shape where
     /// `policy_type(&self) -> &str` let dynamic names return
