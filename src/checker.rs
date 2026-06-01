@@ -108,6 +108,7 @@ use tracing::Instrument;
 /// hydrated row, so authorization is not smeared into the data layer.
 #[derive(Clone)]
 pub struct PermissionChecker<S, R, A, C> {
+    name: Option<std::borrow::Cow<'static, str>>,
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
     max_batch_size: Option<NonZeroUsize>,
 }
@@ -131,12 +132,36 @@ where
     A: Sync,
     C: Sync,
 {
-    /// Creates a new `PermissionChecker` with no policies.
+    /// Creates a new `PermissionChecker` with no policies and no name.
     pub fn new() -> Self {
         Self {
+            name: None,
             policies: Vec::new(),
             max_batch_size: None,
         }
+    }
+
+    /// Creates a new `PermissionChecker` tagged with a name.
+    ///
+    /// The name is recorded on the `evaluate_in_session` /
+    /// `evaluate_batch_in_session_*` tracing spans as `checker.name`, so
+    /// audit pipelines that route to multiple checkers (an `InvoiceChecker`
+    /// alongside a `ProductChecker`, for example) can disambiguate which
+    /// checker produced each evaluation when policy names are shared.
+    ///
+    /// `name` accepts `&'static str` (zero-allocation), `String`, or any
+    /// `Cow<'static, str>`-convertible value.
+    pub fn named(name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self {
+            name: Some(name.into()),
+            policies: Vec::new(),
+            max_batch_size: None,
+        }
+    }
+
+    /// Returns the checker's name if one was set via [`Self::named`].
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Sets the maximum number of pending items passed to a policy batch call.
@@ -205,7 +230,7 @@ where
     /// If every policy denies access, the top-level denial reason is the
     /// summary string `"All policies denied access"`. Inspect the trace for
     /// individual policy reasons.
-    #[tracing::instrument(skip_all, fields(policy_count = self.policies.len(), outcome = tracing::field::Empty, policy.type = tracing::field::Empty))]
+    #[tracing::instrument(skip_all, fields(checker.name = tracing::field::Empty, policy_count = self.policies.len(), outcome = tracing::field::Empty, policy.type = tracing::field::Empty))]
     pub async fn evaluate_in_session(
         &self,
         session: &EvaluationSession,
@@ -214,6 +239,9 @@ where
         resource: &R,
         context: &C,
     ) -> AccessEvaluation {
+        if let Some(name) = self.name.as_deref() {
+            tracing::Span::current().record("checker.name", name);
+        }
         if self.policies.is_empty() {
             tracing::Span::current().record("outcome", "denied");
             tracing::debug!("No policies configured");
@@ -367,7 +395,7 @@ where
     /// assert_eq!(visible.len(), 1);
     /// # });
     /// ```
-    #[tracing::instrument(skip_all, fields(item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
+    #[tracing::instrument(skip_all, fields(checker.name = tracing::field::Empty, item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
     pub async fn evaluate_batch_in_session_by<I, F>(
         &self,
         session: &EvaluationSession,
@@ -382,6 +410,9 @@ where
     {
         let items: Vec<I::Item> = items.into_iter().collect();
         let item_count = items.len();
+        if let Some(name) = self.name.as_deref() {
+            tracing::Span::current().record("checker.name", name);
+        }
         tracing::Span::current().record("item_count", item_count);
         if let Some(max_batch_size) = self.max_batch_size {
             tracing::Span::current().record("max_batch_size", max_batch_size.get());
