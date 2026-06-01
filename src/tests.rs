@@ -2881,6 +2881,77 @@ mod core_tests {
             "denied_reason should return the summary reason"
         );
     }
+
+    // --- Trace-aware helpers (assert_denied_by / assert_trace_contains) -
+
+    /// Checker with two denying policies so we can assert against a
+    /// specific one in the trace tree (the top-level summary won't
+    /// distinguish them).
+    fn multi_deny_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext>
+    {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(AlwaysDenyPolicy("first denial reason"));
+        // A second denying policy with the same `policy_type()` but a
+        // different reason, since AlwaysDenyPolicy is a tuple struct.
+        // (The tree-walker checks policy_type, not reason — what we're
+        // pinning is that it finds *any* matching leaf.)
+        let custom = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
+            "SupplierBlock",
+        )
+        .effect(Effect::Deny)
+        .build();
+        checker.add_policy(custom);
+        checker
+    }
+
+    #[tokio::test]
+    async fn assert_denied_by_finds_specific_leaf_in_multi_policy_trace() {
+        let evaluation = multi_deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        // Both child policies denied; either name should match.
+        evaluation.assert_denied_by("AlwaysDenyPolicy");
+        evaluation.assert_denied_by("SupplierBlock");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected a denying leaf for policy `NeverConsulted`")]
+    async fn assert_denied_by_panics_when_no_matching_leaf() {
+        let evaluation = multi_deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_denied_by("NeverConsulted");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "but access was granted")]
+    async fn assert_denied_by_panics_on_grant() {
+        let evaluation = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_denied_by("AlwaysDenyPolicy");
+    }
+
+    #[tokio::test]
+    async fn assert_trace_contains_matches_per_policy_reason() {
+        // The summary reason is "All policies denied access"; the
+        // per-policy reason "always denied" lives only in the trace
+        // tree. `assert_trace_contains` is the right hammer for that
+        // assertion.
+        let evaluation = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_trace_contains("always denied");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected evaluation trace to contain")]
+    async fn assert_trace_contains_panics_when_substring_absent() {
+        let evaluation = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        evaluation.assert_trace_contains("this string is not in the trace");
+    }
 }
 
 mod policy_builder_tests {

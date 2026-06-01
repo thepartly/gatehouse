@@ -234,6 +234,19 @@ pub enum AccessEvaluation {
     },
 }
 
+/// Walks a [`PolicyEvalResult`] tree looking for a `Denied` leaf whose
+/// `policy_type` equals `expected`. Used by
+/// [`AccessEvaluation::assert_denied_by`].
+fn leaf_denial_matches(node: &PolicyEvalResult, expected: &str) -> bool {
+    match node {
+        PolicyEvalResult::Denied { policy_type, .. } => policy_type.as_ref() == expected,
+        PolicyEvalResult::Granted { .. } => false,
+        PolicyEvalResult::Combined { children, .. } => children
+            .iter()
+            .any(|child| leaf_denial_matches(child, expected)),
+    }
+}
+
 impl AccessEvaluation {
     /// Whether access was granted
     pub fn is_granted(&self) -> bool {
@@ -316,7 +329,15 @@ impl AccessEvaluation {
     }
 
     /// Test helper: panic unless the evaluation is `Denied` and the
-    /// summary denial reason contains `needle`.
+    /// **top-level summary** denial reason contains `needle`.
+    ///
+    /// This matches the single string on [`AccessEvaluation::Denied`],
+    /// which is a summary like `"All policies denied access"` — *not*
+    /// the per-policy reasons inside the trace tree. For a typical
+    /// multi-policy checker, this means individual policy reasons such
+    /// as `"Suppliers cannot approve credit notes"` won't match here;
+    /// reach for [`Self::assert_trace_contains`] or [`Self::assert_denied_by`]
+    /// to inspect specific policies' denial reasons.
     ///
     /// Substring match keeps tests resilient to minor reason-string
     /// rewording. For exact-match assertions, inspect
@@ -327,7 +348,7 @@ impl AccessEvaluation {
             Self::Denied { reason, .. } => {
                 assert!(
                     reason.contains(needle),
-                    "expected denial reason to contain `{needle}`, got `{reason}`"
+                    "expected summary denial reason to contain `{needle}`, got `{reason}`"
                 );
             }
             Self::Granted { policy_type, .. } => {
@@ -336,6 +357,70 @@ impl AccessEvaluation {
                 );
             }
         }
+    }
+
+    /// Test helper: panic unless the evaluation is `Denied` and some
+    /// `Denied` leaf in the trace tree was produced by a policy whose
+    /// name matches `expected`.
+    ///
+    /// Symmetric with [`Self::assert_granted_by`] but walks the trace
+    /// rather than checking the top-level decision, because a denial
+    /// has no single denying policy: every policy in the checker has
+    /// to deny for the overall result to be `Denied`. Use this when you
+    /// want to assert "policy X actually fired and denied", regardless
+    /// of which other policies were consulted.
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # tokio_test::block_on(async {
+    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
+    /// # checker.add_policy(
+    /// #     PolicyBuilder::<(), (), (), ()>::new("StaffOnly")
+    /// #         .effect(Effect::Deny)
+    /// #         .build(),
+    /// # );
+    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// evaluation.assert_denied_by("StaffOnly");
+    /// # });
+    /// ```
+    #[track_caller]
+    pub fn assert_denied_by(&self, expected: &str) {
+        match self {
+            Self::Granted { policy_type, .. } => {
+                panic!(
+                    "expected denial by policy `{expected}`, but access was granted by `{policy_type}`"
+                );
+            }
+            Self::Denied { trace, .. } => {
+                let Some(root) = trace.root() else {
+                    panic!("expected denial by `{expected}`, but the trace is empty");
+                };
+                if !leaf_denial_matches(root, expected) {
+                    panic!(
+                        "expected a denying leaf for policy `{expected}` in the trace; \
+                         got:\n{}",
+                        trace.format()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test helper: panic unless `needle` appears anywhere in the
+    /// formatted evaluation trace.
+    ///
+    /// This is the "any policy reason" assertion: a denial's per-policy
+    /// reasons live in the trace, not on the top-level summary, so
+    /// matching against the formatted trace is how a test can claim
+    /// "some policy denied with this specific reason". Substring match
+    /// against the same string [`Self::display_trace`] produces.
+    #[track_caller]
+    pub fn assert_trace_contains(&self, needle: &str) {
+        let rendered = self.display_trace();
+        assert!(
+            rendered.contains(needle),
+            "expected evaluation trace to contain `{needle}`; got:\n{rendered}"
+        );
     }
 
     /// Converts the evaluation into a `Result`, mapping a denial into an error.
