@@ -11,6 +11,12 @@
 //! request — same answer for every invoice in a list endpoint — but
 //! the obvious shape calls the backend once per resource anyway.
 //!
+//! Identity note: there is no user-to-org translation in this file.
+//! A real app has already authenticated the request and built the
+//! Gatehouse subject, `Supplier { user_id, org_id }`. This policy uses
+//! `org_id` because the authorization question is org-scoped; `user_id`
+//! is present only to show where the caller identity would live.
+//!
 //! Run with:
 //!
 //! ```text
@@ -43,6 +49,11 @@ use uuid::Uuid;
 
 // ---- domain --------------------------------------------------------
 
+/// Authenticated caller plus the supplier organization they are acting for.
+///
+/// The example keeps `user_id` in the subject shape, but the rule below is
+/// deliberately organization-scoped: it asks whether this supplier org rolls
+/// up to the invoice customer.
 #[derive(Debug, Clone)]
 struct Supplier {
     #[allow(dead_code)]
@@ -118,9 +129,9 @@ impl Policy<Supplier, Invoice, ViewAction, ()> for WrongSupplierPolicy {
         let resolved = self.hierarchy.resolve_customer(ctx.subject.org_id).await;
         match resolved {
             Some(customer_id) if customer_id == ctx.resource.customer_id => {
-                ctx.grant("supplier's org bills under the invoice's customer")
+                ctx.grant("subject's supplier org bills under the invoice's customer")
             }
-            _ => ctx.deny("supplier's org does not bill under the invoice's customer"),
+            _ => ctx.deny("subject's supplier org does not bill under the invoice's customer"),
         }
     }
     fn policy_type(&self) -> Cow<'static, str> {
@@ -180,9 +191,9 @@ impl Policy<Supplier, Invoice, ViewAction, ()> for RightSupplierPolicy {
         // the same batch) hits the request-scoped cache.
         match ctx.session.get(CustomerForOrg(ctx.subject.org_id)).await {
             FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
-                ctx.grant("supplier's org bills under the invoice's customer")
+                ctx.grant("subject's supplier org bills under the invoice's customer")
             }
-            _ => ctx.deny("supplier's org does not bill under the invoice's customer"),
+            _ => ctx.deny("subject's supplier org does not bill under the invoice's customer"),
         }
     }
     fn policy_type(&self) -> Cow<'static, str> {

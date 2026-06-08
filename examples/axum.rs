@@ -1,5 +1,11 @@
-// Axum service that authorizes multiple resource types (Invoices, Payments)
-// using a single PermissionChecker. Demonstrates multiple policies and actions.
+// Axum service showing how Gatehouse fits into extractors, shared app state,
+// request-scoped sessions, and route handlers.
+//
+// This compact demo keeps invoices and payments behind one `Resource` enum so
+// the whole integration fits in one file. For a production service with many
+// unrelated resource types, prefer one `PermissionChecker` per resource type
+// and share cross-cutting policies (for example an admin override) across
+// those checkers.
 
 use async_trait::async_trait;
 use axum::{
@@ -166,8 +172,12 @@ pub enum Action {
     View,           // a generic "view" action
 }
 
-/// Two resource types in our app: invoices and payments. We wrap them
-/// in a single enum to share one PermissionChecker across different routes/resources.
+/// Two resource variants kept together for this compact web demo.
+///
+/// This is convenient for a small example, but it should not be read as the
+/// default modeling recommendation for large applications. In production, split
+/// unrelated resource types into separate checkers so each checker has a
+/// concrete `Resource` type.
 #[derive(Debug, Clone)]
 pub enum Resource {
     Invoice(Invoice),
@@ -480,9 +490,10 @@ fn payment_refund_policy() -> Box<dyn Policy<User, Resource, Action, RequestCont
     ))
 }
 
-/// (F) Combine all relevant policies into a single `PermissionChecker`.
+/// (F) Combine this demo's policies into a single `PermissionChecker`.
 ///     The checker uses OR semantics by default: if ANY policy returns Granted,
-///     the request is allowed.
+///     the request is allowed. Larger services usually keep one checker per
+///     resource type and register shared cross-cutting policies with each one.
 pub fn build_permission_checker() -> PermissionChecker<User, Resource, Action, RequestContext> {
     let mut checker = PermissionChecker::new();
 

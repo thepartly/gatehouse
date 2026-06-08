@@ -325,34 +325,48 @@ Fallback behavior when `security_rule()` is not overridden:
 
 ## Examples
 
-See the `examples` directory for complete demonstrations.
+See the `examples` directory for complete demonstrations. Most examples are
+self-contained and run with `cargo run --example <name>`. The web examples
+start local servers, and `pg18_bulk_rebac` needs a live PostgreSQL 18 database.
 
-**Start here, in order:**
+**Start here: policy mechanics**
 
 - `rbac_policy` — basic role-based access control with `PermissionChecker`.
 - `policy_builder` — attribute-style custom policies via `PolicyBuilder`.
 - `combinator_policy` — combining policies with `AndPolicy` / `OrPolicy` / `NotPolicy`.
 - `mfa_freshness_context` — when (and when not) to populate the `Context` generic. Grounds the concept in a high-value-refund / MFA-freshness decision.
 
-**Request-scoped fact loading (the v0.3 design):**
+**Then learn request-scoped facts and list endpoints**
 
+- `factsource_n_plus_one` — contrastive teaching artifact: the obvious "hold an `Arc<Backend>` on the policy and call it directly" shape pays N redundant backend calls per batch; registering the lookup as a `FactSource` collapses it to one. Prints actual call counts so the lesson is visible.
 - `rebac_policy` — relationship-based access control through a registered `FactSource`.
 - `in_ram_rebac` — `FactSource` shared across sessions, with in-RAM relationship facts.
-- `pg18_bulk_rebac` — the same boundary backed by PostgreSQL, with one batched `WITH ORDINALITY` query per request.
-- `factsource_n_plus_one` — contrastive teaching artifact: the obvious "hold an `Arc<Backend>` on the policy and call it directly" shape pays N redundant backend calls per batch; registering the lookup as a `FactSource` collapses it to one. Prints actual call counts so the lesson is visible.
 - `lookup_in_ram` — `LookupSource` + `Hydrator` for "what can this subject see?" list endpoints.
 
-**Composition and integrations:**
+**Then try composition and web integrations**
 
 - `groups_policy` — multiple policies composed for group-management authorization, with trace output.
 - `axum` — Axum integration with shared policies, app state, request-scoped sessions, and a bulk invoice listing endpoint.
 - `actix_web` — Actix Web integration with shared policies.
 
-Run with:
+**Advanced database-backed example**
+
+- `pg18_bulk_rebac` — the same `FactSource` boundary backed by PostgreSQL 18, with one batched `WITH ORDINALITY` query per request. Use it after the in-memory fact examples if you want to validate the SQL-backed performance shape on a real database.
+
+Run a self-contained example with:
 
 ```shell
 cargo run --example rbac_policy
 ```
+
+Run a server example with:
+
+```shell
+cargo run --example axum
+```
+
+Then send requests to `http://127.0.0.1:8000`; `actix_web` listens on
+`http://127.0.0.1:8080`.
 
 ## Performance
 
@@ -362,7 +376,13 @@ your policy definitions.
 
 The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source itself is hot and in-process; it is not a benchmark for network or database latency. The `latency_fact_source` group injects a fixed async delay per source call so the benchmarks also show the intended shape under backend latency: N per-item sessions versus one batched session, and independent repeated loads versus shared-session in-flight coalescing.
 
-The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_in_session_by_resource`:
+The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_in_session_by_resource`.
+
+This example is intentionally outside the quick-start path: it creates and
+seeds a table, requires PostgreSQL 18, and reads `DATABASE_URL`. If
+`DATABASE_URL` is unset, it tries `host=localhost port=15432 user=postgres
+password=test dbname=awa_test`, so set the variable explicitly unless your
+local database matches that default:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
