@@ -169,7 +169,7 @@ async fn main() {
 
     let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
         .await
-        .expect("connect to PostgreSQL 18");
+        .expect("connect to PostgreSQL");
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             eprintln!("postgres connection error: {error}");

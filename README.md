@@ -327,7 +327,7 @@ Fallback behavior when `security_rule()` is not overridden:
 
 See the `examples` directory for complete demonstrations. Most examples are
 self-contained and run with `cargo run --example <name>`. The web examples
-start local servers, and `pg18_bulk_rebac` needs a live PostgreSQL 18 database.
+start local servers, and `pg18_bulk_rebac` needs a live PostgreSQL database.
 
 **Start here: policy mechanics**
 
@@ -351,7 +351,7 @@ start local servers, and `pg18_bulk_rebac` needs a live PostgreSQL 18 database.
 
 **Advanced database-backed example**
 
-- `pg18_bulk_rebac` — the same `FactSource` boundary backed by PostgreSQL 18, with one batched `WITH ORDINALITY` query per request. Use it after the in-memory fact examples if you want to validate the SQL-backed performance shape on a real database.
+- `pg18_bulk_rebac` — the same `FactSource` boundary backed by PostgreSQL, with one batched `WITH ORDINALITY` query per request. Use it after the in-memory fact examples if you want to validate the SQL-backed performance shape on a real database. It is named for the PostgreSQL 18 environment used for local validation.
 
 Run a self-contained example with:
 
@@ -379,7 +379,9 @@ The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead w
 The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_in_session_by_resource`.
 
 This example is intentionally outside the quick-start path: it creates and
-seeds a table, requires PostgreSQL 18, and reads `DATABASE_URL`. If
+seeds a table, expects a live PostgreSQL database, and reads `DATABASE_URL`.
+It was tested and benchmarked with PostgreSQL 18; the SQL is intentionally
+ordinary PostgreSQL, so older supported versions may also work. If
 `DATABASE_URL` is unset, it tries `host=localhost port=15432 user=postgres
 password=test dbname=awa_test`, so set the variable explicitly unless your
 local database matches that default:
