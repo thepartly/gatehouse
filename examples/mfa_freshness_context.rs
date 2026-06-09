@@ -18,7 +18,7 @@
 //! resource, different calls → different decisions.
 
 use async_trait::async_trait;
-use gatehouse::{EvalCtx, PermissionChecker, Policy, PolicyEvalResult};
+use gatehouse::{AccessEvaluation, EvalCtx, PermissionChecker, Policy, PolicyEvalResult};
 use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -189,14 +189,14 @@ async fn main() {
     let r = checker
         .check(&alice, &Approve, &small_refund, &small_no_mfa)
         .await;
-    println!("small refund, no MFA → {}", verdict(&r));
+    report("small refund, no MFA", &r);
     assert!(r.is_granted());
 
     // Case 2: large refund, no MFA. Denied by the freshness rule.
     let r = checker
         .check(&alice, &Approve, &large_refund, &small_no_mfa)
         .await;
-    println!("large refund, no MFA → {}", verdict(&r));
+    report("large refund, no MFA", &r);
     assert!(!r.is_granted());
 
     // Case 3: large refund, MFA reasserted 8 minutes ago. Stale.
@@ -205,7 +205,7 @@ async fn main() {
         mfa_verified_at: Some(now - Duration::from_secs(8 * 60)),
     };
     let r = checker.check(&alice, &Approve, &large_refund, &stale).await;
-    println!("large refund, MFA 8m old → {}", verdict(&r));
+    report("large refund, MFA 8m old", &r);
     assert!(!r.is_granted());
 
     // Case 4: large refund, MFA reasserted 30 seconds ago. Granted.
@@ -214,7 +214,7 @@ async fn main() {
         mfa_verified_at: Some(now - Duration::from_secs(30)),
     };
     let r = checker.check(&alice, &Approve, &large_refund, &fresh).await;
-    println!("large refund, MFA 30s old → {}", verdict(&r));
+    report("large refund, MFA 30s old", &r);
     assert!(r.is_granted());
 
     // The point: cases 2-4 all use the same subject and resource. The
@@ -223,7 +223,20 @@ async fn main() {
     // RefundRequest.
 }
 
-fn verdict(eval: &gatehouse::AccessEvaluation) -> &'static str {
+/// Print the verdict and the decision trace. The trace is where the freshness
+/// reason ("MFA reasserted 480s ago, exceeds freshness window of 300s") shows
+/// up — the deciding policy puts it there, and it is the whole point of the
+/// `Context` data flowing through.
+fn report(label: &str, eval: &AccessEvaluation) {
+    let trace = match eval {
+        AccessEvaluation::Granted { trace, .. } | AccessEvaluation::Denied { trace, .. } => {
+            trace.format()
+        }
+    };
+    println!("{label} → {}\n{trace}", verdict(eval));
+}
+
+fn verdict(eval: &AccessEvaluation) -> &'static str {
     if eval.is_granted() {
         "GRANTED"
     } else {

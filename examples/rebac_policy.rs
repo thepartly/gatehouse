@@ -34,9 +34,6 @@ struct Project {
 struct EditAction;
 
 #[derive(Debug, Clone)]
-struct EmptyContext;
-
-#[derive(Debug, Clone)]
 struct ProjectRelationshipSource {
     relationships: HashSet<RelationshipQuery<Uuid, Uuid, String>>,
     fail: bool,
@@ -130,7 +127,7 @@ async fn main() {
         ))
         .build();
 
-    let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
+    let mut checker = PermissionChecker::<User, Project, EditAction, ()>::new();
     checker.add_policy(RebacPolicy::new(
         |user: &User| user.id,
         |project: &Project| project.id,
@@ -160,12 +157,12 @@ async fn main() {
 }
 
 async fn test_access(
-    checker: &PermissionChecker<User, Project, EditAction, EmptyContext>,
+    checker: &PermissionChecker<User, Project, EditAction, ()>,
     session: &EvaluationSession,
     user: &User,
     project: &Project,
 ) {
-    let context = EmptyContext;
+    let context = ();
     let action = EditAction;
 
     println!("\nChecking if {} can edit {}:", user.name, project.name);
@@ -266,14 +263,14 @@ async fn enum_relationship_example() {
         })
         .build();
 
-    let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
+    let mut checker = PermissionChecker::<User, Project, EditAction, ()>::new();
     checker.add_policy(RebacPolicy::new(
         |user: &User| user.id,
         |project: &Project| project.id,
         Relation::Owner,
     ));
 
-    let context = EmptyContext;
+    let context = ();
     let action = EditAction;
 
     for (user, expected_granted, role) in [

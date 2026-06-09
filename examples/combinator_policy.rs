@@ -38,9 +38,6 @@ impl Document {
 #[derive(Debug, Clone)]
 struct ViewAction;
 
-#[derive(Debug, Clone)]
-struct EmptyContext;
-
 // A policy that records when it's evaluated
 struct CountingPolicy {
     allow: bool,
@@ -49,10 +46,10 @@ struct CountingPolicy {
 }
 
 #[async_trait]
-impl Policy<User, Document, ViewAction, EmptyContext> for CountingPolicy {
+impl Policy<User, Document, ViewAction, ()> for CountingPolicy {
     async fn evaluate(
         &self,
-        ctx: &EvalCtx<'_, User, Document, ViewAction, EmptyContext>,
+        ctx: &EvalCtx<'_, User, Document, ViewAction, ()>,
     ) -> PolicyEvalResult {
         // Increment evaluation counter
         self.counter.fetch_add(1, Ordering::SeqCst);
@@ -75,7 +72,7 @@ async fn main() {
     let user = User::new();
     let document = Document::new();
     let action = ViewAction;
-    let context = EmptyContext;
+    let context = ();
     // These policies have no fact sources, so we add each combinator to a
     // `PermissionChecker` and call `check` — the everyday RBAC/ABAC entry point,
     // with no `EvaluationSession` to thread through. The checker contributes its

@@ -28,9 +28,6 @@ struct Document {
 #[derive(Debug, Clone)]
 struct ReadAction;
 
-#[derive(Debug, Clone)]
-struct EmptyContext;
-
 #[tokio::main]
 async fn main() {
     println!("=== RBAC Policy Example ===\n");
@@ -105,7 +102,7 @@ async fn main() {
     );
 
     // Create a strongly typed permission checker and add our RBAC policy
-    let mut checker = PermissionChecker::<User, Document, ReadAction, EmptyContext>::new();
+    let mut checker = PermissionChecker::<User, Document, ReadAction, ()>::new();
     checker.add_policy(rbac_policy);
 
     println!("=== Testing Access Control ===\n");
@@ -184,13 +181,13 @@ async fn main() {
 }
 
 async fn test_access(
-    checker: &PermissionChecker<User, Document, ReadAction, EmptyContext>,
+    checker: &PermissionChecker<User, Document, ReadAction, ()>,
     user_desc: &str,
     user: &User,
     doc_desc: &str,
     doc: &Document,
 ) {
-    let context = EmptyContext;
+    let context = ();
     let action = ReadAction;
 
     let result = checker.check(user, &action, doc, &context).await;

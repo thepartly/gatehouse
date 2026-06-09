@@ -159,11 +159,16 @@ impl FactKey for CustomerForOrg {
 /// call counter measures the same thing as the WRONG path.
 struct CustomerForOrgSource {
     hierarchy: Arc<HierarchyService>,
+    /// Counts how many times the session invokes `load_many`. This is the
+    /// *batching* lesson, distinct from the backend call count: 25 invoices
+    /// produce one `load_many` call (covering the unique key set), not 25.
+    load_many_calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
 impl FactSource<CustomerForOrg> for CustomerForOrgSource {
     async fn load_many(&self, keys: &[CustomerForOrg]) -> Vec<FactLoadResult<Option<Uuid>>> {
+        self.load_many_calls.fetch_add(1, Ordering::SeqCst);
         // The session has already deduplicated; `keys` are unique.
         // For the example we just loop, but a real source would issue
         // one SQL query / DataLoader batch covering every key.
@@ -260,9 +265,11 @@ async fn main() {
     right_checker.add_policy(RightSupplierPolicy);
 
     hierarchy.reset();
+    let load_many_calls = Arc::new(AtomicUsize::new(0));
     let session = EvaluationSession::builder()
         .with_arc::<CustomerForOrg>(Arc::new(CustomerForOrgSource {
             hierarchy: Arc::clone(&hierarchy),
+            load_many_calls: Arc::clone(&load_many_calls),
         }))
         .build();
     let visible = right_checker
@@ -276,14 +283,20 @@ async fn main() {
         )
         .await;
     let right_calls = hierarchy.calls();
+    let batch_calls = load_many_calls.load(Ordering::SeqCst);
     println!(
-        "[right] {} invoices ->  {} hierarchy lookup  (deduped through the session)",
+        "[right] {} invoices ->  {} hierarchy lookup  ({} batched load_many call, deduped through the session)",
         visible.len(),
         right_calls,
+        batch_calls,
     );
     assert_eq!(
         right_calls, 1,
         "the session deduplicates: one supplier_org, one backend call",
+    );
+    assert_eq!(
+        batch_calls, 1,
+        "the session batches: one load_many call covering the unique key set",
     );
     assert_eq!(visible.len(), 25);
 }

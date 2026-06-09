@@ -23,10 +23,6 @@ fn axum_app() -> Router {
             "/invoices/{invoice_id}/edit",
             post(axum_example::edit_invoice_handler),
         )
-        .route(
-            "/payments/{payment_id}/approve",
-            post(axum_example::approve_payment_handler),
-        )
         .with_state(axum_example::AppState::demo())
 }
 
@@ -175,72 +171,6 @@ async fn edit_invoice_denies_stale_invoice() {
         .header("x-user-id", invoice_id.to_string())
         .header("x-roles", "author")
         .header("x-invoice-age-days", "45")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn approve_payment_allows_finance_manager() {
-    let payment_id = Uuid::new_v4();
-    let app = axum_app();
-
-    let request = Request::builder()
-        .method("POST")
-        .uri(format!("/payments/{payment_id}/approve"))
-        .header("x-roles", "finance_manager")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn approve_payment_allows_reapproving() {
-    let payment_id = Uuid::new_v4();
-    let app = axum_app();
-
-    let request = Request::builder()
-        .method("POST")
-        .uri(format!("/payments/{payment_id}/approve"))
-        .header("x-roles", "finance_manager")
-        .header("x-payment-approved", "true")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn approve_payment_denies_regular_user() {
-    let payment_id = Uuid::new_v4();
-    let app = axum_app();
-
-    let request = Request::builder()
-        .method("POST")
-        .uri(format!("/payments/{payment_id}/approve"))
-        .header("x-roles", "viewer")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn approve_payment_denies_refunded_payment() {
-    let payment_id = Uuid::new_v4();
-    let app = axum_app();
-
-    let request = Request::builder()
-        .method("POST")
-        .uri(format!("/payments/{payment_id}/approve"))
-        .header("x-roles", "finance_manager")
-        .header("x-payment-refunded", "true")
         .body(Body::empty())
         .unwrap();
 

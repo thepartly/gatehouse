@@ -5,13 +5,18 @@
 ### Added
 
 - `examples/deny_override.rs` — demonstrates "deny overrides allow" (account suspensions, legal holds). Contrasts the tempting mistake (adding a deny policy to the `OR`-based `PermissionChecker`, which never vetoes) against the working shape: gating the allow set behind `NotPolicy(blocklist)` under `AndPolicy`. Prints a wrong/right verdict table and the decision trace.
+- `examples/delegating_policy.rs` — demonstrates `DelegatingPolicy` cross-domain delegation: a comment-moderation rule defers to the document domain's `PermissionChecker` ("you may edit a comment if you may edit its document"), with the trace crossing the domain boundary.
 
 ### Changed
 
 - Renamed the `pg18_bulk_rebac` example to `postgres_bulk_rebac`. The SQL is ordinary PostgreSQL (`unnest … WITH ORDINALITY`, `bool_or`, an unlogged table); it was developed and benchmarked against PostgreSQL 18 but does not require it. README references and the example progression updated to match.
+- Reworked `examples/actix_web.rs` into a fact-backed integration: shared `AppState` owns a relationship `FactSource`, each request builds its own `EvaluationSession`, a collaborator (`editor`) relationship gates view/edit, and a batched `GET /posts` list endpoint demonstrates `filter_authorized_in_session_by_resource`. Denials route through a documented `forbidden` helper flagging trace echo as demo-only.
+- Trimmed `examples/axum.rs` to a single resource type (invoices), removing the payments half and the `Resource` enum. One resource type means one checker is the correct shape, so the example no longer models the multi-type-behind-one-enum arrangement the docs caution against. Integration tests updated accordingly.
 - `examples/combinator_policy.rs` now drives its `AndPolicy` / `OrPolicy` combinators through `PermissionChecker::check` instead of hand-building an `EvalCtx`, matching the public RBAC/ABAC entry point used by the other examples. Short-circuit assertions are unchanged.
 - `examples/in_ram_rebac.rs` now prints the single-resource denial and the per-request results of the concurrent batch (previously silent assertions), so `cargo run` shows what the example verifies.
-- `examples/actix_web.rs` denial responses route through a documented `forbidden` helper that flags echoing evaluation traces to clients as a demo-only convenience, not a production pattern.
+- `examples/mfa_freshness_context.rs` now prints the decision trace per case, surfacing the freshness reason strings ("MFA reasserted 480s ago, exceeds freshness window") that the policy builds.
+- `examples/factsource_n_plus_one.rs` now counts and asserts `load_many` invocations (one batched source call), making the batching lesson explicit alongside the existing backend-call (dedup) count.
+- Standardized the genuinely-empty `Context` generic on `()` across `rbac_policy`, `combinator_policy`, `rebac_policy`, `in_ram_rebac`, and `lookup_in_ram` (previously a mix of `EmptyContext`, `RequestContext`, and `RequestCtx`); examples with real per-request data keep a context struct.
 
 ### Removed
 

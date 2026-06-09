@@ -335,6 +335,7 @@ start local servers, and `postgres_bulk_rebac` needs a live PostgreSQL database.
 - `policy_builder` — attribute-style custom policies via `PolicyBuilder`.
 - `combinator_policy` — combining policies with `AndPolicy` / `OrPolicy` / `NotPolicy`.
 - `deny_override` — enforce "deny overrides allow" (account suspensions, legal holds) by gating the allow set behind `NOT(blocklist)` under `AND`. Shows why adding a deny policy straight to the `OR`-based checker does not block anything.
+- `delegating_policy` — defer a decision to another domain's `PermissionChecker` with `DelegatingPolicy` (comment moderation inheriting document edit rights), keeping the trace across the boundary.
 - `mfa_freshness_context` — when (and when not) to populate the `Context` generic. Grounds the concept in a high-value-refund / MFA-freshness decision.
 
 **Then learn request-scoped facts and list endpoints**
@@ -346,8 +347,8 @@ start local servers, and `postgres_bulk_rebac` needs a live PostgreSQL database.
 
 **Then wire it into a web framework**
 
-- `axum` — Axum integration with shared policies, app state, request-scoped sessions, and a bulk invoice listing endpoint.
-- `actix_web` — Actix Web integration with shared policies.
+- `axum` — Axum integration over a single resource type (invoices): custom extractors, shared app state, per-request sessions, a `viewer` relationship `FactSource`, and a batched list endpoint.
+- `actix_web` — Actix Web integration over blog posts: a collaborator (`editor`) relationship loaded through per-request sessions, plus a batched list endpoint.
 
 **Advanced database-backed example**
 

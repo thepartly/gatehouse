@@ -31,9 +31,6 @@ struct Document {
 #[derive(Debug, Clone)]
 struct View;
 
-#[derive(Debug, Clone)]
-struct RequestContext;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Relation {
     Viewer,
@@ -79,7 +76,7 @@ fn request_session(relationships: &Arc<dyn FactSource<RelationshipKey>>) -> Eval
         .build()
 }
 
-fn build_checker() -> PermissionChecker<User, Document, View, RequestContext> {
+fn build_checker() -> PermissionChecker<User, Document, View, ()> {
     let mut checker = PermissionChecker::new();
     checker.add_policy(RebacPolicy::new(
         |user: &User| user.id,
@@ -117,7 +114,7 @@ async fn main() {
     let relationships: Arc<dyn FactSource<RelationshipKey>> = store;
 
     let checker = build_checker();
-    let context = RequestContext;
+    let context = ();
 
     let first_request = request_session(&relationships);
     let visible = checker
@@ -164,7 +161,7 @@ async fn main() {
             let relationships = Arc::clone(&shared);
             tokio::spawn(async move {
                 let session = request_session(&relationships);
-                let context = RequestContext;
+                let context = ();
                 checker
                     .filter_authorized_in_session_by_resource(
                         &session,
