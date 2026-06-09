@@ -20,7 +20,7 @@
 //   -H "x-user-id: 11111111-1111-1111-1111-111111111111"
 //
 // # A collaborator (editor relationship) edits a draft they did not author
-// curl -i -X PUT http://127.0.0.1:8080/posts/11111111-1111-1111-1111-111111111111 \
+// curl -i -X PUT http://127.0.0.1:8080/posts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa \
 //   -H "x-user-id: 22222222-2222-2222-2222-222222222222"
 //
 // # Anyone can view a published post
