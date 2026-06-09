@@ -76,8 +76,11 @@ async fn main() {
     let document = Document::new();
     let action = ViewAction;
     let context = EmptyContext;
-    // RBAC-only example: no fact sources, so the empty session is enough.
-    let session = EvaluationSession::empty();
+    // These policies have no fact sources, so we add each combinator to a
+    // `PermissionChecker` and call `check` — the everyday RBAC/ABAC entry point,
+    // with no `EvaluationSession` to thread through. The checker contributes its
+    // own `OR` root to the trace; the combinator's short-circuit behaviour (what
+    // this example measures) happens inside it regardless.
 
     println!("=== AND Policy Short-Circuit Example ===");
     {
@@ -98,17 +101,11 @@ async fn main() {
         ])
         .expect("Unable to create and-policy policy");
 
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(and_policy);
+
         println!("Evaluating AND(DenyFirst, AllowSecond):");
-        let result = and_policy
-            .evaluate(&EvalCtx {
-                session: &session,
-                subject: &user,
-                action: &action,
-                resource: &document,
-                context: &context,
-                policy_type: and_policy.policy_type(),
-            })
-            .await;
+        let result = checker.check(&user, &action, &document, &context).await;
         println!(
             "Result: {}",
             if result.is_granted() {
@@ -118,7 +115,7 @@ async fn main() {
             }
         );
         println!("Policies evaluated: {}", counter.load(Ordering::SeqCst));
-        println!("Trace:\n{}", result.format(0));
+        println!("Trace:\n{}", trace_of(&result));
 
         // The second policy should not be evaluated due to short-circuiting
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -143,17 +140,11 @@ async fn main() {
         ])
         .expect("Unable to create or-policy policy");
 
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(or_policy);
+
         println!("Evaluating OR(AllowFirst, DenySecond):");
-        let result = or_policy
-            .evaluate(&EvalCtx {
-                session: &session,
-                subject: &user,
-                action: &action,
-                resource: &document,
-                context: &context,
-                policy_type: or_policy.policy_type(),
-            })
-            .await;
+        let result = checker.check(&user, &action, &document, &context).await;
         println!(
             "Result: {}",
             if result.is_granted() {
@@ -163,7 +154,7 @@ async fn main() {
             }
         );
         println!("Policies evaluated: {}", counter.load(Ordering::SeqCst));
-        println!("Trace:\n{}", result.format(0));
+        println!("Trace:\n{}", trace_of(&result));
 
         // The second policy should not be evaluated due to short-circuiting
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -198,17 +189,11 @@ async fn main() {
         ])
         .expect("Unable to create or-policy policy");
 
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(complex_policy);
+
         println!("Evaluating OR(AND(DenyInner, AllowInner), AllowOuter):");
-        let result = complex_policy
-            .evaluate(&EvalCtx {
-                session: &session,
-                subject: &user,
-                action: &action,
-                resource: &document,
-                context: &context,
-                policy_type: complex_policy.policy_type(),
-            })
-            .await;
+        let result = checker.check(&user, &action, &document, &context).await;
         println!(
             "Result: {} for document with ID {} for user with ID {}",
             if result.is_granted() {
@@ -220,10 +205,21 @@ async fn main() {
             user.id
         );
         println!("Policies evaluated: {}", counter.load(Ordering::SeqCst));
-        println!("Trace:\n{}", result.format(0));
+        println!("Trace:\n{}", trace_of(&result));
 
         // The inner AND should evaluate only DenyInner (shorts-circuit),
         // then the OR continues to AllowOuter which grants access
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+}
+
+/// Render just the decision-trace tree (without the summary line that
+/// `display_trace` prepends), so each block above can print it under its own
+/// "Trace:" heading.
+fn trace_of(result: &AccessEvaluation) -> String {
+    match result {
+        AccessEvaluation::Granted { trace, .. } | AccessEvaluation::Denied { trace, .. } => {
+            trace.format()
+        }
     }
 }

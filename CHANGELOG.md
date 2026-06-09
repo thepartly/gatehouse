@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- `examples/deny_override.rs` — demonstrates "deny overrides allow" (account suspensions, legal holds). Contrasts the tempting mistake (adding a deny policy to the `OR`-based `PermissionChecker`, which never vetoes) against the working shape: gating the allow set behind `NotPolicy(blocklist)` under `AndPolicy`. Prints a wrong/right verdict table and the decision trace.
+
+### Changed
+
+- Renamed the `pg18_bulk_rebac` example to `postgres_bulk_rebac`. The SQL is ordinary PostgreSQL (`unnest … WITH ORDINALITY`, `bool_or`, an unlogged table); it was developed and benchmarked against PostgreSQL 18 but does not require it. README references and the example progression updated to match.
+- `examples/combinator_policy.rs` now drives its `AndPolicy` / `OrPolicy` combinators through `PermissionChecker::check` instead of hand-building an `EvalCtx`, matching the public RBAC/ABAC entry point used by the other examples. Short-circuit assertions are unchanged.
+- `examples/in_ram_rebac.rs` now prints the single-resource denial and the per-request results of the concurrent batch (previously silent assertions), so `cargo run` shows what the example verifies.
+- `examples/actix_web.rs` denial responses route through a documented `forbidden` helper that flags echoing evaluation traces to clients as a demo-only convenience, not a production pattern.
+
+### Removed
+
+- `examples/groups_policy.rs`, whose policy-composition and trace-reading concepts are already covered by `combinator_policy` and `policy_builder`.
+
 ## [0.3.0] - 2026-06-02
 
 First stable release of the v0.3 line. v0.3 consolidates around request-scoped fact loading: relationship data is loaded through an `EvaluationSession` registered with a `FactSource` instead of policy-owned `RelationshipResolver`s, list endpoints batch and deduplicate without leaking policy logic into the data layer, and the trait surface tightens around `Cow<'static, str>` policy names with `ctx.grant` / `ctx.deny` shortcuts.

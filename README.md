@@ -222,7 +222,7 @@ If the leader task for an in-flight fact load is cancelled or panics, the sessio
 
 `RebacPolicy` is the first built-in fact-backed policy. It extracts subject/resource IDs, builds `RelationshipQuery<SubjectId, ResourceId, Relation>` keys, and asks the session for those relationship facts.
 
-Use a typed relation enum when your domain has a fixed relation set, even if the backing store uses strings. The `EvaluationSession` deduplicates and caches by the typed `RelationshipQuery`; the `FactSource` owns the backend boundary and can convert `Relation::Viewer` to `"viewer"` when binding SQL parameters. The `pg18_bulk_rebac` example demonstrates this pattern against a PostgreSQL `text` column.
+Use a typed relation enum when your domain has a fixed relation set, even if the backing store uses strings. The `EvaluationSession` deduplicates and caches by the typed `RelationshipQuery`; the `FactSource` owns the backend boundary and can convert `Relation::Viewer` to `"viewer"` when binding SQL parameters. The `postgres_bulk_rebac` example demonstrates this pattern against a PostgreSQL `text` column.
 
 If several relationship domains all look like `Uuid -> Uuid`, prefer one domain relation enum and dispatch inside the corresponding `FactSource`. If you need separate source registrations, wrap IDs in domain newtypes so each `RelationshipQuery<SubjectId, ResourceId, Relation>` has a distinct Rust type.
 
@@ -327,13 +327,14 @@ Fallback behavior when `security_rule()` is not overridden:
 
 See the `examples` directory for complete demonstrations. Most examples are
 self-contained and run with `cargo run --example <name>`. The web examples
-start local servers, and `pg18_bulk_rebac` needs a live PostgreSQL database.
+start local servers, and `postgres_bulk_rebac` needs a live PostgreSQL database.
 
 **Start here: policy mechanics**
 
 - `rbac_policy` — basic role-based access control with `PermissionChecker`.
 - `policy_builder` — attribute-style custom policies via `PolicyBuilder`.
 - `combinator_policy` — combining policies with `AndPolicy` / `OrPolicy` / `NotPolicy`.
+- `deny_override` — enforce "deny overrides allow" (account suspensions, legal holds) by gating the allow set behind `NOT(blocklist)` under `AND`. Shows why adding a deny policy straight to the `OR`-based checker does not block anything.
 - `mfa_freshness_context` — when (and when not) to populate the `Context` generic. Grounds the concept in a high-value-refund / MFA-freshness decision.
 
 **Then learn request-scoped facts and list endpoints**
@@ -343,15 +344,14 @@ start local servers, and `pg18_bulk_rebac` needs a live PostgreSQL database.
 - `in_ram_rebac` — `FactSource` shared across sessions, with in-RAM relationship facts.
 - `lookup_in_ram` — `LookupSource` + `Hydrator` for "what can this subject see?" list endpoints.
 
-**Then try composition and web integrations**
+**Then wire it into a web framework**
 
-- `groups_policy` — multiple policies composed for group-management authorization, with trace output.
 - `axum` — Axum integration with shared policies, app state, request-scoped sessions, and a bulk invoice listing endpoint.
 - `actix_web` — Actix Web integration with shared policies.
 
 **Advanced database-backed example**
 
-- `pg18_bulk_rebac` — the same `FactSource` boundary backed by PostgreSQL, with one batched `WITH ORDINALITY` query per request. Use it after the in-memory fact examples if you want to validate the SQL-backed performance shape on a real database. It is named for the PostgreSQL 18 environment used for local validation.
+- `postgres_bulk_rebac` — the same `FactSource` boundary backed by PostgreSQL, with one batched `WITH ORDINALITY` query per request. Use it after the in-memory fact examples if you want to validate the SQL-backed performance shape on a real database. The SQL is ordinary PostgreSQL; it was developed and benchmarked against PostgreSQL 18.
 
 Run a self-contained example with:
 
@@ -376,7 +376,7 @@ your policy definitions.
 
 The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source itself is hot and in-process; it is not a benchmark for network or database latency. The `latency_fact_source` group injects a fixed async delay per source call so the benchmarks also show the intended shape under backend latency: N per-item sessions versus one batched session, and independent repeated loads versus shared-session in-flight coalescing.
 
-The `pg18_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` using PostgreSQL 18. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_in_session_by_resource`.
+The `postgres_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource`. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_in_session_by_resource`.
 
 This example is intentionally outside the quick-start path: it creates and
 seeds a table, expects a live PostgreSQL database, and reads `DATABASE_URL`.
@@ -388,7 +388,7 @@ local database matches that default:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
-  cargo run --example pg18_bulk_rebac --release
+  cargo run --example postgres_bulk_rebac --release
 ```
 
 The example prints a CSV so you can compare your own database and machine. Local PostgreSQL 18.3 runs of the mixed-policy example show modest wins for tiny lists and tens-to-low-hundreds improvements once the list is large enough for round trips to dominate. Exact numbers vary; the important property is that the policy stack stays in Gatehouse while relationship fact loading collapses to batched SQL.

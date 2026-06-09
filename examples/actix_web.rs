@@ -26,11 +26,15 @@
 // stores them inside a shared [`PermissionChecker`]. Each handler pulls the
 // checker from Actix Web's `Data` extractor and evaluates the request before
 // continuing.
+//
+// Note: on denial these handlers echo the evaluation trace back in the HTTP
+// response so you can see the decision from `curl`. That is a demo convenience,
+// not a production pattern — see `forbidden` below.
 
 use actix_web::{
     dev::Payload, web, App, FromRequest, HttpRequest, HttpResponse, HttpServer, Responder,
 };
-use gatehouse::{AccessEvaluation, AndPolicy, PermissionChecker, Policy, PolicyBuilder};
+use gatehouse::{AccessEvaluation, AndPolicy, EvalTrace, PermissionChecker, Policy, PolicyBuilder};
 use std::future::{ready, Ready};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -277,6 +281,18 @@ pub fn load_published_post(post_id: Uuid, overrides: &PostOverrides) -> BlogPost
 // 4) Actix Web Handlers
 // -------------------------
 
+/// Build the 403 response for a denied request.
+///
+/// This demo echoes the full evaluation trace back to the caller so you can see
+/// *why* a request was denied from `curl` alone. Don't do this in production:
+/// the reason strings and trace are an internal audit surface (see the README's
+/// "Tracing And Telemetry" section) and can expose policy structure or any data
+/// a policy interpolates into a reason. In a real service, log the trace
+/// server-side and return a generic message to the client.
+fn forbidden(reason: &str, trace: &EvalTrace) -> HttpResponse {
+    HttpResponse::Forbidden().body(format!("Denied: {}\n{}", reason, trace.format()))
+}
+
 pub async fn edit_post(
     path: web::Path<Uuid>,
     req: HttpRequest,
@@ -294,9 +310,7 @@ pub async fn edit_post(
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post updated"),
-        AccessEvaluation::Denied { reason, trace } => {
-            HttpResponse::Forbidden().body(format!("Denied: {}\n{}", reason, trace.format()))
-        }
+        AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
     }
 }
 
@@ -317,9 +331,7 @@ pub async fn publish_post(
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post published"),
-        AccessEvaluation::Denied { reason, trace } => {
-            HttpResponse::Forbidden().body(format!("Denied: {}\n{}", reason, trace.format()))
-        }
+        AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
     }
 }
 
@@ -347,9 +359,7 @@ pub async fn view_post(
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Here is your post"),
-        AccessEvaluation::Denied { reason, trace } => {
-            HttpResponse::Forbidden().body(format!("Denied: {}\n{}", reason, trace.format()))
-        }
+        AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
     }
 }
 
