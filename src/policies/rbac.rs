@@ -7,8 +7,12 @@ use async_trait::async_trait;
 /// for the given (resource, action). `user_roles_resolver` extracts the subject's roles.
 /// Access is granted if the subject holds at least one of the required roles.
 ///
-/// Roles are identified by [`Uuid`](uuid::Uuid), allowing integration with external
-/// identity systems without relying on string matching.
+/// The role identifier type is generic — any `PartialEq` type works. Use a
+/// domain enum when the role set is closed (the compiler then checks role
+/// names), string ids when roles are configuration-driven, or
+/// [`Uuid`](uuid::Uuid)s when integrating with an external identity system.
+/// The two resolver closures must agree on the same role type; it is
+/// inferred from their return types.
 ///
 /// # Example
 ///
@@ -45,6 +49,33 @@ use async_trait::async_trait;
 /// assert!(!checker.evaluate_in_session(&session, &unauthorised, &Action, &Resource, &Ctx).await.is_granted());
 /// # });
 /// ```
+///
+/// With a domain role enum instead of `Uuid`s:
+///
+/// ```rust
+/// # use gatehouse::*;
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// enum Role { Admin, Editor }
+/// #[derive(Debug, Clone)]
+/// struct User { roles: Vec<Role> }
+/// # #[derive(Debug, Clone)]
+/// # struct Resource;
+/// # #[derive(Debug, Clone)]
+/// # struct Action;
+///
+/// let rbac = RbacPolicy::new(
+///     |_resource: &Resource, _action: &Action| vec![Role::Admin, Role::Editor],
+///     |user: &User| user.roles.clone(),
+/// );
+///
+/// let mut checker = PermissionChecker::new();
+/// checker.add_policy(rbac);
+///
+/// # tokio_test::block_on(async {
+/// let editor = User { roles: vec![Role::Editor] };
+/// assert!(checker.check(&editor, &Action, &Resource, &()).await.is_granted());
+/// # });
+/// ```
 pub struct RbacPolicy<S, F1, F2> {
     required_roles_resolver: F1,
     user_roles_resolver: F2,
@@ -62,15 +93,20 @@ impl<S, F1, F2> RbacPolicy<S, F1, F2> {
     }
 }
 
+// `RoleId` is constrained through the closures' `Fn(...) -> Vec<RoleId>`
+// output bindings, so it is inferred from the resolvers rather than being a
+// parameter on the struct. `PartialEq` is the only capability the policy
+// needs (the `contains` check below).
 #[async_trait]
-impl<S, R, A, C, F1, F2> Policy<S, R, A, C> for RbacPolicy<S, F1, F2>
+impl<S, R, A, C, F1, F2, RoleId> Policy<S, R, A, C> for RbacPolicy<S, F1, F2>
 where
     S: Sync + Send,
     R: Sync + Send,
     A: Sync + Send,
     C: Sync + Send,
-    F1: Fn(&R, &A) -> Vec<uuid::Uuid> + Sync + Send,
-    F2: Fn(&S) -> Vec<uuid::Uuid> + Sync + Send,
+    RoleId: PartialEq,
+    F1: Fn(&R, &A) -> Vec<RoleId> + Sync + Send,
+    F2: Fn(&S) -> Vec<RoleId> + Sync + Send,
 {
     async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
         let required_roles = (self.required_roles_resolver)(ctx.resource, ctx.action);

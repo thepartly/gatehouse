@@ -2324,6 +2324,59 @@ mod core_tests {
     }
 
     #[tokio::test]
+    async fn test_rbac_policy_with_non_uuid_role_type() {
+        // The role identifier type is generic over any `PartialEq` type,
+        // inferred from the resolver closures — here a domain enum.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Role {
+            Admin,
+            Editor,
+        }
+
+        #[derive(Debug, Clone)]
+        struct RbacUser {
+            roles: Vec<Role>,
+        }
+
+        let policy = RbacPolicy::new(
+            |_resource: &TestResource, _action: &TestAction| vec![Role::Admin],
+            |subject: &RbacUser| subject.roles.clone(),
+        );
+
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let admin = RbacUser {
+            roles: vec![Role::Admin, Role::Editor],
+        };
+        let result: PolicyEvalResult = TestPolicyExt::<
+            RbacUser,
+            TestResource,
+            TestAction,
+            TestContext,
+        >::evaluate_access(
+            &policy, &admin, &TestAction, &resource, &TestContext
+        )
+        .await;
+        assert!(result.is_granted(), "enum role should match");
+
+        let editor_only = RbacUser {
+            roles: vec![Role::Editor],
+        };
+        let result: PolicyEvalResult =
+            TestPolicyExt::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+                &policy,
+                &editor_only,
+                &TestAction,
+                &resource,
+                &TestContext,
+            )
+            .await;
+        assert!(!result.is_granted(), "missing enum role should deny");
+    }
+
+    #[tokio::test]
     async fn test_short_circuit_evaluation() {
         // Create a counter to track policy evaluation
         use std::sync::atomic::{AtomicUsize, Ordering};

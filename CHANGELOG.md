@@ -8,6 +8,7 @@
 - `PolicyEvalResult::reason_str()` — borrowing analogue of `reason()`, for callers that only need to inspect or render the reason without cloning.
 - `EmptyPoliciesError` now implements `Display` and `std::error::Error`, matching every other public error type in the crate, so `AndPolicy::try_new` / `OrPolicy::try_new` failures can be printed with `{}` and propagated with `?` into boxed errors.
 - `CombineOp` now derives `Copy` and `Eq`.
+- `RbacPolicy` is now generic over the role identifier type. Any `PartialEq` type works — a domain enum, string ids, or `Uuid`s — inferred from the resolver closures' return types. Existing `Uuid`-based code keeps working unchanged; the one edge is closures whose role type was previously pinned only by the impl (e.g. a bare `vec![]` with no other mention of the role type), which may now need an annotation.
 - `examples/deny_override.rs` — demonstrates "deny overrides allow" (account suspensions, legal holds). Contrasts the tempting mistake (adding a deny policy to the `OR`-based `PermissionChecker`, which never vetoes) against the working shape: gating the allow set behind `NotPolicy(blocklist)` under `AndPolicy`. Prints a wrong/right verdict table and the decision trace.
 - `examples/delegating_policy.rs` — demonstrates `DelegatingPolicy` cross-domain delegation: a comment-moderation rule defers to the document domain's `PermissionChecker` ("you may edit a comment if you may edit its document"), with the trace crossing the domain boundary.
 
