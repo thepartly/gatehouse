@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 /// The type of boolean combining operation a policy might represent.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CombineOp {
     /// All inner policies must grant access.
     And,
@@ -253,6 +253,17 @@ impl AccessEvaluation {
         matches!(self, Self::Granted { .. })
     }
 
+    /// Returns the evaluation trace regardless of outcome.
+    ///
+    /// Both variants carry an [`EvalTrace`]; this accessor saves callers
+    /// the `match` when they only need the trace — typically to render it
+    /// with [`EvalTrace::format`] for logs or debugging output.
+    pub fn trace(&self) -> &EvalTrace {
+        match self {
+            Self::Granted { trace, .. } | Self::Denied { trace, .. } => trace,
+        }
+    }
+
     /// Returns the granting policy's name when the evaluation was a grant.
     ///
     /// Useful for non-panicking inspection in tests and in production code
@@ -466,17 +477,8 @@ impl AccessEvaluation {
     /// representation (e.g. `[GRANTED] by AdminPolicy - User is admin`)
     /// followed by the indented trace from [`EvalTrace::format`].
     pub fn display_trace(&self) -> String {
-        let trace = match self {
-            AccessEvaluation::Granted {
-                policy_type: _,
-                reason: _,
-                trace,
-            } => trace,
-            AccessEvaluation::Denied { reason: _, trace } => trace,
-        };
-
         // If there's an actual tree to show, add it. Otherwise, fallback.
-        let trace_str = trace.format();
+        let trace_str = self.trace().format();
         if trace_str == "No evaluation trace available" {
             format!("{}\n(No evaluation trace available)", self)
         } else {
@@ -638,9 +640,17 @@ impl PolicyEvalResult {
 
     /// Returns the reason string if available
     pub fn reason(&self) -> Option<String> {
+        self.reason_str().map(str::to_owned)
+    }
+
+    /// Returns the reason without cloning, if available.
+    ///
+    /// Borrowing analogue of [`Self::reason`] for callers that only need
+    /// to inspect or render the reason.
+    pub fn reason_str(&self) -> Option<&str> {
         match self {
-            Self::Granted { reason, .. } => reason.clone(),
-            Self::Denied { reason, .. } => Some(reason.clone()),
+            Self::Granted { reason, .. } => reason.as_deref(),
+            Self::Denied { reason, .. } => Some(reason),
             Self::Combined { .. } => None,
         }
     }
