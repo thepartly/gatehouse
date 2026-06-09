@@ -228,12 +228,7 @@ async fn main() {
 /// up — the deciding policy puts it there, and it is the whole point of the
 /// `Context` data flowing through.
 fn report(label: &str, eval: &AccessEvaluation) {
-    let trace = match eval {
-        AccessEvaluation::Granted { trace, .. } | AccessEvaluation::Denied { trace, .. } => {
-            trace.format()
-        }
-    };
-    println!("{label} → {}\n{trace}", verdict(eval));
+    println!("{label} → {}\n{}", verdict(eval), eval.trace().format());
 }
 
 fn verdict(eval: &AccessEvaluation) -> &'static str {

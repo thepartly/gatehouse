@@ -112,7 +112,7 @@ async fn main() {
             }
         );
         println!("Policies evaluated: {}", counter.load(Ordering::SeqCst));
-        println!("Trace:\n{}", trace_of(&result));
+        println!("Trace:\n{}", result.trace().format());
 
         // The second policy should not be evaluated due to short-circuiting
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -151,7 +151,7 @@ async fn main() {
             }
         );
         println!("Policies evaluated: {}", counter.load(Ordering::SeqCst));
-        println!("Trace:\n{}", trace_of(&result));
+        println!("Trace:\n{}", result.trace().format());
 
         // The second policy should not be evaluated due to short-circuiting
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -202,21 +202,10 @@ async fn main() {
             user.id
         );
         println!("Policies evaluated: {}", counter.load(Ordering::SeqCst));
-        println!("Trace:\n{}", trace_of(&result));
+        println!("Trace:\n{}", result.trace().format());
 
         // The inner AND should evaluate only DenyInner (shorts-circuit),
         // then the OR continues to AllowOuter which grants access
         assert_eq!(counter.load(Ordering::SeqCst), 2);
-    }
-}
-
-/// Render just the decision-trace tree (without the summary line that
-/// `display_trace` prepends), so each block above can print it under its own
-/// "Trace:" heading.
-fn trace_of(result: &AccessEvaluation) -> String {
-    match result {
-        AccessEvaluation::Granted { trace, .. } | AccessEvaluation::Denied { trace, .. } => {
-            trace.format()
-        }
     }
 }

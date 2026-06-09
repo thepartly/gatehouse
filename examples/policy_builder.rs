@@ -1,118 +1,146 @@
-//! # Edit User Settings Permission Example
+//! # PolicyBuilder Example — scoped admin permissions
 //!
-//! This example demonstrates creating a custom policy using the `PolicyBuilder`
-//! to check if an organization's authorization details grant the "edit_user_settings"
-//! permission for a specified target entity.
+//! A staff user holds scoped permission grants like "edit_user_settings on
+//! org-1". The organization being administered is the *resource*, the action
+//! selects which scope is required, and `PolicyBuilder` chains the predicates
+//! with AND logic. (The decision needs nothing call-specific, so the context
+//! type is `()` — see `mfa_freshness_context` for when a real context earns
+//! its place.)
 //!
 //! To run this example:
 //! ```sh
 //! cargo run --example policy_builder
 //! ```
 use gatehouse::*;
-use uuid::Uuid;
 
+/// One grant: a permission scope applied to one entity.
 #[derive(Debug, Clone)]
 pub struct GroupPermission {
     /// The scope of the permission (e.g., `edit_user_settings`).
-    pub scope: String,
-    /// The entity the permission applies to (e.g., an organization ID as string).
+    pub scope: &'static str,
+    /// The entity the permission applies to (an organization id).
     pub entity: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct OrganizationAuthorizationDetails {
-    /// Organization ID.
-    pub id: Uuid,
-    /// A vector of permissions associated with the organization.
+pub struct StaffUser {
+    pub name: &'static str,
     pub permissions: Vec<GroupPermission>,
 }
 
-// A helper function that creates a policy for checking permissions based on the scope.
-fn org_has_permission(
-    scope: String,
-) -> Box<dyn Policy<OrganizationAuthorizationDetails, (), (), String>> {
-    PolicyBuilder::new(scope.clone())
+/// The resource: the organization being administered.
+#[derive(Debug, Clone)]
+pub struct Organization {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AdminAction {
+    EditUserSettings,
+    EditOrgSettings,
+}
+
+impl AdminAction {
+    fn required_scope(self) -> &'static str {
+        match self {
+            Self::EditUserSettings => "edit_user_settings",
+            Self::EditOrgSettings => "edit_org_settings",
+        }
+    }
+}
+
+/// Grants when the user holds the scope the action requires *on this
+/// organization*. The predicate reads three axes (subject, action, resource),
+/// which is exactly the cross-axis case `.when()` exists for.
+fn scoped_permission_policy() -> Box<dyn Policy<StaffUser, Organization, AdminAction, ()>> {
+    PolicyBuilder::new("ScopedPermission")
         .when(
-            move |org: &OrganizationAuthorizationDetails, _action, _resource, target_entity| {
-                // Check if the permission matches the scope and target entity.
-                org.permissions
+            |user: &StaffUser, action: &AdminAction, org: &Organization, _ctx: &()| {
+                user.permissions
                     .iter()
-                    .any(|p| p.scope == scope && p.entity == *target_entity)
+                    .any(|p| p.scope == action.required_scope() && p.entity == org.id)
             },
         )
         .build()
 }
 
+/// Grants on a single axis — the subject — so it uses `.subjects()` rather
+/// than `.when()`: single-axis predicates batch better and read clearer.
+fn global_admin_policy() -> Box<dyn Policy<StaffUser, Organization, AdminAction, ()>> {
+    PolicyBuilder::new("GlobalAdmin")
+        .subjects(|user: &StaffUser| user.permissions.iter().any(|p| p.scope == "global_admin"))
+        .build()
+}
+
 #[tokio::main]
 async fn main() {
-    // Build a PermissionChecker with two custom policies using the above helper.
-    let mut checker = PermissionChecker::<OrganizationAuthorizationDetails, (), (), String>::new();
-    checker.add_policy(org_has_permission("edit_user_settings".to_string()));
-    checker.add_policy(org_has_permission("edit_org_settings".to_string()));
+    let mut checker = PermissionChecker::<StaffUser, Organization, AdminAction, ()>::new();
+    checker.add_policy(scoped_permission_policy());
+    checker.add_policy(global_admin_policy());
 
-    checker.add_policy(
-        PolicyBuilder::new("GlobalAdmin")
-            .subjects(|org: &OrganizationAuthorizationDetails| {
-                org.permissions.iter().any(|p| p.scope == "global_admin")
-            })
-            .build(),
-    );
+    let org1 = Organization { id: "org-1".into() };
+    let org2 = Organization { id: "org-2".into() };
 
-    // Create sample organization authorization details.
-    // org1 has "edit_user_settings" for "org1".
-    let org1 = OrganizationAuthorizationDetails {
-        id: Uuid::new_v4(),
+    let org1_admin = StaffUser {
+        name: "org1-admin",
         permissions: vec![GroupPermission {
-            scope: "edit_user_settings".to_string(),
-            entity: "org1".to_string(),
+            scope: "edit_user_settings",
+            entity: "org-1".into(),
         }],
     };
-
-    // org2 has "edit_user_settings" for "org2".
-    let org2 = OrganizationAuthorizationDetails {
-        id: Uuid::new_v4(),
+    let org2_admin = StaffUser {
+        name: "org2-admin",
         permissions: vec![GroupPermission {
-            scope: "edit_user_settings".to_string(),
-            entity: "org2".to_string(),
+            scope: "edit_user_settings",
+            entity: "org-2".into(),
         }],
     };
-
-    // org3 has no permissions for any org
-    let org3 = OrganizationAuthorizationDetails {
-        id: Uuid::new_v4(),
+    let no_grants = StaffUser {
+        name: "no-grants",
         permissions: vec![],
     };
-    // org4 has global admin permissions
-    let org4 = OrganizationAuthorizationDetails {
-        id: Uuid::new_v4(),
+    let global_admin = StaffUser {
+        name: "global-admin",
         permissions: vec![GroupPermission {
-            scope: "global_admin".to_string(),
-            entity: "".to_string(),
+            scope: "global_admin",
+            entity: String::new(),
         }],
     };
 
-    // 1. org1 should be granted access when the target is "org1".
-    let result1 = checker.check(&org1, &(), &(), &"org1".to_string()).await;
-    println!("Org1 on 'org1': {}", result1);
-    assert!(result1.is_granted());
+    // (user, action, organization, expected outcome)
+    let cases = [
+        // Scoped grant matches its own org…
+        (&org1_admin, AdminAction::EditUserSettings, &org1, true),
+        // …but not another org, and not another scope on the same org.
+        (&org2_admin, AdminAction::EditUserSettings, &org1, false),
+        (&org1_admin, AdminAction::EditOrgSettings, &org1, false),
+        (&org2_admin, AdminAction::EditUserSettings, &org2, true),
+        (&no_grants, AdminAction::EditUserSettings, &org1, false),
+        // The global admin passes via the subject-axis policy on any org.
+        (&global_admin, AdminAction::EditOrgSettings, &org1, true),
+    ];
 
-    // 2. org2 should be denied access when the target is "org1".
-    let result2 = checker.check(&org2, &(), &(), &"org1".to_string()).await;
-    println!("Org2 on 'org1': {}", result2);
-    assert!(!result2.is_granted());
+    for (user, action, org, expected_granted) in cases {
+        let decision = checker.check(user, &action, org, &()).await;
+        println!(
+            "{:<12} {:?} on {}: {}",
+            user.name,
+            action,
+            org.id,
+            if decision.is_granted() {
+                "GRANTED"
+            } else {
+                "DENIED"
+            }
+        );
+        assert_eq!(decision.is_granted(), expected_granted);
+    }
 
-    // 3. org2 should be granted access when the target is "org2".
-    let result3 = checker.check(&org2, &(), &(), &"org2".to_string()).await;
-    println!("Org2 on 'org2': {}", result3);
-    assert!(result3.is_granted());
-
-    // 4. org3 should be denied access regardless of the target since it doesn't have the correct permission.
-    let result4 = checker.check(&org3, &(), &(), &"org1".to_string()).await;
-    println!("Org3 on 'org1': {}", result4);
-    assert!(!result4.is_granted());
-
-    // 5. org4 should be granted access since it has global admin permissions
-    let result5 = checker.check(&org4, &(), &(), &"org1".to_string()).await;
-    println!("Org4 on 'org1': {}", result5);
-    assert!(result5.is_granted());
+    // The trace names the policy that decided; for a denial it shows every
+    // policy that was consulted and why each said no.
+    println!("\nWhy org2-admin cannot edit user settings on org-1:");
+    let decision = checker
+        .check(&org2_admin, &AdminAction::EditUserSettings, &org1, &())
+        .await;
+    println!("{}", decision.display_trace());
 }

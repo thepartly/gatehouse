@@ -227,6 +227,11 @@ async fn main() {
     for doc in &alice_visible {
         println!("  - {} ({})", doc.title, doc.id);
     }
+    let alice_visible_ids: Vec<Uuid> = alice_visible.iter().map(|doc| doc.id).collect();
+    assert_eq!(
+        alice_visible_ids, viewer_doc_ids,
+        "the lookup + policy stack should authorize exactly the viewer-granted documents, in source order"
+    );
 
     // (2) Admin lists "their visible documents" via the same lookup.
     // The viewer lookup does not enumerate documents for the admin (no
@@ -244,6 +249,10 @@ async fn main() {
          by what the source enumerates; admin grants still apply at point checks.",
         admin_via_lookup.len()
     );
+    assert!(
+        admin_via_lookup.is_empty(),
+        "the viewer lookup enumerates nothing for the admin, so the listing is empty"
+    );
 
     // (3) Point check confirms the admin policy is alive: pick a document
     // the admin has no viewer relation on.
@@ -260,6 +269,7 @@ async fn main() {
             "Denied"
         }
     );
+    admin_point.assert_granted_by("AdminPolicy");
 
     // (4) Page-oriented streaming. Drive the lookup one candidate page at
     // a time — useful when you want to flush results to a response writer
@@ -267,6 +277,7 @@ async fn main() {
     println!("\nStreaming Alice's visible documents page-by-page:");
     let mut cursor: Option<Vec<u8>> = None;
     let mut page_index = 0;
+    let mut streamed_total = 0;
     loop {
         let page = checker
             .lookup_authorized_page(
@@ -283,9 +294,14 @@ async fn main() {
             .expect("lookup_authorized_page ok");
         println!("  page {page_index}: {} authorized", page.resources.len());
         page_index += 1;
+        streamed_total += page.resources.len();
         match page.next_cursor {
             None => break,
             Some(next) => cursor = Some(next),
         }
     }
+    // 3 candidate ids paged 2-at-a-time: two candidate pages, same total as
+    // the collecting `lookup_authorized` call above.
+    assert_eq!(page_index, 2);
+    assert_eq!(streamed_total, viewer_doc_ids.len());
 }
