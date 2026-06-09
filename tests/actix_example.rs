@@ -48,7 +48,7 @@ async fn edit_post_allows_author() {
     let app = init_actix_app!().await;
 
     let req = test::TestRequest::put()
-        .uri(&format!("/posts/{}", author_id()))
+        .uri(&format!("/posts/{}", draft_post_id()))
         .insert_header(("x-user-id", author_id().to_string()))
         .insert_header(("x-roles", "author"))
         .to_request();
@@ -77,7 +77,7 @@ async fn edit_post_denies_non_author() {
     let app = init_actix_app!().await;
 
     let req = test::TestRequest::put()
-        .uri(&format!("/posts/{}", author_id()))
+        .uri(&format!("/posts/{}", draft_post_id()))
         .insert_header(("x-user-id", Uuid::new_v4().to_string()))
         .insert_header(("x-roles", "author"))
         .to_request();
@@ -91,7 +91,7 @@ async fn edit_post_denies_locked_post() {
     let app = init_actix_app!().await;
 
     let req = test::TestRequest::put()
-        .uri(&format!("/posts/{}", author_id()))
+        .uri(&format!("/posts/{}", draft_post_id()))
         .insert_header(("x-user-id", author_id().to_string()))
         .insert_header(("x-roles", "author"))
         .insert_header(("x-post-locked", "true"))
@@ -106,7 +106,7 @@ async fn publish_post_allows_editor() {
     let app = init_actix_app!().await;
 
     let req = test::TestRequest::post()
-        .uri(&format!("/posts/{}/publish", author_id()))
+        .uri(&format!("/posts/{}/publish", draft_post_id()))
         .insert_header(("x-user-id", Uuid::new_v4().to_string()))
         .insert_header(("x-roles", "editor"))
         .to_request();
@@ -120,7 +120,7 @@ async fn publish_post_denies_non_editor() {
     let app = init_actix_app!().await;
 
     let req = test::TestRequest::post()
-        .uri(&format!("/posts/{}/publish", author_id()))
+        .uri(&format!("/posts/{}/publish", draft_post_id()))
         .insert_header(("x-user-id", Uuid::new_v4().to_string()))
         .insert_header(("x-roles", "author"))
         .to_request();
@@ -134,7 +134,7 @@ async fn publish_post_denies_locked_post() {
     let app = init_actix_app!().await;
 
     let req = test::TestRequest::post()
-        .uri(&format!("/posts/{}/publish", author_id()))
+        .uri(&format!("/posts/{}/publish", draft_post_id()))
         .insert_header(("x-user-id", Uuid::new_v4().to_string()))
         .insert_header(("x-roles", "editor"))
         .insert_header(("x-post-locked", "true"))
@@ -199,11 +199,9 @@ async fn list_posts_filters_by_relationship() {
     );
     assert!(body.contains("published announcement"));
 
-    // An anonymous caller sees only the published post.
-    let req = test::TestRequest::get()
-        .uri("/posts")
-        .insert_header(("x-user-id", Uuid::new_v4().to_string()))
-        .to_request();
+    // An anonymous caller (no x-user-id; the extractor falls back to the nil
+    // UUID) sees only the published post.
+    let req = test::TestRequest::get().uri("/posts").to_request();
     let body = test::call_and_read_body(&app, req).await;
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(
