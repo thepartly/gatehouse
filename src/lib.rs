@@ -10,8 +10,9 @@
 //!
 //! A *Policy* is an asynchronous decision unit that checks if a given subject may
 //! perform an action on a resource within a given context. Policies implement the
-//! [`Policy`] trait. A [`PermissionChecker`] aggregates multiple policies and uses OR
-//! logic by default (i.e. if any policy grants access, then access is allowed).
+//! [`Policy`] trait. A [`PermissionChecker`] aggregates multiple policies with
+//! deny-overrides semantics: any matching [`Effect::Deny`] policy denies access;
+//! otherwise, if any policy grants access, then access is allowed.
 //! The [`PolicyBuilder`] offers a builder pattern for creating custom policies.
 //! Custom [`Policy`] implementations must provide both [`Policy::evaluate`]
 //! and [`Policy::policy_type`].
@@ -60,7 +61,9 @@
 //! The checker's root node is a `DENY_OVERRIDES` combine node whose children
 //! appear in evaluation order: deny-effect policies first, then allow
 //! policies. A forbid ends the evaluation, so a vetoed request's trace shows
-//! the forbidding policy as its last child.
+//! the forbidding policy as its last child. The exception is a checker with
+//! no policies at all, whose trace is the single `"No policies configured"`
+//! denial leaf with no combine node around it.
 //!
 //! ## When to populate the Context type
 //!

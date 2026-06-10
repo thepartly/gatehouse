@@ -438,7 +438,7 @@ where
 
         // If all policies denied access
         tracing::Span::current().record("outcome", "denied");
-        tracing::trace!("No policies allowed access, returning Forbidden");
+        tracing::trace!("No policy granted access, returning denied");
         let combined = checker_root(policy_results, false);
 
         AccessEvaluation::Denied {
