@@ -2988,14 +2988,17 @@ mod core_tests {
     {
         let mut checker = PermissionChecker::new();
         checker.add_policy(AlwaysDenyPolicy("first denial reason"));
-        // A second denying policy with the same `policy_type()` but a
-        // different reason, since AlwaysDenyPolicy is a tuple struct.
-        // (The tree-walker checks policy_type, not reason — what we're
-        // pinning is that it finds *any* matching leaf.)
+        // A second denying policy with a different name and reason. Its
+        // deny-effect predicate never matches, so it lands in the trace as
+        // a not-applicable `Denied` leaf rather than vetoing the whole
+        // evaluation before the first policy is consulted. (The
+        // tree-walker checks policy_type, not reason — what we're pinning
+        // is that it finds *any* matching leaf.)
         let custom = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
             "SupplierBlock",
         )
         .effect(Effect::Deny)
+        .subjects(|_subject| false)
         .build();
         checker.add_policy(custom);
         checker
@@ -3203,13 +3206,83 @@ mod policy_builder_tests {
         );
     }
 
+    /// The headline deny-overrides behavior: a matched `Effect::Deny` policy
+    /// vetoes a sibling grant, regardless of registration order.
     #[tokio::test]
-    async fn test_policy_builder_effect_deny_does_not_override_other_grants() {
+    async fn test_policy_builder_effect_deny_overrides_other_grants() {
+        for deny_registered_first in [true, false] {
+            let deny_policy =
+                PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
+                    "BlockAlicePolicy",
+                )
+                .effect(Effect::Deny)
+                .subjects(|subject| subject.name == "Alice")
+                .build();
+
+            let allow_policy =
+                PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
+                    "AllowAlicePolicy",
+                )
+                .subjects(|subject| subject.name == "Alice")
+                .build();
+
+            let mut checker = PermissionChecker::new();
+            if deny_registered_first {
+                checker.add_policy(deny_policy);
+                checker.add_policy(allow_policy);
+            } else {
+                checker.add_policy(allow_policy);
+                checker.add_policy(deny_policy);
+            }
+
+            let session = EvaluationSession::empty();
+            let result = checker
+                .evaluate_in_session(
+                    &session,
+                    &TestSubject {
+                        name: "Alice".into(),
+                    },
+                    &TestAction,
+                    &TestResource,
+                    &TestContext,
+                )
+                .await;
+
+            result.assert_forbidden_by("BlockAlicePolicy");
+            assert_eq!(
+                result.denied_reason(),
+                Some("Forbidden by BlockAlicePolicy: Policy forbids access"),
+                "summary reason should name the forbidding policy"
+            );
+
+            // A subject the deny predicate does not match is unaffected:
+            // a non-matching deny policy is "not applicable", never a veto.
+            let bob_result = checker
+                .evaluate_in_session(
+                    &session,
+                    &TestSubject { name: "Bob".into() },
+                    &TestAction,
+                    &TestResource,
+                    &TestContext,
+                )
+                .await;
+            assert!(
+                !bob_result.is_granted(),
+                "Bob has no grant (AllowAlicePolicy does not match him)"
+            );
+            assert_eq!(bob_result.forbidden_by(), None);
+        }
+    }
+
+    /// A non-matching `Effect::Deny` policy contributes nothing: the allow
+    /// set still decides, and the trace root reflects deny-overrides.
+    #[tokio::test]
+    async fn test_non_matching_deny_policy_does_not_block_grants() {
         let deny_policy = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
-            "ExplicitDenyLikePolicy",
+            "BlockNobodyPolicy",
         )
         .effect(Effect::Deny)
-        .subjects(|subject| subject.name == "Alice")
+        .subjects(|_subject| false)
         .build();
 
         let allow_policy =
@@ -3220,8 +3293,8 @@ mod policy_builder_tests {
             .build();
 
         let mut checker = PermissionChecker::new();
-        checker.add_policy(deny_policy);
         checker.add_policy(allow_policy);
+        checker.add_policy(deny_policy);
 
         let session = EvaluationSession::empty();
         let result = checker
@@ -3236,10 +3309,8 @@ mod policy_builder_tests {
             )
             .await;
 
-        assert!(
-            result.is_granted(),
-            "A deny-effect builder policy should not override a later allow under PermissionChecker OR semantics"
-        );
+        result.assert_granted_by("AllowAlicePolicy");
+        result.assert_trace_contains("DENY_OVERRIDES");
     }
 
     // Test that extra conditions (combining multiple inputs) work correctly.

@@ -1,14 +1,53 @@
 use crate::{
-    AccessEvaluation, BatchEvalCtx, CombineOp, EvalCtx, EvalTrace, EvaluationSession, Hydrator,
-    LookupAuthorizedError, LookupAuthorizedPage, LookupSource, Policy, PolicyBatchItem,
+    AccessEvaluation, BatchEvalCtx, CombineOp, Effect, EvalCtx, EvalTrace, EvaluationSession,
+    Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupSource, Policy, PolicyBatchItem,
     PolicyEvalResult, DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tracing::Instrument;
 
-/// A container for multiple policies, applied in an "OR" fashion.
-/// (If any policy returns Ok, access is granted)
+/// Builds the top-level denial reason for a forbid, naming the policy that
+/// vetoed the request so the summary is actionable without opening the trace.
+fn forbid_summary(policy_type: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("Forbidden by {policy_type}: {reason}"),
+        None => format!("Forbidden by {policy_type}"),
+    }
+}
+
+/// Leaf reason recorded when a deny-declared policy violates its contract by
+/// returning a grant; the checker fails closed and treats the result as not
+/// applicable. See [`Policy::effect`].
+const DENY_EFFECT_GRANT_REASON: &str =
+    "Deny-effect policy returned a grant; treated as not applicable";
+
+/// Builds the checker's root trace node: a deny-overrides combine over the
+/// policy results evaluated so far.
+fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalResult {
+    PolicyEvalResult::Combined {
+        policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
+        operation: CombineOp::DenyOverrides,
+        children,
+        outcome,
+    }
+}
+
+/// A container for multiple policies, combined with fixed
+/// **deny-overrides** semantics:
+///
+/// 1. any policy that **forbids** ([`PolicyEvalResult::Forbidden`], produced
+///    by [`crate::Effect::Deny`] policies whose predicate matches) denies the
+///    request, overriding every grant;
+/// 2. otherwise any policy that grants, grants (OR semantics, short-circuits
+///    on the first grant);
+/// 3. otherwise the request is denied (default deny).
+///
+/// Policies declaring [`crate::Effect::Deny`] are evaluated before allow
+/// policies so a veto is always observed before the grant short-circuit.
+/// The semantics are fixed — there is no combining-algorithm knob — and the
+/// effect is declared on the policy itself, so a policy's behaviour is
+/// readable in isolation.
 ///
 /// **Important**: if no policies are added, access is always denied.
 ///
@@ -119,7 +158,16 @@ use tracing::Instrument;
 #[derive(Clone)]
 pub struct PermissionChecker<S, R, A, C> {
     name: Option<std::borrow::Cow<'static, str>>,
+    /// Policies in evaluation order: deny-effect policies first, then allow
+    /// policies, each group in registration order. [`Self::add_policy`]
+    /// maintains this invariant using the policy's declared
+    /// [`Policy::effect`], so evaluation iterates this list directly with no
+    /// per-call partitioning. Deny-first scheduling is what makes
+    /// deny-overrides deterministic: every policy that can veto runs before
+    /// the allow phase, where a grant short-circuits the evaluation.
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
+    /// Number of deny-effect policies at the front of `policies`.
+    deny_count: usize,
     max_batch_size: Option<NonZeroUsize>,
 }
 
@@ -147,6 +195,7 @@ where
         Self {
             name: None,
             policies: Vec::new(),
+            deny_count: 0,
             max_batch_size: None,
         }
     }
@@ -165,6 +214,7 @@ where
         Self {
             name: Some(name.into()),
             policies: Vec::new(),
+            deny_count: 0,
             max_batch_size: None,
         }
     }
@@ -186,11 +236,31 @@ where
 
     /// Adds a policy to the checker.
     ///
+    /// The policy's [`Policy::effect`] is read once here: deny-effect
+    /// policies are scheduled ahead of allow policies so a veto is always
+    /// observed before the grant short-circuit (see the type-level docs).
+    /// Within each group, registration order is preserved.
+    ///
     /// # Arguments
     ///
     /// * `policy` - A type implementing [`Policy`]. It is stored as an `Arc` for shared ownership.
     pub fn add_policy<P: Policy<S, R, A, C> + 'static>(&mut self, policy: P) {
-        self.policies.push(Arc::new(policy));
+        if policy.effect() == Effect::Deny {
+            self.policies.insert(self.deny_count, Arc::new(policy));
+            self.deny_count += 1;
+        } else {
+            self.policies.push(Arc::new(policy));
+        }
+    }
+
+    /// The effect a policy declared when it was added, derived from its
+    /// position in the deny-first `policies` ordering.
+    fn declared_effect(&self, policy_index: usize) -> Effect {
+        if policy_index < self.deny_count {
+            Effect::Deny
+        } else {
+            Effect::Allow
+        }
     }
 
     /// Convenience for RBAC/ABAC-only callers: evaluates against the
@@ -232,14 +302,16 @@ where
     /// Evaluates all policies against the given parameters using a caller-owned
     /// request session.
     ///
-    /// Policies are evaluated sequentially with OR semantics and short-circuit
-    /// on the first success. The returned [`AccessEvaluation`] contains a
-    /// trace tree for the policies that were actually evaluated before
-    /// short-circuiting.
+    /// Policies are evaluated sequentially under deny-overrides semantics:
+    /// declared-deny policies first (a forbid ends the evaluation as a
+    /// denial), then allow policies with a short-circuit on the first grant.
+    /// The returned [`AccessEvaluation`] contains a trace tree for the
+    /// policies that were actually evaluated before short-circuiting.
     ///
-    /// If every policy denies access, the top-level denial reason is the
-    /// summary string `"All policies denied access"`. Inspect the trace for
-    /// individual policy reasons.
+    /// If a forbid fires, the top-level denial reason names the forbidding
+    /// policy (`"Forbidden by <policy>: <reason>"`). If no policy grants,
+    /// the reason is the summary string `"All policies denied access"`.
+    /// Inspect the trace for individual policy reasons.
     #[tracing::instrument(skip_all, fields(checker.name = tracing::field::Empty, policy_count = self.policies.len(), outcome = tracing::field::Empty, policy.type = tracing::field::Empty))]
     pub async fn evaluate_in_session(
         &self,
@@ -267,8 +339,10 @@ where
 
         let mut policy_results = Vec::with_capacity(self.policies.len());
 
-        // Evaluate each policy
-        for policy in &self.policies {
+        // Evaluate each policy; `policies` is kept in deny-first order by
+        // `add_policy`.
+        for (policy_index, policy) in self.policies.iter().enumerate() {
+            let declared_effect = self.declared_effect(policy_index);
             // Move the policy's name straight into the EvalCtx rather than
             // cloning, since for dynamic-name (`Cow::Owned`) policies the
             // clone is a fresh `String` allocation we don't need: the same
@@ -283,8 +357,17 @@ where
                 context,
                 policy_type: policy.policy_type(),
             };
-            let result = policy.evaluate(&ctx).await;
+            let mut result = policy.evaluate(&ctx).await;
+            if declared_effect == Effect::Deny && result.is_granted() {
+                tracing::warn!(
+                    policy.type = ctx.policy_type.as_ref(),
+                    "{DENY_EFFECT_GRANT_REASON}"
+                );
+                result =
+                    PolicyEvalResult::denied(ctx.policy_type.clone(), DENY_EFFECT_GRANT_REASON);
+            }
             let result_passes = result.is_granted();
+            let result_forbids = result.is_forbidden();
 
             // Extract metadata for tracing (always needed for security audit)
             let policy_type_str: &str = ctx.policy_type.as_ref();
@@ -299,6 +382,10 @@ where
                 .ruleset_name()
                 .unwrap_or(PERMISSION_CHECKER_POLICY_TYPE);
             let event_outcome = if result_passes { "success" } else { "failure" };
+            let policy_effect = match declared_effect {
+                Effect::Allow => "allow",
+                Effect::Deny => "deny",
+            };
 
             tracing::trace!(
                 target: "gatehouse::security",
@@ -313,6 +400,7 @@ where
                     security_rule.license = metadata.license(),
                     event.outcome = event_outcome,
                     policy.type = policy_type_str,
+                    policy.effect = policy_effect,
                     policy.result.reason = reason_str,
                 },
                 "Security rule evaluated"
@@ -320,16 +408,22 @@ where
 
             policy_results.push(result);
 
+            // A forbid overrides everything: stop evaluating and deny.
+            if result_forbids {
+                tracing::Span::current().record("outcome", "denied");
+                tracing::Span::current().record("policy.type", policy_type_str);
+                let combined = checker_root(policy_results, false);
+                return AccessEvaluation::Denied {
+                    trace: EvalTrace::with_root(combined),
+                    reason: forbid_summary(policy_type_str, reason.as_deref()),
+                };
+            }
+
             // If any policy allows access, return immediately
             if result_passes {
                 tracing::Span::current().record("outcome", "granted");
                 tracing::Span::current().record("policy.type", policy_type_str);
-                let combined = PolicyEvalResult::Combined {
-                    policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
-                    operation: CombineOp::Or,
-                    children: policy_results,
-                    outcome: true,
-                };
+                let combined = checker_root(policy_results, true);
 
                 // Destructure to move policy_type out of the EvalCtx
                 // without an extra clone.
@@ -345,12 +439,7 @@ where
         // If all policies denied access
         tracing::Span::current().record("outcome", "denied");
         tracing::trace!("No policies allowed access, returning Forbidden");
-        let combined = PolicyEvalResult::Combined {
-            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
-            operation: CombineOp::Or,
-            children: policy_results,
-            outcome: false,
-        };
+        let combined = checker_root(policy_results, false);
 
         AccessEvaluation::Denied {
             trace: EvalTrace::with_root(combined),
@@ -362,10 +451,11 @@ where
     ///
     /// The `parts` callback tells gatehouse how to borrow the resource and
     /// context from each caller-owned item. Returned results preserve input
-    /// order, including duplicate resources. Policy evaluation still uses the
-    /// same OR semantics as [`Self::evaluate_in_session`], but the checker evaluates
-    /// each policy across the still-pending batch before moving to the next
-    /// policy. This lets policies with set-oriented backends override
+    /// order, including duplicate resources. Policy evaluation uses the same
+    /// deny-overrides semantics as [`Self::evaluate_in_session`] (declared-deny
+    /// policies first; a forbid finalizes an item as denied), but the checker
+    /// evaluates each policy across the still-pending batch before moving to
+    /// the next policy. This lets policies with set-oriented backends override
     /// [`Policy::evaluate_batch`] and collapse many point lookups into
     /// one backend call.
     ///
@@ -473,11 +563,15 @@ where
 
         let mut pending: Vec<usize> = (0..item_count).collect();
 
-        for policy in &self.policies {
+        // `policies` is kept in deny-first order by `add_policy`, so a
+        // forbid is always observed before an allow policy can grant an
+        // item out of the pending set.
+        for (policy_index, policy) in self.policies.iter().enumerate() {
             if pending.is_empty() {
                 break;
             }
 
+            let declared_effect = self.declared_effect(policy_index);
             let policy_type = policy.policy_type();
             let policy_type_str: &str = policy_type.as_ref();
             let mut still_pending = Vec::new();
@@ -491,14 +585,21 @@ where
                 let policy_span = tracing::debug_span!(
                     "gatehouse.batch_policy",
                     policy.type = policy_type_str,
+                    policy.effect = match declared_effect {
+                        Effect::Allow => "allow",
+                        Effect::Deny => "deny",
+                    },
                     policy.pending_count = pending_chunk.len(),
                     policy.chunk_index = chunk_index,
                     policy.chunk_count = chunk_count,
                     policy.granted_count = tracing::field::Empty,
                     policy.denied_count = tracing::field::Empty,
+                    policy.forbidden_count = tracing::field::Empty,
                 );
                 let mut policy_granted_count = 0usize;
                 let mut policy_denied_count = 0usize;
+                let mut policy_forbidden_count = 0usize;
+                let mut contract_violation_count = 0usize;
                 let batch_items: Vec<_> = pending_chunk
                     .iter()
                     .map(|&index| PolicyBatchItem {
@@ -527,12 +628,7 @@ where
                             "Policy batch result count did not match input count",
                         );
                         traces[index].push(policy_result);
-                        let combined = PolicyEvalResult::Combined {
-                            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
-                            operation: CombineOp::Or,
-                            children: std::mem::take(&mut traces[index]),
-                            outcome: false,
-                        };
+                        let combined = checker_root(std::mem::take(&mut traces[index]), false);
                         evaluations[index] = Some(AccessEvaluation::Denied {
                             trace: EvalTrace::with_root(combined),
                             reason: "Policy batch result count did not match input count"
@@ -541,23 +637,33 @@ where
                     }
                     policy_span.record("policy.granted_count", policy_granted_count);
                     policy_span.record("policy.denied_count", policy_denied_count);
+                    policy_span.record("policy.forbidden_count", policy_forbidden_count);
                     continue;
                 }
 
                 for (&index, result) in pending_chunk.iter().zip(policy_results) {
+                    let mut result = result;
+                    if declared_effect == Effect::Deny && result.is_granted() {
+                        contract_violation_count += 1;
+                        result =
+                            PolicyEvalResult::denied(policy_type.clone(), DENY_EFFECT_GRANT_REASON);
+                    }
                     let result_passes = result.is_granted();
+                    let result_forbids = result.is_forbidden();
                     let reason = result.reason();
 
                     traces[index].push(result);
 
-                    if result_passes {
+                    if result_forbids {
+                        policy_forbidden_count += 1;
+                        let combined = checker_root(std::mem::take(&mut traces[index]), false);
+                        evaluations[index] = Some(AccessEvaluation::Denied {
+                            trace: EvalTrace::with_root(combined),
+                            reason: forbid_summary(policy_type_str, reason.as_deref()),
+                        });
+                    } else if result_passes {
                         policy_granted_count += 1;
-                        let combined = PolicyEvalResult::Combined {
-                            policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
-                            operation: CombineOp::Or,
-                            children: std::mem::take(&mut traces[index]),
-                            outcome: true,
-                        };
+                        let combined = checker_root(std::mem::take(&mut traces[index]), true);
                         evaluations[index] = Some(AccessEvaluation::Granted {
                             policy_type: policy_type.clone(),
                             reason,
@@ -568,19 +674,24 @@ where
                         still_pending.push(index);
                     }
                 }
+                if contract_violation_count > 0 {
+                    // One warning per chunk, not per item: a misbehaving
+                    // policy in a large batch would otherwise flood the log.
+                    tracing::warn!(
+                        policy.type = policy_type_str,
+                        item_count = contract_violation_count,
+                        "{DENY_EFFECT_GRANT_REASON}"
+                    );
+                }
                 policy_span.record("policy.granted_count", policy_granted_count);
                 policy_span.record("policy.denied_count", policy_denied_count);
+                policy_span.record("policy.forbidden_count", policy_forbidden_count);
             }
             pending = still_pending;
         }
 
         for index in pending {
-            let combined = PolicyEvalResult::Combined {
-                policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
-                operation: CombineOp::Or,
-                children: std::mem::take(&mut traces[index]),
-                outcome: false,
-            };
+            let combined = checker_root(std::mem::take(&mut traces[index]), false);
             evaluations[index] = Some(AccessEvaluation::Denied {
                 trace: EvalTrace::with_root(combined),
                 reason: "All policies denied access".to_string(),

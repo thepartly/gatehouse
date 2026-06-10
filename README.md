@@ -89,14 +89,15 @@ If you are upgrading from 0.2, see `MIGRATION.md` for the `RelationshipResolver`
 
 ## Decision Semantics
 
-- `PermissionChecker` evaluates policies sequentially with `OR` semantics and short-circuits on the first grant.
+- `PermissionChecker` applies fixed **deny-overrides** semantics: any policy that *forbids* (an `Effect::Deny` policy whose predicate matches) denies the request, overriding every grant; otherwise any granting policy grants (`OR`, short-circuiting on the first grant); otherwise the request is denied.
+- Deny-effect policies are evaluated before allow policies, so a veto is never skipped by the grant short-circuit. Registration order does not change the decision. With no deny-effect policies, behavior is plain `OR`, exactly as before.
 - An empty `PermissionChecker` always denies with the reason `"No policies configured"`.
-- `AndPolicy` short-circuits on the first denial; `OrPolicy` short-circuits on the first grant.
+- `AndPolicy` short-circuits on the first non-grant; `OrPolicy` short-circuits on the first grant.
 - `NotPolicy` inverts the result of its inner policy.
-- `PolicyBuilder` combines all configured predicates with `AND` logic.
-- `PolicyBuilder::effect(Effect::Deny)` changes a matching policy result from allow to deny; a non-match is still treated as denied/non-applicable. It does not create global "deny overrides allow" behavior when used inside `PermissionChecker`.
-- `AccessEvaluation::Denied.reason` is a summary string such as `"All policies denied access"`. Inspect the trace tree for individual policy reasons.
-- Evaluation traces only contain policies and branches that were actually evaluated before short-circuiting.
+- Inside combinators a forbid behaves like an ordinary denial: forbids are honored at the checker level, not propagated through combinator trees. Register forbidding policies directly on the checker; use `AndPolicy[grant, NotPolicy(block)]` for an exclusion scoped to one grant path.
+- `PolicyBuilder` combines all configured predicates with `AND` logic. `PolicyBuilder::effect(Effect::Deny)` makes a matching policy *forbid* (`PolicyEvalResult::Forbidden`); a non-match is "not applicable" and never blocks anything. Hand-written policies that can forbid (via `ctx.forbid(...)`) must declare it by overriding `Policy::effect`.
+- `AccessEvaluation::Denied.reason` is a summary string: `"Forbidden by <policy>: <reason>"` for a veto (also exposed via `AccessEvaluation::forbidden_by()`), `"All policies denied access"` otherwise. Inspect the trace tree for individual policy reasons.
+- Evaluation traces only contain policies and branches that were actually evaluated before short-circuiting, in evaluation order (deny-effect policies first).
 
 ## Core Components
 
@@ -107,7 +108,7 @@ The foundation of the authorization system:
 ```rust
 use async_trait::async_trait;
 use std::borrow::Cow;
-use gatehouse::{BatchEvalCtx, EvalCtx, Policy, PolicyEvalResult, SecurityRuleMetadata};
+use gatehouse::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyEvalResult, SecurityRuleMetadata};
 
 #[async_trait]
 trait Policy<Subject, Resource, Action, Context>: Send + Sync {
@@ -121,20 +122,26 @@ trait Policy<Subject, Resource, Action, Context>: Send + Sync {
 
     fn policy_type(&self) -> Cow<'static, str>;
 
+    fn effect(&self) -> Effect {
+        Effect::Allow
+    }
+
     fn security_rule(&self) -> SecurityRuleMetadata {
         SecurityRuleMetadata::default()
     }
 }
 ```
 
-Within `evaluate`, prefer `ctx.grant("reason")` / `ctx.deny("reason")`
-(and the `*_with_facts` variants) to build the `PolicyEvalResult`
-instead of re-passing `self.policy_type()` — the checker captures the
-policy name on `EvalCtx` once per evaluation.
+Within `evaluate`, prefer `ctx.grant("reason")` / `ctx.deny("reason")` /
+`ctx.forbid("reason")` (and the `*_with_facts` variants) to build the
+`PolicyEvalResult` instead of re-passing `self.policy_type()` — the checker
+captures the policy name on `EvalCtx` once per evaluation. A policy that can
+`forbid` must also override `effect()` to return `Effect::Deny` so the
+checker schedules it ahead of the grant short-circuit.
 
 ### `PermissionChecker`
 
-Aggregates multiple policies (e.g. RBAC, ABAC) with `OR` logic by default: if any policy grants access, permission is granted. The returned `AccessEvaluation` contains both the final decision and a trace tree of the evaluated policies.
+Aggregates multiple policies (e.g. RBAC, ABAC) with deny-overrides semantics: any matching `Effect::Deny` policy denies; otherwise, if any policy grants access, permission is granted. The returned `AccessEvaluation` contains both the final decision and a trace tree of the evaluated policies.
 
 ```rust,ignore
 let mut checker = PermissionChecker::new();
@@ -179,7 +186,7 @@ let visible_posts = checker
     .await;
 ```
 
-The caller keeps ownership of resource loading and context construction. Gatehouse borrows the resource/context pair from each item, preserves input order, and applies the same per-item `OR` semantics as `evaluate_in_session`.
+The caller keeps ownership of resource loading and context construction. Gatehouse borrows the resource/context pair from each item, preserves input order, and applies the same per-item deny-overrides semantics as `evaluate_in_session`.
 
 If the item itself is the resource and the context type is `()`, use `evaluate_batch_resources_in_session` or `filter_authorized_resources_in_session`.
 
@@ -332,7 +339,7 @@ See the `examples` directory for complete demonstrations. Most examples are self
 - `rbac_policy` — basic role-based access control with `PermissionChecker`.
 - `policy_builder` — attribute-style custom policies via `PolicyBuilder`.
 - `combinator_policy` — combining policies with `AndPolicy` / `OrPolicy` / `NotPolicy`.
-- `deny_override` — enforce "deny overrides allow" (account suspensions, legal holds) by gating the allow set behind `NOT(blocklist)` under `AND`. Shows why adding a deny policy straight to the `OR`-based checker does not block anything.
+- `deny_override` — "deny overrides allow" with `Effect::Deny` policies (account suspensions, legal holds) registered flat on the checker, plus the `AndPolicy[grant, NotPolicy(block)]` shape for exclusions scoped to a single grant path.
 - `delegating_policy` — defer a decision to another domain's `PermissionChecker` with `DelegatingPolicy` (comment moderation inheriting document edit rights), keeping the trace across the boundary.
 - `mfa_freshness_context` — when (and when not) to populate the `Context` generic. Grounds the concept in a high-value-refund / MFA-freshness decision.
 
