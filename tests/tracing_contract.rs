@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use gatehouse::{
-    BatchEvalCtx, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyEvalResult,
+    BatchEvalCtx, Effect, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
+    PolicyEvalResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -526,4 +527,55 @@ fn named_checker_records_name_on_batch_span() {
 
     let batch = span(&spans, "evaluate_batch_in_session_by");
     assert_value(batch, "checker.name", "InvoiceItemChecker");
+}
+
+#[test]
+fn tracing_fields_are_recorded_for_forbidden_decisions() {
+    // An allow policy that would grant, vetoed by a deny-effect policy.
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(TracePolicy);
+    checker.add_policy(
+        PolicyBuilder::<Subject, Resource, Action, Ctx>::new("GlobalFreeze")
+            .effect(Effect::Deny)
+            .build(),
+    );
+
+    let session = EvaluationSession::empty();
+    let (result, spans) = capture_async(|| async {
+        checker
+            .evaluate_in_session(
+                &session,
+                &Subject,
+                &Action,
+                &Resource { allowed: true },
+                &Ctx,
+            )
+            .await
+    });
+    assert!(!result.is_granted());
+
+    // The single-evaluation span attributes the denial to the forbid.
+    let single = span(&spans, "evaluate_in_session");
+    assert_value(single, "outcome", "denied");
+    assert_value(single, "policy.type", "GlobalFreeze");
+
+    // The batch policy span carries the declared effect and the forbid count.
+    let (_results, spans) = capture_async(|| async {
+        checker
+            .evaluate_batch_in_session_by(
+                &session,
+                &Subject,
+                &Action,
+                vec![(Resource { allowed: true }, Ctx)],
+                |item| (&item.0, &item.1),
+            )
+            .await
+    });
+
+    // Deny-first scheduling: the first batch_policy span is the deny policy.
+    let policy = span(&spans, "gatehouse.batch_policy");
+    assert_value(policy, "policy.type", "GlobalFreeze");
+    assert_value(policy, "policy.effect", "deny");
+    assert_value(policy, "policy.forbidden_count", "1");
+    assert_value(policy, "policy.granted_count", "0");
 }

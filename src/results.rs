@@ -12,6 +12,9 @@ pub enum CombineOp {
     Not,
     /// A parent policy delegated the decision to another checker.
     Delegate,
+    /// Any forbidding policy denies; otherwise at least one policy must
+    /// grant. The root operation of [`crate::PermissionChecker`].
+    DenyOverrides,
 }
 
 impl fmt::Display for CombineOp {
@@ -21,6 +24,7 @@ impl fmt::Display for CombineOp {
             CombineOp::Or => write!(f, "OR"),
             CombineOp::Not => write!(f, "NOT"),
             CombineOp::Delegate => write!(f, "DELEGATE"),
+            CombineOp::DenyOverrides => write!(f, "DENY_OVERRIDES"),
         }
     }
 }
@@ -126,7 +130,14 @@ impl fmt::Display for FactProvenance {
 /// outcome of access evaluation.
 ///
 /// - [`PolicyEvalResult::Granted`]: Indicates that access is granted, with an optional reason.
-/// - [`PolicyEvalResult::Denied`]: Indicates that access is denied, along with an explanatory reason.
+/// - [`PolicyEvalResult::Denied`]: Indicates the policy did not grant access — either its
+///   predicate did not match (the policy is not applicable to this request) or it simply
+///   has nothing positive to say. A `Denied` from one policy never overrides a sibling's grant.
+/// - [`PolicyEvalResult::Forbidden`]: Indicates the policy **actively forbids** this request.
+///   Inside a [`crate::PermissionChecker`] a forbid overrides every grant (deny-overrides
+///   semantics). Produced by [`crate::PolicyBuilder`] policies with
+///   [`crate::Effect::Deny`] whose predicate matches, or by custom policies via
+///   [`crate::EvalCtx::forbid`].
 /// - [`PolicyEvalResult::Combined`]: Represents the aggregate result of combining multiple policies.
 #[derive(Debug, Clone)]
 pub enum PolicyEvalResult {
@@ -152,6 +163,24 @@ pub enum PolicyEvalResult {
         reason: String,
         /// Facts the policy consulted to reach this decision. Empty for
         /// policies that are not fact-backed (RBAC, ABAC, combinators).
+        provenance: Vec<FactProvenance>,
+    },
+    /// Access actively forbidden: the policy matched and vetoes this request.
+    ///
+    /// Unlike [`PolicyEvalResult::Denied`] ("this policy does not grant"),
+    /// `Forbidden` means "this policy forbids". [`crate::PermissionChecker`]
+    /// honors a forbid over any grant from sibling policies. Combinators
+    /// ([`crate::AndPolicy`], [`crate::OrPolicy`], [`crate::NotPolicy`]) treat
+    /// a `Forbidden` child exactly like `Denied` — the veto is honored at the
+    /// checker level, not propagated through combinator trees. Register
+    /// forbidding policies directly on the checker.
+    Forbidden {
+        /// The name of the policy that forbids access.
+        policy_type: Cow<'static, str>,
+        /// A human-readable reason for the veto.
+        reason: String,
+        /// Facts the policy consulted to reach this decision. Empty for
+        /// policies that are not fact-backed.
         provenance: Vec<FactProvenance>,
     },
     /// Combined result from multiple policy evaluations.
@@ -234,12 +263,13 @@ pub enum AccessEvaluation {
     },
 }
 
-/// Walks a [`PolicyEvalResult`] tree looking for a `Denied` leaf whose
-/// `policy_type` equals `expected`. Used by
+/// Walks a [`PolicyEvalResult`] tree looking for a `Denied` or `Forbidden`
+/// leaf whose `policy_type` equals `expected`. Used by
 /// [`AccessEvaluation::assert_denied_by`].
 fn leaf_denial_matches(node: &PolicyEvalResult, expected: &str) -> bool {
     match node {
-        PolicyEvalResult::Denied { policy_type, .. } => policy_type.as_ref() == expected,
+        PolicyEvalResult::Denied { policy_type, .. }
+        | PolicyEvalResult::Forbidden { policy_type, .. } => policy_type.as_ref() == expected,
         PolicyEvalResult::Granted { .. } => false,
         PolicyEvalResult::Combined { children, .. } => children
             .iter()
@@ -283,6 +313,36 @@ impl AccessEvaluation {
             Self::Denied { reason, .. } => Some(reason),
             Self::Granted { .. } => None,
         }
+    }
+
+    /// Returns the name of the policy whose forbid caused this denial, if
+    /// the denial was a deny-overrides veto rather than a plain
+    /// "no policy granted" outcome.
+    ///
+    /// Useful for distinguishing "actively blocked" (suspension, legal
+    /// hold) from "no grant matched" — for example to map the former to a
+    /// distinct HTTP status or audit event. Returns `None` for grants and
+    /// for ordinary denials.
+    pub fn forbidden_by(&self) -> Option<&str> {
+        let Self::Denied { trace, .. } = self else {
+            return None;
+        };
+        let Some(PolicyEvalResult::Combined {
+            operation: CombineOp::DenyOverrides,
+            children,
+            ..
+        }) = trace.root()
+        else {
+            return None;
+        };
+        // The checker honors forbids only from directly-registered
+        // policies, so only direct children of the deny-overrides root
+        // are considered — a Forbidden buried in a combinator subtree
+        // did not veto and must not be reported as if it had.
+        children.iter().find_map(|child| match child {
+            PolicyEvalResult::Forbidden { policy_type, .. } => Some(policy_type.as_ref()),
+            _ => None,
+        })
     }
 
     /// Test helper: panic unless the evaluation is `Granted` and the
@@ -412,6 +472,50 @@ impl AccessEvaluation {
                     );
                 }
             }
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is `Denied` *because of a
+    /// forbid* by the policy named `expected`.
+    ///
+    /// Stronger than [`Self::assert_denied_by`]: this asserts the denial
+    /// was a deny-overrides veto attributed to `expected` (via
+    /// [`Self::forbidden_by`]), not merely that `expected` appears as a
+    /// denying leaf somewhere in the trace.
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # tokio_test::block_on(async {
+    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
+    /// # checker.add_policy(PolicyBuilder::<(), (), (), ()>::new("AllowAll").build());
+    /// # checker.add_policy(
+    /// #     PolicyBuilder::<(), (), (), ()>::new("GlobalFreeze")
+    /// #         .effect(Effect::Deny)
+    /// #         .build(),
+    /// # );
+    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// evaluation.assert_forbidden_by("GlobalFreeze");
+    /// # });
+    /// ```
+    #[track_caller]
+    pub fn assert_forbidden_by(&self, expected: &str) {
+        match self {
+            Self::Granted { policy_type, .. } => {
+                panic!(
+                    "expected forbid by policy `{expected}`, but access was granted by `{policy_type}`"
+                );
+            }
+            Self::Denied { .. } => match self.forbidden_by() {
+                Some(actual) => assert_eq!(
+                    actual, expected,
+                    "expected forbid by policy `{expected}`, but the forbid came from `{actual}`"
+                ),
+                None => panic!(
+                    "expected forbid by policy `{expected}`, but the denial was not a forbid; \
+                     got:\n{}",
+                    self.display_trace()
+                ),
+            },
         }
     }
 
@@ -603,6 +707,22 @@ impl PolicyEvalResult {
         }
     }
 
+    /// Builds a forbidden leaf result with no fact provenance.
+    ///
+    /// A forbid is an **active veto**: inside a [`crate::PermissionChecker`]
+    /// it overrides grants from sibling policies. Custom policies returning
+    /// this from [`crate::Policy::evaluate`] should also override
+    /// [`crate::Policy::effect`] to return [`crate::Effect::Deny`] so the
+    /// checker schedules them ahead of the grant short-circuit. Prefer
+    /// [`crate::EvalCtx::forbid`] inside policy bodies.
+    pub fn forbidden(policy_type: impl Into<Cow<'static, str>>, reason: impl Into<String>) -> Self {
+        Self::Forbidden {
+            policy_type: policy_type.into(),
+            reason: reason.into(),
+            provenance: Vec::new(),
+        }
+    }
+
     /// Builds a granted leaf result carrying the facts that informed it.
     pub fn granted_with_facts(
         policy_type: impl Into<Cow<'static, str>>,
@@ -629,13 +749,37 @@ impl PolicyEvalResult {
         }
     }
 
+    /// Builds a forbidden leaf result carrying the facts that informed it.
+    pub fn forbidden_with_facts(
+        policy_type: impl Into<Cow<'static, str>>,
+        reason: impl Into<String>,
+        provenance: Vec<FactProvenance>,
+    ) -> Self {
+        Self::Forbidden {
+            policy_type: policy_type.into(),
+            reason: reason.into(),
+            provenance,
+        }
+    }
+
     /// Returns whether this evaluation resulted in access being granted
     pub fn is_granted(&self) -> bool {
         match self {
             Self::Granted { .. } => true,
-            Self::Denied { .. } => false,
+            Self::Denied { .. } | Self::Forbidden { .. } => false,
             Self::Combined { outcome, .. } => *outcome,
         }
+    }
+
+    /// Returns whether this result is an active forbid
+    /// ([`PolicyEvalResult::Forbidden`]).
+    ///
+    /// This is a **leaf check**, deliberately: a `Forbidden` nested inside a
+    /// [`PolicyEvalResult::Combined`] subtree does not make the combined
+    /// result forbidding. [`crate::PermissionChecker`] honors forbids only
+    /// from the policies registered directly on it.
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, Self::Forbidden { .. })
     }
 
     /// Returns the reason string if available
@@ -650,7 +794,7 @@ impl PolicyEvalResult {
     pub fn reason_str(&self) -> Option<&str> {
         match self {
             Self::Granted { reason, .. } => reason.as_deref(),
-            Self::Denied { reason, .. } => Some(reason),
+            Self::Denied { reason, .. } | Self::Forbidden { reason, .. } => Some(reason),
             Self::Combined { .. } => None,
         }
     }
@@ -660,7 +804,9 @@ impl PolicyEvalResult {
     /// Empty for combinators and for policies that are not fact-backed.
     pub fn provenance(&self) -> &[FactProvenance] {
         match self {
-            Self::Granted { provenance, .. } | Self::Denied { provenance, .. } => provenance,
+            Self::Granted { provenance, .. }
+            | Self::Denied { provenance, .. }
+            | Self::Forbidden { provenance, .. } => provenance,
             Self::Combined { .. } => &[],
         }
     }
@@ -687,6 +833,14 @@ impl PolicyEvalResult {
                 provenance,
             } => {
                 let headline = format!("{}✘ {} DENIED: {}", indent_str, policy_type, reason);
+                Self::append_provenance(headline, &indent_str, provenance)
+            }
+            Self::Forbidden {
+                policy_type,
+                reason,
+                provenance,
+            } => {
+                let headline = format!("{}⛔ {} FORBIDDEN: {}", indent_str, policy_type, reason);
                 Self::append_provenance(headline, &indent_str, provenance)
             }
             Self::Combined {

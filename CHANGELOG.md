@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+`PermissionChecker` now honors `Effect::Deny` with fixed deny-overrides semantics (#44). Checkers containing no `Effect::Deny` policies behave identically to before — for them this release is purely additive. **If you had already registered an `Effect::Deny` policy in a checker, its behavior changes: it used to do nothing (a matched deny composed into nothing under the old OR-only semantics — the trap this release fixes) and it now vetoes matching requests.** Audit existing `.effect(Effect::Deny)` call sites before upgrading.
+
+### Changed
+
+- **`PermissionChecker` decision semantics are now deny-overrides** (Cedar/IAM-style, fixed, no combining-algorithm knob): any policy that *forbids* denies the request, overriding every grant; otherwise OR-with-short-circuit over grants as before; otherwise default deny. Deny-effect policies are evaluated before allow policies, so a veto is independent of registration order. Applies identically to single, batch (`evaluate_batch_in_session_*`), filter, and lookup (`lookup_authorized*`) paths.
+- A matched `PolicyBuilder` policy with `.effect(Effect::Deny)` now returns the new `PolicyEvalResult::Forbidden` ("this policy forbids") instead of `Denied` ("this policy does not grant"); a non-match still returns `Denied` and never blocks anything.
+- The checker's trace root is now a `CombineOp::DenyOverrides` node (rendered `DENY_OVERRIDES`) instead of `Or`, with children in evaluation order (deny-effect policies first). A veto's summary reason is `"Forbidden by <policy>: <reason>"` rather than `"All policies denied access"`.
+- `Effect` moved from the builder module to sit alongside `Policy` (the crate-root re-export `gatehouse::Effect` is unchanged) and now derives `Copy`.
+- Inside `AndPolicy` / `OrPolicy` / `NotPolicy`, a `Forbidden` child behaves exactly like `Denied`: forbids are honored at the checker level, not propagated through combinator trees. Use `AndPolicy[grant, NotPolicy(block)]` for an exclusion scoped to one grant path.
+- Examples: `deny_override` and `mfa_freshness_context` now use flat `Effect::Deny` policies instead of their previous combinator workarounds.
+
+### Added
+
+- `PolicyEvalResult::Forbidden` variant, with `PolicyEvalResult::forbidden` / `forbidden_with_facts` constructors and `is_forbidden()`. **Breaking for exhaustive `match`es over `PolicyEvalResult` and `CombineOp`** — add an arm for `Forbidden` / `DenyOverrides`.
+- `Policy::effect()` — defaulted trait method (`Effect::Allow`) declaring whether a policy grants or forbids on match. The checker uses it to schedule deny-effect policies first; hand-written policies that can forbid must override it (the contract is documented on the method). A policy declaring `Effect::Deny` that nevertheless returns `Granted` is treated as not applicable (fail-closed) with a warning.
+- `EvalCtx::forbid` / `EvalCtx::forbid_with_facts` shortcuts for custom policies.
+- `AccessEvaluation::forbidden_by()` — returns the name of the vetoing policy when a denial was a forbid (e.g. to distinguish "actively blocked" from "no grant matched"), and the `assert_forbidden_by` test helper.
+- Batch telemetry: `gatehouse.batch_policy` spans gain `policy.effect` and `policy.forbidden_count` fields; the security rule event gains a `policy.effect` attribute.
+
 ## [0.4.0] - 2026-06-10
 
 A small, backward-leaning follow-up to 0.3.0: result-type and `RbacPolicy` ergonomics, plus a reviewed-and-tightened example suite. The one thing to know when upgrading is the `RbacPolicy` role-type generalization below — existing `Uuid`-based code compiles unchanged, but a resolver closure that returned a bare `vec![]` with the role type otherwise unmentioned may now need a type annotation. The minor version bump reflects that single inference edge; everything else is additive.

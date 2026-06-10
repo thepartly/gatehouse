@@ -3,21 +3,24 @@
 //! Almost every real authorization system eventually needs a rule that
 //! overrides all the others: a suspended account is locked out regardless of
 //! role, a document under legal hold is frozen even for its owner and for
-//! admins. The obvious move — "add a deny policy to the `PermissionChecker`" —
-//! does **not** do this. A `PermissionChecker` is `OR`: it grants on the first
-//! policy that grants, so a deny result is just one more "no" among the
-//! policies, and any sibling allow still wins. (`PolicyBuilder::effect(Deny)`
-//! does not change this; see the Decision Semantics section of the README.)
+//! admins. In gatehouse this is exactly what [`Effect::Deny`] does: a policy
+//! built with `.effect(Effect::Deny)` **forbids** the request when its
+//! predicate matches, and [`PermissionChecker`] honors a forbid over any
+//! grant from sibling policies — deny-overrides semantics, in the style of
+//! Cedar and AWS IAM.
 //!
-//! The shape that *does* work is to gate the whole allow set behind
-//! `NOT(blocklist)` under `AND`:
+//! The shape is flat: block rules are ordinary policies registered with
+//! `add_policy`, in natural polarity (predicate matches ⇒ forbidden), in any
+//! order. The decision rule is fixed:
 //!
-//! ```text
-//! AndPolicy [ NotPolicy(OrPolicy[ ...block rules ]),  OrPolicy[ ...allow rules ] ]
-//! ```
+//! 1. any matching `Effect::Deny` policy ⇒ **denied** (the trace names it);
+//! 2. otherwise any granting policy ⇒ **granted**;
+//! 3. otherwise ⇒ **denied** (default deny).
 //!
-//! `AndPolicy` denies if any arm denies, so a blocklist match (inverted by
-//! `NotPolicy` into a denial) overrides every grant in the allow set.
+//! Forbids are honored at the *checker* level. Inside combinators
+//! (`AndPolicy` / `OrPolicy` / `NotPolicy`) a forbid behaves like an
+//! ordinary denial — see the scoped-exclusion section at the bottom for the
+//! combinator shape that covers "this deny should only gate one grant path".
 //!
 //! Run with:
 //!
@@ -25,7 +28,7 @@
 //! cargo run --example deny_override
 //! ```
 
-use gatehouse::{AndPolicy, Effect, NotPolicy, OrPolicy, PermissionChecker, Policy, PolicyBuilder};
+use gatehouse::{AndPolicy, Effect, NotPolicy, PermissionChecker, Policy, PolicyBuilder};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -57,71 +60,48 @@ type DocPolicy = Box<dyn Policy<User, Document, Access, ()>>;
 
 // ---- the allow set -------------------------------------------------
 
-/// The grants: an admin override OR document ownership. This is the part an
-/// author writes first and is happy with — the bug only appears once a block
-/// rule has to override it.
-fn allow_set() -> DocPolicy {
-    let admin = PolicyBuilder::<User, Document, Access, ()>::new("AdminOverride")
+fn admin_override() -> DocPolicy {
+    PolicyBuilder::<User, Document, Access, ()>::new("AdminOverride")
         .subjects(|user| user.is_admin)
-        .build();
-    let owner = PolicyBuilder::<User, Document, Access, ()>::new("DocumentOwner")
+        .build()
+}
+
+fn document_owner() -> DocPolicy {
+    PolicyBuilder::<User, Document, Access, ()>::new("DocumentOwner")
         .when(|user, _action, document, _ctx| user.id == document.owner_id)
-        .build();
-
-    Box::new(
-        OrPolicy::try_new(vec![Arc::from(admin), Arc::from(owner)]).expect("allow set non-empty"),
-    )
+        .build()
 }
 
-// ---- the blocklist -------------------------------------------------
+// ---- the block rules -----------------------------------------------
 
-/// The block rules. Each one **grants when its block condition matches** — it
-/// reports "this request is on the blocklist". On its own that polarity looks
-/// backwards; it only makes sense wrapped in `NotPolicy` below, which turns a
-/// blocklist match into a denial.
-fn blocklist() -> DocPolicy {
-    let suspended = PolicyBuilder::<User, Document, Access, ()>::new("AccountSuspended")
+/// Account suspension: predicate matches ⇒ the request is forbidden. The
+/// effect travels with the policy, so this reads exactly as it behaves —
+/// no inverted polarity, no special registration call.
+fn account_suspended() -> DocPolicy {
+    PolicyBuilder::<User, Document, Access, ()>::new("AccountSuspended")
         .subjects(|user| user.suspended)
-        .build();
-    let legal_hold = PolicyBuilder::<User, Document, Access, ()>::new("LegalHold")
+        .effect(Effect::Deny)
+        .build()
+}
+
+/// Legal hold: a frozen document is blocked for everyone, owner and admin
+/// included.
+fn legal_hold() -> DocPolicy {
+    PolicyBuilder::<User, Document, Access, ()>::new("LegalHold")
         .resources(|document| document.legal_hold)
-        .build();
-
-    Box::new(
-        OrPolicy::try_new(vec![Arc::from(suspended), Arc::from(legal_hold)])
-            .expect("blocklist non-empty"),
-    )
+        .effect(Effect::Deny)
+        .build()
 }
 
-// ---- WRONG: a deny policy added straight to the checker ------------
-
-/// The tempting mistake. Add the blocklist to the checker as a deny-effect
-/// policy and assume it wins. It cannot: under `OR`, a deny is not a veto, and
-/// the admin/owner grant still short-circuits to a grant. Order does not save
-/// it either — the deny is listed first here and is still ignored.
-fn naive_checker() -> PermissionChecker<User, Document, Access, ()> {
-    let mut checker = PermissionChecker::named("NaiveDenyChecker");
-    checker.add_policy(
-        PolicyBuilder::<User, Document, Access, ()>::new("LegalHoldDeny")
-            .resources(|document| document.legal_hold)
-            .effect(Effect::Deny)
-            .build(),
-    );
-    checker.add_policy(allow_set());
-    checker
-}
-
-// ---- RIGHT: gate the allow set behind NOT(blocklist) ---------------
-
-/// The shape that actually enforces deny-overrides-allow.
-fn deny_override_checker() -> PermissionChecker<User, Document, Access, ()> {
-    let not_blocked: Arc<dyn Policy<User, Document, Access, ()>> =
-        Arc::new(NotPolicy::new(blocklist()));
-    let gate = AndPolicy::try_new(vec![not_blocked, Arc::from(allow_set())])
-        .expect("gate has the guard and the allow arm");
-
-    let mut checker = PermissionChecker::named("DenyOverrideChecker");
-    checker.add_policy(gate);
+fn document_checker() -> PermissionChecker<User, Document, Access, ()> {
+    let mut checker = PermissionChecker::named("DocumentChecker");
+    // Flat registration, any order: the deny policies' effect is declared
+    // on the policies themselves, and the checker evaluates deny-effect
+    // policies first so a veto can never be raced by a grant.
+    checker.add_policy(admin_override());
+    checker.add_policy(document_owner());
+    checker.add_policy(account_suspended());
+    checker.add_policy(legal_hold());
     checker
 }
 
@@ -160,8 +140,7 @@ async fn main() {
         legal_hold: true,
     };
 
-    let naive = naive_checker();
-    let correct = deny_override_checker();
+    let checker = document_checker();
 
     // (subject, resource, label)
     let cases = [
@@ -172,64 +151,122 @@ async fn main() {
         (&stranger, &normal_doc, "stranger, someone else's doc"),
     ];
 
-    println!(
-        "{:<32} {:>12} {:>12}",
-        "case", "naive (OR)", "deny-override"
-    );
-    println!("{}", "-".repeat(58));
+    println!("{:<32} {:>10} forbidden by", "case", "decision");
+    println!("{}", "-".repeat(60));
     for (subject, document, label) in cases {
-        let naive_granted = naive
-            .check(subject, &Access, document, &())
-            .await
-            .is_granted();
-        let correct_granted = correct
-            .check(subject, &Access, document, &())
-            .await
-            .is_granted();
+        let decision = checker.check(subject, &Access, document, &()).await;
         println!(
-            "{label:<32} {:>12} {:>12}",
-            verdict(naive_granted),
-            verdict(correct_granted),
+            "{label:<32} {:>10} {}",
+            verdict(decision.is_granted()),
+            decision.forbidden_by().unwrap_or("-"),
         );
     }
 
-    // The two rows where the checkers disagree are the whole point: the naive
-    // checker grants access it should have blocked.
-    assert!(
-        naive
-            .check(&admin, &Access, &held_doc, &())
-            .await
-            .is_granted(),
-        "naive OR checker leaks: admin is granted on a legal-hold document",
-    );
-    assert!(
-        !correct
-            .check(&admin, &Access, &held_doc, &())
-            .await
-            .is_granted(),
-        "deny-override checker blocks the legal-hold document even for an admin",
-    );
-    assert!(
-        !correct
-            .check(&suspended_owner, &Access, &normal_doc, &())
-            .await
-            .is_granted(),
-        "deny-override checker blocks a suspended account even on its own document",
-    );
-    // The allow set still gates everyone else: no grant, no access.
-    assert!(
-        !correct
-            .check(&stranger, &Access, &normal_doc, &())
-            .await
-            .is_granted(),
-        "a stranger with no grant is still denied",
-    );
+    // The grants still work where nothing blocks them.
+    checker
+        .check(&admin, &Access, &normal_doc, &())
+        .await
+        .assert_granted_by("AdminOverride");
+    checker
+        .check(&owner, &Access, &normal_doc, &())
+        .await
+        .assert_granted_by("DocumentOwner");
 
-    // Show the mechanism on the headline case: NOT(blocklist) denies first, so
-    // AND short-circuits before the allow arm is ever consulted.
-    println!("\nWhy the deny-override checker blocks 'admin, LEGAL-HOLD doc':");
-    let decision = correct.check(&admin, &Access, &held_doc, &()).await;
+    // The block rules override every grant — even the admin override.
+    checker
+        .check(&admin, &Access, &held_doc, &())
+        .await
+        .assert_forbidden_by("LegalHold");
+    checker
+        .check(&suspended_owner, &Access, &normal_doc, &())
+        .await
+        .assert_forbidden_by("AccountSuspended");
+
+    // Default deny is untouched: no grant, no access — and no forbid
+    // either, which `forbidden_by()` distinguishes for the caller.
+    let stranger_decision = checker.check(&stranger, &Access, &normal_doc, &()).await;
+    stranger_decision.assert_denied();
+    assert_eq!(stranger_decision.forbidden_by(), None);
+
+    // Show the mechanism on the headline case: the deny-effect policy is
+    // evaluated first and ends the evaluation; the allow set is never
+    // consulted.
+    println!("\nWhy 'admin, LEGAL-HOLD doc' is blocked:");
+    let decision = checker.check(&admin, &Access, &held_doc, &()).await;
     println!("{}", decision.display_trace());
+
+    scoped_exclusion_demo().await;
+}
+
+// ---- scoped exclusion: a deny that gates only one grant path --------
+
+/// `Effect::Deny` is a *global* veto: it blocks every grant path in the
+/// checker. When a block rule should only gate one grant path — here,
+/// muted users lose collaborator access but owners and admins keep
+/// theirs — scope it with combinators instead:
+/// `AndPolicy[ grant_arm, NotPolicy(block) ]`. Inside combinators a
+/// forbid has no special power, so the exclusion stays local to its arm.
+async fn scoped_exclusion_demo() {
+    #[derive(Debug, Clone)]
+    struct Member {
+        is_owner: bool,
+        is_collaborator: bool,
+        muted: bool,
+    }
+    #[derive(Debug, Clone)]
+    struct Thread;
+
+    let owner_policy = PolicyBuilder::<Member, Thread, Access, ()>::new("ThreadOwner")
+        .subjects(|member| member.is_owner)
+        .build();
+    let collaborator_policy: Arc<dyn Policy<Member, Thread, Access, ()>> = Arc::from(
+        PolicyBuilder::<Member, Thread, Access, ()>::new("Collaborator")
+            .subjects(|member| member.is_collaborator)
+            .build(),
+    );
+    // The block rule for the scoped case *grants when it matches* so that
+    // `NotPolicy` can invert it into a local gate. Compare with the
+    // checker-level rules above, where `Effect::Deny` keeps natural
+    // polarity — this inversion is the price of scoping, which is why a
+    // global block should prefer `Effect::Deny`.
+    let muted = PolicyBuilder::<Member, Thread, Access, ()>::new("Muted")
+        .subjects(|member| member.muted)
+        .build();
+
+    let collaborator_unless_muted = AndPolicy::try_new(vec![
+        collaborator_policy,
+        Arc::new(NotPolicy::new(muted)) as Arc<dyn Policy<Member, Thread, Access, ()>>,
+    ])
+    .expect("gate has the grant arm and the guard");
+
+    let mut checker = PermissionChecker::named("ThreadChecker");
+    checker.add_policy(owner_policy);
+    checker.add_policy(collaborator_unless_muted);
+
+    let muted_collaborator = Member {
+        is_owner: false,
+        is_collaborator: true,
+        muted: true,
+    };
+    let muted_owner = Member {
+        is_owner: true,
+        is_collaborator: false,
+        muted: true,
+    };
+
+    // The mute only gates the collaborator path...
+    checker
+        .check(&muted_collaborator, &Access, &Thread, &())
+        .await
+        .assert_denied();
+    // ...the owner path is untouched, which a global Effect::Deny mute
+    // could not express.
+    checker
+        .check(&muted_owner, &Access, &Thread, &())
+        .await
+        .assert_granted_by("ThreadOwner");
+
+    println!("\nScoped exclusion: muted collaborator blocked, muted owner unaffected.");
 }
 
 fn verdict(granted: bool) -> &'static str {

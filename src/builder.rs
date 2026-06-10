@@ -1,16 +1,5 @@
-use crate::{BatchEvalCtx, EvalCtx, Policy, PolicyEvalResult};
+use crate::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyEvalResult};
 use async_trait::async_trait;
-
-/// Represents the intended effect of a policy.
-///
-/// `Allow` means the policy grants access; `Deny` means it denies access.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Effect {
-    /// The policy grants access when its predicates pass.
-    Allow,
-    /// The policy denies access when its predicates pass.
-    Deny,
-}
 
 /// An internal policy type (not exposed to API users) that is constructed via the builder.
 ///
@@ -38,9 +27,13 @@ impl<S, R, A, C> InternalPolicy<S, R, A, C> {
                     self.name.clone(),
                     Some("Policy allowed access".into()),
                 ),
-                Effect::Deny => PolicyEvalResult::denied(self.name.clone(), "Policy denied access"),
+                Effect::Deny => {
+                    PolicyEvalResult::forbidden(self.name.clone(), "Policy forbids access")
+                }
             }
         } else {
+            // A non-match is "not applicable", never a veto — even for
+            // Effect::Deny policies.
             PolicyEvalResult::denied(self.name.clone(), "Policy predicate did not match")
         }
     }
@@ -122,6 +115,10 @@ where
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Owned(self.name.clone())
     }
+
+    fn effect(&self) -> Effect {
+        self.effect
+    }
 }
 
 /// A builder API for creating custom policies.
@@ -134,11 +131,11 @@ where
 /// [`PolicyBuilder`] is designed for synchronous predicate logic. If your policy
 /// needs to perform async I/O or external lookups, implement [`Policy`] directly.
 ///
-/// [`PolicyBuilder::effect`] controls the result returned when the combined
-/// predicate matches. In particular, `Effect::Deny` means "this built policy
-/// returns [`PolicyEvalResult::Denied`] when it matches". A non-match is still
-/// treated as denied/non-applicable, and this does not introduce a global
-/// deny-overrides-allow rule when combined with other policies.
+/// [`PolicyBuilder::effect`] declares whether a match grants or forbids.
+/// With [`Effect::Deny`], a match returns [`PolicyEvalResult::Forbidden`],
+/// which [`crate::PermissionChecker`] honors over any sibling grant
+/// (deny-overrides). A non-match is "not applicable" either way and never
+/// blocks anything.
 ///
 /// # A note on allocation cost
 ///
@@ -346,10 +343,24 @@ where
     ///
     /// Defaults to [`Effect::Allow`].
     ///
-    /// `Effect::Deny` causes the built policy to return
-    /// [`PolicyEvalResult::Denied`] when its combined predicate matches. A
-    /// non-match is still treated as denied/non-applicable, and this does not
-    /// override grants from other policies evaluated by [`crate::PermissionChecker`].
+    /// With [`Effect::Deny`], the built policy returns
+    /// [`PolicyEvalResult::Forbidden`] when its combined predicate matches:
+    /// it reads exactly as it behaves — "predicate matches ⇒ this request is
+    /// forbidden". Inside a [`crate::PermissionChecker`] a forbid overrides
+    /// every grant, regardless of registration order. A non-match is "not
+    /// applicable" and blocks nothing.
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # #[derive(Clone)] struct User { is_suspended: bool }
+    /// # struct Doc; struct Read; struct Ctx;
+    /// let suspended = PolicyBuilder::<User, Doc, Read, Ctx>::new("SuspendedAccount")
+    ///     .subjects(|user| user.is_suspended)
+    ///     .effect(Effect::Deny)
+    ///     .build();
+    /// // checker.add_policy(suspended);  — a suspended user is now locked
+    /// // out even when an admin-override or owner policy would grant.
+    /// ```
     pub fn effect(mut self, effect: Effect) -> Self {
         self.effect = effect;
         self

@@ -360,8 +360,9 @@ fn invoice_editing_policy() -> Box<dyn Policy<User, Invoice, Action, RequestCont
     )
 }
 
-/// (D) Combine the policies into a single `PermissionChecker`. OR semantics: if
-/// any policy grants, access is allowed (and evaluation short-circuits).
+/// (D) Combine the policies into a single `PermissionChecker`. With no
+/// deny-effect policies registered, deny-overrides reduces to OR semantics:
+/// if any policy grants, access is allowed (and evaluation short-circuits).
 pub fn build_permission_checker() -> PermissionChecker<User, Invoice, Action, RequestContext> {
     let mut checker = PermissionChecker::named("InvoiceChecker");
     checker.add_policy(admin_override_policy());

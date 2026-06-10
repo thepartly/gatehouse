@@ -10,39 +10,60 @@
 //!
 //! A *Policy* is an asynchronous decision unit that checks if a given subject may
 //! perform an action on a resource within a given context. Policies implement the
-//! [`Policy`] trait. A [`PermissionChecker`] aggregates multiple policies and uses OR
-//! logic by default (i.e. if any policy grants access, then access is allowed).
+//! [`Policy`] trait. A [`PermissionChecker`] aggregates multiple policies with
+//! deny-overrides semantics: any matching [`Effect::Deny`] policy denies access;
+//! otherwise, if any policy grants access, then access is allowed.
 //! The [`PolicyBuilder`] offers a builder pattern for creating custom policies.
 //! Custom [`Policy`] implementations must provide both [`Policy::evaluate`]
 //! and [`Policy::policy_type`].
 //!
 //! ## Decision Semantics
 //!
-//! `gatehouse` deliberately keeps decision semantics simple and explicit:
+//! `gatehouse` deliberately keeps decision semantics simple, explicit, and
+//! fixed — there is no combining-algorithm knob:
 //!
-//! - [`PermissionChecker`] evaluates policies sequentially with OR semantics and
-//!   short-circuits on the first grant.
+//! - [`PermissionChecker`] applies **deny-overrides**: any policy that
+//!   *forbids* (an [`Effect::Deny`] policy whose predicate matches, producing
+//!   [`PolicyEvalResult::Forbidden`]) denies the request, overriding every
+//!   grant. Otherwise the policies combine with OR semantics and
+//!   short-circuit on the first grant. Otherwise the request is denied.
+//! - Deny-effect policies are evaluated before allow policies, so a veto is
+//!   never skipped by the grant short-circuit. Registration order does not
+//!   change the decision.
 //! - An empty [`PermissionChecker`] denies access with the reason
 //!   `"No policies configured"`.
-//! - [`AndPolicy`] short-circuits on the first denial.
+//! - [`AndPolicy`] short-circuits on the first non-grant.
 //! - [`OrPolicy`] short-circuits on the first grant.
 //! - [`NotPolicy`] inverts the decision of its inner policy.
+//! - Inside combinators a `Forbidden` child behaves exactly like `Denied`:
+//!   forbids are honored at the checker level, not propagated through
+//!   combinator trees. Register forbidding policies directly on the checker;
+//!   use `AndPolicy[grant, NotPolicy(block)]` when an exclusion should gate
+//!   only one grant path (see `examples/deny_override.rs`).
 //! - [`PolicyBuilder`] combines all configured predicates with AND logic.
-//! - [`PolicyBuilder::effect`] changes the result returned by that specific
-//!   built policy when its combined predicate matches. A non-match is still
-//!   treated as denied/non-applicable, and the effect does not create global
-//!   deny-overrides-allow semantics when used inside [`PermissionChecker`].
+//!   [`PolicyBuilder::effect`] declares whether a match grants or forbids; a
+//!   non-match is "not applicable" either way and never blocks anything.
+//! - Hand-written policies that can return `Forbidden` (via
+//!   [`EvalCtx::forbid`]) must override [`Policy::effect`] to declare
+//!   [`Effect::Deny`]; see [`Policy::effect`] for the contract.
 //!
-//! Denials from [`AccessEvaluation`] are intentionally summary-level. For example,
-//! a failed [`PermissionChecker`] returns the top-level reason
-//! `"All policies denied access"`. Use the attached [`EvalTrace`] to inspect the
-//! individual policy reasons that led to that outcome.
+//! Denials from [`AccessEvaluation`] are intentionally summary-level: a veto
+//! reports `"Forbidden by <policy>: <reason>"` (also exposed structurally via
+//! [`AccessEvaluation::forbidden_by`]), and a no-grant denial reports
+//! `"All policies denied access"`. Use the attached [`EvalTrace`] to inspect
+//! the individual policy reasons that led to that outcome.
 //!
 //! ## Trace Semantics
 //!
 //! [`EvalTrace`] records the policies and combinator branches that were actually
 //! evaluated. Because [`PermissionChecker`], [`AndPolicy`], and [`OrPolicy`]
 //! short-circuit, the trace tree does not include policies that were never run.
+//! The checker's root node is a `DENY_OVERRIDES` combine node whose children
+//! appear in evaluation order: deny-effect policies first, then allow
+//! policies. A forbid ends the evaluation, so a vetoed request's trace shows
+//! the forbidding policy as its last child. The exception is a checker with
+//! no policies at all, whose trace is the single `"No policies configured"`
+//! denial leaf with no combine node around it.
 //!
 //! ## When to populate the Context type
 //!
@@ -66,10 +87,11 @@
 //!   requires an MFA assertion within the last 5 minutes." MFA freshness
 //!   lives on the request (the session token records when MFA was last
 //!   reasserted), not on the user record. A `mfa_verified_at:
-//!   Option<SystemTime>` on `Context` lets the high-value policy short-
-//!   circuit deny when freshness has lapsed without forcing every policy
-//!   to plumb the auth-session through their own arguments. See
-//!   `examples/mfa_freshness_context.rs` for the full end-to-end shape.
+//!   Option<SystemTime>` on `Context` lets a deny-effect high-value
+//!   policy forbid the request when freshness has lapsed without forcing
+//!   every policy to plumb the auth-session through their own arguments.
+//!   See `examples/mfa_freshness_context.rs` for the full end-to-end
+//!   shape.
 //!
 //! - **Device / network trust posture.** "Production database access
 //!   requires the request to come from a managed device on the corporate
@@ -238,7 +260,8 @@
 //!     }
 //! }
 //!
-//! // Create a PermissionChecker (which uses OR semantics by default) and add both policies.
+//! // Create a PermissionChecker (deny-overrides over the registered policies;
+//! // with no deny-effect policies this is simply OR) and add both policies.
 //! fn create_document_checker() -> PermissionChecker<User, Document, ReadAction, EmptyContext> {
 //!     let mut checker = PermissionChecker::new();
 //!     checker.add_policy(AdminPolicy);
@@ -343,7 +366,7 @@ mod policy;
 mod results;
 mod session;
 
-pub use builder::{Effect, PolicyBuilder};
+pub use builder::PolicyBuilder;
 pub use checker::PermissionChecker;
 pub use combinators::{AndPolicy, EmptyPoliciesError, NotPolicy, OrPolicy};
 pub use facts::{
@@ -354,7 +377,7 @@ pub use lookup::{Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupPa
 pub use metadata::SecurityRuleMetadata;
 pub(crate) use metadata::{DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE};
 pub use policies::{AbacPolicy, DelegatingPolicy, RbacPolicy, RebacPolicy};
-pub use policy::{BatchEvalCtx, EvalCtx, Policy, PolicyBatchItem};
+pub use policy::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyBatchItem};
 pub use results::{
     AccessEvaluation, CombineOp, EvalTrace, FactOutcome, FactProvenance, PolicyEvalResult,
 };

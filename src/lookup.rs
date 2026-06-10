@@ -36,10 +36,12 @@ use std::num::NonZeroUsize;
 /// out-of-band signal that completeness was broken: the caller will simply
 /// see fewer resources than they should.
 ///
-/// In particular, [`PermissionChecker`] uses OR semantics across policies.
-/// If you compose policies whose grant axes are independent (for example,
-/// "I own it" OR "it is public" OR "the admin override applies"), the
-/// `LookupSource` must enumerate the union of every axis. Lookup is the
+/// In particular, [`PermissionChecker`] grants when any allow policy
+/// grants (deny-overrides over OR). If you compose policies whose grant
+/// axes are independent (for example, "I own it" OR "it is public" OR
+/// "the admin override applies"), the `LookupSource` must enumerate the
+/// union of every grant axis. Deny-effect policies only *remove* results,
+/// so they never widen what the source must enumerate. Lookup is the
 /// scaling story for the narrow case where one axis dominates; it is
 /// **not** a way to express policy logic inside the data layer.
 ///

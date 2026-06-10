@@ -2,6 +2,25 @@ use crate::{EvaluationSession, FactProvenance, PolicyEvalResult, SecurityRuleMet
 use async_trait::async_trait;
 use std::borrow::Cow;
 
+/// The declared effect of a policy: whether a match grants or forbids access.
+///
+/// `Allow` (the default everywhere) means the policy grants access when it
+/// matches. `Deny` means the policy **forbids** access when it matches — a
+/// matched deny produces [`PolicyEvalResult::Forbidden`], which
+/// [`crate::PermissionChecker`] honors over any grant from sibling policies
+/// (deny-overrides semantics).
+///
+/// The effect travels with the policy: set it via
+/// [`crate::PolicyBuilder::effect`], or declare it on a hand-written policy
+/// by overriding [`Policy::effect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// The policy grants access when its predicates pass.
+    Allow,
+    /// The policy forbids access when its predicates pass.
+    Deny,
+}
+
 /// A borrowed resource/context pair passed to batch policy evaluators.
 ///
 /// Values are borrowed from caller-owned batch items, so policy implementations
@@ -88,6 +107,17 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
         PolicyEvalResult::denied(self.policy_type.clone(), reason)
     }
 
+    /// Shorthand for `PolicyEvalResult::forbidden(ctx.policy_type, reason)`.
+    ///
+    /// Use this for an **active veto** — "this request is forbidden" — as
+    /// opposed to [`Self::deny`]'s "this policy does not grant". A policy
+    /// that can return a forbid should also override [`Policy::effect`] to
+    /// return [`Effect::Deny`] so [`crate::PermissionChecker`] evaluates it
+    /// before grant short-circuiting can skip it.
+    pub fn forbid(&self, reason: impl Into<String>) -> PolicyEvalResult {
+        PolicyEvalResult::forbidden(self.policy_type.clone(), reason)
+    }
+
     /// Shorthand for [`PolicyEvalResult::granted_with_facts`] tagged with
     /// `ctx.policy_type`. See [`Self::grant`] for the reason-handling
     /// rationale.
@@ -111,6 +141,17 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
         provenance: Vec<FactProvenance>,
     ) -> PolicyEvalResult {
         PolicyEvalResult::denied_with_facts(self.policy_type.clone(), reason, provenance)
+    }
+
+    /// Shorthand for [`PolicyEvalResult::forbidden_with_facts`] tagged with
+    /// `ctx.policy_type`. See [`Self::forbid`] for when a forbid is the
+    /// right result.
+    pub fn forbid_with_facts(
+        &self,
+        reason: impl Into<String>,
+        provenance: Vec<FactProvenance>,
+    ) -> PolicyEvalResult {
+        PolicyEvalResult::forbidden_with_facts(self.policy_type.clone(), reason, provenance)
     }
 }
 
@@ -235,6 +276,29 @@ where
     /// extra cost.
     fn policy_type(&self) -> Cow<'static, str>;
 
+    /// The declared effect of this policy. Defaults to [`Effect::Allow`].
+    ///
+    /// [`crate::PermissionChecker`] reads this declaration **once, when the
+    /// policy is added**, to schedule evaluation: policies declaring
+    /// [`Effect::Deny`] run **before** the allow policies, so a matched
+    /// forbid is always observed before the grant short-circuit can end the
+    /// evaluation. The declaration must therefore be constant for the
+    /// policy's lifetime. Policies built with
+    /// [`crate::PolicyBuilder::effect`] declare this automatically.
+    ///
+    /// **Contract:** a hand-written policy that can return
+    /// [`PolicyEvalResult::Forbidden`] must override this to return
+    /// [`Effect::Deny`]. The checker still honors a forbid it happens to
+    /// observe from an undeclared policy, but without the declaration a
+    /// sibling's grant can short-circuit evaluation before the forbid is
+    /// reached — the veto would then depend on registration order.
+    /// Conversely, a policy declaring `Effect::Deny` must not return
+    /// `Granted`; the checker treats such a result as not applicable
+    /// (fail-closed) and logs a warning.
+    fn effect(&self) -> Effect {
+        Effect::Allow
+    }
+
     /// Metadata describing the security rule that backs this policy.
     ///
     /// Implementors can override this method to surface additional semantic
@@ -268,6 +332,10 @@ where
 
     fn policy_type(&self) -> Cow<'static, str> {
         (**self).policy_type()
+    }
+
+    fn effect(&self) -> Effect {
+        (**self).effect()
     }
 
     fn security_rule(&self) -> SecurityRuleMetadata {
