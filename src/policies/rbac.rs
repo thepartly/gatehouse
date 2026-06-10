@@ -93,10 +93,9 @@ impl<S, F1, F2> RbacPolicy<S, F1, F2> {
     }
 }
 
-// `RoleId` is constrained through the closures' `Fn(...) -> Vec<RoleId>`
-// output bindings, so it is inferred from the resolvers rather than being a
-// parameter on the struct. `PartialEq` is the only capability the policy
-// needs (the `contains` check below).
+// `RoleId` is a free parameter on this impl rather than on the struct: it is
+// pinned only by the resolver closures' `-> Vec<RoleId>` return types, so it is
+// inferred at the call site instead of being fixed when the policy is stored.
 #[async_trait]
 impl<S, R, A, C, F1, F2, RoleId> Policy<S, R, A, C> for RbacPolicy<S, F1, F2>
 where

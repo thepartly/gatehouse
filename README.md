@@ -325,9 +325,7 @@ Fallback behavior when `security_rule()` is not overridden:
 
 ## Examples
 
-See the `examples` directory for complete demonstrations. Most examples are
-self-contained and run with `cargo run --example <name>`. The web examples
-start local servers, and `postgres_bulk_rebac` needs a live PostgreSQL database.
+See the `examples` directory for complete demonstrations. Most examples are self-contained and run with `cargo run --example <name>`. The web examples start local servers, and `postgres_bulk_rebac` needs a live PostgreSQL database.
 
 **Start here: policy mechanics**
 
@@ -366,8 +364,7 @@ Run a server example with:
 cargo run --example axum
 ```
 
-Then send requests to `http://127.0.0.1:8000`; `actix_web` listens on
-`http://127.0.0.1:8080`.
+Then send requests to `http://127.0.0.1:8000`; `actix_web` listens on `http://127.0.0.1:8080`.
 
 ## Performance
 
@@ -379,13 +376,7 @@ The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead w
 
 The `postgres_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource`. It models a list endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through `filter_authorized_in_session_by_resource`.
 
-This example is intentionally outside the quick-start path: it creates and
-seeds a table, expects a live PostgreSQL database, and reads `DATABASE_URL`.
-It was tested and benchmarked with PostgreSQL 18; the SQL is intentionally
-ordinary PostgreSQL, so older supported versions may also work. If
-`DATABASE_URL` is unset, it tries `host=localhost port=15432 user=postgres
-password=test dbname=awa_test`, so set the variable explicitly unless your
-local database matches that default:
+This example is intentionally outside the quick-start path: it creates and seeds a table, expects a live PostgreSQL database, and reads `DATABASE_URL`. It was tested and benchmarked with PostgreSQL 18; the SQL is intentionally ordinary PostgreSQL, so older supported versions may also work. If `DATABASE_URL` is unset, it tries `host=localhost port=15432 user=postgres password=test dbname=awa_test`, so set the variable explicitly unless your local database matches that default:
 
 ```shell
 DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
