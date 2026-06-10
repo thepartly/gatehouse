@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-10
+
+A small, backward-leaning follow-up to 0.3.0: result-type and `RbacPolicy` ergonomics, plus a reviewed-and-tightened example suite. The one thing to know when upgrading is the `RbacPolicy` role-type generalization below — existing `Uuid`-based code compiles unchanged, but a resolver closure that returned a bare `vec![]` with the role type otherwise unmentioned may now need a type annotation. The minor version bump reflects that single inference edge; everything else is additive.
+
 ### Added
 
 - `RbacPolicy` is now generic over the role identifier type. Any `PartialEq` type works — a domain enum, string ids, or `Uuid`s — inferred from the resolver closures' return types. Existing `Uuid`-based code keeps working unchanged; the one edge is closures whose role type was previously pinned only by the impl (e.g. a bare `vec![]` with no other mention of the role type), which may now need an annotation.
