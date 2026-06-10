@@ -11,6 +11,7 @@
 - The checker's trace root is now a `CombineOp::DenyOverrides` node (rendered `DENY_OVERRIDES`) instead of `Or`, with children in evaluation order (deny-effect policies first). A veto's summary reason is `"Forbidden by <policy>: <reason>"` rather than `"All policies denied access"`.
 - `Effect` moved from the builder module to sit alongside `Policy` (the crate-root re-export `gatehouse::Effect` is unchanged) and now derives `Copy`.
 - Inside `AndPolicy` / `OrPolicy` / `NotPolicy`, a `Forbidden` child behaves exactly like `Denied`: forbids are honored at the checker level, not propagated through combinator trees. Use `AndPolicy[grant, NotPolicy(block)]` for an exclusion scoped to one grant path (see the reworked `deny_override` example, which covers both shapes).
+- The `mfa_freshness_context` example's high-value MFA rule is now a deny-effect policy registered flat on the checker (`ctx.forbid` + an `effect()` override), replacing the previous `AndPolicy` gate whose "rule doesn't apply ⇒ grant" polarity carried a do-not-register-directly footgun warning. The veto now also binds any grant path added later.
 
 ### Added
 

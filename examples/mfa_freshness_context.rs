@@ -13,12 +13,13 @@
 //!
 //! That last bit is what `Context` is for. We carry `mfa_verified_at`
 //! and the request's wall-clock time on `ApprovalContext`. The
-//! high-value policy short-circuits deny when MFA freshness has lapsed;
-//! the role policy ignores the field entirely. Same subject, same
-//! resource, different calls → different decisions.
+//! high-value rule is a deny-effect policy that **forbids** the approval
+//! when MFA freshness has lapsed; the role policy ignores the field
+//! entirely. Same subject, same resource, different calls → different
+//! decisions.
 
 use async_trait::async_trait;
-use gatehouse::{AccessEvaluation, EvalCtx, PermissionChecker, Policy, PolicyEvalResult};
+use gatehouse::{AccessEvaluation, Effect, EvalCtx, PermissionChecker, Policy, PolicyEvalResult};
 use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -79,21 +80,23 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for FinanceCanApprove
     }
 }
 
-/// AND-gate: high-value refunds additionally require recent MFA.
+/// Deny rule: a high-value refund without fresh MFA is **forbidden**.
 ///
-/// This is the policy that *does* care about `Context`. It treats
-/// "not a high-value refund" as granted (the rule doesn't apply), so
-/// pairing it with [`FinanceCanApproveRefunds`] under [`AndPolicy`]
-/// only adds the freshness check when it's relevant.
+/// This is the policy that *does* care about `Context`, and it is a
+/// deny-effect policy in natural polarity: it matches exactly when the
+/// approval must be blocked, and returns `ctx.forbid(...)` for that
+/// case. Everything else — small refunds, fresh MFA — is "not
+/// applicable" (`ctx.deny`), which never blocks and never grants.
 ///
-/// **DO NOT add this policy directly to a `PermissionChecker`** —
-/// the checker uses `OR` semantics, so the "rule doesn't apply"
-/// grant on every below-threshold call would grant *everyone* on
-/// every small refund, regardless of role. This shape is only safe
-/// inside an `AndPolicy` (or any `AND`-combining context) where the
-/// sibling policies enforce the actual access decision. The pattern
-/// is "augment an existing grant with an additional gate," not
-/// "decide on its own."
+/// Registered flat on the [`PermissionChecker`], the forbid overrides
+/// every grant under deny-overrides semantics. That is the right
+/// strength for an MFA requirement: if an admin-override or
+/// service-account grant path is added later, a stale session still
+/// cannot approve a high-value refund through it.
+///
+/// Note the [`Policy::effect`] override below — a hand-written policy
+/// that can forbid must declare [`Effect::Deny`] so the checker
+/// schedules it ahead of the grant short-circuit.
 struct HighValueRequiresFreshMfa {
     threshold_cents: u64,
     max_age: Duration,
@@ -105,14 +108,14 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequires
         &self,
         ctx: &EvalCtx<'_, User, RefundRequest, Approve, ApprovalContext>,
     ) -> PolicyEvalResult {
-        // Rule doesn't apply below the threshold — grant. NOTE: this
-        // only behaves correctly under AND. See the struct's docstring.
+        // Rule doesn't apply below the threshold: not applicable, and a
+        // non-matching deny-effect policy blocks nothing.
         if ctx.resource.amount_cents < self.threshold_cents {
-            return ctx.grant("amount below high-value threshold");
+            return ctx.deny("amount below high-value threshold; rule not applicable");
         }
 
         let Some(verified_at) = ctx.context.mfa_verified_at else {
-            return ctx.deny(format!(
+            return ctx.forbid(format!(
                 "high-value refund (>={} cents) requires recent MFA, but this session has none",
                 self.threshold_cents,
             ));
@@ -124,12 +127,12 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequires
             .duration_since(verified_at)
             .unwrap_or_default();
         if age <= self.max_age {
-            ctx.grant(format!(
-                "MFA reasserted {}s ago, within freshness window",
+            ctx.deny(format!(
+                "MFA reasserted {}s ago, within freshness window; rule not applicable",
                 age.as_secs(),
             ))
         } else {
-            ctx.deny(format!(
+            ctx.forbid(format!(
                 "MFA reasserted {}s ago, exceeds freshness window of {}s",
                 age.as_secs(),
                 self.max_age.as_secs(),
@@ -139,26 +142,21 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequires
     fn policy_type(&self) -> Cow<'static, str> {
         Cow::Borrowed("HighValueRequiresFreshMfa")
     }
+    fn effect(&self) -> Effect {
+        Effect::Deny
+    }
 }
 
 fn build_checker() -> PermissionChecker<User, RefundRequest, Approve, ApprovalContext> {
-    use gatehouse::AndPolicy;
-    use std::sync::Arc;
-
-    // Approval requires BOTH the role check AND the MFA-freshness
-    // check. Both must grant — that's the AND.
-    let combined = AndPolicy::try_new(vec![
-        Arc::new(FinanceCanApproveRefunds)
-            as Arc<dyn Policy<User, RefundRequest, Approve, ApprovalContext>>,
-        Arc::new(HighValueRequiresFreshMfa {
-            threshold_cents: 1_000_000, // $10,000
-            max_age: Duration::from_secs(5 * 60),
-        }),
-    ])
-    .expect("non-empty policy list");
-
+    // Flat registration: the role grant and the MFA veto are siblings.
+    // The checker's deny-overrides rule does the combining — any forbid
+    // wins, otherwise any grant wins, otherwise default deny.
     let mut checker = PermissionChecker::named("RefundApprovalChecker");
-    checker.add_policy(combined);
+    checker.add_policy(FinanceCanApproveRefunds);
+    checker.add_policy(HighValueRequiresFreshMfa {
+        threshold_cents: 1_000_000, // $10,000
+        max_age: Duration::from_secs(5 * 60),
+    });
     checker
 }
 
@@ -181,7 +179,7 @@ async fn main() {
     let checker = build_checker();
 
     // Case 1: small refund, no MFA at all. Granted — the high-value
-    // rule doesn't apply below the threshold.
+    // rule doesn't apply below the threshold, so the role grant decides.
     let small_no_mfa = ApprovalContext {
         current_time: now,
         mfa_verified_at: None,
@@ -190,32 +188,34 @@ async fn main() {
         .check(&alice, &Approve, &small_refund, &small_no_mfa)
         .await;
     report("small refund, no MFA", &r);
-    assert!(r.is_granted());
+    r.assert_granted_by("FinanceCanApproveRefunds");
 
-    // Case 2: large refund, no MFA. Denied by the freshness rule.
+    // Case 2: large refund, no MFA. Forbidden by the freshness rule —
+    // the veto overrides Alice's role grant.
     let r = checker
         .check(&alice, &Approve, &large_refund, &small_no_mfa)
         .await;
     report("large refund, no MFA", &r);
-    assert!(!r.is_granted());
+    r.assert_forbidden_by("HighValueRequiresFreshMfa");
 
-    // Case 3: large refund, MFA reasserted 8 minutes ago. Stale.
+    // Case 3: large refund, MFA reasserted 8 minutes ago. Stale → forbidden.
     let stale = ApprovalContext {
         current_time: now,
         mfa_verified_at: Some(now - Duration::from_secs(8 * 60)),
     };
     let r = checker.check(&alice, &Approve, &large_refund, &stale).await;
     report("large refund, MFA 8m old", &r);
-    assert!(!r.is_granted());
+    r.assert_forbidden_by("HighValueRequiresFreshMfa");
 
-    // Case 4: large refund, MFA reasserted 30 seconds ago. Granted.
+    // Case 4: large refund, MFA reasserted 30 seconds ago. The deny rule
+    // is not applicable, so the role grant decides.
     let fresh = ApprovalContext {
         current_time: now,
         mfa_verified_at: Some(now - Duration::from_secs(30)),
     };
     let r = checker.check(&alice, &Approve, &large_refund, &fresh).await;
     report("large refund, MFA 30s old", &r);
-    assert!(r.is_granted());
+    r.assert_granted_by("FinanceCanApproveRefunds");
 
     // The point: cases 2-4 all use the same subject and resource. The
     // only thing that varies is `ApprovalContext`. That's exactly the

@@ -341,7 +341,7 @@ See the `examples` directory for complete demonstrations. Most examples are self
 - `combinator_policy` — combining policies with `AndPolicy` / `OrPolicy` / `NotPolicy`.
 - `deny_override` — "deny overrides allow" with `Effect::Deny` policies (account suspensions, legal holds) registered flat on the checker, plus the `AndPolicy[grant, NotPolicy(block)]` shape for exclusions scoped to a single grant path.
 - `delegating_policy` — defer a decision to another domain's `PermissionChecker` with `DelegatingPolicy` (comment moderation inheriting document edit rights), keeping the trace across the boundary.
-- `mfa_freshness_context` — when (and when not) to populate the `Context` generic. Grounds the concept in a high-value-refund / MFA-freshness decision.
+- `mfa_freshness_context` — when (and when not) to populate the `Context` generic, grounded in a high-value-refund / MFA-freshness decision. Also shows the hand-written deny-policy shape: `ctx.forbid(...)` plus an `effect()` override, registered flat on the checker.
 
 **Then learn request-scoped facts and list endpoints**
 

@@ -87,10 +87,11 @@
 //!   requires an MFA assertion within the last 5 minutes." MFA freshness
 //!   lives on the request (the session token records when MFA was last
 //!   reasserted), not on the user record. A `mfa_verified_at:
-//!   Option<SystemTime>` on `Context` lets the high-value policy short-
-//!   circuit deny when freshness has lapsed without forcing every policy
-//!   to plumb the auth-session through their own arguments. See
-//!   `examples/mfa_freshness_context.rs` for the full end-to-end shape.
+//!   Option<SystemTime>` on `Context` lets a deny-effect high-value
+//!   policy forbid the request when freshness has lapsed without forcing
+//!   every policy to plumb the auth-session through their own arguments.
+//!   See `examples/mfa_freshness_context.rs` for the full end-to-end
+//!   shape.
 //!
 //! - **Device / network trust posture.** "Production database access
 //!   requires the request to come from a managed device on the corporate
