@@ -31,9 +31,6 @@ struct Document {
 #[derive(Debug, Clone)]
 struct View;
 
-#[derive(Debug, Clone)]
-struct RequestContext;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Relation {
     Viewer,
@@ -79,7 +76,7 @@ fn request_session(relationships: &Arc<dyn FactSource<RelationshipKey>>) -> Eval
         .build()
 }
 
-fn build_checker() -> PermissionChecker<User, Document, View, RequestContext> {
+fn build_checker() -> PermissionChecker<User, Document, View, ()> {
     let mut checker = PermissionChecker::new();
     checker.add_policy(RebacPolicy::new(
         |user: &User| user.id,
@@ -110,11 +107,14 @@ async fn main() {
     let store = Arc::new(InRamRelationships::default());
     store.grant(user.id, documents[0].id, Relation::Viewer);
     store.grant(user.id, documents[1].id, Relation::Viewer);
+    // The store can hold more relation types than any one policy consumes. This
+    // editor grant is never matched below (the checker only asks about Viewer),
+    // and is here to show the source and the policy stack are decoupled.
     store.grant(user.id, documents[1].id, Relation::Editor);
     let relationships: Arc<dyn FactSource<RelationshipKey>> = store;
 
     let checker = build_checker();
-    let context = RequestContext;
+    let context = ();
 
     let first_request = request_session(&relationships);
     let visible = checker
@@ -128,17 +128,28 @@ async fn main() {
         )
         .await;
     println!(
-        "visible documents: {:?}",
+        "batch list — visible documents: {:?}",
         visible
             .iter()
             .map(|document| document.title)
             .collect::<Vec<_>>()
     );
 
+    // A fresh session for a single-resource check. The user has no viewer
+    // relationship on the finance plan, so this denies.
     let second_request = request_session(&relationships);
     let can_view_finance = checker
         .evaluate_in_session(&second_request, &user, &View, &documents[2], &context)
         .await;
+    println!(
+        "single check — can view '{}'? {}",
+        documents[2].title,
+        if can_view_finance.is_granted() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
     assert!(!can_view_finance.is_granted());
 
     let shared = Arc::clone(&relationships);
@@ -150,7 +161,7 @@ async fn main() {
             let relationships = Arc::clone(&shared);
             tokio::spawn(async move {
                 let session = request_session(&relationships);
-                let context = RequestContext;
+                let context = ();
                 checker
                     .filter_authorized_in_session_by_resource(
                         &session,
@@ -166,7 +177,10 @@ async fn main() {
         })
         .collect::<Vec<_>>();
 
-    for request in concurrent_requests {
-        assert_eq!(request.await.unwrap(), 2);
+    println!("\n4 concurrent requests sharing one FactSource (each builds its own session):");
+    for (index, request) in concurrent_requests.into_iter().enumerate() {
+        let visible_count = request.await.unwrap();
+        println!("  request {index}: {visible_count} visible document(s)");
+        assert_eq!(visible_count, 2);
     }
 }

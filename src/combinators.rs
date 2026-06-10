@@ -18,6 +18,14 @@ pub struct AndPolicy<S, R, A, C> {
 #[derive(Debug, Copy, Clone)]
 pub struct EmptyPoliciesError(pub &'static str);
 
+impl std::fmt::Display for EmptyPoliciesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for EmptyPoliciesError {}
+
 impl<S, R, A, C> AndPolicy<S, R, A, C> {
     /// Creates a new `AndPolicy` from a non-empty list of policies.
     ///

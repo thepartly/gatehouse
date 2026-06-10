@@ -2324,6 +2324,59 @@ mod core_tests {
     }
 
     #[tokio::test]
+    async fn test_rbac_policy_with_non_uuid_role_type() {
+        // The role identifier type is generic over any `PartialEq` type,
+        // inferred from the resolver closures — here a domain enum.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Role {
+            Admin,
+            Editor,
+        }
+
+        #[derive(Debug, Clone)]
+        struct RbacUser {
+            roles: Vec<Role>,
+        }
+
+        let policy = RbacPolicy::new(
+            |_resource: &TestResource, _action: &TestAction| vec![Role::Admin],
+            |subject: &RbacUser| subject.roles.clone(),
+        );
+
+        let resource = TestResource {
+            id: uuid::Uuid::new_v4(),
+        };
+
+        let admin = RbacUser {
+            roles: vec![Role::Admin, Role::Editor],
+        };
+        let result: PolicyEvalResult = TestPolicyExt::<
+            RbacUser,
+            TestResource,
+            TestAction,
+            TestContext,
+        >::evaluate_access(
+            &policy, &admin, &TestAction, &resource, &TestContext
+        )
+        .await;
+        assert!(result.is_granted(), "enum role should match");
+
+        let editor_only = RbacUser {
+            roles: vec![Role::Editor],
+        };
+        let result: PolicyEvalResult =
+            TestPolicyExt::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
+                &policy,
+                &editor_only,
+                &TestAction,
+                &resource,
+                &TestContext,
+            )
+            .await;
+        assert!(!result.is_granted(), "missing enum role should deny");
+    }
+
+    #[tokio::test]
     async fn test_short_circuit_evaluation() {
         // Create a counter to track policy evaluation
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2794,6 +2847,16 @@ mod core_tests {
         assert_eq!(cloned.0, "Test");
     }
 
+    #[test]
+    fn test_empty_policies_error_display_and_source() {
+        let error = EmptyPoliciesError("AndPolicy must have at least one policy");
+        assert_eq!(error.to_string(), "AndPolicy must have at least one policy");
+
+        // The whole point of the Error impl: propagation into a boxed error.
+        let boxed: Box<dyn std::error::Error> = Box::new(error);
+        assert!(boxed.source().is_none());
+    }
+
     // --- AccessEvaluation test helpers ----------------------------------
 
     fn allow_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext> {
@@ -2862,6 +2925,40 @@ mod core_tests {
             .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         evaluation.assert_denied_with_reason_containing("anything");
+    }
+
+    #[tokio::test]
+    async fn trace_accessor_returns_tree_for_both_outcomes() {
+        let grant = allow_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        assert!(grant.trace().format().contains("AlwaysAllowPolicy"));
+
+        let deny = deny_checker()
+            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        assert!(deny.trace().format().contains("AlwaysDenyPolicy"));
+    }
+
+    #[test]
+    fn reason_str_borrows_the_reason() {
+        let granted = PolicyEvalResult::granted("P", Some("ok".into()));
+        assert_eq!(granted.reason_str(), Some("ok"));
+        assert_eq!(granted.reason(), Some("ok".to_string()));
+
+        let granted_no_reason = PolicyEvalResult::granted("P", None);
+        assert_eq!(granted_no_reason.reason_str(), None);
+
+        let denied = PolicyEvalResult::denied("P", "nope");
+        assert_eq!(denied.reason_str(), Some("nope"));
+
+        let combined = PolicyEvalResult::Combined {
+            policy_type: "C".into(),
+            operation: CombineOp::Or,
+            children: vec![],
+            outcome: false,
+        };
+        assert_eq!(combined.reason_str(), None);
     }
 
     #[tokio::test]

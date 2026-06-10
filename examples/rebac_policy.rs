@@ -4,8 +4,13 @@
 //! flat IDs and loads relationship facts through a request-scoped
 //! `EvaluationSession`. The happy path declares sources with
 //! `EvaluationSession::builder()` so all request-scoped dependencies are
-//! visible in one place. Relationship store failures are returned as
-//! `FactLoadResult::Error` and fail closed to denial.
+//! visible in one place.
+//!
+//! Relations are a domain enum (`Relation::Owner`), not strings: the session
+//! deduplicates and caches by the typed `RelationshipQuery` key, the compiler
+//! checks relation names, and any backend-specific serialization stays inside
+//! the `FactSource`. Relationship store failures are returned as
+//! `FactLoadResult::Error` and fail closed to denial — asserted at the end.
 //!
 //! To run this example:
 //! ```
@@ -21,35 +26,55 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 struct User {
     id: Uuid,
-    name: String,
+    name: &'static str,
 }
 
 #[derive(Debug, Clone)]
 struct Project {
     id: Uuid,
-    name: String,
+    name: &'static str,
 }
 
 #[derive(Debug, Clone)]
 struct EditAction;
 
-#[derive(Debug, Clone)]
-struct EmptyContext;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Relation {
+    Owner,
+    Contributor,
+    Viewer,
+}
 
+impl fmt::Display for Relation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Relation::Owner => write!(f, "owner"),
+            Relation::Contributor => write!(f, "contributor"),
+            Relation::Viewer => write!(f, "viewer"),
+        }
+    }
+}
+
+type ProjectRelationship = RelationshipQuery<Uuid, Uuid, Relation>;
+
+/// In-memory relationship store. The print in `load_many` makes the session's
+/// behaviour visible when the example runs: each unique key is loaded once
+/// per session, however many policies ask about it.
 #[derive(Debug, Clone)]
 struct ProjectRelationshipSource {
-    relationships: HashSet<RelationshipQuery<Uuid, Uuid, String>>,
+    relationships: HashSet<ProjectRelationship>,
     fail: bool,
 }
 
 impl ProjectRelationshipSource {
-    fn new(relationships: HashSet<RelationshipQuery<Uuid, Uuid, String>>) -> Self {
+    fn new(relationships: HashSet<ProjectRelationship>) -> Self {
         Self {
             relationships,
             fail: false,
         }
     }
 
+    /// Simulate a relationship store outage for the fail-closed section.
     fn with_error(mut self) -> Self {
         self.fail = true;
         self
@@ -57,18 +82,14 @@ impl ProjectRelationshipSource {
 }
 
 #[async_trait]
-impl FactSource<RelationshipQuery<Uuid, Uuid, String>> for ProjectRelationshipSource {
-    async fn load_many(
-        &self,
-        keys: &[RelationshipQuery<Uuid, Uuid, String>],
-    ) -> Vec<FactLoadResult<bool>> {
+impl FactSource<ProjectRelationship> for ProjectRelationshipSource {
+    async fn load_many(&self, keys: &[ProjectRelationship]) -> Vec<FactLoadResult<bool>> {
         keys.iter()
             .map(|key| {
                 println!(
-                    "Loading relationship fact: subject={} relation={} resource={}",
+                    "  loading fact: subject={} relation={} resource={}",
                     key.subject_id, key.relation, key.resource_id
                 );
-
                 if self.fail {
                     FactLoadResult::Error(FactLoadError::backend_message(
                         "simulated relationship store error",
@@ -87,213 +108,106 @@ async fn main() {
 
     let owner = User {
         id: Uuid::new_v4(),
-        name: "Alice (Owner)".to_string(),
+        name: "Alice",
     };
     let contributor = User {
         id: Uuid::new_v4(),
-        name: "Bob (Contributor)".to_string(),
+        name: "Bob",
     };
     let viewer = User {
         id: Uuid::new_v4(),
-        name: "Charlie (Viewer)".to_string(),
+        name: "Charlie",
     };
-    let unauthorized = User {
+    let outsider = User {
         id: Uuid::new_v4(),
-        name: "Dave (Unauthorized)".to_string(),
+        name: "Dave",
     };
     let project = Project {
         id: Uuid::new_v4(),
-        name: "Sample Project".to_string(),
+        name: "Sample Project",
     };
 
     let relationships = HashSet::from([
-        RelationshipQuery {
+        ProjectRelationship {
             subject_id: owner.id,
             resource_id: project.id,
-            relation: "owner".to_string(),
+            relation: Relation::Owner,
         },
-        RelationshipQuery {
+        ProjectRelationship {
             subject_id: contributor.id,
             resource_id: project.id,
-            relation: "contributor".to_string(),
+            relation: Relation::Contributor,
         },
-        RelationshipQuery {
+        ProjectRelationship {
             subject_id: viewer.id,
             resource_id: project.id,
-            relation: "viewer".to_string(),
+            relation: Relation::Viewer,
         },
     ]);
 
     let session = EvaluationSession::builder()
-        .with::<RelationshipQuery<Uuid, Uuid, String>, _>(ProjectRelationshipSource::new(
-            relationships.clone(),
-        ))
+        .with::<ProjectRelationship, _>(ProjectRelationshipSource::new(relationships.clone()))
         .build();
 
-    let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
-    checker.add_policy(RebacPolicy::new(
-        |user: &User| user.id,
-        |project: &Project| project.id,
-        "owner".to_string(),
-    ));
-    checker.add_policy(RebacPolicy::new(
-        |user: &User| user.id,
-        |project: &Project| project.id,
-        "contributor".to_string(),
-    ));
-
-    println!("Testing normal access patterns:");
-    test_access(&checker, &session, &owner, &project).await;
-    test_access(&checker, &session, &contributor, &project).await;
-    test_access(&checker, &session, &viewer, &project).await;
-    test_access(&checker, &session, &unauthorized, &project).await;
-
-    println!("\n=== Error During Relationship Loading ===\n");
-    let error_session = EvaluationSession::builder()
-        .with::<RelationshipQuery<Uuid, Uuid, String>, _>(
-            ProjectRelationshipSource::new(relationships).with_error(),
-        )
-        .build();
-    test_access(&checker, &error_session, &owner, &project).await;
-
-    enum_relationship_example().await;
-}
-
-async fn test_access(
-    checker: &PermissionChecker<User, Project, EditAction, EmptyContext>,
-    session: &EvaluationSession,
-    user: &User,
-    project: &Project,
-) {
-    let context = EmptyContext;
-    let action = EditAction;
-
-    println!("\nChecking if {} can edit {}:", user.name, project.name);
-    let result = checker
-        .evaluate_in_session(session, user, &action, project, &context)
-        .await;
-
-    println!(
-        "Access {} for {}",
-        if result.is_granted() {
-            "GRANTED"
-        } else {
-            "DENIED"
-        },
-        user.name
-    );
-    println!(
-        "Evaluation trace:\n{}\n",
-        match &result {
-            AccessEvaluation::Granted { trace, .. } => trace.format(),
-            AccessEvaluation::Denied { trace, .. } => trace.format(),
-        }
-    );
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Relation {
-    Owner,
-    Contributor,
-    Viewer,
-}
-
-impl fmt::Display for Relation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Relation::Owner => write!(f, "owner"),
-            Relation::Contributor => write!(f, "contributor"),
-            Relation::Viewer => write!(f, "viewer"),
-        }
-    }
-}
-
-struct EnumRelationshipSource {
-    relationships: HashSet<RelationshipQuery<Uuid, Uuid, Relation>>,
-}
-
-#[async_trait]
-impl FactSource<RelationshipQuery<Uuid, Uuid, Relation>> for EnumRelationshipSource {
-    async fn load_many(
-        &self,
-        keys: &[RelationshipQuery<Uuid, Uuid, Relation>],
-    ) -> Vec<FactLoadResult<bool>> {
-        keys.iter()
-            .map(|key| FactLoadResult::Found(self.relationships.contains(key)))
-            .collect()
-    }
-}
-
-async fn enum_relationship_example() {
-    println!("\n=== Enum-Based Relationship Types ===\n");
-
-    let alice = User {
-        id: Uuid::new_v4(),
-        name: "Alice".to_string(),
-    };
-    let bob = User {
-        id: Uuid::new_v4(),
-        name: "Bob".to_string(),
-    };
-    let charlie = User {
-        id: Uuid::new_v4(),
-        name: "Charlie".to_string(),
-    };
-    let project = Project {
-        id: Uuid::new_v4(),
-        name: "Typed Project".to_string(),
-    };
-
-    let session = EvaluationSession::builder()
-        .with::<RelationshipQuery<Uuid, Uuid, Relation>, _>(EnumRelationshipSource {
-            relationships: HashSet::from([
-                RelationshipQuery {
-                    subject_id: alice.id,
-                    resource_id: project.id,
-                    relation: Relation::Owner,
-                },
-                RelationshipQuery {
-                    subject_id: bob.id,
-                    resource_id: project.id,
-                    relation: Relation::Contributor,
-                },
-                RelationshipQuery {
-                    subject_id: charlie.id,
-                    resource_id: project.id,
-                    relation: Relation::Viewer,
-                },
-            ]),
-        })
-        .build();
-
-    let mut checker = PermissionChecker::<User, Project, EditAction, EmptyContext>::new();
+    // Editing requires an owner OR contributor relationship; a viewer
+    // relationship exists in the store but grants nothing here.
+    let mut checker = PermissionChecker::<User, Project, EditAction, ()>::new();
     checker.add_policy(RebacPolicy::new(
         |user: &User| user.id,
         |project: &Project| project.id,
         Relation::Owner,
     ));
+    checker.add_policy(RebacPolicy::new(
+        |user: &User| user.id,
+        |project: &Project| project.id,
+        Relation::Contributor,
+    ));
 
-    let context = EmptyContext;
-    let action = EditAction;
-
-    for (user, expected_granted, role) in [
-        (&alice, true, "owner"),
-        (&bob, false, "contributor"),
-        (&charlie, false, "viewer"),
-    ] {
-        let result = checker
-            .evaluate_in_session(&session, user, &action, &project, &context)
+    // (user, relationship held, expected outcome)
+    let cases = [
+        (&owner, "owner", true),
+        (&contributor, "contributor", true),
+        (&viewer, "viewer", false),
+        (&outsider, "none", false),
+    ];
+    for (user, held, expected_granted) in cases {
+        println!("Can {} ({held}) edit {}?", user.name, project.name);
+        let decision = checker
+            .evaluate_in_session(&session, user, &EditAction, &project, &())
             .await;
         println!(
-            "{} ({}) edit access: {}",
-            user.name,
-            role,
-            if result.is_granted() {
+            "  -> {}\n",
+            if decision.is_granted() {
                 "GRANTED"
             } else {
                 "DENIED"
-            },
+            }
         );
-        assert_eq!(result.is_granted(), expected_granted);
+        assert_eq!(decision.is_granted(), expected_granted);
     }
+
+    // The trace records the facts each policy consulted (the `↳ fact` lines)
+    // alongside its decision — here the viewer's denial shows both
+    // relationship lookups coming back false. Note that no new "loading fact"
+    // lines appear: this re-check runs in the same session, so the facts come
+    // from the session cache.
+    println!("Why {} is denied:", viewer.name);
+    let decision = checker
+        .evaluate_in_session(&session, &viewer, &EditAction, &project, &())
+        .await;
+    println!("{}\n", decision.display_trace());
+
+    println!("=== Error During Relationship Loading ===\n");
+
+    // A failing store must never grant: the load error is carried into the
+    // trace and the decision fails closed to denial — even for the owner.
+    let error_session = EvaluationSession::builder()
+        .with::<ProjectRelationship, _>(ProjectRelationshipSource::new(relationships).with_error())
+        .build();
+    let decision = checker
+        .evaluate_in_session(&error_session, &owner, &EditAction, &project, &())
+        .await;
+    println!("{}", decision.display_trace());
+    decision.assert_denied();
+    decision.assert_trace_contains("simulated relationship store error");
 }

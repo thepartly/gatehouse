@@ -43,20 +43,14 @@ struct Document {
 #[derive(Clone, Debug)]
 struct View;
 
-#[derive(Clone, Debug)]
-struct RequestCtx;
-
 // --- Policies ----------------------------------------------------------
 
 /// Grants admins access to any document, regardless of relationships.
 struct AdminPolicy;
 
 #[async_trait]
-impl Policy<User, Document, View, RequestCtx> for AdminPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, User, Document, View, RequestCtx>,
-    ) -> PolicyEvalResult {
+impl Policy<User, Document, View, ()> for AdminPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, View, ()>) -> PolicyEvalResult {
         if ctx.subject.is_admin {
             ctx.grant("admin override")
         } else {
@@ -75,11 +69,8 @@ struct ViewerPolicy {
 }
 
 #[async_trait]
-impl Policy<User, Document, View, RequestCtx> for ViewerPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, User, Document, View, RequestCtx>,
-    ) -> PolicyEvalResult {
+impl Policy<User, Document, View, ()> for ViewerPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, View, ()>) -> PolicyEvalResult {
         let granted = self
             .viewers
             .get(&ctx.resource.id)
@@ -220,7 +211,7 @@ async fn main() {
     // Compose policies: admin override OR viewer relation. The lookup
     // source only enumerates the viewer axis — admin overrides apply only
     // to point checks.
-    let mut checker = PermissionChecker::<User, Document, View, RequestCtx>::new();
+    let mut checker = PermissionChecker::<User, Document, View, ()>::new();
     checker.add_policy(AdminPolicy);
     checker.add_policy(ViewerPolicy { viewers });
 
@@ -229,21 +220,18 @@ async fn main() {
 
     // (1) Alice lists her visible documents via lookup_authorized.
     let alice_visible = checker
-        .lookup_authorized(
-            &session,
-            &alice,
-            &View,
-            &RequestCtx,
-            &lookup,
-            page_size,
-            &hydrator,
-        )
+        .lookup_authorized(&session, &alice, &View, &(), &lookup, page_size, &hydrator)
         .await
         .expect("lookup ok");
     println!("Alice sees {} document(s):", alice_visible.len());
     for doc in &alice_visible {
         println!("  - {} ({})", doc.title, doc.id);
     }
+    let alice_visible_ids: Vec<Uuid> = alice_visible.iter().map(|doc| doc.id).collect();
+    assert_eq!(
+        alice_visible_ids, viewer_doc_ids,
+        "the lookup + policy stack should authorize exactly the viewer-granted documents, in source order"
+    );
 
     // (2) Admin lists "their visible documents" via the same lookup.
     // The viewer lookup does not enumerate documents for the admin (no
@@ -253,15 +241,7 @@ async fn main() {
     // route admin requests to a different source or simply skip the
     // lookup path and list directly.
     let admin_via_lookup = checker
-        .lookup_authorized(
-            &session,
-            &admin,
-            &View,
-            &RequestCtx,
-            &lookup,
-            page_size,
-            &hydrator,
-        )
+        .lookup_authorized(&session, &admin, &View, &(), &lookup, page_size, &hydrator)
         .await
         .expect("lookup ok");
     println!(
@@ -269,12 +249,16 @@ async fn main() {
          by what the source enumerates; admin grants still apply at point checks.",
         admin_via_lookup.len()
     );
+    assert!(
+        admin_via_lookup.is_empty(),
+        "the viewer lookup enumerates nothing for the admin, so the listing is empty"
+    );
 
     // (3) Point check confirms the admin policy is alive: pick a document
     // the admin has no viewer relation on.
     let any_doc = &docs[0];
     let admin_point = checker
-        .evaluate_in_session(&session, &admin, &View, any_doc, &RequestCtx)
+        .evaluate_in_session(&session, &admin, &View, any_doc, &())
         .await;
     println!(
         "\nAdmin point check on '{}': {}",
@@ -285,6 +269,7 @@ async fn main() {
             "Denied"
         }
     );
+    admin_point.assert_granted_by("AdminPolicy");
 
     // (4) Page-oriented streaming. Drive the lookup one candidate page at
     // a time — useful when you want to flush results to a response writer
@@ -292,13 +277,14 @@ async fn main() {
     println!("\nStreaming Alice's visible documents page-by-page:");
     let mut cursor: Option<Vec<u8>> = None;
     let mut page_index = 0;
+    let mut streamed_total = 0;
     loop {
         let page = checker
             .lookup_authorized_page(
                 &session,
                 &alice,
                 &View,
-                &RequestCtx,
+                &(),
                 &lookup,
                 cursor.as_deref(),
                 page_size,
@@ -308,9 +294,14 @@ async fn main() {
             .expect("lookup_authorized_page ok");
         println!("  page {page_index}: {} authorized", page.resources.len());
         page_index += 1;
+        streamed_total += page.resources.len();
         match page.next_cursor {
             None => break,
             Some(next) => cursor = Some(next),
         }
     }
+    // 3 candidate ids paged 2-at-a-time: two candidate pages, same total as
+    // the collecting `lookup_authorized` call above.
+    assert_eq!(page_index, 2);
+    assert_eq!(streamed_total, viewer_doc_ids.len());
 }

@@ -1,5 +1,18 @@
-// Axum service that authorizes multiple resource types (Invoices, Payments)
-// using a single PermissionChecker. Demonstrates multiple policies and actions.
+// Axum service showing how Gatehouse fits into extractors, shared app state,
+// request-scoped sessions, and route handlers.
+//
+// The app authorizes one resource type — invoices — across a few actions and a
+// batch list endpoint. Keeping it to a single resource type means a single
+// `PermissionChecker` is the right shape here. A larger service with several
+// unrelated resource types would use one checker per resource type and share
+// cross-cutting policies (an admin override, say) across them, rather than
+// widening one checker over a `Resource` enum.
+//
+// Authorization paths:
+//   - an admin may do anything (cross-cutting override),
+//   - the owner may edit an unlocked invoice that is under 30 days old,
+//   - a user with a `viewer` relationship may view an invoice (the relationship
+//     is loaded through a request-scoped `EvaluationSession` + `FactSource`).
 
 use async_trait::async_trait;
 use axum::{
@@ -68,6 +81,8 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Header overrides so a single demo invoice can be coerced into different
+/// shapes (locked, older than the edit window) from `curl`.
 #[derive(Debug, Default, Clone)]
 pub struct InvoiceOverrides {
     locked: Option<bool>,
@@ -111,71 +126,15 @@ where
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct PaymentOverrides {
-    refunded: Option<bool>,
-    approved: Option<bool>,
-}
-
-impl PaymentOverrides {
-    pub fn from_headers(headers: &HeaderMap) -> Self {
-        let refunded = headers
-            .get("x-payment-refunded")
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_bool);
-
-        let approved = headers
-            .get("x-payment-approved")
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_bool);
-
-        Self { refunded, approved }
-    }
-
-    fn build_payment(&self, payment_id: Uuid) -> Payment {
-        Payment {
-            id: payment_id,
-            invoice_id: Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
-            is_refunded: self.refunded.unwrap_or(false),
-            approved: self.approved.unwrap_or(false),
-        }
-    }
-}
-
-impl<S> FromRequestParts<S> for PaymentOverrides
-where
-    S: Send + Sync,
-{
-    type Rejection = (StatusCode, String);
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self::from_headers(&parts.headers))
-    }
-}
-
-/// Main "Action" enum. Your app might have more actions:
-///   - Edit an invoice
-///   - Approve a payment
-///   - Refund a payment
-///   - View a resource, etc.
+/// Actions an invoice supports in this demo.
 #[derive(Debug, Clone)]
 pub enum Action {
-    Edit,           // e.g. editing an invoice
-    ApprovePayment, // e.g. approving a payment resource
-    RefundPayment,  // e.g. refunding a payment
-    View,           // a generic "view" action
+    Edit,
+    View,
 }
 
-/// Two resource types in our app: invoices and payments. We wrap them
-/// in a single enum to share one PermissionChecker across different routes/resources.
-#[derive(Debug, Clone)]
-pub enum Resource {
-    Invoice(Invoice),
-    Payment(Payment),
-}
-
-/// An invoice resource. For example, you can only edit it if it isn't locked and
-/// it's within 30 days of creation (unless you're an admin, which overrides).
+/// An invoice. It can be edited only if it isn't locked and is within 30 days
+/// of creation (unless you're an admin, which overrides).
 #[derive(Debug, Clone)]
 pub struct Invoice {
     pub id: Uuid,
@@ -184,17 +143,8 @@ pub struct Invoice {
     pub created_at: SystemTime,
 }
 
-/// A payment resource. Let’s suppose we can only approve or refund it if we have
-/// certain roles (e.g., "finance_manager" or "admin").
-#[derive(Debug, Clone)]
-pub struct Payment {
-    pub id: Uuid,
-    pub invoice_id: Uuid,
-    pub is_refunded: bool,
-    pub approved: bool,
-}
-
-/// Extra context. Could include "current_time", "feature flags", "organization info", etc.
+/// Extra request-scoped context. Could include feature flags, organization
+/// info, etc.; here it carries the request's wall clock for the age check.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub current_time: SystemTime,
@@ -262,9 +212,16 @@ impl From<Invoice> for InvoiceSummary {
     }
 }
 
+// --------------------------
+// 2) Shared application state
+// --------------------------
+
+/// The long-lived pieces are built once at startup: the checker and the
+/// relationship source. Each request derives a fresh `EvaluationSession` from
+/// the source.
 #[derive(Clone)]
 pub struct AppState {
-    checker: PermissionChecker<User, Resource, Action, RequestContext>,
+    checker: PermissionChecker<User, Invoice, Action, RequestContext>,
     invoice_relationships: Arc<dyn FactSource<InvoiceRelationship>>,
     invoices: Arc<Vec<Invoice>>,
 }
@@ -273,6 +230,8 @@ impl AppState {
     pub fn demo() -> Self {
         let viewer_id = demo_viewer_id();
         let invoices = Arc::new(demo_invoices());
+        // The demo viewer has a `viewer` relationship on every invoice they
+        // don't already own.
         let grants = invoices
             .iter()
             .filter(|invoice| invoice.owner_id != demo_owner_id())
@@ -327,179 +286,92 @@ fn demo_invoices() -> Vec<Invoice> {
     ]
 }
 
-/// --------------------------
-/// 2) Building Our Policies
-/// --------------------------
-/// We'll create multiple policies that each handle a slice of the logic.
-/// Then we combine them with OR or AND as needed.
-///
-/// (A) `AdminOverridePolicy`
-///     Allows any action on any resource if user has the "admin" role.
-fn admin_override_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
-    PolicyBuilder::<User, Resource, Action, RequestContext>::new("AdminOverridePolicy")
-        .when(|user, _action, _resource, _ctx| user.roles.contains(&"admin".to_string()))
+// --------------------------
+// 3) Building Our Policies
+// --------------------------
+// Each policy handles a slice of the logic; the checker ORs them together.
+
+/// (A) Admins may do anything — the cross-cutting override.
+fn admin_override_policy() -> Box<dyn Policy<User, Invoice, Action, RequestContext>> {
+    PolicyBuilder::<User, Invoice, Action, RequestContext>::new("AdminOverridePolicy")
+        .when(|user, _action, _invoice, _ctx| user.roles.contains(&"admin".to_string()))
         .build()
 }
 
-/// (B) `InvoiceViewerPolicy`
-///     Allows viewing an invoice when the request user has a `viewer`
-///     relationship with that invoice. In a real service the source would wrap
-///     a database pool or graph client; this example uses an in-memory source
-///     so the request/session wiring is easy to see.
-fn invoice_viewer_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
-    let is_invoice_view: Arc<dyn Policy<User, Resource, Action, RequestContext>> = Arc::from(
-        PolicyBuilder::<User, Resource, Action, RequestContext>::new("IsInvoiceView")
-            .when(|_user, action, resource, _ctx| {
-                matches!(action, Action::View) && matches!(resource, Resource::Invoice(_))
-            })
+/// (B) A user with a `viewer` relationship may view the invoice. The
+/// relationship is loaded through the request-scoped `EvaluationSession`; in a
+/// real service the source wraps a database pool or graph client.
+fn invoice_viewer_policy() -> Box<dyn Policy<User, Invoice, Action, RequestContext>> {
+    let is_view: Arc<dyn Policy<User, Invoice, Action, RequestContext>> = Arc::from(
+        PolicyBuilder::<User, Invoice, Action, RequestContext>::new("IsView")
+            .when(|_user, action, _invoice, _ctx| matches!(action, Action::View))
             .build(),
     );
-
-    let viewer_relationship: Arc<dyn Policy<User, Resource, Action, RequestContext>> =
+    let viewer_relationship: Arc<dyn Policy<User, Invoice, Action, RequestContext>> =
         Arc::new(RebacPolicy::new(
             |user: &User| user.id,
-            |resource: &Resource| match resource {
-                Resource::Invoice(invoice) => invoice.id,
-                _ => Uuid::nil(),
-            },
+            |invoice: &Invoice| invoice.id,
             Relation::Viewer,
         ));
 
     Box::new(
-        AndPolicy::try_new(vec![is_invoice_view, viewer_relationship])
-            .expect("invoice viewer policy should have guard and relationship checks"),
+        AndPolicy::try_new(vec![is_view, viewer_relationship])
+            .expect("invoice viewer policy has the guard and relationship checks"),
     )
 }
 
-/// (C) `InvoiceEditingPolicy`
-///     Allows editing an invoice if:
-///       - It's an `Invoice` resource and the requested action is `Action::Edit`,
-///       - The user is the invoice owner,
-///       - The invoice is NOT locked,
-///       - The invoice is < 30 days old.
-///     (If any of these fail, it denies.)
-/// We do this by creating four separate sub-policies, `IsInvoiceAndEdit`, `IsOwnerOfInvoice`
-/// `InvoiceNotLocked`, `InvoiceAgeUnder30Days`.
-/// Then we AND them together. If any sub-policy fails, you’ll see which one did
-/// in the evaluation trace (with its own reason).
-fn invoice_editing_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
-    // Sub-policy #1: Check that (resource=Invoice) and (action=Edit).
-    let is_invoice_and_edit =
-        PolicyBuilder::<User, Resource, Action, RequestContext>::new("IsInvoiceAndEdit")
-            .when(|_user, action, resource, _ctx| {
-                matches!(action, Action::Edit) && matches!(resource, Resource::Invoice(_))
-            })
-            .build();
-
-    // Sub-policy #2: Must be the owner of the invoice.
-    // We must ensure we only run the check *if* it's an Invoice; else we treat it as failing.
-    let is_owner = PolicyBuilder::<User, Resource, Action, RequestContext>::new("IsOwnerOfInvoice")
-        .when(|user, _action, resource, _ctx| match resource {
-            Resource::Invoice(inv) => user.id == inv.owner_id,
-            _ => false,
-        })
+/// (C) The owner may edit the invoice if it is unlocked and under 30 days old.
+/// Built from small sub-policies AND-ed together, so a denial trace names the
+/// sub-policy that failed.
+fn invoice_editing_policy() -> Box<dyn Policy<User, Invoice, Action, RequestContext>> {
+    let is_edit = PolicyBuilder::<User, Invoice, Action, RequestContext>::new("IsEdit")
+        .when(|_user, action, _invoice, _ctx| matches!(action, Action::Edit))
         .build();
 
-    // Sub-policy #3: Invoice must not be locked
+    let is_owner = PolicyBuilder::<User, Invoice, Action, RequestContext>::new("IsOwnerOfInvoice")
+        .when(|user, _action, invoice, _ctx| user.id == invoice.owner_id)
+        .build();
+
     let invoice_not_locked =
-        PolicyBuilder::<User, Resource, Action, RequestContext>::new("InvoiceNotLocked")
-            .when(|_user, _action, resource, _ctx| match resource {
-                Resource::Invoice(inv) => !inv.locked,
-                _ => false,
-            })
+        PolicyBuilder::<User, Invoice, Action, RequestContext>::new("InvoiceNotLocked")
+            .when(|_user, _action, invoice, _ctx| !invoice.locked)
             .build();
 
-    // Sub-policy #4: Invoice must be < 30 days old
     const THIRTY_DAYS: u64 = 30 * 24 * 60 * 60;
     let invoice_age_under_30_days =
-        PolicyBuilder::<User, Resource, Action, RequestContext>::new("InvoiceAgeUnder30Days")
-            .when(move |_user, _action, resource, ctx| match resource {
-                Resource::Invoice(inv) => {
-                    let age_secs = ctx
-                        .current_time
-                        .duration_since(inv.created_at)
-                        .unwrap_or_default()
-                        .as_secs();
-                    age_secs <= THIRTY_DAYS
-                }
-                _ => false,
+        PolicyBuilder::<User, Invoice, Action, RequestContext>::new("InvoiceAgeUnder30Days")
+            .when(move |_user, _action, invoice, ctx| {
+                ctx.current_time
+                    .duration_since(invoice.created_at)
+                    .unwrap_or_default()
+                    .as_secs()
+                    <= THIRTY_DAYS
             })
             .build();
 
-    // Now AND them together:
-    let and_policy = AndPolicy::try_new(vec![
-        Arc::from(is_invoice_and_edit),
-        Arc::from(is_owner),
-        Arc::from(invoice_not_locked),
-        Arc::from(invoice_age_under_30_days),
-    ])
-    .expect("Should have at least one policy in the AND set");
-
-    // Return as a boxed dyn Policy
-    Box::new(and_policy)
+    Box::new(
+        AndPolicy::try_new(vec![
+            Arc::from(is_edit),
+            Arc::from(is_owner),
+            Arc::from(invoice_not_locked),
+            Arc::from(invoice_age_under_30_days),
+        ])
+        .expect("invoice editing policy has at least one rule"),
+    )
 }
 
-/// (D) `PaymentApprovePolicy`
-///     Allows approving a payment if:
-///       - It's a `Payment` resource
-///       - Action is `Action::ApprovePayment`
-///       - The user has "finance_manager" (or "admin", but we have AdminOverride separately)
-///       - The payment has not been refunded (already-approved payments can be re-approved)
-fn payment_approve_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
-    PolicyBuilder::<User, Resource, Action, RequestContext>::new("PaymentApprovePolicy")
-        .when(|user, action, resource, _ctx| match resource {
-            Resource::Payment(payment) => {
-                matches!(action, Action::ApprovePayment)
-                    && user.roles.contains(&"finance_manager".to_string())
-                    && !payment.is_refunded
-            }
-            _ => false,
-        })
-        .build()
-}
-
-/// (E) `PaymentRefundPolicy`
-///     Allows refunding a payment if:
-///       - It's a `Payment` resource
-///       - Action is `Action::RefundPayment`
-///       - The user has "finance_manager"
-///         OR some other "refund" special role.  (We’ll keep it simple.)
-fn payment_refund_policy() -> Box<dyn Policy<User, Resource, Action, RequestContext>> {
-    // Alternatively, we can just do a single condition for finance_manager,
-    // or combine them. Here let's say "finance_manager" or "refund_specialist".
-    Box::new(AbacPolicy::new(
-        |user: &User, resource: &Resource, action: &Action, _ctx: &RequestContext| {
-            if let Resource::Payment(_) = resource {
-                if matches!(action, Action::RefundPayment) {
-                    return user.roles.contains(&"finance_manager".into())
-                        || user.roles.contains(&"refund_specialist".into());
-                }
-            }
-            false
-        },
-    ))
-}
-
-/// (F) Combine all relevant policies into a single `PermissionChecker`.
-///     The checker uses OR semantics by default: if ANY policy returns Granted,
-///     the request is allowed.
-pub fn build_permission_checker() -> PermissionChecker<User, Resource, Action, RequestContext> {
-    let mut checker = PermissionChecker::new();
-
-    // We add them in the order we want them to be evaluated,
-    // but note that OR short-circuits on the first Granted. So
-    // e.g. if "AdminOverridePolicy" passes, we never evaluate the others.
+/// (D) Combine the policies into a single `PermissionChecker`. OR semantics: if
+/// any policy grants, access is allowed (and evaluation short-circuits).
+pub fn build_permission_checker() -> PermissionChecker<User, Invoice, Action, RequestContext> {
+    let mut checker = PermissionChecker::named("InvoiceChecker");
     checker.add_policy(admin_override_policy());
     checker.add_policy(invoice_viewer_policy());
     checker.add_policy(invoice_editing_policy());
-    checker.add_policy(payment_approve_policy());
-    checker.add_policy(payment_refund_policy());
-
     checker
 }
 
 // ---------------------------------
-// 3) Using in Axum Route Handlers
+// 4) Using in Axum Route Handlers
 // ---------------------------------
 
 pub async fn view_invoice_handler(
@@ -508,19 +380,23 @@ pub async fn view_invoice_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     overrides: InvoiceOverrides,
 ) -> impl IntoResponse {
-    // Simulate DB fetch
+    // Simulate a DB fetch.
     let invoice = overrides.build_invoice(invoice_id);
-    let resource = Resource::Invoice(invoice.clone());
-    let context = RequestContext::now();
     let session = state.request_session();
 
     if state
         .checker
-        .evaluate_in_session(&session, &user, &Action::View, &resource, &context)
+        .evaluate_in_session(
+            &session,
+            &user,
+            &Action::View,
+            &invoice,
+            &RequestContext::now(),
+        )
         .await
         .is_granted()
     {
-        (StatusCode::OK, format!("{:?}", invoice)).into_response()
+        (StatusCode::OK, format!("{invoice:?}")).into_response()
     } else {
         (
             StatusCode::FORBIDDEN,
@@ -534,34 +410,25 @@ pub async fn list_invoices_handler(
     State(state): State<AppState>,
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> impl IntoResponse {
-    let context = RequestContext::now();
-    let action = Action::View;
     let session = state.request_session();
-    let candidates = state
-        .invoices
-        .iter()
-        .cloned()
-        .map(Resource::Invoice)
-        .collect::<Vec<_>>();
+    let candidates = state.invoices.as_ref().clone();
 
     // The session is request-scoped: app state owns the source, this request
-    // registers it, and the batch authorization call uses it for all invoices.
+    // registers it, and the batch authorization call uses it for every invoice
+    // — relationship loads are batched and deduplicated.
     let visible = state
         .checker
         .filter_authorized_in_session_by_resource(
             &session,
             &user,
-            &action,
+            &Action::View,
             candidates,
-            &context,
-            |resource| resource,
+            &RequestContext::now(),
+            |invoice| invoice,
         )
         .await
         .into_iter()
-        .filter_map(|resource| match resource {
-            Resource::Invoice(invoice) => Some(InvoiceSummary::from(invoice)),
-            Resource::Payment(_) => None,
-        })
+        .map(InvoiceSummary::from)
         .collect::<Vec<_>>();
 
     Json(visible).into_response()
@@ -573,21 +440,21 @@ pub async fn edit_invoice_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     overrides: InvoiceOverrides,
 ) -> impl IntoResponse {
-    // Simulate DB fetch
     let invoice = overrides.build_invoice(invoice_id);
-
-    let resource = Resource::Invoice(invoice);
-    let action = Action::Edit;
-    let context = RequestContext::now();
     let session = state.request_session();
 
-    let decision = state
+    if state
         .checker
-        .evaluate_in_session(&session, &user, &action, &resource, &context)
-        .await;
-
-    if decision.is_granted() {
-        // do the editing...
+        .evaluate_in_session(
+            &session,
+            &user,
+            &Action::Edit,
+            &invoice,
+            &RequestContext::now(),
+        )
+        .await
+        .is_granted()
+    {
         (StatusCode::OK, "Invoice edited successfully").into_response()
     } else {
         (
@@ -598,40 +465,8 @@ pub async fn edit_invoice_handler(
     }
 }
 
-pub async fn approve_payment_handler(
-    Path(payment_id): Path<Uuid>,
-    State(state): State<AppState>,
-    AuthenticatedUser(user): AuthenticatedUser,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    // Simulate DB fetch
-    let overrides = PaymentOverrides::from_headers(&headers);
-    let payment = overrides.build_payment(payment_id);
-
-    let resource = Resource::Payment(payment);
-    let action = Action::ApprovePayment;
-    let context = RequestContext::now();
-    let session = state.request_session();
-
-    let decision = state
-        .checker
-        .evaluate_in_session(&session, &user, &action, &resource, &context)
-        .await;
-
-    if decision.is_granted() {
-        // do the approval...
-        (StatusCode::OK, "Payment approved").into_response()
-    } else {
-        (
-            StatusCode::FORBIDDEN,
-            "You are not authorized to approve this payment",
-        )
-            .into_response()
-    }
-}
-
 // ----------------------------------------
-// 4) The Axum App with Our PermissionChecker
+// 5) The Axum App with Our PermissionChecker
 // ----------------------------------------
 
 #[tokio::main]
@@ -640,18 +475,12 @@ async fn main() {
     // fresh EvaluationSession inside each handler.
     let state = AppState::demo();
 
-    // Construct Axum Router
     let app = Router::new()
         .route("/invoices", get(list_invoices_handler))
         .route("/invoices/{invoice_id}", get(view_invoice_handler))
         .route("/invoices/{invoice_id}/edit", post(edit_invoice_handler))
-        .route(
-            "/payments/{payment_id}/approve",
-            post(approve_payment_handler),
-        )
         .with_state(state);
 
-    // Run Axum App
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
     println!("Listening on http://0.0.0.0:8000");
     axum::serve(listener, app).await.unwrap();
@@ -663,7 +492,6 @@ mod tests {
     use gatehouse::AccessEvaluation;
     use std::time::{Duration, SystemTime};
 
-    // Helper to quickly build an invoice with desired properties
     fn make_invoice(owner_id: Uuid, locked: bool, age_in_days: u64) -> Invoice {
         Invoice {
             id: Uuid::new_v4(),
@@ -673,17 +501,6 @@ mod tests {
         }
     }
 
-    // Helper to quickly build a payment
-    fn make_payment(invoice_id: Uuid, is_refunded: bool, approved: bool) -> Payment {
-        Payment {
-            id: Uuid::new_v4(),
-            invoice_id,
-            is_refunded,
-            approved,
-        }
-    }
-
-    // Helper to build a RequestContext
     fn context_now() -> RequestContext {
         RequestContext {
             current_time: SystemTime::now(),
@@ -691,40 +508,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_admin_override() {
+    async fn admin_override_allows_anything() {
         let checker = build_permission_checker();
-        let admin_user = User {
+        let admin = User {
             id: Uuid::new_v4(),
             roles: vec!["admin".to_string()],
         };
 
-        // Attempt any action on any resource
+        // A locked, 60-day-old invoice the admin doesn't own.
         let invoice = make_invoice(
-            admin_user.id,
+            Uuid::new_v4(),
             /*locked=*/ true,
             /*age_in_days=*/ 60,
         );
-        let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .check(&admin_user, &Action::Edit, &resource, &context_now())
+            .check(&admin, &Action::Edit, &invoice, &context_now())
             .await;
 
-        assert!(
-            result.is_granted(),
-            "AdminOverridePolicy should allow admin to do anything"
-        );
-
+        assert!(result.is_granted(), "admin override should allow anything");
         match result {
             AccessEvaluation::Granted { policy_type, .. } => {
                 assert_eq!(&policy_type, "AdminOverridePolicy");
             }
-            _ => panic!("Expected admin override to be granted"),
+            _ => panic!("expected admin override to grant"),
         }
     }
 
     #[tokio::test]
-    async fn test_invoice_editing_owner_unlocked_recent() {
+    async fn owner_can_edit_unlocked_recent_invoice() {
         let checker = build_permission_checker();
         let owner_id = Uuid::new_v4();
         let user = User {
@@ -732,23 +544,20 @@ mod tests {
             roles: vec!["user".to_string()],
         };
 
-        // Invoice is not locked, 10 days old
         let invoice = make_invoice(owner_id, /*locked=*/ false, /*age_in_days=*/ 10);
-        let resource = Resource::Invoice(invoice);
 
-        // The user is the owner, the invoice is unlocked, <30 days old => should be granted
         let result = checker
-            .check(&user, &Action::Edit, &resource, &context_now())
+            .check(&user, &Action::Edit, &invoice, &context_now())
             .await;
 
         assert!(
             result.is_granted(),
-            "Invoice editing policy should allow owner if under 30 days, unlocked"
+            "owner should edit an unlocked invoice under 30 days old"
         );
     }
 
     #[tokio::test]
-    async fn test_invoice_editing_denied_if_locked() {
+    async fn locked_invoice_cannot_be_edited() {
         let checker = build_permission_checker();
         let owner_id = Uuid::new_v4();
         let user = User {
@@ -756,68 +565,52 @@ mod tests {
             roles: vec!["user".to_string()],
         };
 
-        // Invoice is locked, 10 days old
         let invoice = make_invoice(owner_id, /*locked=*/ true, /*age_in_days=*/ 10);
-        let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .check(&user, &Action::Edit, &resource, &context_now())
+            .check(&user, &Action::Edit, &invoice, &context_now())
             .await;
 
-        assert!(
-            !result.is_granted(),
-            "Should be denied if invoice is locked"
-        );
+        assert!(!result.is_granted(), "a locked invoice should be denied");
 
-        // We can also look at trace to see which sub-policy failed
         if let AccessEvaluation::Denied { trace, .. } = result {
             let trace_str = trace.format();
             assert!(
                 trace_str.contains("InvoiceNotLocked"),
-                "Expected InvoiceNotLocked sub-policy to fail in trace: \n{}",
-                trace_str
+                "expected InvoiceNotLocked to fail in trace:\n{trace_str}"
             );
         }
     }
 
     #[tokio::test]
-    async fn test_invoice_editing_denied_if_not_owner() {
+    async fn non_owner_cannot_edit() {
         let checker = build_permission_checker();
-        let actual_owner_id = Uuid::new_v4();
-        let another_user_id = Uuid::new_v4();
-
         let user = User {
-            id: another_user_id,
+            id: Uuid::new_v4(),
             roles: vec!["user".to_string()],
         };
 
         let invoice = make_invoice(
-            actual_owner_id,
+            Uuid::new_v4(),
             /*locked=*/ false,
             /*age_in_days=*/ 10,
         );
-        let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .check(&user, &Action::Edit, &resource, &context_now())
+            .check(&user, &Action::Edit, &invoice, &context_now())
             .await;
 
-        assert!(
-            !result.is_granted(),
-            "Should be denied if user is not the owner"
-        );
-
+        assert!(!result.is_granted(), "a non-owner should be denied");
         if let AccessEvaluation::Denied { trace, .. } = result {
-            let trace_str = trace.format();
             assert!(
-                trace_str.contains("IsOwnerOfInvoice"),
-                "Expected IsOwnerOfInvoice sub-policy to fail"
+                trace.format().contains("IsOwnerOfInvoice"),
+                "expected IsOwnerOfInvoice to fail in trace"
             );
         }
     }
 
     #[tokio::test]
-    async fn test_invoice_editing_denied_if_too_old() {
+    async fn stale_invoice_cannot_be_edited() {
         let checker = build_permission_checker();
         let owner_id = Uuid::new_v4();
         let user = User {
@@ -825,146 +618,16 @@ mod tests {
             roles: vec!["user".to_string()],
         };
 
-        // 31 days old => should fail the "InvoiceAgeUnder30Days" sub-policy
+        // 31 days old => fails InvoiceAgeUnder30Days.
         let invoice = make_invoice(owner_id, /*locked=*/ false, /*age_in_days=*/ 31);
-        let resource = Resource::Invoice(invoice);
 
         let result = checker
-            .check(&user, &Action::Edit, &resource, &context_now())
+            .check(&user, &Action::Edit, &invoice, &context_now())
             .await;
         assert!(
             !result.is_granted(),
-            "Should be denied if invoice is older than 30 days"
+            "an invoice older than 30 days should be denied"
         );
-    }
-
-    #[tokio::test]
-    async fn test_payment_approve_finance_manager() {
-        let checker = build_permission_checker();
-
-        // finance_manager role is allowed to ApprovePayment
-        let user = User {
-            id: Uuid::new_v4(),
-            roles: vec!["finance_manager".to_string()],
-        };
-        let payment = make_payment(
-            Uuid::new_v4(),
-            /*is_refunded=*/ false,
-            /*approved=*/ false,
-        );
-        let resource = Resource::Payment(payment);
-
-        let result = checker
-            .check(&user, &Action::ApprovePayment, &resource, &context_now())
-            .await;
-
-        assert!(
-            result.is_granted(),
-            "PaymentApprovePolicy should allow finance_manager to approve"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_payment_approve_finance_manager_idempotent() {
-        let checker = build_permission_checker();
-
-        let user = User {
-            id: Uuid::new_v4(),
-            roles: vec!["finance_manager".to_string()],
-        };
-        let payment = make_payment(
-            Uuid::new_v4(),
-            /*is_refunded=*/ false,
-            /*approved=*/ true,
-        );
-        let resource = Resource::Payment(payment);
-
-        let result = checker
-            .check(&user, &Action::ApprovePayment, &resource, &context_now())
-            .await;
-
-        assert!(
-            result.is_granted(),
-            "PaymentApprovePolicy should allow finance_manager to re-approve",
-        );
-    }
-
-    #[tokio::test]
-    async fn test_payment_approve_denied_for_regular_user() {
-        let checker = build_permission_checker();
-
-        let user = User {
-            id: Uuid::new_v4(),
-            roles: vec!["regular_user".to_string()],
-        };
-        let payment = make_payment(Uuid::new_v4(), false, false);
-        let resource = Resource::Payment(payment);
-
-        // Not finance_manager or admin => deny
-        let result = checker
-            .check(&user, &Action::ApprovePayment, &resource, &context_now())
-            .await;
-        assert!(
-            !result.is_granted(),
-            "Regular user should not be able to approve"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_payment_refund_finance_or_refund_specialist() {
-        let checker = build_permission_checker();
-
-        let user_finance = User {
-            id: Uuid::new_v4(),
-            roles: vec!["finance_manager".to_string()],
-        };
-        let user_refund_specialist = User {
-            id: Uuid::new_v4(),
-            roles: vec!["refund_specialist".to_string()],
-        };
-
-        let payment = make_payment(Uuid::new_v4(), false, false);
-        let resource = Resource::Payment(payment);
-
-        // 1) finance_manager can refund
-        let res1 = checker
-            .check(
-                &user_finance,
-                &Action::RefundPayment,
-                &resource,
-                &context_now(),
-            )
-            .await;
-        assert!(res1.is_granted(), "finance_manager is allowed to refund");
-
-        // 2) refund_specialist can refund
-        let res2 = checker
-            .check(
-                &user_refund_specialist,
-                &Action::RefundPayment,
-                &resource,
-                &context_now(),
-            )
-            .await;
-        assert!(res2.is_granted(), "refund_specialist is allowed to refund");
-    }
-
-    #[tokio::test]
-    async fn test_payment_refund_denied_for_regular_user() {
-        let checker = build_permission_checker();
-
-        let user = User {
-            id: Uuid::new_v4(),
-            roles: vec!["user".to_string()],
-        };
-        let payment = make_payment(Uuid::new_v4(), false, false);
-        let resource = Resource::Payment(payment);
-
-        // Should be denied
-        let result = checker
-            .check(&user, &Action::RefundPayment, &resource, &context_now())
-            .await;
-        assert!(!result.is_granted(), "Regular user can't refund payment");
     }
 }
 
@@ -985,10 +648,9 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_edit_invoice_handler_allows_admin() {
+    async fn edit_invoice_handler_allows_admin() {
         let app = test_app();
 
-        // We'll pretend the path param is some random UUID
         let req = Request::builder()
             .method("POST")
             .uri("/invoices/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/edit")
@@ -997,12 +659,11 @@ mod integration_tests {
             .unwrap();
 
         let response = app.clone().oneshot(req).await.unwrap();
-        // With the admin role header set we expect 200 OK
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn test_edit_invoice_handler_denies_regular_user_if_locked() {
+    async fn edit_invoice_handler_denies_regular_user_if_locked() {
         let app = test_app();
 
         let req = Request::builder()
@@ -1015,7 +676,6 @@ mod integration_tests {
             .unwrap();
 
         let response = app.clone().oneshot(req).await.unwrap();
-
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

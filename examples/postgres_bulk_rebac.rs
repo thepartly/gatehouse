@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 use tokio_postgres::{Client, NoTls, Statement};
 use uuid::Uuid;
 
-static UNIT_CONTEXT: () = ();
 type RelationshipKey = RelationshipQuery<Uuid, Uuid, Relation>;
 
 #[derive(Clone)]
@@ -169,7 +168,7 @@ async fn main() {
 
     let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
         .await
-        .expect("connect to PostgreSQL 18");
+        .expect("connect to PostgreSQL");
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             eprintln!("postgres connection error: {error}");
@@ -309,7 +308,7 @@ async fn main() {
             for post in &sample {
                 let session = session_with(&source);
                 if checker
-                    .evaluate_in_session(&session, &subject, &View, post, &UNIT_CONTEXT)
+                    .evaluate_in_session(&session, &subject, &View, post, &())
                     .await
                     .is_granted()
                 {
@@ -328,7 +327,7 @@ async fn main() {
                     &subject,
                     &View,
                     sample.clone(),
-                    &UNIT_CONTEXT,
+                    &(),
                     |post| post,
                 )
                 .await

@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- `RbacPolicy` is now generic over the role identifier type. Any `PartialEq` type works — a domain enum, string ids, or `Uuid`s — inferred from the resolver closures' return types. Existing `Uuid`-based code keeps working unchanged; the one edge is closures whose role type was previously pinned only by the impl (e.g. a bare `vec![]` with no other mention of the role type), which may now need an annotation.
+- `AccessEvaluation::trace()` — returns the `EvalTrace` regardless of outcome. Both variants carry a trace; callers previously had to hand-roll the same two-arm `match` to render it.
+- `PolicyEvalResult::reason_str()` — borrowing analogue of `reason()`, for callers that only need to inspect or render the reason without cloning.
+- `EmptyPoliciesError` now implements `Display` and `std::error::Error`, matching every other public error type in the crate, so `AndPolicy::try_new` / `OrPolicy::try_new` failures can be printed with `{}` and propagated with `?` into boxed errors.
+- `CombineOp` now derives `Copy` and `Eq`.
+
+### Changed
+
+- Renamed the `pg18_bulk_rebac` example to `postgres_bulk_rebac`: the SQL is ordinary PostgreSQL (`unnest … WITH ORDINALITY`, `bool_or`, an unlogged table), developed and benchmarked against PostgreSQL 18 but not requiring it. Update any `cargo run --example pg18_bulk_rebac` invocation accordingly.
+- Reviewed and tightened the whole example suite (no library behavior changed). Across the board: every example now asserts its outcomes and prints its decision trace, the genuinely-empty `Context` generic is standardized on `()`, and traces render through the new `AccessEvaluation::trace()` accessor. New examples: `deny_override` (enforce "deny overrides allow" — account suspensions, legal holds — by gating the allow set behind `NotPolicy(blocklist)` under `AndPolicy`, contrasted with the tempting `OR`-checker mistake that never vetoes) and `delegating_policy` (`DelegatingPolicy` cross-domain delegation, with the trace crossing the domain boundary). Notable reworks: `rbac_policy` around a domain `Role` enum (exercising the now-generic role type); `policy_builder` so the administered organization is the *resource* rather than riding in `Context`; `rebac_policy` trimmed to the enum-relation shape with the fail-closed store-error path asserted; `actix_web` into a fact-backed integration with a collaborator (`editor`) relationship and a batched list endpoint; and `axum` down to a single resource type.
+
+### Removed
+
+- `examples/groups_policy.rs`, whose policy-composition and trace-reading concepts are already covered by `combinator_policy` and `policy_builder`.
+
 ## [0.3.0] - 2026-06-02
 
 First stable release of the v0.3 line. v0.3 consolidates around request-scoped fact loading: relationship data is loaded through an `EvaluationSession` registered with a `FactSource` instead of policy-owned `RelationshipResolver`s, list endpoints batch and deduplicate without leaking policy logic into the data layer, and the trait surface tightens around `Cow<'static, str>` policy names with `ctx.grant` / `ctx.deny` shortcuts.
