@@ -2,14 +2,13 @@ use crate::{BatchEvalCtx, CombineOp, EvalCtx, Policy, PolicyBatchItem, PolicyEva
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// ---
-/// Policy Combinators
-/// ---
+/// Combines multiple policies with logical AND semantics.
 ///
-/// AndPolicy
-///
-/// Combines multiple policies with a logical AND. Access is granted only if every
-/// inner policy grants access.
+/// Access is granted only if every inner policy grants access. Evaluation
+/// short-circuits on the first non-grant. A [`PolicyEvalResult::Forbidden`]
+/// child is treated like a denial inside the combinator; deny-overrides vetoes
+/// are honored by [`crate::PermissionChecker`] when a forbidding policy is
+/// registered directly on the checker.
 pub struct AndPolicy<S, R, A, C> {
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
 }
@@ -174,10 +173,13 @@ where
     }
 }
 
-/// OrPolicy
+/// Combines multiple policies with logical OR semantics.
 ///
-/// Combines multiple policies with a logical OR. Access is granted if any inner policy
-/// grants access.
+/// Access is granted if any inner policy grants access. Evaluation
+/// short-circuits on the first grant. A [`PolicyEvalResult::Forbidden`] child
+/// is treated like a denial inside the combinator; deny-overrides vetoes are
+/// honored by [`crate::PermissionChecker`] when a forbidding policy is
+/// registered directly on the checker.
 pub struct OrPolicy<S, R, A, C> {
     policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
 }
@@ -327,10 +329,12 @@ where
     }
 }
 
-/// NotPolicy
+/// Inverts the decision of an inner policy.
 ///
-/// Inverts the result of an inner policy. If the inner policy allows access, then NotPolicy
-/// denies it, and vice versa.
+/// If the inner policy grants access, `NotPolicy` denies it; otherwise it
+/// grants. A [`PolicyEvalResult::Forbidden`] child is treated like any other
+/// non-grant inside the combinator. Use a flat [`crate::Effect::Deny`] policy
+/// on [`crate::PermissionChecker`] when the intent is a global veto.
 pub struct NotPolicy<S, R, A, C> {
     policy: Arc<dyn Policy<S, R, A, C>>,
 }

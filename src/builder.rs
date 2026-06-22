@@ -260,7 +260,7 @@ where
 /// The case where pattern #1 (typed closure args) is not enough on its
 /// own combines three ingredients:
 ///
-/// ```ignore
+/// ```text
 /// fn factory() -> Box<dyn Policy<MySubject, MyResource, MyAction, ()>> {
 ///     PolicyBuilder::new("Name")          // <- no anchor yet
 ///         .when(move |subject, _, _, _| {  // <- placeholder closure args
@@ -285,7 +285,7 @@ where
 ///
 /// In this shape, two practical fixes:
 ///
-/// ```ignore
+/// ```text
 /// // a) Annotate every closure arg concretely. `&_` placeholders are
 /// //    not enough — each unbound `_` still needs to be resolved
 /// //    before the return-type constraint propagates.

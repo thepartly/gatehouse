@@ -7,9 +7,9 @@ use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
 
-/// ### ReBAC Policy
+/// Relationship-based access control backed by request-scoped fact loading.
 ///
-/// ReBAC is backed by [`crate::FactSource`] in v0.3. A policy extracts flat,
+/// `RebacPolicy` is backed by [`crate::FactSource`]. A policy extracts flat,
 /// hashable IDs from the subject and resource, builds a [`RelationshipQuery`],
 /// then loads relationship facts through the request-scoped
 /// [`crate::EvaluationSession`].
