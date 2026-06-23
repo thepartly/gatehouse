@@ -1364,6 +1364,26 @@ async fn and_policy_requires_each_child_to_grant_across_veto_boundary() {
     assert!(!batch[0].1.is_granted());
 }
 
+#[tokio::test]
+async fn or_policy_grants_from_first_allow_only_child_after_veto_boundary() {
+    let session = EvaluationSession::empty();
+    let or_gate = OrPolicy::try_new(vec![
+        Arc::new(MixedNotApplicablePolicy) as Arc<dyn Policy<Domain>>,
+        Arc::from(allow_everything("AllowAll")),
+    ])
+    .unwrap();
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(or_gate);
+
+    let granted = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    granted.assert_granted_by("OrPolicy");
+    assert!(granted.trace().format().contains("AllowAll"));
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }]).await;
+    assert!(batch[0].1.is_granted());
+    assert!(batch[0].1.trace().format().contains("AllowAll"));
+}
+
 /// Identity-mapped delegating policy whose child checker grants everything
 /// except odd resource ids, which it forbids.
 fn delegating_forbid_policy() -> DelegatingPolicy<Domain, Domain> {
