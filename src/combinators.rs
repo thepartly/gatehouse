@@ -17,16 +17,19 @@ fn ordered_policies<D>(policies: Vec<Arc<dyn Policy<D>>>) -> (Vec<Arc<dyn Policy
 where
     D: PolicyDomain,
 {
-    let mut ordered = Vec::with_capacity(policies.len());
-    let mut veto_capable_count = 0;
+    let mut veto_capable = Vec::new();
+    let mut allow_only = Vec::new();
     for policy in policies {
         if policy.effect().can_forbid() {
-            ordered.insert(veto_capable_count, policy);
-            veto_capable_count += 1;
+            veto_capable.push(policy);
         } else {
-            ordered.push(policy);
+            allow_only.push(policy);
         }
     }
+    let veto_capable_count = veto_capable.len();
+    let mut ordered = Vec::with_capacity(veto_capable_count + allow_only.len());
+    ordered.extend(veto_capable);
+    ordered.extend(allow_only);
     (ordered, veto_capable_count)
 }
 
