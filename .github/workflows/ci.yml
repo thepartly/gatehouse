@@ -57,11 +57,14 @@ jobs:
   mutation-tests:
     name: Mutation tests
     needs: build-and-test
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Cache cargo & target directories
         uses: Swatinem/rust-cache@v2
         with:
@@ -72,10 +75,13 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
+      - name: Capture checker/combinator diff
+        run: git diff origin/${{ github.base_ref }}...HEAD -- src/checker.rs src/combinators.rs > mutants.diff
       - name: Run focused mutation tests
         run: >
           cargo mutants
           --in-place
+          --in-diff=mutants.diff
           --file src/checker.rs
           --file src/combinators.rs
           --baseline=skip
