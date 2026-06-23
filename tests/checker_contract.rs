@@ -130,10 +130,7 @@ impl BatchGrantPolicy {
 
 struct RandomStackPolicy {
     name: String,
-    grant_percent: u8,
-    forbid_percent: u8,
-    salt: u16,
-    effect: Effect,
+    spec: RandomPolicySpec,
 }
 
 #[async_trait]
@@ -157,40 +154,211 @@ impl Policy<Domain> for RandomStackPolicy {
     }
 
     fn effect(&self) -> Effect {
-        self.effect
+        self.spec.effect
     }
 }
 
 impl RandomStackPolicy {
     fn result_for(&self, resource_id: u8) -> PolicyEvalResult {
+        match self.spec.leaf_outcome(resource_id) {
+            LeafOutcome::Grant => {
+                PolicyEvalResult::granted(self.name.clone(), Some(format!("{resource_id} granted")))
+            }
+            LeafOutcome::Forbid => {
+                PolicyEvalResult::forbidden(self.name.clone(), format!("{resource_id} forbidden"))
+            }
+            LeafOutcome::NotApplicable => {
+                PolicyEvalResult::not_applicable(self.name.clone(), format!("{resource_id} denied"))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RandomPolicySpec {
+    grant_percent: u8,
+    forbid_percent: u8,
+    salt: u16,
+    effect: Effect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeafOutcome {
+    Grant,
+    Forbid,
+    NotApplicable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpectedDecision {
+    Granted,
+    Forbidden,
+    Denied,
+}
+
+impl RandomPolicySpec {
+    fn leaf_outcome(self, resource_id: u8) -> LeafOutcome {
         let grant_score = ((resource_id as u16 * 37) ^ self.salt).wrapping_add(self.salt / 3) % 100;
         let forbid_score =
             ((resource_id as u16 * 53) ^ self.salt).wrapping_add(self.salt / 5) % 100;
         let grant_matched = grant_score < self.grant_percent as u16;
         let forbid_matched = forbid_score < self.forbid_percent as u16;
 
-        if self.effect == Effect::Forbid {
-            if forbid_matched {
-                PolicyEvalResult::forbidden(self.name.clone(), format!("{resource_id} forbidden"))
-            } else {
-                PolicyEvalResult::not_applicable(self.name.clone(), format!("{resource_id} denied"))
-            }
-        } else if self.effect == Effect::AllowOrForbid && forbid_matched {
-            PolicyEvalResult::forbidden(self.name.clone(), format!("{resource_id} forbidden"))
-        } else if grant_matched {
-            PolicyEvalResult::granted(self.name.clone(), Some(format!("{resource_id} granted")))
+        if self.effect.can_forbid() && forbid_matched {
+            LeafOutcome::Forbid
+        } else if self.effect.can_grant() && grant_matched {
+            LeafOutcome::Grant
         } else {
-            PolicyEvalResult::not_applicable(self.name.clone(), format!("{resource_id} denied"))
+            LeafOutcome::NotApplicable
+        }
+    }
+
+    fn into_policy(self, index: usize) -> RandomStackPolicy {
+        RandomStackPolicy {
+            name: format!("random_{index}"),
+            spec: self,
         }
     }
 }
 
-fn effect_from_tag(tag: u8) -> Effect {
-    match tag % 3 {
-        0 => Effect::Allow,
-        1 => Effect::Forbid,
-        _ => Effect::AllowOrForbid,
+fn oracle_decision(specs: &[RandomPolicySpec], resource_id: u8) -> ExpectedDecision {
+    let mut saw_grant = false;
+    for outcome in specs.iter().map(|spec| spec.leaf_outcome(resource_id)) {
+        match outcome {
+            LeafOutcome::Forbid => return ExpectedDecision::Forbidden,
+            LeafOutcome::Grant => saw_grant = true,
+            LeafOutcome::NotApplicable => {}
+        }
     }
+
+    if saw_grant {
+        ExpectedDecision::Granted
+    } else {
+        ExpectedDecision::Denied
+    }
+}
+
+fn access_decision(evaluation: &AccessEvaluation) -> ExpectedDecision {
+    if evaluation.is_granted() {
+        ExpectedDecision::Granted
+    } else if evaluation.forbidden_by().is_some() {
+        ExpectedDecision::Forbidden
+    } else {
+        ExpectedDecision::Denied
+    }
+}
+
+fn policy_decision(result: &PolicyEvalResult) -> ExpectedDecision {
+    if result.is_forbidden() {
+        ExpectedDecision::Forbidden
+    } else if result.is_granted() {
+        ExpectedDecision::Granted
+    } else {
+        ExpectedDecision::Denied
+    }
+}
+
+fn checker_from_specs(
+    specs: &[RandomPolicySpec],
+    max_batch_size: Option<usize>,
+) -> PermissionChecker<Domain> {
+    let mut checker = if let Some(max_batch_size) = max_batch_size {
+        PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(max_batch_size).unwrap())
+    } else {
+        PermissionChecker::new()
+    };
+    for (index, spec) in specs.iter().copied().enumerate() {
+        checker.add_policy(spec.into_policy(index));
+    }
+    checker
+}
+
+fn arc_policies_from_specs(specs: &[RandomPolicySpec]) -> Vec<Arc<dyn Policy<Domain>>> {
+    specs
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, spec)| Arc::new(spec.into_policy(index)) as Arc<dyn Policy<Domain>>)
+        .collect()
+}
+
+fn policy_spec_strategy() -> impl Strategy<Value = RandomPolicySpec> {
+    prop_oneof![
+        2 => (0u8..=100, any::<u16>()).prop_map(|(grant_percent, salt)| RandomPolicySpec {
+            grant_percent,
+            forbid_percent: 0,
+            salt,
+            effect: Effect::Allow,
+        }),
+        3 => (0u8..=100, any::<u16>()).prop_map(|(forbid_percent, salt)| RandomPolicySpec {
+            grant_percent: 0,
+            forbid_percent,
+            salt,
+            effect: Effect::Forbid,
+        }),
+        5 => (0u8..=100, 0u8..=100, any::<u16>()).prop_map(
+            |(grant_percent, forbid_percent, salt)| RandomPolicySpec {
+                grant_percent,
+                forbid_percent,
+                salt,
+                effect: Effect::AllowOrForbid,
+            }
+        ),
+    ]
+}
+
+fn adversarial_policy_stack_strategy() -> impl Strategy<Value = Vec<RandomPolicySpec>> {
+    let exact_deferred_grant = prop::collection::vec(
+        prop_oneof![
+            Just(RandomPolicySpec {
+                grant_percent: 0,
+                forbid_percent: 0,
+                salt: 0,
+                effect: Effect::Allow,
+            }),
+            Just(RandomPolicySpec {
+                grant_percent: 0,
+                forbid_percent: 0,
+                salt: 0,
+                effect: Effect::AllowOrForbid,
+            }),
+        ],
+        0..=3,
+    )
+    .prop_map(|mut tail| {
+        let mut specs = vec![
+            RandomPolicySpec {
+                grant_percent: 100,
+                forbid_percent: 0,
+                salt: 0,
+                effect: Effect::AllowOrForbid,
+            },
+            RandomPolicySpec {
+                grant_percent: 0,
+                forbid_percent: 0,
+                salt: 0,
+                effect: Effect::AllowOrForbid,
+            },
+        ];
+        specs.append(&mut tail);
+        specs
+    });
+
+    let veto_heavy = prop::collection::vec(policy_spec_strategy(), 2..=5).prop_filter(
+        "at least two veto-capable policies, one mixed-capability policy",
+        |specs| {
+            specs.iter().filter(|spec| spec.effect.can_forbid()).count() >= 2
+                && specs
+                    .iter()
+                    .any(|spec| spec.effect == Effect::AllowOrForbid)
+        },
+    );
+
+    prop_oneof![
+        5 => exact_deferred_grant,
+        7 => veto_heavy,
+        2 => prop::collection::vec(policy_spec_strategy(), 1..=5),
+    ]
 }
 
 struct NeverConsultedPolicy {
@@ -502,84 +670,154 @@ proptest! {
     })]
 
     #[test]
-    fn batch_decisions_match_naive_loop_for_random_policy_stacks(
-        policy_specs in prop::collection::vec((0u8..=100, 0u8..=100, any::<u16>(), 0u8..3), 1..=5),
+    fn checker_paths_match_deny_overrides_oracle(
+        policy_specs in adversarial_policy_stack_strategy(),
         resource_ids in prop::collection::vec(0u8..64, 0..50),
         max_batch_size in prop::option::of(1usize..8),
     ) {
-        let mut checker = if let Some(max_batch_size) = max_batch_size {
-            PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(max_batch_size).unwrap())
-        } else {
-            PermissionChecker::new()
-        };
-        for (index, (grant_percent, forbid_percent, salt, effect_tag)) in policy_specs.into_iter().enumerate() {
-            checker.add_policy(RandomStackPolicy {
-                name: format!("random_{index}"),
-                grant_percent,
-                forbid_percent,
-                salt,
-                effect: effect_from_tag(effect_tag),
-            });
-        }
-
         let items = resource_ids
             .iter()
             .copied()
             .map(|id| Resource { id })
             .collect::<Vec<_>>();
-        let batch_session = EvaluationSession::empty();
-        let batch = tokio_test::block_on(evaluate_resources(&checker, &batch_session, items.clone()))
-        .into_iter()
-        .map(|(_item, evaluation)| {
-            (
-                evaluation.is_granted(),
-                evaluation.forbidden_by().map(str::to_owned),
-            )
-        })
-        .collect::<Vec<_>>();
+        let expected = resource_ids
+            .iter()
+            .map(|id| oracle_decision(&policy_specs, *id))
+            .collect::<Vec<_>>();
 
-        let mut naive = Vec::new();
-        for resource in &items {
-            let session = EvaluationSession::empty();
-            let evaluation = tokio_test::block_on(check_resource(&checker, &session, resource));
-            naive.push((
-                evaluation.is_granted(),
-                evaluation.forbidden_by().map(str::to_owned),
-            ));
+        let unchunked = checker_from_specs(&policy_specs, None);
+        let unchunked_session = EvaluationSession::empty();
+        let unchunked_batch = tokio_test::block_on(evaluate_resources(
+            &unchunked,
+            &unchunked_session,
+            items.clone(),
+        ))
+        .into_iter()
+        .map(|(_item, evaluation)| access_decision(&evaluation))
+        .collect::<Vec<_>>();
+        prop_assert_eq!(&unchunked_batch, &expected);
+
+        let chunk_one = checker_from_specs(&policy_specs, Some(1));
+        let chunk_one_session = EvaluationSession::empty();
+        let chunk_one_batch = tokio_test::block_on(evaluate_resources(
+            &chunk_one,
+            &chunk_one_session,
+            items.clone(),
+        ))
+        .into_iter()
+        .map(|(_item, evaluation)| access_decision(&evaluation))
+        .collect::<Vec<_>>();
+        prop_assert_eq!(&chunk_one_batch, &expected);
+
+        if let Some(max_batch_size) = max_batch_size {
+            let chunked = checker_from_specs(&policy_specs, Some(max_batch_size));
+            let chunked_session = EvaluationSession::empty();
+            let chunked_batch = tokio_test::block_on(evaluate_resources(
+                &chunked,
+                &chunked_session,
+                items.clone(),
+            ))
+            .into_iter()
+            .map(|(_item, evaluation)| access_decision(&evaluation))
+            .collect::<Vec<_>>();
+            prop_assert_eq!(&chunked_batch, &expected);
         }
 
-        prop_assert_eq!(batch, naive);
+        let mut repeated_single = Vec::new();
+        for resource in &items {
+            let session = EvaluationSession::empty();
+            let evaluation = tokio_test::block_on(check_resource(&unchunked, &session, resource));
+            repeated_single.push(access_decision(&evaluation));
+        }
+        prop_assert_eq!(repeated_single, expected);
     }
 
     #[test]
     fn singleton_filter_matches_single_resource_check_for_random_policy_stacks(
-        policy_specs in prop::collection::vec((0u8..=100, 0u8..=100, any::<u16>(), 0u8..3), 1..=5),
+        policy_specs in adversarial_policy_stack_strategy(),
         resource_id in 0u8..64,
         max_batch_size in prop::option::of(1usize..8),
     ) {
-        let mut checker = if let Some(max_batch_size) = max_batch_size {
-            PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(max_batch_size).unwrap())
-        } else {
-            PermissionChecker::new()
-        };
-        for (index, (grant_percent, forbid_percent, salt, effect_tag)) in policy_specs.into_iter().enumerate() {
-            checker.add_policy(RandomStackPolicy {
-                name: format!("random_{index}"),
-                grant_percent,
-                forbid_percent,
-                salt,
-                effect: effect_from_tag(effect_tag),
-            });
-        }
+        let checker = checker_from_specs(&policy_specs, max_batch_size);
 
         let resource = Resource { id: resource_id };
         let single_session = EvaluationSession::empty();
         let single = tokio_test::block_on(check_resource(&checker, &single_session, &resource));
+        let expected = oracle_decision(&policy_specs, resource_id);
+        prop_assert_eq!(access_decision(&single), expected);
 
         let filter_session = EvaluationSession::empty();
         let filtered = tokio_test::block_on(filter_resources(&checker, &filter_session, vec![resource]));
 
-        prop_assert_eq!(single.is_granted(), !filtered.is_empty());
+        prop_assert_eq!(single.is_granted(), expected == ExpectedDecision::Granted);
+        prop_assert_eq!(!filtered.is_empty(), expected == ExpectedDecision::Granted);
+    }
+
+    #[test]
+    fn checker_decision_is_registration_order_invariant(
+        policy_specs in adversarial_policy_stack_strategy(),
+        resource_id in 0u8..64,
+        rotation in 0usize..8,
+        reverse in any::<bool>(),
+    ) {
+        let mut permuted = policy_specs.clone();
+        let len = permuted.len();
+        permuted.rotate_left(rotation % len);
+        if reverse {
+            permuted.reverse();
+        }
+
+        let checker = checker_from_specs(&policy_specs, None);
+        let permuted_checker = checker_from_specs(&permuted, None);
+        let resource = Resource { id: resource_id };
+
+        let session = EvaluationSession::empty();
+        let decision = tokio_test::block_on(check_resource(&checker, &session, &resource));
+        let permuted_session = EvaluationSession::empty();
+        let permuted_decision =
+            tokio_test::block_on(check_resource(&permuted_checker, &permuted_session, &resource));
+
+        let expected = oracle_decision(&policy_specs, resource_id);
+        prop_assert_eq!(oracle_decision(&permuted, resource_id), expected);
+        prop_assert_eq!(access_decision(&decision), expected);
+        prop_assert_eq!(access_decision(&permuted_decision), expected);
+    }
+
+    #[test]
+    fn combinator_single_and_batch_paths_agree(
+        policy_specs in adversarial_policy_stack_strategy(),
+        resource_id in 0u8..64,
+        combinator in 0u8..3,
+    ) {
+        let policy: Box<dyn Policy<Domain>> = match combinator {
+            0 => Box::new(AndPolicy::try_new(arc_policies_from_specs(&policy_specs)).unwrap()),
+            1 => Box::new(OrPolicy::try_new(arc_policies_from_specs(&policy_specs)).unwrap()),
+            _ => Box::new(NotPolicy::new(policy_specs[0].into_policy(0))),
+        };
+
+        let session = EvaluationSession::empty();
+        let resource = Resource { id: resource_id };
+        let single = tokio_test::block_on(policy.evaluate(&EvalCtx {
+            session: &session,
+            subject: &Subject,
+            action: &Action,
+            resource: &resource,
+            context: &Ctx,
+            policy_type: policy.policy_type(),
+        }));
+
+        let items = [PolicyBatchItem { resource: &resource }];
+        let batch = tokio_test::block_on(policy.evaluate_batch(&BatchEvalCtx {
+            session: &session,
+            subject: &Subject,
+            action: &Action,
+            context: &Ctx,
+            items: &items,
+            policy_type: policy.policy_type(),
+        }));
+
+        prop_assert_eq!(batch.len(), 1);
+        prop_assert_eq!(policy_decision(&single), policy_decision(&batch[0]));
     }
 }
 

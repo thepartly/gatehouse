@@ -64,6 +64,8 @@ no-session checker shortcut, and uses explicit policy-level
 - Optional `serde` feature for serializing decision and trace types used in
   audit logging.
 - `#![forbid(unsafe_code)]`.
+- Differential checker contract properties with a simple deny-overrides oracle,
+  plus a focused cargo-mutants CI gate for checker/combinator semantics.
 
 ### Removed
 
