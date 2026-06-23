@@ -3013,9 +3013,9 @@ mod core_tests {
     {
         let mut checker = PermissionChecker::new();
         checker.add_policy(AlwaysDenyPolicy("first denial reason"));
-        // A second denying policy with a different name and reason. Its
+        // A second policy with a different name and reason. Its
         // forbid-effect predicate never matches, so it lands in the trace as
-        // a not-applicable `Denied` leaf rather than vetoing the whole
+        // a not-applicable leaf rather than vetoing the whole
         // evaluation before the first policy is consulted. (The
         // tree-walker checks policy_type, not reason — what we're pinning
         // is that it finds *any* matching leaf.)
@@ -3034,13 +3034,13 @@ mod core_tests {
         let evaluation = multi_deny_checker()
             .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
-        // Both child policies denied; either name should match.
+        // Both child policies were not applicable; either name should match.
         evaluation.assert_not_applicable_by("AlwaysDenyPolicy");
         evaluation.assert_not_applicable_by("SupplierBlock");
     }
 
     #[tokio::test]
-    #[should_panic(expected = "expected a non-grant leaf for policy `NeverConsulted`")]
+    #[should_panic(expected = "expected a not-applicable leaf for policy `NeverConsulted`")]
     async fn assert_not_applicable_by_panics_when_no_matching_leaf() {
         let evaluation = multi_deny_checker()
             .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
@@ -3055,6 +3055,19 @@ mod core_tests {
             .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         evaluation.assert_not_applicable_by("AlwaysDenyPolicy");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected a not-applicable leaf for policy `GlobalFreeze`")]
+    async fn assert_not_applicable_by_does_not_match_forbidden_veto() {
+        let mut checker = PermissionChecker::<(), (), (), ()>::new();
+        checker.add_policy(
+            PolicyBuilder::<(), (), (), ()>::new("GlobalFreeze")
+                .forbid()
+                .build(),
+        );
+        let evaluation = checker.check(&(), &(), &(), &()).await;
+        evaluation.assert_not_applicable_by("GlobalFreeze");
     }
 
     #[tokio::test]
@@ -3190,7 +3203,7 @@ mod policy_builder_tests {
             "Policy should allow access for subject 'Alice'"
         );
 
-        // Otherwise, it should deny
+        // Otherwise, it should not apply.
         let result2 = policy
             .evaluate_access(
                 &TestSubject { name: "Bob".into() },
@@ -3201,20 +3214,21 @@ mod policy_builder_tests {
             .await;
         assert!(
             !result2.is_granted(),
-            "Policy should deny access for subject not named 'Alice'"
+            "Policy should not grant access for subject not named 'Alice'"
         );
     }
 
-    // Test that setting the effect to Deny overrides an otherwise matching predicate.
+    // Test that `.forbid()` turns an otherwise matching predicate into an active veto.
     #[tokio::test]
-    async fn test_policy_builder_effect_deny() {
-        let policy =
-            PolicyBuilder::<TestSubject, TestAction, TestResource, TestContext>::new("DenyPolicy")
-                .forbid()
-                .build();
+    async fn test_policy_builder_forbid() {
+        let policy = PolicyBuilder::<TestSubject, TestAction, TestResource, TestContext>::new(
+            "ForbidPolicy",
+        )
+        .forbid()
+        .build();
 
         // Even though no predicate fails (so predicate returns true),
-        // the effect should result in a Denied outcome.
+        // the forbid effect should result in a Denied outcome.
         let result = policy
             .evaluate_access(
                 &TestSubject {
@@ -3227,16 +3241,16 @@ mod policy_builder_tests {
             .await;
         assert!(
             !result.is_granted(),
-            "Policy with effect Deny should result in denial even if the predicate passes"
+            "forbid policy should not grant even if the predicate passes"
         );
     }
 
     /// The headline deny-overrides behavior: a matched `Effect::Forbid` policy
     /// vetoes a sibling grant, regardless of registration order.
     #[tokio::test]
-    async fn test_policy_builder_effect_deny_overrides_other_grants() {
-        for deny_registered_first in [true, false] {
-            let deny_policy =
+    async fn test_policy_builder_forbid_overrides_other_grants() {
+        for block_registered_first in [true, false] {
+            let block_policy =
                 PolicyBuilder::<TestSubject, TestAction, TestResource, TestContext>::new(
                     "BlockAlicePolicy",
                 )
@@ -3252,12 +3266,12 @@ mod policy_builder_tests {
                 .build();
 
             let mut checker = PermissionChecker::new();
-            if deny_registered_first {
-                checker.add_policy(deny_policy);
+            if block_registered_first {
+                checker.add_policy(block_policy);
                 checker.add_policy(allow_policy);
             } else {
                 checker.add_policy(allow_policy);
-                checker.add_policy(deny_policy);
+                checker.add_policy(block_policy);
             }
 
             let session = EvaluationSession::empty();
@@ -3280,7 +3294,7 @@ mod policy_builder_tests {
                 "summary reason should name the forbidding policy"
             );
 
-            // A subject the deny predicate does not match is unaffected:
+            // A subject the forbid predicate does not match is unaffected:
             // a non-matching forbid policy is "not applicable", never a veto.
             let bob_result = checker
                 .evaluate_in_session(

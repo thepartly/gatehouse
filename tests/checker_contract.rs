@@ -908,10 +908,10 @@ async fn custom_policy_forbid_via_ctx_forbid_is_honored() {
 
 /// Contract violation: a policy declaring `Effect::Forbid` must not grant.
 /// The checker fails closed, treating the grant as not applicable.
-struct MisbehavingDenyPolicy;
+struct MisbehavingForbidPolicy;
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for MisbehavingDenyPolicy {
+impl Policy<Subject, Action, Resource, Ctx> for MisbehavingForbidPolicy {
     async fn evaluate(
         &self,
         ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
@@ -920,7 +920,7 @@ impl Policy<Subject, Action, Resource, Ctx> for MisbehavingDenyPolicy {
     }
 
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("MisbehavingDenyPolicy")
+        std::borrow::Cow::Borrowed("MisbehavingForbidPolicy")
     }
 
     fn effect(&self) -> Effect {
@@ -929,10 +929,10 @@ impl Policy<Subject, Action, Resource, Ctx> for MisbehavingDenyPolicy {
 }
 
 #[tokio::test]
-async fn grant_from_deny_declared_policy_is_treated_as_not_applicable() {
+async fn grant_from_forbid_declared_policy_is_treated_as_not_applicable() {
     // Alone in a checker, the misbehaving grant must not grant access.
     let mut checker = PermissionChecker::new();
-    checker.add_policy(MisbehavingDenyPolicy);
+    checker.add_policy(MisbehavingForbidPolicy);
     let session = EvaluationSession::empty();
     let alone = checker
         .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 0 }, &Ctx)
@@ -1008,10 +1008,10 @@ async fn undeclared_forbid_is_honored_when_observed_but_not_scheduled_first() {
 /// A forbid-effect policy whose batch override returns the wrong number of
 /// results fails closed: affected items are denied, not granted by the
 /// allow phase.
-struct WrongLengthDenyPolicy;
+struct WrongLengthForbidPolicy;
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for WrongLengthDenyPolicy {
+impl Policy<Subject, Action, Resource, Ctx> for WrongLengthForbidPolicy {
     async fn evaluate(
         &self,
         ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
@@ -1027,7 +1027,7 @@ impl Policy<Subject, Action, Resource, Ctx> for WrongLengthDenyPolicy {
     }
 
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("WrongLengthDenyPolicy")
+        std::borrow::Cow::Borrowed("WrongLengthForbidPolicy")
     }
 
     fn effect(&self) -> Effect {
@@ -1036,10 +1036,10 @@ impl Policy<Subject, Action, Resource, Ctx> for WrongLengthDenyPolicy {
 }
 
 #[tokio::test]
-async fn wrong_length_batch_from_deny_policy_fails_closed() {
+async fn wrong_length_batch_from_forbid_policy_fails_closed() {
     let mut checker = PermissionChecker::new();
     checker.add_policy(allow_everything("AllowAll"));
-    checker.add_policy(WrongLengthDenyPolicy);
+    checker.add_policy(WrongLengthForbidPolicy);
 
     let session = EvaluationSession::empty();
     let results = checker

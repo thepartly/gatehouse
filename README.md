@@ -84,9 +84,10 @@ For checkers with any fact-backed policy (ReBAC or custom `FactSource`-using pol
 `registry.session()`, and call `checker.evaluate_in_session(&session, …)` or the matching
 batch/list API.
 
-## Which API should I use?
+## Core authorization flows
 
-Three workflows cover most call sites:
+Gatehouse intentionally keeps the public call surface small. Most call sites are one of three
+shapes:
 
 ```text
 single resource

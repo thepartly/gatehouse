@@ -263,17 +263,16 @@ pub enum AccessEvaluation {
     },
 }
 
-/// Walks a [`PolicyEvalResult`] tree looking for a `NotApplicable` or `Forbidden`
+/// Walks a [`PolicyEvalResult`] tree looking for a `NotApplicable`
 /// leaf whose `policy_type` equals `expected`. Used by
 /// [`AccessEvaluation::assert_not_applicable_by`].
-fn leaf_non_grant_matches(node: &PolicyEvalResult, expected: &str) -> bool {
+fn leaf_not_applicable_matches(node: &PolicyEvalResult, expected: &str) -> bool {
     match node {
-        PolicyEvalResult::NotApplicable { policy_type, .. }
-        | PolicyEvalResult::Forbidden { policy_type, .. } => policy_type.as_ref() == expected,
-        PolicyEvalResult::Granted { .. } => false,
+        PolicyEvalResult::NotApplicable { policy_type, .. } => policy_type.as_ref() == expected,
+        PolicyEvalResult::Granted { .. } | PolicyEvalResult::Forbidden { .. } => false,
         PolicyEvalResult::Combined { children, .. } => children
             .iter()
-            .any(|child| leaf_non_grant_matches(child, expected)),
+            .any(|child| leaf_not_applicable_matches(child, expected)),
     }
 }
 
@@ -430,14 +429,14 @@ impl AccessEvaluation {
     }
 
     /// Test helper: panic unless the evaluation is `Denied` and some
-    /// `NotApplicable` or `Forbidden` leaf in the trace tree was produced by
-    /// a policy whose name matches `expected`.
+    /// `NotApplicable` leaf in the trace tree was produced by a policy whose
+    /// name matches `expected`.
     ///
     /// Symmetric with [`Self::assert_granted_by`] but walks the trace
-    /// rather than checking the top-level decision, because a final denial
-    /// has no single denying policy: every policy in the checker either has
-    /// to be not applicable, or one policy has to forbid. Use this to assert
-    /// that policy `expected` actually fired and declined to grant.
+    /// rather than checking the top-level decision, because an ordinary final
+    /// denial has no single denying policy: every policy in the checker declined
+    /// to grant. Use this to assert that policy `expected` actually fired and
+    /// was not applicable. Use [`Self::assert_forbidden_by`] for active vetoes.
     ///
     /// ```rust
     /// # use gatehouse::*;
@@ -445,7 +444,7 @@ impl AccessEvaluation {
     /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
     /// # checker.add_policy(
     /// #     PolicyBuilder::<(), (), (), ()>::new("StaffOnly")
-    /// #         .forbid()
+    /// #         .subjects(|_: &()| false)
     /// #         .build(),
     /// # );
     /// # let evaluation = checker.check(&(), &(), &(), &()).await;
@@ -457,16 +456,16 @@ impl AccessEvaluation {
         match self {
             Self::Granted { policy_type, .. } => {
                 panic!(
-                    "expected non-grant by policy `{expected}`, but access was granted by `{policy_type}`"
+                    "expected not-applicable by policy `{expected}`, but access was granted by `{policy_type}`"
                 );
             }
             Self::Denied { trace, .. } => {
                 let Some(root) = trace.root() else {
-                    panic!("expected non-grant by `{expected}`, but the trace is empty");
+                    panic!("expected not-applicable by `{expected}`, but the trace is empty");
                 };
-                if !leaf_non_grant_matches(root, expected) {
+                if !leaf_not_applicable_matches(root, expected) {
                     panic!(
-                        "expected a non-grant leaf for policy `{expected}` in the trace; \
+                        "expected a not-applicable leaf for policy `{expected}` in the trace; \
                          got:\n{}",
                         trace.format()
                     );
@@ -481,7 +480,7 @@ impl AccessEvaluation {
     /// Stronger than [`Self::assert_not_applicable_by`]: this asserts the denial
     /// was a deny-overrides veto attributed to `expected` (via
     /// [`Self::forbidden_by`]), not merely that `expected` appears as a
-    /// denying leaf somewhere in the trace.
+    /// not-applicable leaf somewhere in the trace.
     ///
     /// ```rust
     /// # use gatehouse::*;

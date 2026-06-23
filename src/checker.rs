@@ -65,7 +65,7 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 /// // Don't do this:
 /// enum BillingResource { Event, Invoice, Product }
 ///
-/// async fn evaluate(&self, ctx: &EvalCtx<'_, _, BillingResource, _, _>) -> PolicyEvalResult {
+/// async fn evaluate(&self, ctx: &EvalCtx<'_, _, _, BillingResource, _>) -> PolicyEvalResult {
 ///     if !matches!(ctx.resource, BillingResource::Event) {
 ///         return ctx.not_applicable("resource mismatch");   // tag dispatch in every policy
 ///     }
@@ -209,8 +209,8 @@ where
 
     /// Creates a new `PermissionChecker` tagged with a name.
     ///
-    /// The name is recorded on the `evaluate_in_session` /
-    /// `evaluate_batch_in_session_*` tracing spans as `checker.name`, so
+    /// The name is recorded on the `evaluate_in_session` and
+    /// `evaluate_batch_in_session` tracing spans as `checker.name`, so
     /// audit pipelines that route to multiple checkers (an `InvoiceChecker`
     /// alongside a `ProductChecker`, for example) can disambiguate which
     /// checker produced each evaluation when policy names are shared.
@@ -321,7 +321,7 @@ where
     /// request session.
     ///
     /// Policies are evaluated sequentially under deny-overrides semantics:
-    /// declared-deny policies first (a forbid ends the evaluation as a
+    /// forbid-effect policies first (a forbid ends the evaluation as a
     /// denial), then allow policies with a short-circuit on the first grant.
     /// The returned [`AccessEvaluation`] contains a trace tree for the
     /// policies that were actually evaluated before short-circuiting.
@@ -474,7 +474,7 @@ where
     /// The `parts` callback tells gatehouse how to borrow the resource and
     /// context from each caller-owned item. Returned results preserve input
     /// order, including duplicate resources. Policy evaluation uses the same
-    /// deny-overrides semantics as [`Self::evaluate_in_session`] (declared-deny
+    /// deny-overrides semantics as [`Self::evaluate_in_session`] (forbid-effect
     /// policies first; a forbid finalizes an item as denied), but the checker
     /// evaluates each policy across the still-pending batch before moving to
     /// the next policy. This lets policies with set-oriented backends override
