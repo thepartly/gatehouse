@@ -33,7 +33,7 @@ impl<D: PolicyDomain> InternalPolicy<D> {
     fn build_result(&self, all_axes_pass: bool) -> PolicyEvalResult {
         if all_axes_pass {
             match self.effect {
-                Effect::Allow => PolicyEvalResult::granted(
+                Effect::Allow | Effect::AllowOrForbid => PolicyEvalResult::granted(
                     self.name.clone(),
                     Some("Policy allowed access".into()),
                 ),

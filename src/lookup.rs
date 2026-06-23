@@ -156,6 +156,7 @@ where
 /// The generic parameters carry the source's and hydrator's own error
 /// types, so callers retain full backend context on the wrapped variants.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LookupAuthorizedError<LookupErr, HydrateErr> {
     /// The [`LookupSource`] returned an error for the current page.
     Lookup(LookupErr),

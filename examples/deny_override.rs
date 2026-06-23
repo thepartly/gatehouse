@@ -17,10 +17,10 @@
 //! 2. otherwise any granting policy ⇒ **granted**;
 //! 3. otherwise ⇒ **denied** (default deny).
 //!
-//! Forbids are honored at the *checker* level. Inside combinators
-//! (`AndPolicy` / `OrPolicy` / `NotPolicy`) a forbid behaves like an
-//! ordinary denial — see the scoped-exclusion section at the bottom for the
-//! combinator shape that covers "this deny should only gate one grant path".
+//! Active forbids propagate through combinators and delegation. See the
+//! scoped-exclusion section at the bottom for the combinator shape that covers
+//! "this exclusion should only gate one grant path" without creating a global
+//! veto.
 //!
 //! Run with:
 //!
@@ -231,8 +231,9 @@ async fn main() {
 /// checker. When a block rule should only gate one grant path — here,
 /// muted users lose collaborator access but owners and admins keep
 /// theirs — scope it with combinators instead:
-/// `AndPolicy[ grant_arm, NotPolicy(block) ]`. Inside combinators a
-/// forbid has no special power, so the exclusion stays local to its arm.
+/// `AndPolicy[ grant_arm, NotPolicy(block) ]`. The block policy in this local
+/// shape should be an ordinary grant-style predicate, not `.forbid()`;
+/// `Forbidden` is active and would still veto globally.
 async fn scoped_exclusion_demo() {
     #[derive(Debug, Clone)]
     struct Member {

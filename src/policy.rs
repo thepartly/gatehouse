@@ -20,18 +20,51 @@ pub trait PolicyDomain: Send + Sync + 'static {
     type Context: Send + Sync;
 }
 
-/// The declared effect of a policy: whether a match grants or forbids access.
+/// The declared effect of a policy: whether it can grant, forbid, or both.
 ///
 /// `Allow` (the default everywhere) means the policy grants access when it
 /// matches. `Forbid` means the policy **forbids** access when it matches: a
 /// matched forbid produces [`PolicyEvalResult::Forbidden`], which
 /// [`crate::PermissionChecker`] honors over any grant from sibling policies.
+/// `AllowOrForbid` is for composed or custom policies that can produce either
+/// result depending on their inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Effect {
-    /// The policy grants access when its predicates pass.
+    /// The policy may grant access, but must not actively forbid.
     Allow,
-    /// The policy forbids access when its predicates pass.
+    /// The policy may actively forbid access, but must not grant.
     Forbid,
+    /// The policy may either grant or actively forbid access.
+    AllowOrForbid,
+}
+
+impl Effect {
+    /// Whether this effect can produce a grant.
+    pub fn can_grant(self) -> bool {
+        matches!(self, Self::Allow | Self::AllowOrForbid)
+    }
+
+    /// Whether this effect can produce an active forbid.
+    pub fn can_forbid(self) -> bool {
+        matches!(self, Self::Forbid | Self::AllowOrForbid)
+    }
+
+    pub(crate) fn from_capabilities(can_grant: bool, can_forbid: bool) -> Self {
+        match (can_grant, can_forbid) {
+            (true, true) => Self::AllowOrForbid,
+            (false, true) => Self::Forbid,
+            _ => Self::Allow,
+        }
+    }
+
+    pub(crate) fn telemetry_label(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Forbid => "deny",
+            Self::AllowOrForbid => "allow_or_forbid",
+        }
+    }
 }
 
 /// A borrowed resource passed to batch policy evaluators.
@@ -79,10 +112,11 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
 
     /// Shorthand for `PolicyEvalResult::forbidden(ctx.policy_type, reason)`.
     ///
-    /// Use this for an active veto. A hand-written policy that can return a
-    /// forbid should also override [`Policy::effect`] to return
-    /// [`Effect::Forbid`] so [`crate::PermissionChecker`] evaluates it before
-    /// grant short-circuiting can skip it.
+    /// Use this for an active veto. A hand-written policy that can only veto
+    /// should override [`Policy::effect`] to return [`Effect::Forbid`]. A policy
+    /// that can grant or veto should return [`Effect::AllowOrForbid`]. Both
+    /// make [`crate::PermissionChecker`] evaluate the policy before allow-only
+    /// policies so grant short-circuiting cannot skip the veto.
     pub fn forbid(&self, reason: impl Into<String>) -> PolicyEvalResult {
         PolicyEvalResult::forbidden(self.policy_type.clone(), reason)
     }
@@ -176,8 +210,9 @@ pub trait Policy<D: PolicyDomain>: Send + Sync {
     /// The declared effect of this policy. Defaults to [`Effect::Allow`].
     ///
     /// [`crate::PermissionChecker`] reads this declaration when the policy is
-    /// added. Policies declaring [`Effect::Forbid`] run before allow policies,
-    /// so a matched forbid is observed before a grant can short-circuit.
+    /// added. Policies declaring [`Effect::Forbid`] or
+    /// [`Effect::AllowOrForbid`] run before allow-only policies, so a matched
+    /// forbid is observed before a grant can short-circuit.
     fn effect(&self) -> Effect {
         Effect::Allow
     }

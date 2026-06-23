@@ -474,6 +474,7 @@ pub async fn view_post(
             HttpResponse::Ok().body(format!("Viewing '{}'", post.title))
         }
         AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
+        _ => HttpResponse::Forbidden().body("Access denied"),
     }
 }
 
@@ -495,6 +496,7 @@ pub async fn edit_post(
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post updated"),
         AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
+        _ => HttpResponse::Forbidden().body("Access denied"),
     }
 }
 
@@ -516,6 +518,7 @@ pub async fn publish_post(
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post published"),
         AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
+        _ => HttpResponse::Forbidden().body("Access denied"),
     }
 }
 

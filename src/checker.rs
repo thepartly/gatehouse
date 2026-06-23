@@ -3,7 +3,7 @@ use crate::{
     Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupSource, Policy, PolicyBatchItem,
     PolicyDomain, PolicyEvalResult, DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE,
 };
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -31,7 +31,8 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 pub struct PermissionChecker<D: PolicyDomain> {
     name: Option<std::borrow::Cow<'static, str>>,
     policies: Vec<Arc<dyn Policy<D>>>,
-    forbid_count: usize,
+    effects: Vec<Effect>,
+    veto_capable_count: usize,
     max_batch_size: Option<NonZeroUsize>,
 }
 
@@ -40,7 +41,8 @@ impl<D: PolicyDomain> Clone for PermissionChecker<D> {
         Self {
             name: self.name.clone(),
             policies: self.policies.clone(),
-            forbid_count: self.forbid_count,
+            effects: self.effects.clone(),
+            veto_capable_count: self.veto_capable_count,
             max_batch_size: self.max_batch_size,
         }
     }
@@ -58,7 +60,8 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         Self {
             name: None,
             policies: Vec::new(),
-            forbid_count: 0,
+            effects: Vec::new(),
+            veto_capable_count: 0,
             max_batch_size: None,
         }
     }
@@ -68,7 +71,8 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         Self {
             name: Some(name.into()),
             policies: Vec::new(),
-            forbid_count: 0,
+            effects: Vec::new(),
+            veto_capable_count: 0,
             max_batch_size: None,
         }
     }
@@ -86,22 +90,29 @@ impl<D: PolicyDomain> PermissionChecker<D> {
 
     /// Adds a policy to the checker.
     ///
-    /// Forbid-effect policies are scheduled ahead of allow policies so a veto
-    /// is always observed before the grant short-circuit.
+    /// Veto-capable policies are scheduled ahead of allow-only policies so a
+    /// forbid is always observed before the grant short-circuit.
     pub fn add_policy<P: Policy<D> + 'static>(&mut self, policy: P) {
-        if policy.effect() == Effect::Forbid {
-            self.policies.insert(self.forbid_count, Arc::new(policy));
-            self.forbid_count += 1;
+        let effect = policy.effect();
+        if effect.can_forbid() {
+            self.policies
+                .insert(self.veto_capable_count, Arc::new(policy));
+            self.effects.insert(self.veto_capable_count, effect);
+            self.veto_capable_count += 1;
         } else {
             self.policies.push(Arc::new(policy));
+            self.effects.push(effect);
         }
     }
 
     /// Adds a hand-written policy that can actively forbid access even if it
     /// does not override [`Policy::effect`].
     pub fn add_forbid_policy<P: Policy<D> + 'static>(&mut self, policy: P) {
-        self.policies.insert(self.forbid_count, Arc::new(policy));
-        self.forbid_count += 1;
+        self.policies
+            .insert(self.veto_capable_count, Arc::new(policy));
+        self.effects
+            .insert(self.veto_capable_count, Effect::AllowOrForbid);
+        self.veto_capable_count += 1;
     }
 
     /// Binds a request-scoped evaluation session and shared inputs to this
@@ -127,11 +138,16 @@ impl<D: PolicyDomain> PermissionChecker<D> {
     }
 
     fn declared_effect(&self, policy_index: usize) -> Effect {
-        if policy_index < self.forbid_count {
-            Effect::Forbid
-        } else {
-            Effect::Allow
-        }
+        self.effects
+            .get(policy_index)
+            .copied()
+            .unwrap_or(Effect::Allow)
+    }
+
+    pub(crate) fn aggregate_effect(&self) -> Effect {
+        let can_grant = self.effects.iter().any(|effect| effect.can_grant());
+        let can_forbid = self.effects.iter().any(|effect| effect.can_forbid());
+        Effect::from_capabilities(can_grant, can_forbid)
     }
 
     #[tracing::instrument(skip_all, fields(checker.name = tracing::field::Empty, policy_count = self.policies.len(), outcome = tracing::field::Empty, policy.type = tracing::field::Empty))]
@@ -160,6 +176,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         }
 
         let mut policy_results = Vec::with_capacity(self.policies.len());
+        let mut first_grant: Option<(Cow<'static, str>, Option<String>)> = None;
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             let declared_effect = self.declared_effect(policy_index);
@@ -197,10 +214,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                 .ruleset_name()
                 .unwrap_or(PERMISSION_CHECKER_POLICY_TYPE);
             let event_outcome = if result_passes { "success" } else { "failure" };
-            let policy_effect = match declared_effect {
-                Effect::Allow => "allow",
-                Effect::Forbid => "deny",
-            };
+            let policy_effect = declared_effect.telemetry_label();
 
             tracing::trace!(
                 target: "gatehouse::security",
@@ -221,28 +235,42 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                 "Security rule evaluated"
             );
 
+            let forbidden = result_forbids.then(|| {
+                result
+                    .forbidden_leaf()
+                    .map(|(policy_type, reason)| {
+                        (policy_type.to_string(), reason.map(str::to_owned))
+                    })
+                    .unwrap_or_else(|| (policy_type_str.to_string(), reason.clone()))
+            });
+
             policy_results.push(result);
 
-            if result_forbids {
+            if let Some((forbid_policy_type, forbid_reason)) = forbidden {
                 tracing::Span::current().record("outcome", "denied");
-                tracing::Span::current().record("policy.type", policy_type_str);
+                tracing::Span::current().record("policy.type", forbid_policy_type.as_str());
                 let combined = checker_root(policy_results, false);
                 return AccessEvaluation::Denied {
                     trace: EvalTrace::with_root(combined),
-                    reason: forbid_summary(policy_type_str, reason.as_deref()),
+                    reason: forbid_summary(&forbid_policy_type, forbid_reason.as_deref()),
                 };
             }
 
             if result_passes {
-                tracing::Span::current().record("outcome", "granted");
-                tracing::Span::current().record("policy.type", policy_type_str);
-                let combined = checker_root(policy_results, true);
-                let EvalCtx { policy_type, .. } = ctx;
-                return AccessEvaluation::Granted {
-                    policy_type,
-                    reason,
-                    trace: EvalTrace::with_root(combined),
-                };
+                first_grant.get_or_insert_with(|| (ctx.policy_type.clone(), reason));
+                if policy_index + 1 >= self.veto_capable_count {
+                    tracing::Span::current().record("outcome", "granted");
+                    let (policy_type, reason) = first_grant
+                        .take()
+                        .expect("grant branch stores first grant before returning");
+                    tracing::Span::current().record("policy.type", policy_type.as_ref());
+                    let combined = checker_root(policy_results, true);
+                    return AccessEvaluation::Granted {
+                        policy_type,
+                        reason,
+                        trace: EvalTrace::with_root(combined),
+                    };
+                }
             }
         }
 
@@ -254,18 +282,19 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(checker.name = tracing::field::Empty, item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
-    async fn evaluate_batch<I>(
+    #[tracing::instrument(name = "evaluate_batch", skip_all, fields(checker.name = tracing::field::Empty, item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
+    async fn evaluate_batch_by<I, F>(
         &self,
         session: &EvaluationSession,
         subject: &D::Subject,
         action: &D::Action,
         context: &D::Context,
         resources: I,
+        resource_of: F,
     ) -> Vec<(I::Item, AccessEvaluation)>
     where
         I: IntoIterator,
-        I::Item: Borrow<D::Resource>,
+        F: for<'item> Fn(&'item I::Item) -> &'item D::Resource,
     {
         let items: Vec<I::Item> = resources.into_iter().collect();
         let item_count = items.len();
@@ -305,11 +334,13 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         let item_parts = items
             .iter()
             .map(|item| PolicyBatchItem::<D> {
-                resource: Borrow::<D::Resource>::borrow(item),
+                resource: resource_of(item),
             })
             .collect::<Vec<_>>();
 
         let mut pending: Vec<usize> = (0..item_count).collect();
+        let mut first_grants: Vec<Option<(Cow<'static, str>, Option<String>)>> =
+            vec![None; item_count];
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             if pending.is_empty() {
@@ -330,10 +361,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                 let policy_span = tracing::debug_span!(
                     "gatehouse.batch_policy",
                     policy.type = policy_type_str,
-                    policy.effect = match declared_effect {
-                        Effect::Allow => "allow",
-                        Effect::Forbid => "deny",
-                    },
+                    policy.effect = declared_effect.telemetry_label(),
                     policy.pending_count = pending_chunk.len(),
                     policy.chunk_index = chunk_index,
                     policy.chunk_count = chunk_count,
@@ -398,27 +426,50 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     let result_passes = result.is_granted();
                     let result_forbids = result.is_forbidden();
                     let reason = result.reason();
+                    let forbidden = result_forbids.then(|| {
+                        result
+                            .forbidden_leaf()
+                            .map(|(policy_type, reason)| {
+                                (policy_type.to_string(), reason.map(str::to_owned))
+                            })
+                            .unwrap_or_else(|| (policy_type_str.to_string(), reason.clone()))
+                    });
 
                     traces[index].push(result);
 
-                    if result_forbids {
+                    if let Some((forbid_policy_type, forbid_reason)) = forbidden {
                         policy_forbidden_count += 1;
                         let combined = checker_root(std::mem::take(&mut traces[index]), false);
                         evaluations[index] = Some(AccessEvaluation::Denied {
                             trace: EvalTrace::with_root(combined),
-                            reason: forbid_summary(policy_type_str, reason.as_deref()),
-                        });
-                    } else if result_passes {
-                        policy_granted_count += 1;
-                        let combined = checker_root(std::mem::take(&mut traces[index]), true);
-                        evaluations[index] = Some(AccessEvaluation::Granted {
-                            policy_type: policy_type.clone(),
-                            reason,
-                            trace: EvalTrace::with_root(combined),
+                            reason: forbid_summary(&forbid_policy_type, forbid_reason.as_deref()),
                         });
                     } else {
-                        policy_denied_count += 1;
-                        still_pending.push(index);
+                        if result_passes {
+                            policy_granted_count += 1;
+                            first_grants[index]
+                                .get_or_insert_with(|| (policy_type.clone(), reason));
+                        } else {
+                            policy_denied_count += 1;
+                        }
+
+                        if policy_index + 1 >= self.veto_capable_count {
+                            if let Some((grant_policy_type, grant_reason)) =
+                                first_grants[index].take()
+                            {
+                                let combined =
+                                    checker_root(std::mem::take(&mut traces[index]), true);
+                                evaluations[index] = Some(AccessEvaluation::Granted {
+                                    policy_type: grant_policy_type,
+                                    reason: grant_reason,
+                                    trace: EvalTrace::with_root(combined),
+                                });
+                            } else {
+                                still_pending.push(index);
+                            }
+                        } else {
+                            still_pending.push(index);
+                        }
                     }
                 }
                 if contract_violation_count > 0 {
@@ -471,6 +522,24 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         tracing::Span::current().record("denied_count", denied_count);
         results
     }
+
+    async fn evaluate_batch<I>(
+        &self,
+        session: &EvaluationSession,
+        subject: &D::Subject,
+        action: &D::Action,
+        context: &D::Context,
+        resources: I,
+    ) -> Vec<(I::Item, AccessEvaluation)>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<D::Resource>,
+    {
+        self.evaluate_batch_by(session, subject, action, context, resources, |item| {
+            Borrow::<D::Resource>::borrow(item)
+        })
+        .await
+    }
 }
 
 /// A request-bound evaluator for one checker, subject, action, context, and
@@ -514,6 +583,36 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
             .await
     }
 
+    /// Evaluates a batch of caller-owned items by projecting each item to the
+    /// resource used for authorization.
+    ///
+    /// Use this for list endpoints that carry wide database rows but authorize
+    /// a narrower resource projection:
+    ///
+    /// ```rust,ignore
+    /// let decisions = bound.evaluate_by(rows, |row| &row.authz_resource).await;
+    /// ```
+    pub async fn evaluate_by<I, F>(
+        &self,
+        items: I,
+        resource_of: F,
+    ) -> Vec<(I::Item, AccessEvaluation)>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item D::Resource,
+    {
+        self.checker
+            .evaluate_batch_by(
+                self.session,
+                self.subject,
+                self.action,
+                self.context,
+                items,
+                resource_of,
+            )
+            .await
+    }
+
     /// Returns only the resources granted by [`Self::evaluate`].
     pub async fn filter<I>(&self, resources: I) -> Vec<I::Item>
     where
@@ -521,6 +620,22 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
         I::Item: Borrow<D::Resource>,
     {
         self.evaluate(resources)
+            .await
+            .into_iter()
+            .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
+            .collect()
+    }
+
+    /// Returns only the caller-owned items granted by [`Self::evaluate_by`].
+    ///
+    /// The returned values are the original input items, not cloned projected
+    /// resources.
+    pub async fn filter_by<I, F>(&self, items: I, resource_of: F) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item D::Resource,
+    {
+        self.evaluate_by(items, resource_of)
             .await
             .into_iter()
             .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))

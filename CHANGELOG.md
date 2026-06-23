@@ -2,24 +2,76 @@
 
 ## [Unreleased]
 
-`PermissionChecker` now honors `Effect::Deny` with fixed deny-overrides semantics (#44). Checkers containing no `Effect::Deny` policies behave identically to before — for them this release is purely additive. **If you had already registered an `Effect::Deny` policy in a checker, its behavior changes: it used to do nothing (a matched deny composed into nothing under the old OR-only semantics — the trap this release fixes) and it now vetoes matching requests.** Audit existing `.effect(Effect::Deny)` call sites before upgrading.
+This is a semver-major API cleanup. Gatehouse now centers public authorization
+APIs around a `PolicyDomain` marker and a session-bound evaluator, removes the
+no-session checker shortcut, and uses explicit policy-level
+`NotApplicable`/`Forbidden` results. See `MIGRATION.md` for the upgrade path.
 
 ### Changed
 
-- **`PermissionChecker` decision semantics are now deny-overrides** (Cedar/IAM-style, fixed, no combining-algorithm knob): any policy that *forbids* denies the request, overriding every grant; otherwise OR-with-short-circuit over grants as before; otherwise default deny. Deny-effect policies are evaluated before allow policies, so a veto is independent of registration order. Applies identically to single, batch (`evaluate_batch_in_session_*`), filter, and lookup (`lookup_authorized*`) paths.
-- A matched `PolicyBuilder` policy with `.effect(Effect::Deny)` now returns the new `PolicyEvalResult::Forbidden` ("this policy forbids") instead of `Denied` ("this policy does not grant"); a non-match still returns `Denied` and never blocks anything.
-- The checker's trace root is now a `CombineOp::DenyOverrides` node (rendered `DENY_OVERRIDES`) instead of `Or`, with children in evaluation order (deny-effect policies first). A veto's summary reason is `"Forbidden by <policy>: <reason>"` rather than `"All policies denied access"`.
-- `Effect` moved from the builder module to sit alongside `Policy` (the crate-root re-export `gatehouse::Effect` is unchanged) and now derives `Copy`.
-- Inside `AndPolicy` / `OrPolicy` / `NotPolicy`, a `Forbidden` child behaves exactly like `Denied`: forbids are honored at the checker level, not propagated through combinator trees. Use `AndPolicy[grant, NotPolicy(block)]` for an exclusion scoped to one grant path.
-- Examples: `deny_override` and `mfa_freshness_context` now use flat `Effect::Deny` policies instead of their previous combinator workarounds.
+- **`Policy` now takes a single `PolicyDomain` type parameter.** Define a
+  domain marker with associated `Subject`, `Action`, `Resource`, and `Context`
+  types, then implement `Policy<Domain>` and use `EvalCtx<'_, Domain>`.
+- **Checker calls now go through `PermissionChecker::bind`.** Bind an
+  `EvaluationSession`, subject, action, and context once, then call
+  `BoundEvaluator::check`, `evaluate`, `evaluate_by`, `filter`, `filter_by`,
+  or `lookup_page`.
+  `PermissionChecker::check`, `evaluate_in_session`,
+  `evaluate_batch_in_session_*`, `filter_authorized_in_session_*`, and
+  `lookup_authorized*` are removed.
+- **Policy-level denials are now `NotApplicable`.** `AccessEvaluation::Denied`
+  remains the final top-level access denial. In policy bodies, migrate
+  `ctx.deny(...)` to `ctx.not_applicable(...)`.
+- **`PermissionChecker` decision semantics are fixed deny-overrides:** any
+  evaluated result containing `Forbidden` denies the request, overriding grants;
+  otherwise the first grant wins; otherwise the request is denied.
+  Veto-capable policies are evaluated before allow-only policies.
+- `PolicyBuilder` is now domain-parameterized (`PolicyBuilder::<Domain>`) and
+  uses `.forbid()` for matching veto policies. A non-match remains
+  `NotApplicable` and never blocks a sibling grant.
+- `LookupSource` is now domain-parameterized (`LookupSource<Domain>`), and
+  lookup authorization is driven through `BoundEvaluator::lookup_page`.
+- `BatchEvalCtx` now carries one shared subject, action, and context for many
+  resources. `PolicyBatchItem` is resource-only.
+- Fact-source setup now goes through `FactRegistry` /
+  `FactRegistryBuilder`; create a fresh `registry.session()` per request.
+- `Effect::Deny` is renamed to `Effect::Forbid`.
+- `Forbidden` now propagates through `AndPolicy`, `OrPolicy`, `NotPolicy`, and
+  `DelegatingPolicy`. `NotPolicy` does not invert an active forbid into a grant.
+- Public enums are now `#[non_exhaustive]`; downstream exhaustive matches need
+  wildcard arms.
+- `uuid` is no longer a normal dependency. It remains a dev-dependency for
+  examples, tests, and doctests.
+- README, crate docs, examples, tests, and benchmark docs were refreshed for
+  the domain-bound evaluator API.
 
 ### Added
 
-- `PolicyEvalResult::Forbidden` variant, with `PolicyEvalResult::forbidden` / `forbidden_with_facts` constructors and `is_forbidden()`. **Breaking for exhaustive `match`es over `PolicyEvalResult` and `CombineOp`** — add an arm for `Forbidden` / `DenyOverrides`.
-- `Policy::effect()` — defaulted trait method (`Effect::Allow`) declaring whether a policy grants or forbids on match. The checker uses it to schedule deny-effect policies first; hand-written policies that can forbid must override it (the contract is documented on the method). A policy declaring `Effect::Deny` that nevertheless returns `Granted` is treated as not applicable (fail-closed) with a warning.
-- `EvalCtx::forbid` / `EvalCtx::forbid_with_facts` shortcuts for custom policies.
-- `AccessEvaluation::forbidden_by()` — returns the name of the vetoing policy when a denial was a forbid (e.g. to distinguish "actively blocked" from "no grant matched"), and the `assert_forbidden_by` test helper.
-- Batch telemetry: `gatehouse.batch_policy` spans gain `policy.effect` and `policy.forbidden_count` fields; the security rule event gains a `policy.effect` attribute.
+- `PolicyDomain`.
+- `BoundEvaluator`.
+- `BoundEvaluator::evaluate_by` and `BoundEvaluator::filter_by` for wide
+  caller-owned rows that project to an authorization resource.
+- `PolicyExt` fluent combinators: `.and(...)`, `.or(...)`, `.not()`, and
+  `.boxed()`.
+- `PolicyEvalResult::NotApplicable`, `not_applicable`,
+  `not_applicable_with_facts`, and `EvalCtx::not_applicable`.
+- `PolicyEvalResult::Forbidden`, `forbidden`, `forbidden_with_facts`,
+  `is_forbidden`, `EvalCtx::forbid`, and `EvalCtx::forbid_with_facts`.
+- `Policy::effect()` with `Effect::Allow`, `Effect::Forbid`, and
+  `Effect::AllowOrForbid`.
+- `AccessEvaluation::forbidden_by()` and `assert_forbidden_by`.
+- Batch telemetry fields `policy.effect` and `policy.forbidden_count`.
+- Optional `serde` feature for serializing decision and trace types used in
+  audit logging.
+- `#![forbid(unsafe_code)]`.
+
+### Removed
+
+- `AbacPolicy`; use `PolicyBuilder::when` for synchronous attribute-style
+  predicates, or a hand-written `Policy<Domain>` for async/custom behavior.
+- The old four-generic public policy/checker/builder surface.
+- The no-session `PermissionChecker::check` shortcut and the `_in_session`
+  checker method family.
 
 ## [0.4.0] - 2026-06-10
 

@@ -614,6 +614,79 @@ mod core_tests {
     }
 
     #[tokio::test]
+    async fn bound_filter_by_returns_wide_rows_projected_to_resources() {
+        #[derive(Debug)]
+        struct InvoiceRow {
+            row_id: u128,
+            authz_resource: TestResource,
+            total_cents: u64,
+        }
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let rows = vec![
+            InvoiceRow {
+                row_id: 10,
+                authz_resource: TestResource {
+                    id: uuid::Uuid::from_u128(3),
+                },
+                total_cents: 100,
+            },
+            InvoiceRow {
+                row_id: 11,
+                authz_resource: TestResource {
+                    id: uuid::Uuid::from_u128(2),
+                },
+                total_cents: 200,
+            },
+            InvoiceRow {
+                row_id: 12,
+                authz_resource: TestResource {
+                    id: uuid::Uuid::from_u128(4),
+                },
+                total_cents: 300,
+            },
+        ];
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls,
+        });
+
+        let session = EvaluationSession::empty();
+        let bound = checker.bind(&session, &subject, &TestAction, &TestContext);
+
+        let decisions = bound.evaluate_by(rows, |row| &row.authz_resource).await;
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|(row, evaluation)| (row.row_id, evaluation.is_granted()))
+                .collect::<Vec<_>>(),
+            vec![(10, false), (11, true), (12, true)]
+        );
+
+        let rows = decisions
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect::<Vec<_>>();
+        let authorized = bound.filter_by(rows, |row| &row.authz_resource).await;
+
+        assert_eq!(
+            authorized
+                .into_iter()
+                .map(|row| (row.row_id, row.total_cents))
+                .collect::<Vec<_>>(),
+            vec![(11, 200), (12, 300)]
+        );
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn test_evaluate_batch_by_respects_max_batch_size() {
         let batch_calls = Arc::new(AtomicUsize::new(0));
         let single_calls = Arc::new(AtomicUsize::new(0));
@@ -3005,6 +3078,19 @@ mod core_tests {
         assert_eq!(combined.reason_str(), None);
     }
 
+    #[cfg(feature = "serde")]
+    #[test]
+    fn audit_result_types_implement_serde_serialize() {
+        fn assert_serialize<T: serde::Serialize>() {}
+
+        assert_serialize::<AccessEvaluation>();
+        assert_serialize::<EvalTrace>();
+        assert_serialize::<PolicyEvalResult>();
+        assert_serialize::<FactProvenance>();
+        assert_serialize::<FactOutcome>();
+        assert_serialize::<CombineOp>();
+    }
+
     #[tokio::test]
     async fn granted_policy_type_and_denied_reason_accessors() {
         let grant = allow_checker()
@@ -3325,6 +3411,69 @@ mod policy_builder_tests {
                 "Bob has no grant (AllowAlicePolicy does not match him)"
             );
             assert_eq!(bob_result.forbidden_by(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn forbid_veto_composes_through_fluent_or_policy() {
+        let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+        let block_policy = PolicyBuilder::<TestDomain>::new("BlockAlicePolicy")
+            .forbid()
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(allow_policy.or(block_policy));
+
+        let session = EvaluationSession::empty();
+        let result = checker
+            .bind(
+                &session,
+                &TestSubject {
+                    name: "Alice".into(),
+                },
+                &TestAction,
+                &TestContext,
+            )
+            .check(&TestResource)
+            .await;
+
+        result.assert_forbidden_by("BlockAlicePolicy");
+        result.assert_trace_contains("OrPolicy");
+    }
+
+    #[tokio::test]
+    async fn forbid_veto_composes_through_fluent_and_policy_batch() {
+        let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+        let block_policy = PolicyBuilder::<TestDomain>::new("BlockAlicePolicy")
+            .forbid()
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(allow_policy.and(block_policy));
+
+        let session = EvaluationSession::empty();
+        let results = checker
+            .bind(
+                &session,
+                &TestSubject {
+                    name: "Alice".into(),
+                },
+                &TestAction,
+                &TestContext,
+            )
+            .evaluate(vec![TestResource, TestResource])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        for (_resource, evaluation) in results {
+            evaluation.assert_forbidden_by("BlockAlicePolicy");
+            evaluation.assert_trace_contains("AndPolicy");
         }
     }
 

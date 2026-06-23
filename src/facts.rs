@@ -42,6 +42,7 @@ impl std::error::Error for MessageError {}
 
 /// Error raised while loading a fact.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum FactLoadError {
     /// No source is registered for the requested fact key type.
     SourceNotRegistered {
@@ -125,6 +126,7 @@ impl std::error::Error for FactLoadError {}
 /// distinction that matters for fail-closed authorization — and so the type can
 /// gain variants later without breaking a `Result` alias callers rely on.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum FactLoadResult<V> {
     /// The fact exists and has the given value.
     Found(V),

@@ -17,11 +17,12 @@ logic into the data layer.
 - **Typed authorization domains**: Define one `PolicyDomain` per authorization
   domain and keep subject, action, resource, and context types consistent.
 - **Request-bound evaluation**: Bind session, subject, action, and context once,
-  then call `check`, `evaluate`, `filter`, or `lookup_page` on resources.
+  then call `check`, `evaluate`, `evaluate_by`, `filter`, `filter_by`, or
+  `lookup_page`.
 - **RBAC, ReBAC, and predicate policies**: Use `RbacPolicy`, `RebacPolicy`, or
   synchronous `PolicyBuilder::when` predicates.
-- **Deny-overrides semantics**: `PolicyBuilder::forbid()` and custom
-  `Effect::Forbid` policies can veto grants when registered on the checker.
+- **Deny-overrides semantics**: `PolicyBuilder::forbid()` and custom forbid
+  results veto grants, including through combinators and delegation.
 - **Batch-safe list endpoints**: Authorize already-loaded resources or enumerate
   candidate IDs with `LookupSource` and `Hydrator`.
 - **Evaluation traces and telemetry**: Inspect the policies and fact provenance
@@ -99,6 +100,7 @@ let bound = checker.bind(&session, &subject, &action, &request_context);
 let decision = bound.check(&resource).await;
 let decisions = bound.evaluate(resources.clone()).await;
 let authorized = bound.filter(resources).await;
+let authorized_rows = bound.filter_by(rows, |row| &row.authz_resource).await;
 let page = bound.lookup_page(&lookup, &hydrator, cursor.as_deref(), limit).await?;
 ```
 
@@ -116,17 +118,21 @@ flowchart LR
 
 `BoundEvaluator::evaluate` preserves input order and returns one
 `AccessEvaluation` per resource. `BoundEvaluator::filter` keeps only granted
-resources. `BoundEvaluator::lookup_page` is for list endpoints where the
-application cannot load every possible candidate first; a `LookupSource`
-enumerates candidate IDs, a `Hydrator` resolves them, and the full policy stack
-authorizes the hydrated resources.
+resources. Use `evaluate_by` and `filter_by` when the caller owns wider rows
+and authorization should project each row to an embedded resource. The returned
+values are still the original rows. `BoundEvaluator::lookup_page` is for list
+endpoints where the application cannot load every possible candidate first; a
+`LookupSource` enumerates candidate IDs, a `Hydrator` resolves them, and the
+full policy stack authorizes the hydrated resources.
 
 ## Decision Semantics
 
-- `PermissionChecker` applies fixed deny-overrides semantics: any directly
-  registered forbidding policy denies; otherwise the first grant wins.
-- Policies declaring `Effect::Forbid` are evaluated before allow policies, so a
-  veto cannot be skipped by grant short-circuiting.
+- `PermissionChecker` applies fixed deny-overrides semantics: any evaluated
+  result containing `PolicyEvalResult::Forbidden` denies; otherwise the first
+  grant wins.
+- Policies declaring `Effect::Forbid` or `Effect::AllowOrForbid` are evaluated
+  before allow-only policies, so a veto cannot be skipped by grant
+  short-circuiting.
 - If nothing grants, the checker denies with `"All policies denied access"`.
 - An empty checker denies with `"No policies configured"`.
 - `PolicyEvalResult::NotApplicable` means the policy did not grant.
@@ -134,10 +140,11 @@ authorizes the hydrated resources.
 - `PolicyBuilder` combines configured predicates with AND logic.
   `PolicyBuilder::forbid()` makes a matching policy forbid; a non-match remains
   not applicable and does not block.
-- `AndPolicy` short-circuits on the first non-grant. `OrPolicy` short-circuits
-  on the first grant. `NotPolicy` inverts the inner decision.
-- Inside combinators, a forbidden child behaves like a non-grant. Register
-  global veto rules directly on the checker.
+- `AndPolicy` and `OrPolicy` evaluate veto-capable children before allow-only
+  children, then short-circuit normally. `NotPolicy` inverts grants and
+  non-grants, but never turns `Forbidden` into a grant.
+- `Forbidden` propagates through `AndPolicy`, `OrPolicy`, `NotPolicy`, and
+  `DelegatingPolicy`.
 
 Denials from `AccessEvaluation` are summary-level. Use
 `AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect
@@ -290,6 +297,16 @@ let visible_posts = checker
     .await;
 ```
 
+If each item is a wide row and the authorization resource is a projection, use
+the extractor variants:
+
+```rust,ignore
+let visible_rows = checker
+    .bind(&session, &user, &InvoiceAction::View, &request_context)
+    .filter_by(rows, |row| &row.authz_resource)
+    .await;
+```
+
 For lists where the candidate set is too large to load first, implement
 `LookupSource<Domain>` and `Hydrator<Id>`:
 
@@ -304,6 +321,18 @@ A `LookupSource` must enumerate a superset of every resource that any policy
 could grant for the bound subject/action/context. Lookup narrows candidates; it
 does not replace the policy stack.
 
+## Long-Lived Streams
+
+`EvaluationSession` caches are scoped to one authorization pass. For SSE,
+WebSocket, and other long-lived streams, do not keep one fact-backed session for
+the stream lifetime.
+
+If your product contract authorizes once at stream open, create a fresh session,
+compute the visible ID set with `filter` / `filter_by`, drop the session, and
+only emit frames for that set. If the stream must observe mid-stream permission
+revocation, run periodic reauthorization with a fresh `registry.session()` each
+tick and re-bind the checker for that pass.
+
 ## Tracing And Telemetry
 
 When trace-level events are enabled, checker evaluation records spans for
@@ -314,6 +343,8 @@ counts.
 
 Reason strings are emitted verbatim. Keep credentials, tokens, raw PII, and
 other sensitive material out of policy reasons and fact provenance details.
+Enable the optional `serde` feature to serialize `AccessEvaluation`, `EvalTrace`,
+`PolicyEvalResult`, and fact provenance for audit logs.
 
 Security event fields:
 

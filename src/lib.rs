@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! An in-process authorization engine for Rust.
 //!
 //! Gatehouse keeps authorization logic in Rust while giving policy code a
@@ -88,6 +90,7 @@
 //! let decision = bound.check(&resource).await;
 //! let decisions = bound.evaluate(resources.clone()).await;
 //! let authorized = bound.filter(resources).await;
+//! let authorized_rows = bound.filter_by(rows, |row| &row.authz_resource).await;
 //! let page = bound.lookup_page(&lookup, &hydrator, cursor.as_deref(), limit).await?;
 //! ```
 //!
@@ -97,20 +100,24 @@
 //!
 //! [`BoundEvaluator::evaluate`] preserves input order and returns one
 //! [`AccessEvaluation`] per input resource. [`BoundEvaluator::filter`] keeps
-//! only granted resources. [`BoundEvaluator::lookup_page`] is for list
-//! endpoints where the application cannot load every possible candidate first;
-//! the [`LookupSource`] enumerates candidate IDs, a [`Hydrator`] resolves them,
-//! and the full policy stack authorizes the hydrated resources.
+//! only granted resources. [`BoundEvaluator::evaluate_by`] and
+//! [`BoundEvaluator::filter_by`] are for wide caller-owned rows where
+//! authorization uses a projected resource. [`BoundEvaluator::lookup_page`] is
+//! for list endpoints where the application cannot load every possible
+//! candidate first; the [`LookupSource`] enumerates candidate IDs, a
+//! [`Hydrator`] resolves them, and the full policy stack authorizes the
+//! hydrated resources.
 //!
 //! # Decision Semantics
 //!
 //! Gatehouse deliberately keeps combining semantics fixed:
 //!
-//! - [`PermissionChecker`] applies deny-overrides. A policy that returns
-//!   [`PolicyEvalResult::Forbidden`] denies the request and overrides grants
-//!   from sibling policies.
-//! - Policies declaring [`Effect::Forbid`] are evaluated before allow policies
-//!   so a veto cannot be skipped by grant short-circuiting.
+//! - [`PermissionChecker`] applies deny-overrides. Any evaluated result
+//!   containing [`PolicyEvalResult::Forbidden`] denies the request and
+//!   overrides grants.
+//! - Policies declaring [`Effect::Forbid`] or [`Effect::AllowOrForbid`] are
+//!   evaluated before allow-only policies so a veto cannot be skipped by grant
+//!   short-circuiting.
 //! - If no policy forbids, the first grant wins.
 //! - If nothing grants, the checker denies with `"All policies denied access"`.
 //! - An empty checker denies with `"No policies configured"`.
@@ -119,12 +126,11 @@
 //! - [`PolicyBuilder`] combines configured predicates with AND logic.
 //!   [`PolicyBuilder::forbid`] makes a matching built policy forbid; a
 //!   non-match remains not applicable and does not block.
-//! - [`AndPolicy`] short-circuits on the first non-grant. [`OrPolicy`]
-//!   short-circuits on the first grant. [`NotPolicy`] inverts the inner
-//!   decision.
-//! - Inside combinators, a forbidden child behaves like a non-grant. Register
-//!   global veto rules directly on the checker; use `grant.and(block.not())`
-//!   when an exclusion should gate only one grant path.
+//! - [`AndPolicy`] and [`OrPolicy`] evaluate veto-capable children before
+//!   allow-only children, then short-circuit normally. [`NotPolicy`] inverts
+//!   grants and non-grants, but never turns `Forbidden` into a grant.
+//! - `Forbidden` propagates through [`AndPolicy`], [`OrPolicy`], [`NotPolicy`],
+//!   and [`DelegatingPolicy`].
 //!
 //! Denials from [`AccessEvaluation`] are summary-level. Use
 //! [`AccessEvaluation::display_trace`] or the attached [`EvalTrace`] to inspect
@@ -143,6 +149,19 @@
 //! when the request session loads a `Found(true)` relationship fact. Missing
 //! sources, missing facts, backend errors, and fact-source contract violations
 //! fail closed to denied ReBAC decisions.
+//!
+//! # Long-Lived Streams
+//!
+//! [`EvaluationSession`] caches are scoped to one authorization pass. For SSE,
+//! WebSocket, and other long-lived streams, do not hold one fact-backed session
+//! for the stream lifetime.
+//!
+//! If your product contract authorizes once at stream open, create a fresh
+//! session, compute the visible ID set with [`BoundEvaluator::filter`] or
+//! [`BoundEvaluator::filter_by`], drop the session, and only emit frames for
+//! that set. If the stream must observe mid-stream permission revocation, run
+//! periodic reauthorization with a fresh [`FactRegistry::session`] and re-bind
+//! the checker for that pass.
 //!
 //! # Built-In Policies
 //!

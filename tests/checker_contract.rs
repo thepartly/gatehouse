@@ -165,11 +165,11 @@ impl RandomStackPolicy {
         let score = ((resource_id as u16 * 37) ^ self.salt).wrapping_add(self.salt / 3) % 100;
         let matched = score < self.grant_percent as u16;
         match (self.effect, matched) {
-            (Effect::Allow, true) => {
-                PolicyEvalResult::granted(self.name.clone(), Some(format!("{resource_id} granted")))
-            }
             (Effect::Forbid, true) => {
                 PolicyEvalResult::forbidden(self.name.clone(), format!("{resource_id} forbidden"))
+            }
+            (_, true) => {
+                PolicyEvalResult::granted(self.name.clone(), Some(format!("{resource_id} granted")))
             }
             (_, false) => {
                 PolicyEvalResult::not_applicable(self.name.clone(), format!("{resource_id} denied"))
@@ -334,6 +334,7 @@ async fn delegating_policy_preserves_child_batch_evaluation() {
     let delegated_node = match &results[1].1 {
         AccessEvaluation::Granted { trace, .. } => trace.root().unwrap(),
         AccessEvaluation::Denied { .. } => panic!("expected delegated decision to grant"),
+        _ => panic!("expected delegated decision to grant"),
     };
     assert!(delegated_node.format(0).contains("DelegatedRead"));
     assert!(delegated_node.format(0).contains("child-even"));
@@ -723,15 +724,14 @@ async fn single_and_batch_forbid_decisions_agree() {
     }
 }
 
-/// Forbids are honored at the checker level only: inside combinators a
-/// `Forbidden` child behaves exactly like `Denied`. Register forbidding
-/// policies directly on the checker.
+/// Forbids propagate through combinators so a fluent wrapper cannot silently
+/// drop a veto.
 #[tokio::test]
-async fn forbid_inside_combinators_acts_as_plain_denial() {
+async fn forbid_inside_combinators_vetoes_access() {
     let session = EvaluationSession::empty();
     let blocked = Resource { id: 1 };
 
-    // OR: the allow arm wins; the nested forbid does not veto.
+    // OR: the nested forbid overrides the allow arm.
     let or_gate = OrPolicy::try_new(vec![
         Arc::from(allow_everything("AllowAll")),
         Arc::from(forbid_odd_resources("OddBlock")),
@@ -740,11 +740,9 @@ async fn forbid_inside_combinators_acts_as_plain_denial() {
     let mut or_checker = PermissionChecker::new();
     or_checker.add_policy(or_gate);
     let or_result = check_resource(&or_checker, &session, &blocked).await;
-    assert!(or_result.is_granted());
-    assert_eq!(or_result.forbidden_by(), None);
+    or_result.assert_forbidden_by("OddBlock");
 
-    // AND: a forbid is not a grant, so the conjunction fails — but as an
-    // ordinary denial, not a checker-level veto.
+    // AND: the conjunction fails because the child actively vetoes.
     let and_gate = AndPolicy::try_new(vec![
         Arc::from(allow_everything("AllowAll")),
         Arc::from(forbid_odd_resources("OddBlock")),
@@ -753,12 +751,10 @@ async fn forbid_inside_combinators_acts_as_plain_denial() {
     let mut and_checker = PermissionChecker::new();
     and_checker.add_policy(and_gate);
     let and_result = check_resource(&and_checker, &session, &blocked).await;
-    assert!(!and_result.is_granted());
-    assert_eq!(and_result.forbidden_by(), None);
+    and_result.assert_forbidden_by("OddBlock");
 
-    // NOT: inverts not-granted into granted — the pre-Forbidden blocklist
-    // polarity. A forbid that must veto belongs on the checker, not under
-    // NOT.
+    // NOT still grants for a non-matching forbid child, but an active forbid
+    // is not inverted into a grant.
     let mut not_checker = PermissionChecker::new();
     not_checker.add_policy(NotPolicy::new(forbid_odd_resources("OddBlock")));
     let not_result = check_resource(&not_checker, &session, &Resource { id: 0 }).await;
@@ -766,6 +762,8 @@ async fn forbid_inside_combinators_acts_as_plain_denial() {
         not_result.is_granted(),
         "NOT(non-matching deny) is granted, as for any non-granting child"
     );
+    let not_blocked = check_resource(&not_checker, &session, &blocked).await;
+    not_blocked.assert_forbidden_by("OddBlock");
 }
 
 /// Identity-mapped delegating policy whose child checker grants everything
@@ -786,29 +784,33 @@ fn delegating_forbid_policy() -> DelegatingPolicy<Domain, Domain> {
     )
 }
 
-/// A forbid inside a delegated child checker is scoped to that checker:
-/// the parent sees an ordinary denial from the delegating policy, and a
-/// sibling grant in the parent still wins.
+/// A forbid inside a delegated child checker propagates to the parent checker:
+/// delegation must not silently downgrade a child veto into an ordinary
+/// non-grant.
 #[tokio::test]
-async fn delegated_child_forbid_is_scoped_to_the_child_checker() {
-    let mut parent = PermissionChecker::new();
-    parent.add_policy(delegating_forbid_policy());
-    parent.add_policy(allow_everything("ParentAllow"));
-
+async fn delegated_child_forbid_propagates_to_parent_checker() {
     let session = EvaluationSession::empty();
-    let result = check_resource(&parent, &session, &Resource { id: 1 }).await;
+    for delegate_registered_first in [true, false] {
+        let mut parent = PermissionChecker::new();
+        if delegate_registered_first {
+            parent.add_policy(delegating_forbid_policy());
+            parent.add_policy(allow_everything("ParentAllow"));
+        } else {
+            parent.add_policy(allow_everything("ParentAllow"));
+            parent.add_policy(delegating_forbid_policy());
+        }
 
-    // The child checker forbids id 1, so the delegate denies — but the
-    // veto does not propagate: the parent's own allow still grants.
-    result.assert_granted_by("ParentAllow");
+        let result = check_resource(&parent, &session, &Resource { id: 1 }).await;
 
-    // Without the parent grant, the delegated denial is an ordinary
-    // denial, not a parent-level forbid.
+        result.assert_forbidden_by("ChildBlock");
+    }
+
+    // Without the parent grant, the delegated veto is still reported as the
+    // cause of denial.
     let mut parent_without_allow = PermissionChecker::new();
     parent_without_allow.add_policy(delegating_forbid_policy());
     let denied = check_resource(&parent_without_allow, &session, &Resource { id: 1 }).await;
-    assert!(!denied.is_granted());
-    assert_eq!(denied.forbidden_by(), None);
+    denied.assert_forbidden_by("ChildBlock");
 }
 
 /// A hand-written policy that declares `Effect::Forbid` and forbids via

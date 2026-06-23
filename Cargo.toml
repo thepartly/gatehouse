@@ -1,6 +1,6 @@
 [package]
 name = "gatehouse"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # 1.82 is required for `Option::is_none_or` (stabilized 2024-10-17), used
 # in the builder's per-axis predicate evaluation. Other dependencies on
@@ -13,9 +13,13 @@ description = "An in-process authorization engine for Rust with composable polic
 
 [dependencies]
 tracing = "0.1"
-uuid = {version="1", features = ["serde", "v4"]}
 async-trait = "0.1"
 futures-channel = "0.3"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
 
 # Regular dev-deps. Gated on `cfg(not(loom))` because several of them
 # (tokio's `net` module, anything that depends on it: actix-rt, axum, hyper,
@@ -34,6 +38,7 @@ criterion = { version = "0.8" }
 dashmap = "6"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
 # Loom is a permutation-testing model checker for concurrent Rust. Pulled in

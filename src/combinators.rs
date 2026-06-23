@@ -1,5 +1,6 @@
 use crate::{
-    BatchEvalCtx, CombineOp, EvalCtx, Policy, PolicyBatchItem, PolicyDomain, PolicyEvalResult,
+    BatchEvalCtx, CombineOp, Effect, EvalCtx, Policy, PolicyBatchItem, PolicyDomain,
+    PolicyEvalResult,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -12,6 +13,30 @@ where
     Arc::new(policy)
 }
 
+fn ordered_policies<D>(policies: Vec<Arc<dyn Policy<D>>>) -> (Vec<Arc<dyn Policy<D>>>, usize)
+where
+    D: PolicyDomain,
+{
+    let mut ordered = Vec::with_capacity(policies.len());
+    let mut veto_capable_count = 0;
+    for policy in policies {
+        if policy.effect().can_forbid() {
+            ordered.insert(veto_capable_count, policy);
+            veto_capable_count += 1;
+        } else {
+            ordered.push(policy);
+        }
+    }
+    (ordered, veto_capable_count)
+}
+
+fn any_child_can_forbid<D>(policies: &[Arc<dyn Policy<D>>]) -> bool
+where
+    D: PolicyDomain,
+{
+    policies.iter().any(|policy| policy.effect().can_forbid())
+}
+
 /// Fluent combinator helpers for policies.
 pub trait PolicyExt<D>: Policy<D> + Sized + 'static
 where
@@ -22,9 +47,7 @@ where
     where
         P: Policy<D> + 'static,
     {
-        AndPolicy {
-            policies: vec![arc_policy::<D, _>(self), arc_policy::<D, _>(other)],
-        }
+        AndPolicy::from_policies(vec![arc_policy::<D, _>(self), arc_policy::<D, _>(other)])
     }
 
     /// Grants when this policy or `other` grants.
@@ -32,9 +55,7 @@ where
     where
         P: Policy<D> + 'static,
     {
-        OrPolicy {
-            policies: vec![arc_policy::<D, _>(self), arc_policy::<D, _>(other)],
-        }
+        OrPolicy::from_policies(vec![arc_policy::<D, _>(self), arc_policy::<D, _>(other)])
     }
 
     /// Inverts this policy.
@@ -60,6 +81,7 @@ where
 /// Combines multiple policies with logical AND semantics.
 pub struct AndPolicy<D: PolicyDomain> {
     policies: Vec<Arc<dyn Policy<D>>>,
+    veto_capable_count: usize,
 }
 
 /// Error returned when no policies are provided to a combinator policy.
@@ -75,6 +97,14 @@ impl std::fmt::Display for EmptyPoliciesError {
 impl std::error::Error for EmptyPoliciesError {}
 
 impl<D: PolicyDomain> AndPolicy<D> {
+    fn from_policies(policies: Vec<Arc<dyn Policy<D>>>) -> Self {
+        let (policies, veto_capable_count) = ordered_policies(policies);
+        Self {
+            policies,
+            veto_capable_count,
+        }
+    }
+
     /// Creates a new `AndPolicy` from a non-empty list of policies.
     pub fn try_new(policies: Vec<Arc<dyn Policy<D>>>) -> Result<Self, EmptyPoliciesError> {
         if policies.is_empty() {
@@ -82,7 +112,7 @@ impl<D: PolicyDomain> AndPolicy<D> {
                 "AndPolicy must have at least one policy",
             ))
         } else {
-            Ok(Self { policies })
+            Ok(Self::from_policies(policies))
         }
     }
 }
@@ -93,10 +123,19 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
         std::borrow::Cow::Borrowed("AndPolicy")
     }
 
+    fn effect(&self) -> Effect {
+        let can_grant = self
+            .policies
+            .iter()
+            .all(|policy| policy.effect().can_grant());
+        Effect::from_capabilities(can_grant, any_child_can_forbid(&self.policies))
+    }
+
     async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
+        let mut veto_prefix_failed = false;
 
-        for policy in &self.policies {
+        for (policy_index, policy) in self.policies.iter().enumerate() {
             let inner_ctx = EvalCtx {
                 session: ctx.session,
                 subject: ctx.subject,
@@ -107,9 +146,29 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
             };
             let result = policy.evaluate(&inner_ctx).await;
             let is_granted = result.is_granted();
+            let is_forbidden = result.is_forbidden();
             children_results.push(result);
 
-            if !is_granted {
+            if is_forbidden {
+                return PolicyEvalResult::Combined {
+                    policy_type: self.policy_type(),
+                    operation: CombineOp::And,
+                    children: children_results,
+                    outcome: false,
+                };
+            }
+
+            if policy_index < self.veto_capable_count {
+                veto_prefix_failed |= !is_granted;
+                if policy_index + 1 == self.veto_capable_count && veto_prefix_failed {
+                    return PolicyEvalResult::Combined {
+                        policy_type: self.policy_type(),
+                        operation: CombineOp::And,
+                        children: children_results,
+                        outcome: false,
+                    };
+                }
+            } else if !is_granted {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
                     operation: CombineOp::And,
@@ -131,8 +190,9 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
         let mut children_by_item = vec![Vec::new(); ctx.items.len()];
         let mut results = vec![None; ctx.items.len()];
         let mut pending = (0..ctx.items.len()).collect::<Vec<_>>();
+        let mut veto_prefix_failed = vec![false; ctx.items.len()];
 
-        for policy in &self.policies {
+        for (policy_index, policy) in self.policies.iter().enumerate() {
             if pending.is_empty() {
                 break;
             }
@@ -172,9 +232,29 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
             let mut still_pending = Vec::new();
             for (index, child_result) in pending.into_iter().zip(child_results) {
                 let is_granted = child_result.is_granted();
+                let is_forbidden = child_result.is_forbidden();
                 children_by_item[index].push(child_result);
 
-                if is_granted {
+                if is_forbidden {
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type(),
+                        operation: CombineOp::And,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: false,
+                    });
+                } else if policy_index < self.veto_capable_count {
+                    veto_prefix_failed[index] |= !is_granted;
+                    if policy_index + 1 == self.veto_capable_count && veto_prefix_failed[index] {
+                        results[index] = Some(PolicyEvalResult::Combined {
+                            policy_type: self.policy_type(),
+                            operation: CombineOp::And,
+                            children: std::mem::take(&mut children_by_item[index]),
+                            outcome: false,
+                        });
+                    } else {
+                        still_pending.push(index);
+                    }
+                } else if is_granted {
                     still_pending.push(index);
                 } else {
                     results[index] = Some(PolicyEvalResult::Combined {
@@ -214,15 +294,24 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
 /// Combines multiple policies with logical OR semantics.
 pub struct OrPolicy<D: PolicyDomain> {
     policies: Vec<Arc<dyn Policy<D>>>,
+    veto_capable_count: usize,
 }
 
 impl<D: PolicyDomain> OrPolicy<D> {
+    fn from_policies(policies: Vec<Arc<dyn Policy<D>>>) -> Self {
+        let (policies, veto_capable_count) = ordered_policies(policies);
+        Self {
+            policies,
+            veto_capable_count,
+        }
+    }
+
     /// Creates a new `OrPolicy` from a non-empty list of policies.
     pub fn try_new(policies: Vec<Arc<dyn Policy<D>>>) -> Result<Self, EmptyPoliciesError> {
         if policies.is_empty() {
             Err(EmptyPoliciesError("OrPolicy must have at least one policy"))
         } else {
-            Ok(Self { policies })
+            Ok(Self::from_policies(policies))
         }
     }
 }
@@ -233,10 +322,19 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
         std::borrow::Cow::Borrowed("OrPolicy")
     }
 
+    fn effect(&self) -> Effect {
+        let can_grant = self
+            .policies
+            .iter()
+            .any(|policy| policy.effect().can_grant());
+        Effect::from_capabilities(can_grant, any_child_can_forbid(&self.policies))
+    }
+
     async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
+        let mut veto_prefix_granted = false;
 
-        for policy in &self.policies {
+        for (policy_index, policy) in self.policies.iter().enumerate() {
             let inner_ctx = EvalCtx {
                 session: ctx.session,
                 subject: ctx.subject,
@@ -247,9 +345,29 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
             };
             let result = policy.evaluate(&inner_ctx).await;
             let is_granted = result.is_granted();
+            let is_forbidden = result.is_forbidden();
             children_results.push(result);
 
-            if is_granted {
+            if is_forbidden {
+                return PolicyEvalResult::Combined {
+                    policy_type: self.policy_type(),
+                    operation: CombineOp::Or,
+                    children: children_results,
+                    outcome: false,
+                };
+            }
+
+            if policy_index < self.veto_capable_count {
+                veto_prefix_granted |= is_granted;
+                if policy_index + 1 == self.veto_capable_count && veto_prefix_granted {
+                    return PolicyEvalResult::Combined {
+                        policy_type: self.policy_type(),
+                        operation: CombineOp::Or,
+                        children: children_results,
+                        outcome: true,
+                    };
+                }
+            } else if is_granted {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
                     operation: CombineOp::Or,
@@ -271,8 +389,9 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
         let mut children_by_item = vec![Vec::new(); ctx.items.len()];
         let mut results = vec![None; ctx.items.len()];
         let mut pending = (0..ctx.items.len()).collect::<Vec<_>>();
+        let mut veto_prefix_granted = vec![false; ctx.items.len()];
 
-        for policy in &self.policies {
+        for (policy_index, policy) in self.policies.iter().enumerate() {
             if pending.is_empty() {
                 break;
             }
@@ -312,9 +431,29 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
             let mut still_pending = Vec::new();
             for (index, child_result) in pending.into_iter().zip(child_results) {
                 let is_granted = child_result.is_granted();
+                let is_forbidden = child_result.is_forbidden();
                 children_by_item[index].push(child_result);
 
-                if is_granted {
+                if is_forbidden {
+                    results[index] = Some(PolicyEvalResult::Combined {
+                        policy_type: self.policy_type(),
+                        operation: CombineOp::Or,
+                        children: std::mem::take(&mut children_by_item[index]),
+                        outcome: false,
+                    });
+                } else if policy_index < self.veto_capable_count {
+                    veto_prefix_granted[index] |= is_granted;
+                    if policy_index + 1 == self.veto_capable_count && veto_prefix_granted[index] {
+                        results[index] = Some(PolicyEvalResult::Combined {
+                            policy_type: self.policy_type(),
+                            operation: CombineOp::Or,
+                            children: std::mem::take(&mut children_by_item[index]),
+                            outcome: true,
+                        });
+                    } else {
+                        still_pending.push(index);
+                    }
+                } else if is_granted {
                     results[index] = Some(PolicyEvalResult::Combined {
                         policy_type: self.policy_type(),
                         operation: CombineOp::Or,
@@ -371,6 +510,10 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
         std::borrow::Cow::Borrowed("NotPolicy")
     }
 
+    fn effect(&self) -> Effect {
+        Effect::from_capabilities(true, self.policy.effect().can_forbid())
+    }
+
     async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let inner_ctx = EvalCtx {
             session: ctx.session,
@@ -381,13 +524,14 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
             policy_type: self.policy.policy_type(),
         };
         let inner_result = self.policy.evaluate(&inner_ctx).await;
+        let is_forbidden = inner_result.is_forbidden();
         let is_granted = inner_result.is_granted();
 
         PolicyEvalResult::Combined {
             policy_type: Policy::<D>::policy_type(self),
             operation: CombineOp::Not,
             children: vec![inner_result],
-            outcome: !is_granted,
+            outcome: !is_forbidden && !is_granted,
         }
     }
 
@@ -418,12 +562,13 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
         inner_results
             .into_iter()
             .map(|inner_result| {
+                let is_forbidden = inner_result.is_forbidden();
                 let is_granted = inner_result.is_granted();
                 PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
                     operation: CombineOp::Not,
                     children: vec![inner_result],
-                    outcome: !is_granted,
+                    outcome: !is_forbidden && !is_granted,
                 }
             })
             .collect()

@@ -1,6 +1,6 @@
 use crate::{
-    AccessEvaluation, BatchEvalCtx, CombineOp, EvalCtx, PermissionChecker, Policy, PolicyDomain,
-    PolicyEvalResult, SecurityRuleMetadata, PERMISSION_CHECKER_POLICY_TYPE,
+    AccessEvaluation, BatchEvalCtx, CombineOp, Effect, EvalCtx, PermissionChecker, Policy,
+    PolicyDomain, PolicyEvalResult, SecurityRuleMetadata, PERMISSION_CHECKER_POLICY_TYPE,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -158,6 +158,10 @@ where
 
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         self.policy_type.clone()
+    }
+
+    fn effect(&self) -> Effect {
+        self.checker.aggregate_effect()
     }
 
     fn security_rule(&self) -> SecurityRuleMetadata {

@@ -3,6 +3,9 @@ use std::fmt;
 
 /// The type of boolean combining operation a policy might represent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum CombineOp {
     /// All inner policies must grant access.
     And,
@@ -37,6 +40,9 @@ impl fmt::Display for CombineOp {
 /// check) is reflected by the grant/deny outcome and the node's reason, not by
 /// this enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum FactOutcome {
     /// The fact existed.
     Found,
@@ -81,6 +87,7 @@ impl fmt::Display for FactOutcome {
 /// separate concern surfaced through `tracing` spans (`gatehouse.fact_load`);
 /// this type is for per-decision explanation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct FactProvenance {
     /// The [`crate::FactKey::NAME`] of the consulted fact (e.g. `"relationship"`).
     pub fact_name: &'static str,
@@ -140,6 +147,9 @@ impl fmt::Display for FactProvenance {
 ///   [`crate::EvalCtx::forbid`].
 /// - [`PolicyEvalResult::Combined`]: Represents the aggregate result of combining multiple policies.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum PolicyEvalResult {
     /// Access granted. Contains the policy type and an optional reason.
     Granted {
@@ -169,11 +179,8 @@ pub enum PolicyEvalResult {
     ///
     /// Unlike [`PolicyEvalResult::NotApplicable`] ("this policy does not grant"),
     /// `Forbidden` means "this policy forbids". [`crate::PermissionChecker`]
-    /// honors a forbid over any grant from sibling policies. Combinators
-    /// ([`crate::AndPolicy`], [`crate::OrPolicy`], [`crate::NotPolicy`]) treat
-    /// a `Forbidden` child exactly like `Denied` — the veto is honored at the
-    /// checker level, not propagated through combinator trees. Register
-    /// forbidding policies directly on the checker.
+    /// honors a forbid over any grant from sibling policies, including forbids
+    /// nested inside combinator results.
     Forbidden {
         /// The name of the policy that forbids access.
         policy_type: Cow<'static, str>,
@@ -245,10 +252,16 @@ pub enum PolicyEvalResult {
 ///         println!("Access denied: {}", reason);
 ///         println!("Full evaluation trace:\n{}", trace.format());
 ///     }
+///     _ => {
+///         println!("Access denied: unknown decision variant");
+///     }
 /// }
 /// # });
 /// ```
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum AccessEvaluation {
     /// Access was granted.
     Granted {
@@ -341,14 +354,9 @@ impl AccessEvaluation {
         else {
             return None;
         };
-        // The checker honors forbids only from directly-registered
-        // policies, so only direct children of the deny-overrides root
-        // are considered — a Forbidden buried in a combinator subtree
-        // did not veto and must not be reported as if it had.
-        children.iter().find_map(|child| match child {
-            PolicyEvalResult::Forbidden { policy_type, .. } => Some(policy_type.as_ref()),
-            _ => None,
-        })
+        children
+            .iter()
+            .find_map(|child| child.forbidden_leaf().map(|(policy_type, _)| policy_type))
     }
 
     /// Test helper: panic unless the evaluation is `Granted` and the
@@ -679,6 +687,7 @@ impl fmt::Display for AccessEvaluation {
 /// assert!(trace.format().contains("AdminPolicy GRANTED"));
 /// ```
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct EvalTrace {
     root: Option<PolicyEvalResult>,
 }
@@ -752,8 +761,9 @@ impl PolicyEvalResult {
     /// A forbid is an **active veto**: inside a [`crate::PermissionChecker`]
     /// it overrides grants from sibling policies. Custom policies returning
     /// this from [`crate::Policy::evaluate`] should also override
-    /// [`crate::Policy::effect`] to return [`crate::Effect::Forbid`] so the
-    /// checker schedules them ahead of the grant short-circuit. Prefer
+    /// [`crate::Policy::effect`] to return [`crate::Effect::Forbid`] if they
+    /// can only veto, or [`crate::Effect::AllowOrForbid`] if they can grant or
+    /// veto, so the checker schedules them ahead of allow-only policies. Prefer
     /// [`crate::EvalCtx::forbid`] inside policy bodies.
     pub fn forbidden(policy_type: impl Into<Cow<'static, str>>, reason: impl Into<String>) -> Self {
         Self::Forbidden {
@@ -811,15 +821,22 @@ impl PolicyEvalResult {
         }
     }
 
-    /// Returns whether this result is an active forbid
+    /// Returns whether this result contains an active forbid
     /// ([`PolicyEvalResult::Forbidden`]).
-    ///
-    /// This is a **leaf check**, deliberately: a `Forbidden` nested inside a
-    /// [`PolicyEvalResult::Combined`] subtree does not make the combined
-    /// result forbidding. [`crate::PermissionChecker`] honors forbids only
-    /// from the policies registered directly on it.
     pub fn is_forbidden(&self) -> bool {
-        matches!(self, Self::Forbidden { .. })
+        self.forbidden_leaf().is_some()
+    }
+
+    pub(crate) fn forbidden_leaf(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            Self::Forbidden {
+                policy_type,
+                reason,
+                ..
+            } => Some((policy_type.as_ref(), Some(reason.as_str()))),
+            Self::Combined { children, .. } => children.iter().find_map(Self::forbidden_leaf),
+            Self::Granted { .. } | Self::NotApplicable { .. } => None,
+        }
     }
 
     /// Returns the reason string if available
