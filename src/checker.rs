@@ -258,11 +258,11 @@ impl<D: PolicyDomain> PermissionChecker<D> {
 
             if result_passes {
                 first_grant.get_or_insert_with(|| (ctx.policy_type.clone(), reason));
-                if policy_index + 1 >= self.veto_capable_count {
+            }
+
+            if policy_index + 1 >= self.veto_capable_count {
+                if let Some((policy_type, reason)) = first_grant.take() {
                     tracing::Span::current().record("outcome", "granted");
-                    let (policy_type, reason) = first_grant
-                        .take()
-                        .expect("grant branch stores first grant before returning");
                     tracing::Span::current().record("policy.type", policy_type.as_ref());
                     let combined = checker_root(policy_results, true);
                     return AccessEvaluation::Granted {

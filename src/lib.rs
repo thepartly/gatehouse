@@ -131,6 +131,13 @@
 //!   grants and non-grants, but never turns `Forbidden` into a grant.
 //! - `Forbidden` propagates through [`AndPolicy`], [`OrPolicy`], [`NotPolicy`],
 //!   and [`DelegatingPolicy`].
+//! - [`NotPolicy`] does not neutralize a veto. `admin.or(blocked.not())` still
+//!   denies when `blocked` returns `Forbidden`. For "grant unless blocked", use
+//!   an allow-only `blocked` predicate under `not()`, or register an explicit
+//!   forbid policy when the block should be global.
+//! - `grant.and(forbid_only)` can never grant: a forbid-only child does not
+//!   satisfy AND's "all children grant" rule. Use
+//!   `grant.and(blocked_allow_predicate.not())` for a local exclusion.
 //!
 //! Denials from [`AccessEvaluation`] are summary-level. Use
 //! [`AccessEvaluation::display_trace`] or the attached [`EvalTrace`] to inspect

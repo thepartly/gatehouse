@@ -131,6 +131,7 @@ impl BatchGrantPolicy {
 struct RandomStackPolicy {
     name: String,
     grant_percent: u8,
+    forbid_percent: u8,
     salt: u16,
     effect: Effect,
 }
@@ -162,19 +163,33 @@ impl Policy<Domain> for RandomStackPolicy {
 
 impl RandomStackPolicy {
     fn result_for(&self, resource_id: u8) -> PolicyEvalResult {
-        let score = ((resource_id as u16 * 37) ^ self.salt).wrapping_add(self.salt / 3) % 100;
-        let matched = score < self.grant_percent as u16;
-        match (self.effect, matched) {
-            (Effect::Forbid, true) => {
+        let grant_score = ((resource_id as u16 * 37) ^ self.salt).wrapping_add(self.salt / 3) % 100;
+        let forbid_score =
+            ((resource_id as u16 * 53) ^ self.salt).wrapping_add(self.salt / 5) % 100;
+        let grant_matched = grant_score < self.grant_percent as u16;
+        let forbid_matched = forbid_score < self.forbid_percent as u16;
+
+        if self.effect == Effect::Forbid {
+            if forbid_matched {
                 PolicyEvalResult::forbidden(self.name.clone(), format!("{resource_id} forbidden"))
-            }
-            (_, true) => {
-                PolicyEvalResult::granted(self.name.clone(), Some(format!("{resource_id} granted")))
-            }
-            (_, false) => {
+            } else {
                 PolicyEvalResult::not_applicable(self.name.clone(), format!("{resource_id} denied"))
             }
+        } else if self.effect == Effect::AllowOrForbid && forbid_matched {
+            PolicyEvalResult::forbidden(self.name.clone(), format!("{resource_id} forbidden"))
+        } else if grant_matched {
+            PolicyEvalResult::granted(self.name.clone(), Some(format!("{resource_id} granted")))
+        } else {
+            PolicyEvalResult::not_applicable(self.name.clone(), format!("{resource_id} denied"))
         }
+    }
+}
+
+fn effect_from_tag(tag: u8) -> Effect {
+    match tag % 3 {
+        0 => Effect::Allow,
+        1 => Effect::Forbid,
+        _ => Effect::AllowOrForbid,
     }
 }
 
@@ -488,7 +503,7 @@ proptest! {
 
     #[test]
     fn batch_decisions_match_naive_loop_for_random_policy_stacks(
-        policy_specs in prop::collection::vec((0u8..=100, any::<u16>(), any::<bool>()), 1..=5),
+        policy_specs in prop::collection::vec((0u8..=100, 0u8..=100, any::<u16>(), 0u8..3), 1..=5),
         resource_ids in prop::collection::vec(0u8..64, 0..50),
         max_batch_size in prop::option::of(1usize..8),
     ) {
@@ -497,12 +512,13 @@ proptest! {
         } else {
             PermissionChecker::new()
         };
-        for (index, (grant_percent, salt, is_deny)) in policy_specs.into_iter().enumerate() {
+        for (index, (grant_percent, forbid_percent, salt, effect_tag)) in policy_specs.into_iter().enumerate() {
             checker.add_policy(RandomStackPolicy {
                 name: format!("random_{index}"),
                 grant_percent,
+                forbid_percent,
                 salt,
-                effect: if is_deny { Effect::Forbid } else { Effect::Allow },
+                effect: effect_from_tag(effect_tag),
             });
         }
 
@@ -533,6 +549,37 @@ proptest! {
         }
 
         prop_assert_eq!(batch, naive);
+    }
+
+    #[test]
+    fn singleton_filter_matches_single_resource_check_for_random_policy_stacks(
+        policy_specs in prop::collection::vec((0u8..=100, 0u8..=100, any::<u16>(), 0u8..3), 1..=5),
+        resource_id in 0u8..64,
+        max_batch_size in prop::option::of(1usize..8),
+    ) {
+        let mut checker = if let Some(max_batch_size) = max_batch_size {
+            PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(max_batch_size).unwrap())
+        } else {
+            PermissionChecker::new()
+        };
+        for (index, (grant_percent, forbid_percent, salt, effect_tag)) in policy_specs.into_iter().enumerate() {
+            checker.add_policy(RandomStackPolicy {
+                name: format!("random_{index}"),
+                grant_percent,
+                forbid_percent,
+                salt,
+                effect: effect_from_tag(effect_tag),
+            });
+        }
+
+        let resource = Resource { id: resource_id };
+        let single_session = EvaluationSession::empty();
+        let single = tokio_test::block_on(check_resource(&checker, &single_session, &resource));
+
+        let filter_session = EvaluationSession::empty();
+        let filtered = tokio_test::block_on(filter_resources(&checker, &filter_session, vec![resource]));
+
+        prop_assert_eq!(single.is_granted(), !filtered.is_empty());
     }
 }
 
@@ -655,6 +702,56 @@ fn forbid_odd_resources(name: &str) -> Box<dyn Policy<Domain>> {
         .resources(|resource: &Resource| resource.id % 2 == 1)
         .forbid()
         .build()
+}
+
+struct MixedGrantPolicy;
+
+#[async_trait]
+impl Policy<Domain> for MixedGrantPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.grant("granted")
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("MixedGrantPolicy")
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::AllowOrForbid
+    }
+}
+
+struct MixedNotApplicablePolicy;
+
+#[async_trait]
+impl Policy<Domain> for MixedNotApplicablePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.not_applicable("n/a")
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("MixedNotApplicablePolicy")
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::AllowOrForbid
+    }
+}
+
+#[tokio::test]
+async fn single_check_flushes_grant_after_veto_capable_prefix() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(MixedGrantPolicy);
+    checker.add_policy(MixedNotApplicablePolicy);
+
+    let session = EvaluationSession::empty();
+    let resource = Resource { id: 0 };
+
+    let single = check_resource(&checker, &session, &resource).await;
+    single.assert_granted_by("MixedGrantPolicy");
+
+    let filtered = filter_resources(&checker, &session, vec![resource]).await;
+    assert_eq!(filtered.len(), 1);
 }
 
 #[tokio::test]
