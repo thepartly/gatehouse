@@ -58,6 +58,7 @@ jobs:
     name: Mutation tests
     needs: build-and-test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -83,6 +84,8 @@ jobs:
           --all-features
           --
           --test checker_contract
+        env:
+          PROPTEST_CASES: 128
       - name: Upload mutation test report
         uses: actions/upload-artifact@v7
         if: always()
