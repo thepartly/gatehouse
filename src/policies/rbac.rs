@@ -1,116 +1,43 @@
-use crate::{EvalCtx, Policy, PolicyEvalResult};
+use crate::{EvalCtx, Policy, PolicyDomain, PolicyEvalResult};
 use async_trait::async_trait;
+use std::marker::PhantomData;
 
-/// A role-based access control policy.
+/// Role-based access control policy.
 ///
-/// `required_roles_resolver` is a closure that determines which roles are required
-/// for the given (action, resource). `user_roles_resolver` extracts the subject's roles.
-/// Access is granted if the subject holds at least one of the required roles.
-///
-/// The role identifier type is generic — any `PartialEq` type works. Use a
-/// domain enum when the role set is closed (the compiler then checks role
-/// names), string ids when roles are configuration-driven, or
-/// [`Uuid`](uuid::Uuid)s when integrating with an external identity system.
-/// The two resolver closures must agree on the same role type; it is
-/// inferred from their return types.
-///
-/// # Example
-///
-/// ```rust
-/// # use gatehouse::*;
-/// # use uuid::Uuid;
-/// #[derive(Debug, Clone)]
-/// struct User { role_ids: Vec<Uuid> }
-/// #[derive(Debug, Clone)]
-/// struct Resource;
-/// #[derive(Debug, Clone)]
-/// struct Action;
-/// #[derive(Debug, Clone)]
-/// struct Ctx;
-///
-/// let editor_role = Uuid::new_v4();
-///
-/// let rbac = RbacPolicy::new(
-///     // required_roles_resolver: which roles can access this resource/action?
-///     move |_action: &Action, _resource: &Resource| vec![editor_role],
-///     // user_roles_resolver: which roles does this user have?
-///     |user: &User| user.role_ids.clone(),
-/// );
-///
-/// let mut checker = PermissionChecker::new();
-/// checker.add_policy(rbac);
-///
-/// # tokio_test::block_on(async {
-/// let session = EvaluationSession::empty();
-/// let authorised = User { role_ids: vec![editor_role] };
-/// assert!(checker.evaluate_in_session(&session, &authorised, &Action, &Resource, &Ctx).await.is_granted());
-///
-/// let unauthorised = User { role_ids: vec![Uuid::new_v4()] };
-/// assert!(!checker.evaluate_in_session(&session, &unauthorised, &Action, &Resource, &Ctx).await.is_granted());
-/// # });
-/// ```
-///
-/// With a domain role enum instead of `Uuid`s:
-///
-/// ```rust
-/// # use gatehouse::*;
-/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// enum Role { Admin, Editor }
-/// #[derive(Debug, Clone)]
-/// struct User { roles: Vec<Role> }
-/// # #[derive(Debug, Clone)]
-/// # struct Resource;
-/// # #[derive(Debug, Clone)]
-/// # struct Action;
-///
-/// let rbac = RbacPolicy::new(
-///     |_action: &Action, _resource: &Resource| vec![Role::Admin, Role::Editor],
-///     |user: &User| user.roles.clone(),
-/// );
-///
-/// let mut checker = PermissionChecker::new();
-/// checker.add_policy(rbac);
-///
-/// # tokio_test::block_on(async {
-/// let editor = User { roles: vec![Role::Editor] };
-/// assert!(checker.check(&editor, &Action, &Resource, &()).await.is_granted());
-/// # });
-/// ```
-pub struct RbacPolicy<S, F1, F2> {
+/// The required-role resolver receives `(action, resource)` and the
+/// subject-role resolver receives the subject. Access is granted when the
+/// subject holds at least one required role.
+pub struct RbacPolicy<D: PolicyDomain, F1, F2> {
     required_roles_resolver: F1,
-    user_roles_resolver: F2,
-    _marker: std::marker::PhantomData<S>,
+    subject_roles_resolver: F2,
+    _domain: PhantomData<D>,
 }
 
-impl<S, F1, F2> RbacPolicy<S, F1, F2> {
-    /// Creates a new RBAC policy from two resolver closures.
-    pub fn new(required_roles_resolver: F1, user_roles_resolver: F2) -> Self {
+impl<D: PolicyDomain, F1, F2> RbacPolicy<D, F1, F2> {
+    /// Creates an RBAC policy from required-role and subject-role resolvers.
+    pub fn new(required_roles_resolver: F1, subject_roles_resolver: F2) -> Self {
         Self {
             required_roles_resolver,
-            user_roles_resolver,
-            _marker: std::marker::PhantomData,
+            subject_roles_resolver,
+            _domain: PhantomData,
         }
     }
 }
 
-// `RoleId` is a free parameter on this impl rather than on the struct: it is
-// pinned only by the resolver closures' `-> Vec<RoleId>` return types, so it is
-// inferred at the call site instead of being fixed when the policy is stored.
 #[async_trait]
-impl<S, A, R, C, F1, F2, RoleId> Policy<S, A, R, C> for RbacPolicy<S, F1, F2>
+impl<D, F1, F2, RoleId> Policy<D> for RbacPolicy<D, F1, F2>
 where
-    S: Sync + Send,
-    R: Sync + Send,
-    A: Sync + Send,
-    C: Sync + Send,
+    D: PolicyDomain,
     RoleId: PartialEq,
-    F1: Fn(&A, &R) -> Vec<RoleId> + Sync + Send,
-    F2: Fn(&S) -> Vec<RoleId> + Sync + Send,
+    F1: Fn(&D::Action, &D::Resource) -> Vec<RoleId> + Sync + Send,
+    F2: Fn(&D::Subject) -> Vec<RoleId> + Sync + Send,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let required_roles = (self.required_roles_resolver)(ctx.action, ctx.resource);
-        let user_roles = (self.user_roles_resolver)(ctx.subject);
-        let has_role = required_roles.iter().any(|role| user_roles.contains(role));
+        let subject_roles = (self.subject_roles_resolver)(ctx.subject);
+        let has_role = required_roles
+            .iter()
+            .any(|role| subject_roles.contains(role));
 
         if has_role {
             ctx.grant("User has required role")

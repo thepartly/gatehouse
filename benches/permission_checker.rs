@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use gatehouse::{
     EvaluationSession, FactLoadResult, FactRegistry, FactSource, PermissionChecker, PolicyBuilder,
-    RebacPolicy, RelationshipQuery,
+    PolicyDomain, RebacPolicy, RelationshipQuery,
 };
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -17,44 +17,42 @@ type Resource = ();
 type Action = ();
 type Context = ();
 
-fn build_all_deny_checker(
-    policy_count: usize,
-) -> PermissionChecker<Subject, Action, Resource, Context> {
+struct UnitDomain;
+
+impl PolicyDomain for UnitDomain {
+    type Subject = Subject;
+    type Action = Action;
+    type Resource = Resource;
+    type Context = Context;
+}
+
+fn build_all_deny_checker(policy_count: usize) -> PermissionChecker<UnitDomain> {
     let mut checker = PermissionChecker::new();
 
     for index in 0..policy_count {
-        let policy = PolicyBuilder::<Subject, Action, Resource, Context>::new(format!(
-            "deny_policy_{index}"
-        ))
-        .forbid()
-        .build();
+        let policy = PolicyBuilder::<UnitDomain>::new(format!("deny_policy_{index}"))
+            .forbid()
+            .build();
         checker.add_policy(policy);
     }
 
     checker
 }
 
-fn build_trailing_allow_checker(
-    policy_count: usize,
-) -> PermissionChecker<Subject, Action, Resource, Context> {
+fn build_trailing_allow_checker(policy_count: usize) -> PermissionChecker<UnitDomain> {
     assert!(policy_count > 0, "policy count must be greater than zero");
 
     let mut checker = PermissionChecker::new();
 
     for index in 0..(policy_count - 1) {
-        let policy = PolicyBuilder::<Subject, Action, Resource, Context>::new(format!(
-            "deny_policy_{index}"
-        ))
-        .forbid()
-        .build();
+        let policy = PolicyBuilder::<UnitDomain>::new(format!("deny_policy_{index}"))
+            .forbid()
+            .build();
         checker.add_policy(policy);
     }
 
-    let allow_policy = PolicyBuilder::<Subject, Action, Resource, Context>::new(format!(
-        "allow_policy_{}",
-        policy_count - 1
-    ))
-    .build();
+    let allow_policy =
+        PolicyBuilder::<UnitDomain>::new(format!("allow_policy_{}", policy_count - 1)).build();
     checker.add_policy(allow_policy);
 
     checker
@@ -66,7 +64,7 @@ fn bench_permission_checker(c: &mut Criterion) {
     let action: Action = ();
     let resource: Resource = ();
     let context: Context = ();
-    let mut group = c.benchmark_group("permission_checker_evaluate_in_session");
+    let mut group = c.benchmark_group("permission_checker_bound_check");
 
     for &policy_count in &[1usize, 4, 16, 64] {
         let allow_checker = build_trailing_allow_checker(policy_count);
@@ -78,7 +76,8 @@ fn bench_permission_checker(c: &mut Criterion) {
                     let session = EvaluationSession::empty();
                     let result = runtime.block_on(
                         checker
-                            .evaluate_in_session(&session, &subject, &action, &resource, &context),
+                            .bind(&session, &subject, &action, &context)
+                            .check(&resource),
                     );
                     black_box(result)
                 });
@@ -94,7 +93,8 @@ fn bench_permission_checker(c: &mut Criterion) {
                     let session = EvaluationSession::empty();
                     let result = runtime.block_on(
                         checker
-                            .evaluate_in_session(&session, &subject, &action, &resource, &context),
+                            .bind(&session, &subject, &action, &context)
+                            .check(&resource),
                     );
                     black_box(result)
                 });
@@ -118,6 +118,15 @@ struct BenchResource {
 struct BenchAction;
 #[derive(Clone)]
 struct BenchContext;
+
+struct BenchDomain;
+
+impl PolicyDomain for BenchDomain {
+    type Subject = BenchUser;
+    type Action = BenchAction;
+    type Resource = BenchResource;
+    type Context = BenchContext;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BenchRelation {
@@ -206,9 +215,9 @@ impl CoarseReferenceSession {
     }
 }
 
-fn build_rebac_checker() -> PermissionChecker<BenchUser, BenchAction, BenchResource, BenchContext> {
+fn build_rebac_checker() -> PermissionChecker<BenchDomain> {
     let mut checker = PermissionChecker::new();
-    checker.add_policy(RebacPolicy::new(
+    checker.add_policy(RebacPolicy::<BenchDomain, Uuid, Uuid, BenchRelation>::new(
         |user: &BenchUser| user.id,
         |resource: &BenchResource| resource.id,
         BenchRelation::Viewer,
@@ -273,19 +282,9 @@ fn bench_in_ram_fact_source(c: &mut Criterion) {
                 b.iter(|| {
                     let session = registry.session();
                     let result = runtime.block_on(
-                        checker.filter_authorized_in_session(
-                            &session,
-                            &subject,
-                            &action,
-                            black_box(
-                                resources
-                                    .clone()
-                                    .into_iter()
-                                    .map(|resource| (resource, context.clone()))
-                                    .collect::<Vec<_>>(),
-                            ),
-                            |(resource, context)| (resource, context),
-                        ),
+                        checker
+                            .bind(&session, &subject, &action, &context)
+                            .filter(black_box(resources.clone())),
                     );
                     black_box(result)
                 });
@@ -341,13 +340,8 @@ fn bench_latency_fact_source(c: &mut Criterion) {
                         for resource in black_box(resources.clone()) {
                             let session = batch_registry.session();
                             let mut visible = checker
-                                .filter_authorized_in_session(
-                                    &session,
-                                    &subject,
-                                    &action,
-                                    vec![(resource, context.clone())],
-                                    |(resource, context)| (resource, context),
-                                )
+                                .bind(&session, &subject, &action, &context)
+                                .filter(vec![resource])
                                 .await;
                             authorized.append(&mut visible);
                         }
@@ -365,19 +359,9 @@ fn bench_latency_fact_source(c: &mut Criterion) {
                 b.iter(|| {
                     let session = batch_registry.session();
                     let result = runtime.block_on(
-                        checker.filter_authorized_in_session(
-                            &session,
-                            &subject,
-                            &action,
-                            black_box(
-                                resources
-                                    .clone()
-                                    .into_iter()
-                                    .map(|resource| (resource, context.clone()))
-                                    .collect::<Vec<_>>(),
-                            ),
-                            |(resource, context)| (resource, context),
-                        ),
+                        checker
+                            .bind(&session, &subject, &action, &context)
+                            .filter(black_box(resources.clone())),
                     );
                     black_box(result)
                 });
@@ -549,6 +533,15 @@ struct SubjectOnlyAction;
 #[derive(Clone)]
 struct SubjectOnlyContext;
 
+struct SubjectOnlyDomain;
+
+impl PolicyDomain for SubjectOnlyDomain {
+    type Subject = SubjectOnlyUser;
+    type Action = SubjectOnlyAction;
+    type Resource = SubjectOnlyResource;
+    type Context = SubjectOnlyContext;
+}
+
 /// Mirrors the PolicyBuilder shape — dynamic name in `name: String`,
 /// no `evaluate_batch` override, so it falls through to the trait's
 /// serial-loop default. Makes the comparison with the overridden
@@ -559,18 +552,10 @@ struct ManualSubjectOnlyDynamic {
 }
 
 #[async_trait]
-impl gatehouse::Policy<SubjectOnlyUser, SubjectOnlyAction, SubjectOnlyResource, SubjectOnlyContext>
-    for ManualSubjectOnlyDynamic
-{
+impl gatehouse::Policy<SubjectOnlyDomain> for ManualSubjectOnlyDynamic {
     async fn evaluate(
         &self,
-        ctx: &gatehouse::EvalCtx<
-            '_,
-            SubjectOnlyUser,
-            SubjectOnlyAction,
-            SubjectOnlyResource,
-            SubjectOnlyContext,
-        >,
+        ctx: &gatehouse::EvalCtx<'_, SubjectOnlyDomain>,
     ) -> gatehouse::PolicyEvalResult {
         if ctx.subject.is_staff {
             ctx.grant("staff")
@@ -590,18 +575,10 @@ impl gatehouse::Policy<SubjectOnlyUser, SubjectOnlyAction, SubjectOnlyResource, 
 struct ManualSubjectOnlyStatic;
 
 #[async_trait]
-impl gatehouse::Policy<SubjectOnlyUser, SubjectOnlyAction, SubjectOnlyResource, SubjectOnlyContext>
-    for ManualSubjectOnlyStatic
-{
+impl gatehouse::Policy<SubjectOnlyDomain> for ManualSubjectOnlyStatic {
     async fn evaluate(
         &self,
-        ctx: &gatehouse::EvalCtx<
-            '_,
-            SubjectOnlyUser,
-            SubjectOnlyAction,
-            SubjectOnlyResource,
-            SubjectOnlyContext,
-        >,
+        ctx: &gatehouse::EvalCtx<'_, SubjectOnlyDomain>,
     ) -> gatehouse::PolicyEvalResult {
         if ctx.subject.is_staff {
             ctx.grant("staff")
@@ -626,39 +603,19 @@ fn bench_subject_only_batch(c: &mut Criterion) {
         let resources: Vec<SubjectOnlyResource> =
             (0..item_count).map(|_| SubjectOnlyResource).collect();
 
-        let mut builder_checker = PermissionChecker::<
-            SubjectOnlyUser,
-            SubjectOnlyAction,
-            SubjectOnlyResource,
-            SubjectOnlyContext,
-        >::new();
+        let mut builder_checker = PermissionChecker::<SubjectOnlyDomain>::new();
         builder_checker.add_policy(
-            PolicyBuilder::<
-                SubjectOnlyUser,
-                SubjectOnlyAction,
-                SubjectOnlyResource,
-                SubjectOnlyContext,
-            >::new("BuilderSubjectOnly")
-            .subjects(|u: &SubjectOnlyUser| u.is_staff)
-            .build(),
+            PolicyBuilder::<SubjectOnlyDomain>::new("BuilderSubjectOnly")
+                .subjects(|u: &SubjectOnlyUser| u.is_staff)
+                .build(),
         );
 
-        let mut manual_dynamic_checker = PermissionChecker::<
-            SubjectOnlyUser,
-            SubjectOnlyAction,
-            SubjectOnlyResource,
-            SubjectOnlyContext,
-        >::new();
+        let mut manual_dynamic_checker = PermissionChecker::<SubjectOnlyDomain>::new();
         manual_dynamic_checker.add_policy(ManualSubjectOnlyDynamic {
             name: "BuilderSubjectOnly".into(),
         });
 
-        let mut manual_static_checker = PermissionChecker::<
-            SubjectOnlyUser,
-            SubjectOnlyAction,
-            SubjectOnlyResource,
-            SubjectOnlyContext,
-        >::new();
+        let mut manual_static_checker = PermissionChecker::<SubjectOnlyDomain>::new();
         manual_static_checker.add_policy(ManualSubjectOnlyStatic);
 
         // PolicyBuilder path — overrides evaluate_batch to broadcast.
@@ -669,17 +626,9 @@ fn bench_subject_only_batch(c: &mut Criterion) {
                 b.iter(|| {
                     let session = EvaluationSession::empty();
                     let result = runtime.block_on(
-                        checker.evaluate_batch_in_session(
-                            &session,
-                            &subject,
-                            &action,
-                            resources
-                                .clone()
-                                .into_iter()
-                                .map(|resource| (resource, ctx.clone()))
-                                .collect::<Vec<_>>(),
-                            |(resource, context)| (resource, context),
-                        ),
+                        checker
+                            .bind(&session, &subject, &action, &ctx)
+                            .evaluate(resources.clone()),
                     );
                     black_box(result)
                 });
@@ -697,17 +646,9 @@ fn bench_subject_only_batch(c: &mut Criterion) {
                 b.iter(|| {
                     let session = EvaluationSession::empty();
                     let result = runtime.block_on(
-                        checker.evaluate_batch_in_session(
-                            &session,
-                            &subject,
-                            &action,
-                            resources
-                                .clone()
-                                .into_iter()
-                                .map(|resource| (resource, ctx.clone()))
-                                .collect::<Vec<_>>(),
-                            |(resource, context)| (resource, context),
-                        ),
+                        checker
+                            .bind(&session, &subject, &action, &ctx)
+                            .evaluate(resources.clone()),
                     );
                     black_box(result)
                 });
@@ -724,17 +665,9 @@ fn bench_subject_only_batch(c: &mut Criterion) {
                 b.iter(|| {
                     let session = EvaluationSession::empty();
                     let result = runtime.block_on(
-                        checker.evaluate_batch_in_session(
-                            &session,
-                            &subject,
-                            &action,
-                            resources
-                                .clone()
-                                .into_iter()
-                                .map(|resource| (resource, ctx.clone()))
-                                .collect::<Vec<_>>(),
-                            |(resource, context)| (resource, context),
-                        ),
+                        checker
+                            .bind(&session, &subject, &action, &ctx)
+                            .evaluate(resources.clone()),
                     );
                     black_box(result)
                 });

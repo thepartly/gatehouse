@@ -200,7 +200,7 @@ pub enum FactLoadResult<V> {
 /// ```rust,ignore
 /// async fn evaluate(
 ///     &self,
-///     ctx: &EvalCtx<'_, OrgAuth, Invoice, Read, ()>,
+///     ctx: &EvalCtx<'_, InvoiceAccess>,
 /// ) -> PolicyEvalResult {
 ///     match ctx.session.get(CustomerForOrg(ctx.subject.org_id)).await {
 ///         FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {

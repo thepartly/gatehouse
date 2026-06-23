@@ -37,6 +37,15 @@ struct Project {
 #[derive(Debug, Clone)]
 struct EditAction;
 
+struct ProjectDomain;
+
+impl PolicyDomain for ProjectDomain {
+    type Subject = User;
+    type Action = EditAction;
+    type Resource = Project;
+    type Context = ();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Relation {
     Owner,
@@ -151,13 +160,13 @@ async fn main() {
 
     // Editing requires an owner OR contributor relationship; a viewer
     // relationship exists in the store but grants nothing here.
-    let mut checker = PermissionChecker::<User, EditAction, Project, ()>::new();
-    checker.add_policy(RebacPolicy::new(
+    let mut checker = PermissionChecker::<ProjectDomain>::new();
+    checker.add_policy(RebacPolicy::<ProjectDomain, Uuid, Uuid, Relation>::new(
         |user: &User| user.id,
         |project: &Project| project.id,
         Relation::Owner,
     ));
-    checker.add_policy(RebacPolicy::new(
+    checker.add_policy(RebacPolicy::<ProjectDomain, Uuid, Uuid, Relation>::new(
         |user: &User| user.id,
         |project: &Project| project.id,
         Relation::Contributor,
@@ -173,7 +182,8 @@ async fn main() {
     for (user, held, expected_granted) in cases {
         println!("Can {} ({held}) edit {}?", user.name, project.name);
         let decision = checker
-            .evaluate_in_session(&session, user, &EditAction, &project, &())
+            .bind(&session, user, &EditAction, &())
+            .check(&project)
             .await;
         println!(
             "  -> {}\n",
@@ -193,7 +203,8 @@ async fn main() {
     // from the session cache.
     println!("Why {} is denied:", viewer.name);
     let decision = checker
-        .evaluate_in_session(&session, &viewer, &EditAction, &project, &())
+        .bind(&session, &viewer, &EditAction, &())
+        .check(&project)
         .await;
     println!("{}\n", decision.display_trace());
 
@@ -206,7 +217,8 @@ async fn main() {
         .build();
     let error_session = error_registry.session();
     let decision = checker
-        .evaluate_in_session(&error_session, &owner, &EditAction, &project, &())
+        .bind(&error_session, &owner, &EditAction, &())
+        .check(&project)
         .await;
     println!("{}", decision.display_trace());
     decision.assert_denied();

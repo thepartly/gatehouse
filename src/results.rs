@@ -219,11 +219,18 @@ pub enum PolicyEvalResult {
 /// # struct EmptyContext;
 /// #
 /// # async fn example() -> AccessEvaluation {
-/// #     let mut checker = PermissionChecker::<User, ReadAction, Document, EmptyContext>::new();
+/// #     struct Documents;
+/// #     impl PolicyDomain for Documents {
+/// #         type Subject = User;
+/// #         type Action = ReadAction;
+/// #         type Resource = Document;
+/// #         type Context = EmptyContext;
+/// #     }
+/// #     let checker = PermissionChecker::<Documents>::new();
 /// #     let user = User { id: Uuid::new_v4() };
 /// #     let document = Document { id: Uuid::new_v4() };
 /// #     let session = EvaluationSession::empty();
-/// #     checker.evaluate_in_session(&session, &user, &ReadAction, &document, &EmptyContext).await
+/// #     checker.bind(&session, &user, &ReadAction, &EmptyContext).check(&document).await
 /// # }
 /// #
 /// # tokio_test::block_on(async {
@@ -354,9 +361,17 @@ impl AccessEvaluation {
     /// ```rust
     /// # use gatehouse::*;
     /// # tokio_test::block_on(async {
-    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
-    /// # checker.add_policy(PolicyBuilder::<(), (), (), ()>::new("AllowAll").build());
-    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// # struct Domain;
+    /// # impl PolicyDomain for Domain {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// # let mut checker = PermissionChecker::<Domain>::new();
+    /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").build());
+    /// # let session = EvaluationSession::empty();
+    /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
     /// evaluation.assert_granted_by("AllowAll");
     /// # });
     /// ```
@@ -441,13 +456,21 @@ impl AccessEvaluation {
     /// ```rust
     /// # use gatehouse::*;
     /// # tokio_test::block_on(async {
-    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
+    /// # struct Domain;
+    /// # impl PolicyDomain for Domain {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// # let mut checker = PermissionChecker::<Domain>::new();
     /// # checker.add_policy(
-    /// #     PolicyBuilder::<(), (), (), ()>::new("StaffOnly")
+    /// #     PolicyBuilder::<Domain>::new("StaffOnly")
     /// #         .subjects(|_: &()| false)
     /// #         .build(),
     /// # );
-    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// # let session = EvaluationSession::empty();
+    /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
     /// evaluation.assert_not_applicable_by("StaffOnly");
     /// # });
     /// ```
@@ -485,14 +508,22 @@ impl AccessEvaluation {
     /// ```rust
     /// # use gatehouse::*;
     /// # tokio_test::block_on(async {
-    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
-    /// # checker.add_policy(PolicyBuilder::<(), (), (), ()>::new("AllowAll").build());
+    /// # struct Domain;
+    /// # impl PolicyDomain for Domain {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// # let mut checker = PermissionChecker::<Domain>::new();
+    /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").build());
     /// # checker.add_policy(
-    /// #     PolicyBuilder::<(), (), (), ()>::new("GlobalFreeze")
+    /// #     PolicyBuilder::<Domain>::new("GlobalFreeze")
     /// #         .forbid()
     /// #         .build(),
     /// # );
-    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// # let session = EvaluationSession::empty();
+    /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
     /// evaluation.assert_forbidden_by("GlobalFreeze");
     /// # });
     /// ```
@@ -556,10 +587,17 @@ impl AccessEvaluation {
     /// # struct Action;
     /// # #[derive(Debug, Clone)]
     /// # struct Ctx;
+    /// # struct Domain;
+    /// # impl PolicyDomain for Domain {
+    /// #     type Subject = User;
+    /// #     type Action = Action;
+    /// #     type Resource = Resource;
+    /// #     type Context = Ctx;
+    /// # }
     /// # tokio_test::block_on(async {
-    /// let checker = PermissionChecker::<User, Action, Resource, Ctx>::new();
+    /// let checker = PermissionChecker::<Domain>::new();
     /// let session = EvaluationSession::empty();
-    /// let result = checker.evaluate_in_session(&session, &User, &Action, &Resource, &Ctx).await;
+    /// let result = checker.bind(&session, &User, &Action, &Ctx).check(&Resource).await;
     ///
     /// // Map a denial into a standard error:
     /// let outcome: Result<(), String> = result.to_result(|reason| reason.to_string());

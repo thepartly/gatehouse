@@ -4,27 +4,28 @@
 [![Crates.io](https://img.shields.io/crates/v/gatehouse)](https://crates.io/crates/gatehouse)
 [![Documentation](https://docs.rs/gatehouse/badge.svg)](https://docs.rs/gatehouse)
 
-An in-process authorization engine for Rust. Compose RBAC, ReBAC, and ABAC-style predicates while
-loading relationship facts through request-scoped sessions that batch, deduplicate, and coalesce
-backend calls. List endpoints stay correct and fast without pushing policy into your data layer.
+An in-process authorization engine for Rust. Gatehouse keeps policy logic in
+Rust while giving each request an `EvaluationSession` for relationship and
+backend-loaded facts. Sessions batch, deduplicate, cache, and coalesce fact
+loads, so list endpoints can stay policy-correct without pushing authorization
+logic into the data layer.
 
 ![Gatehouse Logo](https://raw.githubusercontent.com/thepartly/gatehouse/main/.github/logo.svg)
 
 ## Features
 
-- **In-process authorization**: Keep policy logic in Rust without requiring a separate authorization
-  service
-- **Multi-paradigm policies**: Compose RBAC, ReBAC, and ABAC-style `PolicyBuilder` predicates
-- **Request-scoped fact loading**: Load relationship facts through `EvaluationSession` and
-  `FactSource`
-- **Batch-safe list endpoints**: Authorize many resources with policy-correct batching,
-  deduplication, and caller-order preservation
-- **Policy Composition**: Combine policies with logical operators (`AND`, `OR`, `NOT`)
-- **Detailed Evaluation Tracing**: Decision trace for the policies and branches that were actually
-  evaluated
-- **Fluent Builder API**: Construct custom policies with a PolicyBuilder.
-- **Type Safety**: Strongly typed resources/actions/contexts
-- **Async Ready**: Built with async/await support
+- **Typed authorization domains**: Define one `PolicyDomain` per authorization
+  domain and keep subject, action, resource, and context types consistent.
+- **Request-bound evaluation**: Bind session, subject, action, and context once,
+  then call `check`, `evaluate`, `filter`, or `lookup_page` on resources.
+- **RBAC, ReBAC, and predicate policies**: Use `RbacPolicy`, `RebacPolicy`, or
+  synchronous `PolicyBuilder::when` predicates.
+- **Deny-overrides semantics**: `PolicyBuilder::forbid()` and custom
+  `Effect::Forbid` policies can veto grants when registered on the checker.
+- **Batch-safe list endpoints**: Authorize already-loaded resources or enumerate
+  candidate IDs with `LookupSource` and `Hydrator`.
+- **Evaluation traces and telemetry**: Inspect the policies and fact provenance
+  that were actually evaluated.
 
 ## Quick Start
 
@@ -34,7 +35,7 @@ use gatehouse::*;
 #[derive(Debug, Clone)]
 struct User {
     id: u64,
-    roles: Vec<String>,
+    roles: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,380 +44,278 @@ struct Document {
 }
 
 #[derive(Debug, Clone)]
-struct Action;
+struct ReadAction;
 
-#[derive(Debug, Clone)]
-struct Context;
+struct Documents;
+impl PolicyDomain for Documents {
+    type Subject = User;
+    type Action = ReadAction;
+    type Resource = Document;
+    type Context = ();
+}
 
-let admin_policy = PolicyBuilder::<User, Action, Document, Context>::new("AdminOnly")
-    .subjects(|user| user.roles.iter().any(|role| role == "admin"))
+let admin_policy = PolicyBuilder::<Documents>::new("AdminOnly")
+    .subjects(|user: &User| user.roles.contains(&"admin"))
     .build();
 
-let owner_policy = PolicyBuilder::<User, Action, Document, Context>::new("OwnerOnly")
-    .when(|user, _action, resource, _ctx| resource.owner_id == user.id)
+let owner_policy = PolicyBuilder::<Documents>::new("OwnerOnly")
+    .when(|user: &User, _action: &ReadAction, doc: &Document, _ctx: &()| {
+        user.id == doc.owner_id
+    })
     .build();
 
-let mut checker = PermissionChecker::new();
+let mut checker = PermissionChecker::<Documents>::new();
 checker.add_policy(admin_policy);
 checker.add_policy(owner_policy);
 
 # tokio_test::block_on(async {
-let user = User {
-    id: 1,
-    roles: vec!["admin".to_string()],
-};
-let document = Document { owner_id: 1 };
+let session = EvaluationSession::empty();
+let action = ReadAction;
+let document = Document { owner_id: 7 };
 
-// `check` is the everyday call for fact-free checkers. Reach for
-// `evaluate_in_session` when the checker has any fact-backed policy.
-let evaluation = checker.check(&user, &Action, &document, &Context).await;
+let admin = User { id: 1, roles: vec!["admin"] };
+let owner = User { id: 7, roles: vec!["user"] };
+let guest = User { id: 2, roles: vec!["user"] };
 
-assert!(evaluation.is_granted());
-println!("{}", evaluation.display_trace());
-
-let outcome: Result<(), String> = evaluation.to_result(|reason| reason.to_string());
-assert!(outcome.is_ok());
+assert!(checker.bind(&session, &admin, &action, &()).check(&document).await.is_granted());
+assert!(checker.bind(&session, &owner, &action, &()).check(&document).await.is_granted());
+assert!(!checker.bind(&session, &guest, &action, &()).check(&document).await.is_granted());
 # });
 ```
 
-For checkers with any fact-backed policy (ReBAC or custom `FactSource`-using policies), build a
-`FactRegistry` at application setup, create an `EvaluationSession` per request with
-`registry.session()`, and call `checker.evaluate_in_session(&session, …)` or the matching
-batch/list API.
+Use `EvaluationSession::empty()` for fact-free checkers. When any policy reads
+facts through `ctx.session.get(...)`, build a `FactRegistry` at application
+setup and create a fresh `registry.session()` for each request.
 
-## Core authorization flows
+## Core Flow
 
-Gatehouse intentionally keeps the public call surface small. Most call sites are one of three
-shapes:
+Most call sites bind request-wide inputs once and evaluate one or more
+resources through the bound evaluator:
 
-```text
-single resource
-  subject + action + resource + context
-      -> check / evaluate_in_session
-      -> AccessEvaluation
+```rust,ignore
+let session = registry.session();
+let bound = checker.bind(&session, &subject, &action, &request_context);
 
-already-loaded candidates
-  Vec<item>
-      -> evaluate_batch_in_session   (keep every decision)
-      -> filter_authorized_in_session (keep only allowed items)
-
-unknown candidate set
-  LookupSource -> Hydrator -> lookup_authorized_page
+let decision = bound.check(&resource).await;
+let decisions = bound.evaluate(resources.clone()).await;
+let authorized = bound.filter(resources).await;
+let page = bound.lookup_page(&lookup, &hydrator, cursor.as_deref(), limit).await?;
 ```
-
-Start with `PermissionChecker::check` for ordinary point checks that do not load facts. Use
-`PermissionChecker::evaluate_in_session` when any policy reads fact-backed state.
-
-For lists where you already have the candidate resources, use `filter_authorized_in_session` when
-you only need the allowed items, or `evaluate_batch_in_session` when you need the full per-item
-`AccessEvaluation` trace. Both methods take an item iterator plus a closure that borrows
-`(&resource, &context)` from each item.
-
-For lists where the candidate set is too large to load first, use `lookup_authorized_page` with a
-`LookupSource` and `Hydrator`.
-
-`check` uses `EvaluationSession::shared_empty()` internally. For ReBAC or any custom policy that
-calls `ctx.session.get(...)`, create the request session from a `FactRegistry` and pass it to
-`evaluate_in_session` or the corresponding batch API.
-
-## Why Request-Scoped Facts Matter
-
-Simple checks still look like normal Rust predicates. The difference shows up when an endpoint has
-to authorize a page, feed, subscription batch, or search result. Without request-scoped fact
-loading, those paths either pay N policy evaluations and N backend round trips, or duplicate policy
-logic into SQL and risk bypassing later checker policies.
-
-Gatehouse now treats authorization as computation over request-scoped facts. A policy stack can keep
-in-memory checks, combinators, and relationship checks in one place, while `EvaluationSession`
-batches and caches the fact loads needed by that request.
 
 ```mermaid
 flowchart LR
-    App[app startup] --> Registry[FactRegistry]
-    Registry --> Session[request EvaluationSession]
-    Checker[PermissionChecker] --> Policy[policies]
-    Policy --> Session
-    Session --> Source[FactSource::load_many]
-    Source --> Backend[(backend)]
-    Session --> Trace[AccessEvaluation + trace]
+    Request[request] --> Session[EvaluationSession]
+    Request --> Bound[BoundEvaluator]
+    Checker[PermissionChecker] --> Bound
+    Bound --> Policies[policies]
+    Policies --> Session
+    Session --> Facts[FactSource::load_many]
+    Facts --> Backend[(backend)]
+    Policies --> Decision[AccessEvaluation + EvalTrace]
 ```
 
-You do not need to model every check as a fact. RBAC and `PolicyBuilder` predicates stay simple and
-in-process; fact sources are the production path for data that would otherwise require per-resource
-I/O, such as relationship checks behind list endpoints.
-
-If you are upgrading from 0.2, see `MIGRATION.md` for the `RelationshipResolver` to `FactSource`
-migration path and `Policy` trait changes.
+`BoundEvaluator::evaluate` preserves input order and returns one
+`AccessEvaluation` per resource. `BoundEvaluator::filter` keeps only granted
+resources. `BoundEvaluator::lookup_page` is for list endpoints where the
+application cannot load every possible candidate first; a `LookupSource`
+enumerates candidate IDs, a `Hydrator` resolves them, and the full policy stack
+authorizes the hydrated resources.
 
 ## Decision Semantics
 
-- `PermissionChecker` applies fixed **deny-overrides** semantics: any policy that _forbids_ (an
-  `Effect::Forbid` policy whose predicate matches) denies the request, overriding every grant;
-  otherwise any granting policy grants (`OR`, short-circuiting on the first grant); otherwise the
-  request is denied.
-- Forbid-effect policies are evaluated before allow policies, so a veto is never skipped by the grant
-  short-circuit. Registration order does not change the decision. With no forbid-effect policies,
-  behavior is plain `OR`, exactly as before.
-- An empty `PermissionChecker` always denies with the reason `"No policies configured"`.
-- `AndPolicy` short-circuits on the first non-grant; `OrPolicy` short-circuits on the first grant.
-- `NotPolicy` inverts the result of its inner policy.
-- Inside combinators a forbid behaves like an ordinary denial: forbids are honored at the checker
-  level, not propagated through combinator trees. Register forbidding policies directly on the
-  checker; use `AndPolicy[grant, NotPolicy(block)]` for an exclusion scoped to one grant path.
-- `PolicyBuilder` combines all configured predicates with `AND` logic.
-  `PolicyBuilder::forbid()` makes a matching policy _forbid_ (`PolicyEvalResult::Forbidden`); a
-  non-match is "not applicable" and never blocks anything. Hand-written policies that can forbid
-  (via `ctx.forbid(...)`) must declare it by overriding `Policy::effect`.
-- `AccessEvaluation::Denied.reason` is a summary string: `"Forbidden by <policy>: <reason>"` for a
-  veto (also exposed via `AccessEvaluation::forbidden_by()`), `"All policies denied access"`
-  otherwise. Inspect the trace tree for individual policy reasons.
-- Evaluation traces only contain policies and branches that were actually evaluated before
-  short-circuiting, in evaluation order (forbid-effect policies first).
+- `PermissionChecker` applies fixed deny-overrides semantics: any directly
+  registered forbidding policy denies; otherwise the first grant wins.
+- Policies declaring `Effect::Forbid` are evaluated before allow policies, so a
+  veto cannot be skipped by grant short-circuiting.
+- If nothing grants, the checker denies with `"All policies denied access"`.
+- An empty checker denies with `"No policies configured"`.
+- `PolicyEvalResult::NotApplicable` means the policy did not grant.
+  `PolicyEvalResult::Forbidden` means the policy actively vetoed.
+- `PolicyBuilder` combines configured predicates with AND logic.
+  `PolicyBuilder::forbid()` makes a matching policy forbid; a non-match remains
+  not applicable and does not block.
+- `AndPolicy` short-circuits on the first non-grant. `OrPolicy` short-circuits
+  on the first grant. `NotPolicy` inverts the inner decision.
+- Inside combinators, a forbidden child behaves like a non-grant. Register
+  global veto rules directly on the checker.
 
-## Core Components
+Denials from `AccessEvaluation` are summary-level. Use
+`AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect
+individual policy reasons and fact provenance.
 
-### `Policy` Trait
+## Policy Domains
 
-The foundation of the authorization system:
+A `PolicyDomain` names the four types involved in one authorization domain:
+
+```rust
+use gatehouse::PolicyDomain;
+
+# struct User;
+# struct DocAction;
+# struct Document;
+# struct RequestContext;
+struct Documents;
+
+impl PolicyDomain for Documents {
+    type Subject = User;
+    type Action = DocAction;
+    type Resource = Document;
+    type Context = RequestContext;
+}
+```
+
+The generic parameter then stays short and consistent:
+
+```rust,ignore
+let policy = PolicyBuilder::<Documents>::new("Owner")
+    .when(|user, _action, doc, _ctx| user.id == doc.owner_id)
+    .build();
+
+let checker = PermissionChecker::<Documents>::new();
+```
+
+## PolicyBuilder
+
+Use `PolicyBuilder` for synchronous predicate logic:
+
+```rust,ignore
+let suspended_account = PolicyBuilder::<Documents>::new("SuspendedAccount")
+    .when(|user, _action, _doc, _ctx| user.is_suspended)
+    .forbid()
+    .build();
+```
+
+Reach for a direct `Policy<D>` implementation when a rule needs async work,
+custom batching, custom telemetry metadata, or hand-written forbid behavior.
 
 ```rust
 use async_trait::async_trait;
+use gatehouse::{EvalCtx, Policy, PolicyDomain, PolicyEvalResult};
 use std::borrow::Cow;
-use gatehouse::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyEvalResult, SecurityRuleMetadata};
+
+# #[derive(Debug, Clone)]
+# struct User { id: u64 }
+# #[derive(Debug, Clone)]
+# struct Document { owner_id: u64 }
+# #[derive(Debug, Clone)]
+# struct ReadAction;
+# struct Documents;
+# impl PolicyDomain for Documents {
+#     type Subject = User;
+#     type Action = ReadAction;
+#     type Resource = Document;
+#     type Context = ();
+# }
+struct OwnerPolicy;
 
 #[async_trait]
-trait Policy<Subject, Action, Resource, Context>: Send + Sync {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, Subject, Action, Resource, Context>)
-        -> PolicyEvalResult;
-
-    async fn evaluate_batch<'item>(
-        &self,
-        ctx: &BatchEvalCtx<'item, Subject, Action, Resource, Context>,
-    ) -> Vec<PolicyEvalResult>;
-
-    fn policy_type(&self) -> Cow<'static, str>;
-
-    fn effect(&self) -> Effect {
-        Effect::Allow
+impl Policy<Documents> for OwnerPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Documents>) -> PolicyEvalResult {
+        if ctx.subject.id == ctx.resource.owner_id {
+            ctx.grant("subject owns the document")
+        } else {
+            ctx.not_applicable("subject does not own the document")
+        }
     }
 
-    fn security_rule(&self) -> SecurityRuleMetadata {
-        SecurityRuleMetadata::default()
+    fn policy_type(&self) -> Cow<'static, str> {
+        Cow::Borrowed("OwnerPolicy")
     }
 }
 ```
 
-Within `evaluate`, prefer `ctx.grant("reason")` / `ctx.not_applicable("reason")` / `ctx.forbid("reason")` (and
-the `*_with_facts` variants) to build the `PolicyEvalResult` instead of re-passing
-`self.policy_type()` — the checker captures the policy name on `EvalCtx` once per evaluation. A
-policy that can `forbid` must also override `effect()` to return `Effect::Forbid` so the checker
-schedules it ahead of the grant short-circuit.
+## Built-In Policies
 
-### `PermissionChecker`
+- `RbacPolicy`: role-based access control. Grants when at least one required
+  role for `(action, resource)` is present in the subject's roles.
+- `RebacPolicy`: relationship-based access control. Extracts subject/resource
+  IDs, builds `RelationshipQuery` keys, and grants when the request session
+  loads `Found(true)` from a registered `FactSource`.
+- `DelegatingPolicy`: maps inputs into another `PolicyDomain` and delegates to
+  a child `PermissionChecker` while preserving batching and trace shape.
 
-Aggregates multiple policies with deny-overrides semantics: any matching `Effect::Forbid` policy
-denies; otherwise, if any policy grants access, permission is granted. The returned
-`AccessEvaluation` contains both the final decision and a trace tree of the evaluated policies.
+Use `PolicyBuilder::when` for attribute-style predicates that compare subject,
+action, resource, and context in one closure.
+
+## Fluent Combinators
+
+Policies can be composed with the `PolicyExt` helpers:
 
 ```rust,ignore
-let mut checker = PermissionChecker::new();
-checker.add_policy(rbac_policy);
-checker.add_policy(owner_policy);
+use gatehouse::PolicyExt;
 
-// Fact-free path: no fact sources, so `check` is the
-// idiomatic call. For fact-backed checkers (ReBAC, lookup), build
-// an EvaluationSession per request and use evaluate_in_session.
-let evaluation = checker.check(&user, &action, &resource, &context).await;
-if evaluation.is_granted() {
-    // Access allowed
-} else {
-    // Access denied
-}
-
-println!("{}", evaluation.display_trace());
+let rule = is_editor.and(not_locked.not()).or(admin_override);
+checker.add_policy(rule);
 ```
 
-For multi-checker applications where the same policy name might appear in several checkers (an
-`Invoice` checker and a `Product` checker both reusing a shared `AdminOverride` policy), construct
-each checker with `PermissionChecker::named("InvoiceChecker")`. The name surfaces on the
-`gatehouse::security` tracing span as `checker.name`, so audit pipelines can disambiguate the
-source.
+`AndPolicy::try_new`, `OrPolicy::try_new`, and `NotPolicy::new` remain available
+when constructing policies from dynamic collections.
 
-### Batch Authorization
+## Request-Scoped Facts
 
-List and subscription endpoints often need to answer "which of these resources can this subject
-access?" Use `evaluate_batch_in_session` when you need the decision for every input item, or
-`filter_authorized_in_session` when only the authorized subset matters. Both methods accept any
-iterator of caller-owned items and a closure that borrows the resource and context from one item.
+`FactSource::load_many` receives unique keys and must return exactly one result
+per key in the same order. `EvaluationSession` expands duplicate caller inputs,
+preserves caller order, caches results for the request, chunks loads according
+to `FactSource::max_batch_size`, and joins concurrent in-flight loads for the
+same key.
 
-```rust
-let session = EvaluationSession::empty();
+```mermaid
+flowchart LR
+    Policy[policy] --> Session[EvaluationSession]
+    Session --> Cache{cached?}
+    Cache -- yes --> Result[FactLoadResult]
+    Cache -- no --> Source[FactSource::load_many]
+    Source --> Backend[(backend)]
+    Backend --> Result
+```
+
+`RebacPolicy` is the built-in fact-backed policy. Missing sources, missing
+facts, backend errors, and source contract violations fail closed to denied
+ReBAC decisions.
+
+Use typed relation enums when the domain has a fixed relation set, even if the
+backing store uses strings. The `FactSource` owns the backend boundary and can
+convert `Relation::Viewer` to `"viewer"` when binding SQL parameters.
+
+## List Endpoints
+
+For lists where the application already has candidate resources, use
+`BoundEvaluator::filter`:
+
+```rust,ignore
+let session = registry.session();
 let visible_posts = checker
-    .filter_authorized_in_session(
-        &session,
-        &user,
-        &Action::View,
-        posts
-            .into_iter()
-            .map(|post| (post, request_context.clone()))
-            .collect::<Vec<_>>(),
-        |(post, context)| (post, context),
-    )
+    .bind(&session, &user, &PostAction::View, &request_context)
+    .filter(posts)
     .await;
 ```
 
-The caller keeps ownership of resource loading and context construction. Gatehouse borrows the
-resource/context pair from each item, preserves input order, and applies the same per-item
-deny-overrides semantics as `evaluate_in_session`.
-
-Policies can override `Policy::evaluate_batch` to collapse backend work. `RebacPolicy` builds
-`RelationshipQuery` fact keys and loads them through the request-scoped `EvaluationSession`, so
-deduplication, chunking, caching, and fail-closed source errors live in one `FactSource` layer.
-Combinator policies (`AndPolicy`, `OrPolicy`, and `NotPolicy`) preserve batching for their inner
-policies. `PolicyBuilder`-built policies additionally short-circuit the batch-shared axes
-(`.subjects()` / `.actions()`) once per batch instead of once per item — this is specific to
-`PolicyBuilder`'s generated `evaluate_batch`; a hand-written `Policy` impl that doesn't override
-`evaluate_batch` falls through to the serial-loop default and gets nothing for free.
-
-Checker and combinator batch evaluation remain sequential by design: they preserve policy order,
-per-item short-circuiting, and trace shape. Parallel work belongs inside policy implementations or
-fact sources today; any future checker-level parallel batch API should be explicit.
-`EvaluationSession` is safe to share across those parallel loaders, and unrelated fact keys do not
-contend on one global cache or in-flight lock.
-
-`PermissionChecker::with_max_batch_size` caps the number of still-pending items passed to each
-policy batch call. Fact-backed policies can also set `FactSource::max_batch_size`, which caps
-source-level loads after session deduplication.
-
-```rust
-use std::num::NonZeroUsize;
-
-let checker = PermissionChecker::new()
-    .with_max_batch_size(NonZeroUsize::new(500).unwrap());
-```
-
-### Fact Sources And Sessions
-
-`EvaluationSession` is request-scoped. Build a `FactRegistry` once during application setup, create
-a fresh session from that registry for each request, run the checker, then drop the session:
+For lists where the candidate set is too large to load first, implement
+`LookupSource<Domain>` and `Hydrator<Id>`:
 
 ```rust,ignore
-let registry = FactRegistry::builder()
-    .with_arc::<RelationshipQuery<Uuid, Uuid, Relation>>(Arc::clone(&relationships))
-    .build();
-
-let session = registry.session();
+let page = checker
+    .bind(&session, &user, &PostAction::View, &request_context)
+    .lookup_page(&lookup, &hydrator, cursor.as_deref(), limit)
+    .await?;
 ```
 
-For hot fact-free paths, `EvaluationSession::shared_empty()` returns a process-wide empty session
-and avoids per-call allocation. Only use it when no fact-backed policies are expected.
-
-The source registry is keyed by the exact Rust fact key type. If two backends serve the same logical
-key shape, define distinct key/newtype wrappers rather than registering both under one
-`RelationshipQuery<...>` type.
-
-#### Cache Lifetime And Revocation
-
-Cached facts, cached errors, and in-flight load state do not outlive the request-scoped session.
-This is a correctness boundary as well as a performance detail: if a permission is revoked after one
-request has loaded it, a new request builds a new session and must load the fact again.
-
-`FactSource::load_many` receives unique keys and must return exactly one result per key in the same
-order. The session handles duplicate expansion and caller-order preservation. Missing sources,
-backend errors, missing facts, wrong result counts, and cancelled loader tasks all fail closed.
-
-If the leader task for an in-flight fact load is cancelled or panics, the session caches
-`FactLoadError::LoaderCancelled` for those keys and wakes waiters. That intentionally poisons those
-keys for the rest of the request-scoped session so the request fails closed instead of hanging.
-Build a fresh session for a retry or a new request.
-
-`RebacPolicy` is the first built-in fact-backed policy. It extracts subject/resource IDs, builds
-`RelationshipQuery<SubjectId, ResourceId, Relation>` keys, and asks the session for those
-relationship facts.
-
-Use a typed relation enum when your domain has a fixed relation set, even if the backing store uses
-strings. The `EvaluationSession` deduplicates and caches by the typed `RelationshipQuery`; the
-`FactSource` owns the backend boundary and can convert `Relation::Viewer` to `"viewer"` when binding
-SQL parameters. The `postgres_bulk_rebac` example demonstrates this pattern against a PostgreSQL
-`text` column.
-
-If several relationship domains all look like `Uuid -> Uuid`, prefer one domain relation enum and
-dispatch inside the corresponding `FactSource`. If you need separate source registrations, wrap IDs
-in domain newtypes so each `RelationshipQuery<SubjectId, ResourceId, Relation>` has a distinct Rust
-type.
-
-### PolicyBuilder
-
-The `PolicyBuilder` provides a fluent API to construct custom policies by chaining predicate
-functions for subjects, actions, resources, and context. Every configured predicate must pass for
-the built policy to grant access. Once built, the policy can be added to a `PermissionChecker`.
-
-Use `PolicyBuilder` for synchronous predicate logic. If your policy needs async I/O or external
-lookups, implement `Policy` directly.
-
-```rust,ignore
-let custom_policy = PolicyBuilder::<MySubject, MyAction, MyResource, MyContext>::new("CustomPolicy")
-    .subjects(|s| /* ... */)
-    .actions(|a| /* ... */)
-    .resources(|r| /* ... */)
-    .context(|c| /* ... */)
-    .when(|s, a, r, c| /* ... */)
-    .build();
-```
-
-### Built-in Policies
-
-- `RbacPolicy`: Role-based access control. Grants when at least one required role for
-  `(action, resource)` is present in the subject's roles.
-- `RebacPolicy`: Relationship-based access control. Extracts flat subject/resource IDs, builds
-  `RelationshipQuery` keys, and grants when the request-scoped `EvaluationSession` loads
-  `Found(true)` from a registered `FactSource`.
-- `DelegatingPolicy`: Delegates a decision to another `PermissionChecker` after mapping
-  parent-domain inputs into child-domain inputs. Batch delegation preserves the child checker's
-  batch path and trace.
-
-Use `PolicyBuilder::when` for attribute-style predicates that compare subject, action, resource,
-and context in one synchronous closure.
-
-Fact-backed ReBAC failures fail closed: missing sources, missing facts, source errors, and source
-contract violations produce denied decisions rather than panics or accidental grants.
-
-### Combinators
-
-- `AndPolicy`: Grants access only if all inner policies allow access. Must be created with at least
-  one policy.
-- `OrPolicy`: Grants access if any inner policy allows access. Must be created with at least one
-  policy.
-- `NotPolicy`: Inverts the decision of an inner policy.
-- `DelegatingPolicy`: Cross-domain delegation through another checker, useful when one resource's
-  access depends on another authorization domain.
+A `LookupSource` must enumerate a superset of every resource that any policy
+could grant for the bound subject/action/context. Lookup narrows candidates; it
+does not replace the policy stack.
 
 ## Tracing And Telemetry
 
-When trace-level events are enabled, `PermissionChecker::evaluate_in_session` creates an
-instrumented span and every evaluated policy records a `trace!` event on the `gatehouse::security`
-target. Batch evaluation records checker-level aggregate fields and nested `gatehouse.batch_policy`
-spans with per-policy pending/granted/denied counts.
+When trace-level events are enabled, checker evaluation records spans for
+single-resource and batch evaluation, and each evaluated policy records a
+`trace!` event on the `gatehouse::security` target. Batch evaluation records
+aggregate item counts and nested `gatehouse.batch_policy` spans with per-policy
+counts.
 
-Span, event target, and field names listed here are public observability API. Renaming or removing
-them is treated as a semver-major change.
+Reason strings are emitted verbatim. Keep credentials, tokens, raw PII, and
+other sensitive material out of policy reasons and fact provenance details.
 
-**Reason strings are emitted verbatim.** The `policy.result.reason` field and
-`FactProvenance.detail` rendered inside `EvalTrace::format` carry whatever the policy or fact source
-put there. Policies that interpolate subject- or context-derived data into reasons
-(`format!("user {} not in {}", subject.email, …)`) will expose that data to every tracing
-subscriber, including production log shippers. Treat reason strings as part of the public audit
-surface and keep credentials, tokens, raw PII, and other sensitive material out of them.
-
-Span and event names:
-
-- `evaluate_in_session` span for single-item checker evaluation
-- `evaluate_batch_in_session` span for batch checker evaluation
-- `gatehouse.batch_policy` span for each policy batch pass
-- `gatehouse.fact_load` span for each source-level fact load
-- `gatehouse::security` target for per-policy security events
-
-Single-item security event fields:
+Security event fields:
 
 - `security_rule.name`
 - `security_rule.category`
@@ -430,85 +329,7 @@ Single-item security event fields:
 - `policy.type`
 - `policy.result.reason`
 
-Single-item checker span fields:
-
-- `policy_count`
-- `outcome`
-- `policy.type`
-
-Batch checker span fields:
-
-- `item_count`
-- `granted_count`
-- `denied_count`
-- `policy_count`
-- `max_batch_size`
-
-Nested `gatehouse.batch_policy` span fields:
-
-- `policy.type`
-- `policy.pending_count`
-- `policy.chunk_index`
-- `policy.chunk_count`
-- `policy.granted_count`
-- `policy.denied_count`
-
-`gatehouse.fact_load` span fields:
-
-- `fact.name`
-- `fact.load_id`
-- `fact.key_count`
-- `fact.unique_key_count`
-
-Fallback behavior when `security_rule()` is not overridden:
-
-- `security_rule.name` falls back to `policy_type()`
-- `security_rule.category` falls back to `"Access Control"`
-- `security_rule.ruleset.name` falls back to `"PermissionChecker"`
-
 ## Examples
-
-See the `examples` directory for complete demonstrations. Most examples are self-contained and run
-with `cargo run --example <name>`. The web examples start local servers, and `postgres_bulk_rebac`
-needs a live PostgreSQL database.
-
-**Start here: policy mechanics**
-
-- `rbac_policy` — basic role-based access control with `PermissionChecker`.
-- `policy_builder` — attribute-style custom policies via `PolicyBuilder`.
-- `combinator_policy` — combining policies with `AndPolicy` / `OrPolicy` / `NotPolicy`.
-- `deny_override` — "deny overrides allow" with `Effect::Forbid` policies (account suspensions, legal
-  holds) registered flat on the checker, plus the `AndPolicy[grant, NotPolicy(block)]` shape for
-  exclusions scoped to a single grant path.
-- `delegating_policy` — defer a decision to another domain's `PermissionChecker` with
-  `DelegatingPolicy` (comment moderation inheriting document edit rights), keeping the trace across
-  the boundary.
-- `mfa_freshness_context` — when (and when not) to populate the `Context` generic, grounded in a
-  high-value-refund / MFA-freshness decision. Also shows the hand-written deny-policy shape:
-  `ctx.forbid(...)` plus an `effect()` override, registered flat on the checker.
-
-**Then learn request-scoped facts and list endpoints**
-
-- `factsource_n_plus_one` — contrastive teaching artifact: the obvious "hold an `Arc<Backend>` on
-  the policy and call it directly" shape pays N redundant backend calls per batch; registering the
-  lookup as a `FactSource` collapses it to one. Prints actual call counts so the lesson is visible.
-- `rebac_policy` — relationship-based access control through a registered `FactSource`.
-- `in_ram_rebac` — `FactSource` shared across sessions, with in-RAM relationship facts.
-- `lookup_in_ram` — `LookupSource` + `Hydrator` for "what can this subject see?" list endpoints.
-
-**Then wire it into a web framework**
-
-- `axum` — Axum integration over a single resource type (invoices): custom extractors, shared app
-  state, per-request sessions, a `viewer` relationship `FactSource`, and a batched list endpoint.
-- `actix_web` — Actix Web integration over blog posts: a collaborator (`editor`) relationship loaded
-  through per-request sessions, plus a batched list endpoint.
-
-**Advanced database-backed example**
-
-- `postgres_bulk_rebac` — the same `FactSource` boundary backed by PostgreSQL, with one batched
-  `WITH ORDINALITY` query per request. Use it after the in-memory fact examples if you want to
-  validate the SQL-backed performance shape on a real database. The SQL is ordinary PostgreSQL; it
-  was developed and benchmarked against PostgreSQL 18.
 
 Run a self-contained example with:
 
@@ -522,43 +343,34 @@ Run a server example with:
 cargo run --example axum
 ```
 
-Then send requests to `http://127.0.0.1:8000`; `actix_web` listens on `http://127.0.0.1:8080`.
+Then send requests to `http://127.0.0.1:8000`; `actix_web` listens on
+`http://127.0.0.1:8080`.
+
+Examples to start with:
+
+- `rbac_policy`: basic role-based access control.
+- `policy_builder`: attribute-style custom policies.
+- `combinator_policy`: fluent `and` / `or` / `not` composition.
+- `deny_override`: global veto policies with `PolicyBuilder::forbid()`.
+- `delegating_policy`: cross-domain checks with `DelegatingPolicy`.
+- `mfa_freshness_context`: request-scoped context inputs.
+- `rebac_policy`: relationship checks through `FactSource`.
+- `in_ram_rebac`: in-memory relationship facts and session caching.
+- `lookup_in_ram`: `LookupSource` plus `Hydrator` list authorization.
+- `factsource_n_plus_one`: why request-scoped facts matter for list endpoints.
+- `axum` and `actix_web`: web-framework integration.
+- `postgres_bulk_rebac`: SQL-backed ReBAC fact loading.
 
 ## Performance
 
-Criterion benchmarks in `benches/permission_checker.rs` exercise
-`PermissionChecker::evaluate_in_session` across several policy stack sizes. Run them with
-`cargo bench` to track changes in evaluation latency as you evolve your policy definitions.
-
-The `in_ram_fact_source` Criterion group isolates Gatehouse's session overhead when the source
-itself is hot and in-process; it is not a benchmark for network or database latency. The
-`latency_fact_source` group injects a fixed async delay per source call so the benchmarks also show
-the intended shape under backend latency: N per-item sessions versus one batched session, and
-independent repeated loads versus shared-session in-flight coalescing.
-
-The `postgres_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource`. It models a list
-endpoint with an in-memory `PublicPost` policy plus a SQL-backed `viewer` relationship policy, then
-compares N point queries through per-item sessions with one batched `WITH ORDINALITY` query through
-`filter_authorized_in_session`.
-
-This example is intentionally outside the quick-start path: it creates and seeds a table, expects a
-live PostgreSQL database, and reads `DATABASE_URL`. It was tested and benchmarked with PostgreSQL
-18; the SQL is intentionally ordinary PostgreSQL, so older supported versions may also work. If
-`DATABASE_URL` is unset, it tries
-`host=localhost port=15432 user=postgres password=test dbname=awa_test`, so set the variable
-explicitly unless your local database matches that default:
+Criterion benchmarks in `benches/permission_checker.rs` exercise bound checker
+evaluation, fact loading, batching, and policy-builder batch shortcuts. Run them
+with:
 
 ```shell
-DATABASE_URL="host=localhost port=15432 user=postgres password=test dbname=awa_test" \
-  cargo run --example postgres_bulk_rebac --release
+cargo bench
 ```
 
-The example prints a CSV so you can compare your own database and machine. Local PostgreSQL 18.3
-runs of the mixed-policy example show modest wins for tiny lists and tens-to-low-hundreds
-improvements once the list is large enough for round trips to dominate. Exact numbers vary; the
-important property is that the policy stack stays in Gatehouse while relationship fact loading
-collapses to batched SQL.
-
-The PostgreSQL example uses `tokio-postgres` directly to keep the demonstration small. `sqlx` users
-should keep the same boundary: implement `FactSource<RelationshipQuery<...>>`, map backend errors to
-`FactLoadError::backend`, and preserve the one-result-per-input-key contract.
+The `postgres_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource`
+with one batched `WITH ORDINALITY` query per request. It expects a live
+PostgreSQL database and reads `DATABASE_URL`.

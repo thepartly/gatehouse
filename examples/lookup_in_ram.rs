@@ -1,6 +1,6 @@
 //! Lookup-style authorization with an in-memory backend.
 //!
-//! Demonstrates `PermissionChecker::lookup_authorized_page` against an in-RAM
+//! Demonstrates `BoundEvaluator::lookup_page` against an in-RAM
 //! `LookupSource` and a `Hydrator`, composed with a non-lookup policy
 //! (admin override) — the production shape #24 was scoped to enable.
 //!
@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    EvalCtx, EvaluationSession, LookupPage, LookupSource, PermissionChecker, Policy,
+    EvalCtx, EvaluationSession, LookupPage, LookupSource, PermissionChecker, Policy, PolicyDomain,
     PolicyEvalResult,
 };
 use std::collections::HashMap;
@@ -43,14 +43,23 @@ struct Document {
 #[derive(Clone, Debug)]
 struct View;
 
+struct DocumentDomain;
+
+impl PolicyDomain for DocumentDomain {
+    type Subject = User;
+    type Action = View;
+    type Resource = Document;
+    type Context = ();
+}
+
 // --- Policies ----------------------------------------------------------
 
 /// Grants admins access to any document, regardless of relationships.
 struct AdminPolicy;
 
 #[async_trait]
-impl Policy<User, View, Document, ()> for AdminPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, User, View, Document, ()>) -> PolicyEvalResult {
+impl Policy<DocumentDomain> for AdminPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, DocumentDomain>) -> PolicyEvalResult {
         if ctx.subject.is_admin {
             ctx.grant("admin override")
         } else {
@@ -69,8 +78,8 @@ struct ViewerPolicy {
 }
 
 #[async_trait]
-impl Policy<User, View, Document, ()> for ViewerPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, User, View, Document, ()>) -> PolicyEvalResult {
+impl Policy<DocumentDomain> for ViewerPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, DocumentDomain>) -> PolicyEvalResult {
         let granted = self
             .viewers
             .get(&ctx.resource.id)
@@ -109,10 +118,7 @@ impl fmt::Display for ViewerLookupError {
 impl std::error::Error for ViewerLookupError {}
 
 #[async_trait]
-impl LookupSource for InMemoryViewerLookup {
-    type Subject = User;
-    type Action = View;
-    type Context = ();
+impl LookupSource<DocumentDomain> for InMemoryViewerLookup {
     type Id = Uuid;
     type Error = ViewerLookupError;
 
@@ -154,7 +160,7 @@ impl LookupSource for InMemoryViewerLookup {
 }
 
 async fn collect_authorized<H>(
-    checker: &PermissionChecker<User, View, Document, ()>,
+    checker: &PermissionChecker<DocumentDomain>,
     session: &EvaluationSession,
     subject: &User,
     lookup: &InMemoryViewerLookup,
@@ -166,18 +172,10 @@ where
 {
     let mut cursor: Option<Vec<u8>> = None;
     let mut authorized = Vec::new();
+    let bound = checker.bind(session, subject, &View, &());
     loop {
-        let page = checker
-            .lookup_authorized_page(
-                session,
-                subject,
-                &View,
-                &(),
-                lookup,
-                cursor.as_deref(),
-                page_size,
-                hydrator,
-            )
+        let page = bound
+            .lookup_page(lookup, hydrator, cursor.as_deref(), page_size)
             .await?;
         authorized.extend(page.resources);
         match page.next_cursor {
@@ -249,7 +247,7 @@ async fn main() {
     // Compose policies: admin override OR viewer relation. The lookup
     // source only enumerates the viewer axis — admin overrides apply only
     // to point checks.
-    let mut checker = PermissionChecker::<User, View, Document, ()>::new();
+    let mut checker = PermissionChecker::<DocumentDomain>::new();
     checker.add_policy(AdminPolicy);
     checker.add_policy(ViewerPolicy { viewers });
 
@@ -296,7 +294,8 @@ async fn main() {
     // the admin has no viewer relation on.
     let any_doc = &docs[0];
     let admin_point = checker
-        .evaluate_in_session(&session, &admin, &View, any_doc, &())
+        .bind(&session, &admin, &View, &())
+        .check(any_doc)
         .await;
     println!(
         "\nAdmin point check on '{}': {}",
@@ -316,20 +315,12 @@ async fn main() {
     let mut cursor: Option<Vec<u8>> = None;
     let mut page_index = 0;
     let mut streamed_total = 0;
+    let alice_bound = checker.bind(&session, &alice, &View, &());
     loop {
-        let page = checker
-            .lookup_authorized_page(
-                &session,
-                &alice,
-                &View,
-                &(),
-                &lookup,
-                cursor.as_deref(),
-                page_size,
-                &hydrator,
-            )
+        let page = alice_bound
+            .lookup_page(&lookup, &hydrator, cursor.as_deref(), page_size)
             .await
-            .expect("lookup_authorized_page ok");
+            .expect("lookup_page ok");
         println!("  page {page_index}: {} authorized", page.resources.len());
         page_index += 1;
         streamed_total += page.resources.len();

@@ -158,6 +158,15 @@ impl RequestContext {
     }
 }
 
+pub struct InvoiceDomain;
+
+impl PolicyDomain for InvoiceDomain {
+    type Subject = User;
+    type Action = Action;
+    type Resource = Invoice;
+    type Context = RequestContext;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Relation {
     Viewer,
@@ -221,7 +230,7 @@ impl From<Invoice> for InvoiceSummary {
 /// registry.
 #[derive(Clone)]
 pub struct AppState {
-    checker: PermissionChecker<User, Action, Invoice, RequestContext>,
+    checker: PermissionChecker<InvoiceDomain>,
     fact_registry: FactRegistry,
     invoices: Arc<Vec<Invoice>>,
 }
@@ -292,8 +301,8 @@ fn demo_invoices() -> Vec<Invoice> {
 // Each policy handles a slice of the logic; the checker ORs them together.
 
 /// (A) Admins may do anything — the cross-cutting override.
-fn admin_override_policy() -> Box<dyn Policy<User, Action, Invoice, RequestContext>> {
-    PolicyBuilder::<User, Action, Invoice, RequestContext>::new("AdminOverridePolicy")
+fn admin_override_policy() -> Box<dyn Policy<InvoiceDomain>> {
+    PolicyBuilder::<InvoiceDomain>::new("AdminOverridePolicy")
         .when(|user, _action, _invoice, _ctx| user.roles.contains(&"admin".to_string()))
         .build()
 }
@@ -301,14 +310,14 @@ fn admin_override_policy() -> Box<dyn Policy<User, Action, Invoice, RequestConte
 /// (B) A user with a `viewer` relationship may view the invoice. The
 /// relationship is loaded through the request-scoped `EvaluationSession`; in a
 /// real service the source wraps a database pool or graph client.
-fn invoice_viewer_policy() -> Box<dyn Policy<User, Action, Invoice, RequestContext>> {
-    let is_view: Arc<dyn Policy<User, Action, Invoice, RequestContext>> = Arc::from(
-        PolicyBuilder::<User, Action, Invoice, RequestContext>::new("IsView")
+fn invoice_viewer_policy() -> Box<dyn Policy<InvoiceDomain>> {
+    let is_view: Arc<dyn Policy<InvoiceDomain>> = Arc::from(
+        PolicyBuilder::<InvoiceDomain>::new("IsView")
             .when(|_user, action, _invoice, _ctx| matches!(action, Action::View))
             .build(),
     );
-    let viewer_relationship: Arc<dyn Policy<User, Action, Invoice, RequestContext>> =
-        Arc::new(RebacPolicy::new(
+    let viewer_relationship: Arc<dyn Policy<InvoiceDomain>> =
+        Arc::new(RebacPolicy::<InvoiceDomain, Uuid, Uuid, Relation>::new(
             |user: &User| user.id,
             |invoice: &Invoice| invoice.id,
             Relation::Viewer,
@@ -323,31 +332,29 @@ fn invoice_viewer_policy() -> Box<dyn Policy<User, Action, Invoice, RequestConte
 /// (C) The owner may edit the invoice if it is unlocked and under 30 days old.
 /// Built from small sub-policies AND-ed together, so a denial trace names the
 /// sub-policy that failed.
-fn invoice_editing_policy() -> Box<dyn Policy<User, Action, Invoice, RequestContext>> {
-    let is_edit = PolicyBuilder::<User, Action, Invoice, RequestContext>::new("IsEdit")
+fn invoice_editing_policy() -> Box<dyn Policy<InvoiceDomain>> {
+    let is_edit = PolicyBuilder::<InvoiceDomain>::new("IsEdit")
         .when(|_user, action, _invoice, _ctx| matches!(action, Action::Edit))
         .build();
 
-    let is_owner = PolicyBuilder::<User, Action, Invoice, RequestContext>::new("IsOwnerOfInvoice")
+    let is_owner = PolicyBuilder::<InvoiceDomain>::new("IsOwnerOfInvoice")
         .when(|user, _action, invoice, _ctx| user.id == invoice.owner_id)
         .build();
 
-    let invoice_not_locked =
-        PolicyBuilder::<User, Action, Invoice, RequestContext>::new("InvoiceNotLocked")
-            .when(|_user, _action, invoice, _ctx| !invoice.locked)
-            .build();
+    let invoice_not_locked = PolicyBuilder::<InvoiceDomain>::new("InvoiceNotLocked")
+        .when(|_user, _action, invoice, _ctx| !invoice.locked)
+        .build();
 
     const THIRTY_DAYS: u64 = 30 * 24 * 60 * 60;
-    let invoice_age_under_30_days =
-        PolicyBuilder::<User, Action, Invoice, RequestContext>::new("InvoiceAgeUnder30Days")
-            .when(move |_user, _action, invoice, ctx| {
-                ctx.current_time
-                    .duration_since(invoice.created_at)
-                    .unwrap_or_default()
-                    .as_secs()
-                    <= THIRTY_DAYS
-            })
-            .build();
+    let invoice_age_under_30_days = PolicyBuilder::<InvoiceDomain>::new("InvoiceAgeUnder30Days")
+        .when(move |_user, _action, invoice, ctx| {
+            ctx.current_time
+                .duration_since(invoice.created_at)
+                .unwrap_or_default()
+                .as_secs()
+                <= THIRTY_DAYS
+        })
+        .build();
 
     Box::new(
         AndPolicy::try_new(vec![
@@ -363,7 +370,7 @@ fn invoice_editing_policy() -> Box<dyn Policy<User, Action, Invoice, RequestCont
 /// (D) Combine the policies into a single `PermissionChecker`. With no
 /// forbid-effect policies registered, deny-overrides reduces to OR semantics:
 /// if any policy grants, access is allowed (and evaluation short-circuits).
-pub fn build_permission_checker() -> PermissionChecker<User, Action, Invoice, RequestContext> {
+pub fn build_permission_checker() -> PermissionChecker<InvoiceDomain> {
     let mut checker = PermissionChecker::named("InvoiceChecker");
     checker.add_policy(admin_override_policy());
     checker.add_policy(invoice_viewer_policy());
@@ -384,16 +391,12 @@ pub async fn view_invoice_handler(
     // Simulate a DB fetch.
     let invoice = overrides.build_invoice(invoice_id);
     let session = state.request_session();
+    let context = RequestContext::now();
 
     if state
         .checker
-        .evaluate_in_session(
-            &session,
-            &user,
-            &Action::View,
-            &invoice,
-            &RequestContext::now(),
-        )
+        .bind(&session, &user, &Action::View, &context)
+        .check(&invoice)
         .await
         .is_granted()
     {
@@ -420,19 +423,11 @@ pub async fn list_invoices_handler(
     // — relationship loads are batched and deduplicated.
     let visible = state
         .checker
-        .filter_authorized_in_session(
-            &session,
-            &user,
-            &Action::View,
-            candidates
-                .into_iter()
-                .map(|invoice| (invoice, context.clone()))
-                .collect::<Vec<_>>(),
-            |(invoice, context)| (invoice, context),
-        )
+        .bind(&session, &user, &Action::View, &context)
+        .filter(candidates)
         .await
         .into_iter()
-        .map(|(invoice, _context)| InvoiceSummary::from(invoice))
+        .map(InvoiceSummary::from)
         .collect::<Vec<_>>();
 
     Json(visible).into_response()
@@ -446,16 +441,12 @@ pub async fn edit_invoice_handler(
 ) -> impl IntoResponse {
     let invoice = overrides.build_invoice(invoice_id);
     let session = state.request_session();
+    let context = RequestContext::now();
 
     if state
         .checker
-        .evaluate_in_session(
-            &session,
-            &user,
-            &Action::Edit,
-            &invoice,
-            &RequestContext::now(),
-        )
+        .bind(&session, &user, &Action::Edit, &context)
+        .check(&invoice)
         .await
         .is_granted()
     {
@@ -526,8 +517,11 @@ mod tests {
             /*age_in_days=*/ 60,
         );
 
+        let session = EvaluationSession::empty();
+        let context = context_now();
         let result = checker
-            .check(&admin, &Action::Edit, &invoice, &context_now())
+            .bind(&session, &admin, &Action::Edit, &context)
+            .check(&invoice)
             .await;
 
         assert!(result.is_granted(), "admin override should allow anything");
@@ -550,8 +544,11 @@ mod tests {
 
         let invoice = make_invoice(owner_id, /*locked=*/ false, /*age_in_days=*/ 10);
 
+        let session = EvaluationSession::empty();
+        let context = context_now();
         let result = checker
-            .check(&user, &Action::Edit, &invoice, &context_now())
+            .bind(&session, &user, &Action::Edit, &context)
+            .check(&invoice)
             .await;
 
         assert!(
@@ -571,8 +568,11 @@ mod tests {
 
         let invoice = make_invoice(owner_id, /*locked=*/ true, /*age_in_days=*/ 10);
 
+        let session = EvaluationSession::empty();
+        let context = context_now();
         let result = checker
-            .check(&user, &Action::Edit, &invoice, &context_now())
+            .bind(&session, &user, &Action::Edit, &context)
+            .check(&invoice)
             .await;
 
         assert!(!result.is_granted(), "a locked invoice should be denied");
@@ -600,8 +600,11 @@ mod tests {
             /*age_in_days=*/ 10,
         );
 
+        let session = EvaluationSession::empty();
+        let context = context_now();
         let result = checker
-            .check(&user, &Action::Edit, &invoice, &context_now())
+            .bind(&session, &user, &Action::Edit, &context)
+            .check(&invoice)
             .await;
 
         assert!(!result.is_granted(), "a non-owner should be denied");
@@ -625,8 +628,11 @@ mod tests {
         // 31 days old => fails InvoiceAgeUnder30Days.
         let invoice = make_invoice(owner_id, /*locked=*/ false, /*age_in_days=*/ 31);
 
+        let session = EvaluationSession::empty();
+        let context = context_now();
         let result = checker
-            .check(&user, &Action::Edit, &invoice, &context_now())
+            .bind(&session, &user, &Action::Edit, &context)
+            .check(&invoice)
             .await;
         assert!(
             !result.is_granted(),

@@ -1,16 +1,65 @@
-use crate::{BatchEvalCtx, CombineOp, EvalCtx, Policy, PolicyBatchItem, PolicyEvalResult};
+use crate::{
+    BatchEvalCtx, CombineOp, EvalCtx, Policy, PolicyBatchItem, PolicyDomain, PolicyEvalResult,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+fn arc_policy<D, P>(policy: P) -> Arc<dyn Policy<D>>
+where
+    D: PolicyDomain,
+    P: Policy<D> + 'static,
+{
+    Arc::new(policy)
+}
+
+/// Fluent combinator helpers for policies.
+pub trait PolicyExt<D>: Policy<D> + Sized + 'static
+where
+    D: PolicyDomain,
+{
+    /// Requires this policy and `other` to grant.
+    fn and<P>(self, other: P) -> AndPolicy<D>
+    where
+        P: Policy<D> + 'static,
+    {
+        AndPolicy {
+            policies: vec![arc_policy::<D, _>(self), arc_policy::<D, _>(other)],
+        }
+    }
+
+    /// Grants when this policy or `other` grants.
+    fn or<P>(self, other: P) -> OrPolicy<D>
+    where
+        P: Policy<D> + 'static,
+    {
+        OrPolicy {
+            policies: vec![arc_policy::<D, _>(self), arc_policy::<D, _>(other)],
+        }
+    }
+
+    /// Inverts this policy.
+    fn not(self) -> NotPolicy<D> {
+        NotPolicy {
+            policy: arc_policy::<D, _>(self),
+        }
+    }
+
+    /// Boxes this policy as a trait object.
+    fn boxed(self) -> Box<dyn Policy<D>> {
+        Box::new(self)
+    }
+}
+
+impl<D, P> PolicyExt<D> for P
+where
+    D: PolicyDomain,
+    P: Policy<D> + Sized + 'static,
+{
+}
+
 /// Combines multiple policies with logical AND semantics.
-///
-/// Access is granted only if every inner policy grants access. Evaluation
-/// short-circuits on the first non-grant. A [`PolicyEvalResult::Forbidden`]
-/// child is treated like a denial inside the combinator; deny-overrides vetoes
-/// are honored by [`crate::PermissionChecker`] when a forbidding policy is
-/// registered directly on the checker.
-pub struct AndPolicy<S, A, R, C> {
-    policies: Vec<Arc<dyn Policy<S, A, R, C>>>,
+pub struct AndPolicy<D: PolicyDomain> {
+    policies: Vec<Arc<dyn Policy<D>>>,
 }
 
 /// Error returned when no policies are provided to a combinator policy.
@@ -25,11 +74,9 @@ impl std::fmt::Display for EmptyPoliciesError {
 
 impl std::error::Error for EmptyPoliciesError {}
 
-impl<S, A, R, C> AndPolicy<S, A, R, C> {
+impl<D: PolicyDomain> AndPolicy<D> {
     /// Creates a new `AndPolicy` from a non-empty list of policies.
-    ///
-    /// Returns [`EmptyPoliciesError`] if `policies` is empty.
-    pub fn try_new(policies: Vec<Arc<dyn Policy<S, A, R, C>>>) -> Result<Self, EmptyPoliciesError> {
+    pub fn try_new(policies: Vec<Arc<dyn Policy<D>>>) -> Result<Self, EmptyPoliciesError> {
         if policies.is_empty() {
             Err(EmptyPoliciesError(
                 "AndPolicy must have at least one policy",
@@ -41,19 +88,12 @@ impl<S, A, R, C> AndPolicy<S, A, R, C> {
 }
 
 #[async_trait]
-impl<S, A, R, C> Policy<S, A, R, C> for AndPolicy<S, A, R, C>
-where
-    S: Sync + Send,
-    R: Sync + Send,
-    A: Sync + Send,
-    C: Sync + Send,
-{
-    // Override the default policy_type implementation
+impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("AndPolicy")
     }
 
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
@@ -69,7 +109,6 @@ where
             let is_granted = result.is_granted();
             children_results.push(result);
 
-            // Short-circuit on first denial
             if !is_granted {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
@@ -80,7 +119,6 @@ where
             }
         }
 
-        // All policies granted access
         PolicyEvalResult::Combined {
             policy_type: self.policy_type(),
             operation: CombineOp::And,
@@ -89,10 +127,7 @@ where
         }
     }
 
-    async fn evaluate_batch<'item>(
-        &self,
-        ctx: &BatchEvalCtx<'item, S, A, R, C>,
-    ) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
         let mut children_by_item = vec![Vec::new(); ctx.items.len()];
         let mut results = vec![None; ctx.items.len()];
         let mut pending = (0..ctx.items.len()).collect::<Vec<_>>();
@@ -106,13 +141,13 @@ where
                 .iter()
                 .map(|&index| PolicyBatchItem {
                     resource: ctx.items[index].resource,
-                    context: ctx.items[index].context,
                 })
                 .collect::<Vec<_>>();
             let batch_ctx = BatchEvalCtx {
                 session: ctx.session,
                 subject: ctx.subject,
                 action: ctx.action,
+                context: ctx.context,
                 items: &batch_items,
                 policy_type: policy.policy_type(),
             };
@@ -177,21 +212,13 @@ where
 }
 
 /// Combines multiple policies with logical OR semantics.
-///
-/// Access is granted if any inner policy grants access. Evaluation
-/// short-circuits on the first grant. A [`PolicyEvalResult::Forbidden`] child
-/// is treated like a denial inside the combinator; deny-overrides vetoes are
-/// honored by [`crate::PermissionChecker`] when a forbidding policy is
-/// registered directly on the checker.
-pub struct OrPolicy<S, A, R, C> {
-    policies: Vec<Arc<dyn Policy<S, A, R, C>>>,
+pub struct OrPolicy<D: PolicyDomain> {
+    policies: Vec<Arc<dyn Policy<D>>>,
 }
 
-impl<S, A, R, C> OrPolicy<S, A, R, C> {
+impl<D: PolicyDomain> OrPolicy<D> {
     /// Creates a new `OrPolicy` from a non-empty list of policies.
-    ///
-    /// Returns [`EmptyPoliciesError`] if `policies` is empty.
-    pub fn try_new(policies: Vec<Arc<dyn Policy<S, A, R, C>>>) -> Result<Self, EmptyPoliciesError> {
+    pub fn try_new(policies: Vec<Arc<dyn Policy<D>>>) -> Result<Self, EmptyPoliciesError> {
         if policies.is_empty() {
             Err(EmptyPoliciesError("OrPolicy must have at least one policy"))
         } else {
@@ -201,18 +228,12 @@ impl<S, A, R, C> OrPolicy<S, A, R, C> {
 }
 
 #[async_trait]
-impl<S, A, R, C> Policy<S, A, R, C> for OrPolicy<S, A, R, C>
-where
-    S: Sync + Send,
-    R: Sync + Send,
-    A: Sync + Send,
-    C: Sync + Send,
-{
-    // Override the default policy_type implementation
+impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("OrPolicy")
     }
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
+
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
@@ -228,7 +249,6 @@ where
             let is_granted = result.is_granted();
             children_results.push(result);
 
-            // Short-circuit on first success
             if is_granted {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
@@ -239,7 +259,6 @@ where
             }
         }
 
-        // All policies denied access
         PolicyEvalResult::Combined {
             policy_type: self.policy_type(),
             operation: CombineOp::Or,
@@ -248,10 +267,7 @@ where
         }
     }
 
-    async fn evaluate_batch<'item>(
-        &self,
-        ctx: &BatchEvalCtx<'item, S, A, R, C>,
-    ) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
         let mut children_by_item = vec![Vec::new(); ctx.items.len()];
         let mut results = vec![None; ctx.items.len()];
         let mut pending = (0..ctx.items.len()).collect::<Vec<_>>();
@@ -265,13 +281,13 @@ where
                 .iter()
                 .map(|&index| PolicyBatchItem {
                     resource: ctx.items[index].resource,
-                    context: ctx.items[index].context,
                 })
                 .collect::<Vec<_>>();
             let batch_ctx = BatchEvalCtx {
                 session: ctx.session,
                 subject: ctx.subject,
                 action: ctx.action,
+                context: ctx.context,
                 items: &batch_items,
                 policy_type: policy.policy_type(),
             };
@@ -336,24 +352,13 @@ where
 }
 
 /// Inverts the decision of an inner policy.
-///
-/// If the inner policy grants access, `NotPolicy` denies it; otherwise it
-/// grants. A [`PolicyEvalResult::Forbidden`] child is treated like any other
-/// non-grant inside the combinator. Use a flat [`crate::Effect::Forbid`] policy
-/// on [`crate::PermissionChecker`] when the intent is a global veto.
-pub struct NotPolicy<S, A, R, C> {
-    policy: Arc<dyn Policy<S, A, R, C>>,
+pub struct NotPolicy<D: PolicyDomain> {
+    policy: Arc<dyn Policy<D>>,
 }
 
-impl<S, A, R, C> NotPolicy<S, A, R, C>
-where
-    S: Sync,
-    R: Sync,
-    A: Sync,
-    C: Sync,
-{
+impl<D: PolicyDomain> NotPolicy<D> {
     /// Creates a new `NotPolicy` that inverts the given policy's decision.
-    pub fn new(policy: impl Policy<S, A, R, C> + 'static) -> Self {
+    pub fn new(policy: impl Policy<D> + 'static) -> Self {
         Self {
             policy: Arc::new(policy),
         }
@@ -361,19 +366,12 @@ where
 }
 
 #[async_trait]
-impl<S, A, R, C> Policy<S, A, R, C> for NotPolicy<S, A, R, C>
-where
-    S: Sync + Send,
-    R: Sync + Send,
-    A: Sync + Send,
-    C: Sync + Send,
-{
-    // Override the default policy_type implementation
+impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("NotPolicy")
     }
 
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let inner_ctx = EvalCtx {
             session: ctx.session,
             subject: ctx.subject,
@@ -386,26 +384,19 @@ where
         let is_granted = inner_result.is_granted();
 
         PolicyEvalResult::Combined {
-            policy_type: Policy::<S, A, R, C>::policy_type(self),
+            policy_type: Policy::<D>::policy_type(self),
             operation: CombineOp::Not,
             children: vec![inner_result],
             outcome: !is_granted,
         }
     }
 
-    async fn evaluate_batch<'item>(
-        &self,
-        ctx: &BatchEvalCtx<'item, S, A, R, C>,
-    ) -> Vec<PolicyEvalResult> {
-        // Rebuild the BatchEvalCtx with the inner policy's name so any
-        // result built via `ctx.grant`/`ctx.not_applicable` (or the default
-        // evaluate_batch impl, which forwards through per-item EvalCtx)
-        // is tagged with the wrapped policy, not "NotPolicy". Matches the
-        // single-item path and the AndPolicy/OrPolicy batch paths.
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
         let inner_ctx = BatchEvalCtx {
             session: ctx.session,
             subject: ctx.subject,
             action: ctx.action,
+            context: ctx.context,
             items: ctx.items,
             policy_type: self.policy.policy_type(),
         };

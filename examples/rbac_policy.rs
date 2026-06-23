@@ -40,6 +40,15 @@ struct Document {
 #[derive(Debug, Clone)]
 struct ReadAction;
 
+struct DocumentDomain;
+
+impl PolicyDomain for DocumentDomain {
+    type Subject = User;
+    type Action = ReadAction;
+    type Resource = Document;
+    type Context = ();
+}
+
 fn user<const N: usize>(name: &'static str, roles: [Role; N]) -> User {
     User {
         name,
@@ -59,12 +68,12 @@ async fn main() {
     // The first resolver reads the requirement off the resource/action; the
     // second extracts the subject's roles. The role type (`Role`) is inferred
     // from the closures' return types.
-    let rbac_policy = RbacPolicy::new(
+    let rbac_policy = RbacPolicy::<DocumentDomain, _, _>::new(
         |_action: &ReadAction, doc: &Document| doc.required_roles.iter().copied().collect(),
         |user: &User| user.roles.iter().copied().collect(),
     );
 
-    let mut checker = PermissionChecker::<User, ReadAction, Document, ()>::new();
+    let mut checker = PermissionChecker::<DocumentDomain>::new();
     checker.add_policy(rbac_policy);
 
     let admin = user("admin", [Role::Admin]);
@@ -88,10 +97,17 @@ async fn main() {
         (&no_roles, &shared_doc, false),
     ];
 
+    let session = EvaluationSession::empty();
+    let action = ReadAction;
+    let context = ();
+
     println!("{:<16} {:<16} verdict", "user", "document");
     println!("{}", "-".repeat(42));
     for (user, document, expected_granted) in cases {
-        let decision = checker.check(user, &ReadAction, document, &()).await;
+        let decision = checker
+            .bind(&session, user, &action, &context)
+            .check(document)
+            .await;
         println!(
             "{:<16} {:<16} {}",
             user.name,
@@ -111,6 +127,9 @@ async fn main() {
     // set or add a separate admin-override policy to the checker.
 
     println!("\nWhy the editor is denied the admin handbook:");
-    let decision = checker.check(&editor, &ReadAction, &admin_doc, &()).await;
+    let decision = checker
+        .bind(&session, &editor, &action, &context)
+        .check(&admin_doc)
+        .await;
     println!("{}", decision.display_trace());
 }

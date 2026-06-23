@@ -28,7 +28,9 @@
 //! cargo run --example deny_override
 //! ```
 
-use gatehouse::{AndPolicy, NotPolicy, PermissionChecker, Policy, PolicyBuilder};
+use gatehouse::{
+    AndPolicy, EvaluationSession, NotPolicy, PermissionChecker, Policy, PolicyBuilder, PolicyDomain,
+};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -56,18 +58,27 @@ struct Access;
 // No request-scoped facts here, so the context is the unit type. (`()` is the
 // idiomatic "no context" — reserve a context struct for data that genuinely
 // varies per request, as in the mfa_freshness_context example.)
-type DocPolicy = Box<dyn Policy<User, Access, Document, ()>>;
+struct DocumentDomain;
+
+impl PolicyDomain for DocumentDomain {
+    type Subject = User;
+    type Action = Access;
+    type Resource = Document;
+    type Context = ();
+}
+
+type DocPolicy = Box<dyn Policy<DocumentDomain>>;
 
 // ---- the allow set -------------------------------------------------
 
 fn admin_override() -> DocPolicy {
-    PolicyBuilder::<User, Access, Document, ()>::new("AdminOverride")
+    PolicyBuilder::<DocumentDomain>::new("AdminOverride")
         .subjects(|user| user.is_admin)
         .build()
 }
 
 fn document_owner() -> DocPolicy {
-    PolicyBuilder::<User, Access, Document, ()>::new("DocumentOwner")
+    PolicyBuilder::<DocumentDomain>::new("DocumentOwner")
         .when(|user, _action, document, _ctx| user.id == document.owner_id)
         .build()
 }
@@ -78,7 +89,7 @@ fn document_owner() -> DocPolicy {
 /// effect travels with the policy, so this reads exactly as it behaves —
 /// no inverted polarity, no special registration call.
 fn account_suspended() -> DocPolicy {
-    PolicyBuilder::<User, Access, Document, ()>::new("AccountSuspended")
+    PolicyBuilder::<DocumentDomain>::new("AccountSuspended")
         .subjects(|user| user.suspended)
         .forbid()
         .build()
@@ -87,13 +98,13 @@ fn account_suspended() -> DocPolicy {
 /// Legal hold: a frozen document is blocked for everyone, owner and admin
 /// included.
 fn legal_hold() -> DocPolicy {
-    PolicyBuilder::<User, Access, Document, ()>::new("LegalHold")
+    PolicyBuilder::<DocumentDomain>::new("LegalHold")
         .resources(|document| document.legal_hold)
         .forbid()
         .build()
 }
 
-fn document_checker() -> PermissionChecker<User, Access, Document, ()> {
+fn document_checker() -> PermissionChecker<DocumentDomain> {
     let mut checker = PermissionChecker::named("DocumentChecker");
     // Flat registration, any order: the deny policies' effect is declared
     // on the policies themselves, and the checker evaluates forbid-effect
@@ -141,6 +152,9 @@ async fn main() {
     };
 
     let checker = document_checker();
+    let session = EvaluationSession::empty();
+    let action = Access;
+    let context = ();
 
     // (subject, resource, label)
     let cases = [
@@ -154,7 +168,10 @@ async fn main() {
     println!("{:<32} {:>10} forbidden by", "case", "decision");
     println!("{}", "-".repeat(60));
     for (subject, document, label) in cases {
-        let decision = checker.check(subject, &Access, document, &()).await;
+        let decision = checker
+            .bind(&session, subject, &action, &context)
+            .check(document)
+            .await;
         println!(
             "{label:<32} {:>10} {}",
             verdict(decision.is_granted()),
@@ -164,27 +181,34 @@ async fn main() {
 
     // The grants still work where nothing blocks them.
     checker
-        .check(&admin, &Access, &normal_doc, &())
+        .bind(&session, &admin, &action, &context)
+        .check(&normal_doc)
         .await
         .assert_granted_by("AdminOverride");
     checker
-        .check(&owner, &Access, &normal_doc, &())
+        .bind(&session, &owner, &action, &context)
+        .check(&normal_doc)
         .await
         .assert_granted_by("DocumentOwner");
 
     // The block rules override every grant — even the admin override.
     checker
-        .check(&admin, &Access, &held_doc, &())
+        .bind(&session, &admin, &action, &context)
+        .check(&held_doc)
         .await
         .assert_forbidden_by("LegalHold");
     checker
-        .check(&suspended_owner, &Access, &normal_doc, &())
+        .bind(&session, &suspended_owner, &action, &context)
+        .check(&normal_doc)
         .await
         .assert_forbidden_by("AccountSuspended");
 
     // Default deny is untouched: no grant, no access — and no forbid
     // either, which `forbidden_by()` distinguishes for the caller.
-    let stranger_decision = checker.check(&stranger, &Access, &normal_doc, &()).await;
+    let stranger_decision = checker
+        .bind(&session, &stranger, &action, &context)
+        .check(&normal_doc)
+        .await;
     stranger_decision.assert_denied();
     assert_eq!(stranger_decision.forbidden_by(), None);
 
@@ -192,7 +216,10 @@ async fn main() {
     // evaluated first and ends the evaluation; the allow set is never
     // consulted.
     println!("\nWhy 'admin, LEGAL-HOLD doc' is blocked:");
-    let decision = checker.check(&admin, &Access, &held_doc, &()).await;
+    let decision = checker
+        .bind(&session, &admin, &action, &context)
+        .check(&held_doc)
+        .await;
     println!("{}", decision.display_trace());
 
     scoped_exclusion_demo().await;
@@ -216,11 +243,20 @@ async fn scoped_exclusion_demo() {
     #[derive(Debug, Clone)]
     struct Thread;
 
-    let owner_policy = PolicyBuilder::<Member, Access, Thread, ()>::new("ThreadOwner")
+    struct ThreadDomain;
+
+    impl PolicyDomain for ThreadDomain {
+        type Subject = Member;
+        type Action = Access;
+        type Resource = Thread;
+        type Context = ();
+    }
+
+    let owner_policy = PolicyBuilder::<ThreadDomain>::new("ThreadOwner")
         .subjects(|member| member.is_owner)
         .build();
-    let collaborator_policy: Arc<dyn Policy<Member, Access, Thread, ()>> = Arc::from(
-        PolicyBuilder::<Member, Access, Thread, ()>::new("Collaborator")
+    let collaborator_policy: Arc<dyn Policy<ThreadDomain>> = Arc::from(
+        PolicyBuilder::<ThreadDomain>::new("Collaborator")
             .subjects(|member| member.is_collaborator)
             .build(),
     );
@@ -229,17 +265,17 @@ async fn scoped_exclusion_demo() {
     // checker-level rules above, where `Effect::Forbid` keeps natural
     // polarity — this inversion is the price of scoping, which is why a
     // global block should prefer `Effect::Forbid`.
-    let muted = PolicyBuilder::<Member, Access, Thread, ()>::new("Muted")
+    let muted = PolicyBuilder::<ThreadDomain>::new("Muted")
         .subjects(|member| member.muted)
         .build();
 
     let collaborator_unless_muted = AndPolicy::try_new(vec![
         collaborator_policy,
-        Arc::new(NotPolicy::new(muted)) as Arc<dyn Policy<Member, Access, Thread, ()>>,
+        Arc::new(NotPolicy::new(muted)) as Arc<dyn Policy<ThreadDomain>>,
     ])
     .expect("gate has the grant arm and the guard");
 
-    let mut checker = PermissionChecker::named("ThreadChecker");
+    let mut checker = PermissionChecker::<ThreadDomain>::named("ThreadChecker");
     checker.add_policy(owner_policy);
     checker.add_policy(collaborator_unless_muted);
 
@@ -254,15 +290,21 @@ async fn scoped_exclusion_demo() {
         muted: true,
     };
 
+    let session = EvaluationSession::empty();
+    let action = Access;
+    let context = ();
+
     // The mute only gates the collaborator path...
     checker
-        .check(&muted_collaborator, &Access, &Thread, &())
+        .bind(&session, &muted_collaborator, &action, &context)
+        .check(&Thread)
         .await
         .assert_denied();
     // ...the owner path is untouched, which a global Effect::Forbid mute
     // could not express.
     checker
-        .check(&muted_owner, &Access, &Thread, &())
+        .bind(&session, &muted_owner, &action, &context)
+        .check(&Thread)
         .await
         .assert_granted_by("ThreadOwner");
 

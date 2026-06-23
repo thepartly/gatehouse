@@ -40,7 +40,7 @@
 use async_trait::async_trait;
 use gatehouse::{
     EvalCtx, EvaluationSession, FactKey, FactLoadResult, FactRegistry, FactSource,
-    PermissionChecker, Policy, PolicyEvalResult,
+    PermissionChecker, Policy, PolicyDomain, PolicyEvalResult,
 };
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,6 +70,15 @@ struct Invoice {
 
 #[derive(Debug, Clone)]
 struct ViewAction;
+
+struct SupplierInvoiceDomain;
+
+impl PolicyDomain for SupplierInvoiceDomain {
+    type Subject = Supplier;
+    type Action = ViewAction;
+    type Resource = Invoice;
+    type Context = ();
+}
 
 // ---- backend service the policy needs to consult ------------------
 
@@ -119,11 +128,8 @@ struct WrongSupplierPolicy {
 }
 
 #[async_trait]
-impl Policy<Supplier, ViewAction, Invoice, ()> for WrongSupplierPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Supplier, ViewAction, Invoice, ()>,
-    ) -> PolicyEvalResult {
+impl Policy<SupplierInvoiceDomain> for WrongSupplierPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, SupplierInvoiceDomain>) -> PolicyEvalResult {
         // N+1: every item in a batch re-asks the hierarchy for the
         // same org -> customer mapping.
         let resolved = self.hierarchy.resolve_customer(ctx.subject.org_id).await;
@@ -187,11 +193,8 @@ impl FactSource<CustomerForOrg> for CustomerForOrgSource {
 struct RightSupplierPolicy;
 
 #[async_trait]
-impl Policy<Supplier, ViewAction, Invoice, ()> for RightSupplierPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Supplier, ViewAction, Invoice, ()>,
-    ) -> PolicyEvalResult {
+impl Policy<SupplierInvoiceDomain> for RightSupplierPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, SupplierInvoiceDomain>) -> PolicyEvalResult {
         // Ask the session, not the backend service directly. The
         // first call inside this request triggers `load_many`; every
         // subsequent call with the same key (e.g. another invoice in
@@ -232,7 +235,7 @@ async fn main() {
         .collect();
 
     // ---- WRONG ----
-    let mut wrong_checker = PermissionChecker::<Supplier, ViewAction, Invoice, ()>::new();
+    let mut wrong_checker = PermissionChecker::<SupplierInvoiceDomain>::new();
     wrong_checker.add_policy(WrongSupplierPolicy {
         hierarchy: Arc::clone(&hierarchy),
     });
@@ -240,17 +243,8 @@ async fn main() {
     hierarchy.reset();
     let session = EvaluationSession::empty();
     let visible = wrong_checker
-        .filter_authorized_in_session(
-            &session,
-            &supplier,
-            &ViewAction,
-            invoices
-                .clone()
-                .into_iter()
-                .map(|invoice| (invoice, ()))
-                .collect::<Vec<_>>(),
-            |(invoice, context)| (invoice, context),
-        )
+        .bind(&session, &supplier, &ViewAction, &())
+        .filter(invoices.clone())
         .await;
     let wrong_calls = hierarchy.calls();
     println!(
@@ -268,7 +262,7 @@ async fn main() {
     assert_eq!(visible.len(), 25);
 
     // ---- RIGHT ----
-    let mut right_checker = PermissionChecker::<Supplier, ViewAction, Invoice, ()>::new();
+    let mut right_checker = PermissionChecker::<SupplierInvoiceDomain>::new();
     right_checker.add_policy(RightSupplierPolicy);
 
     hierarchy.reset();
@@ -281,16 +275,8 @@ async fn main() {
         .build()
         .session();
     let visible = right_checker
-        .filter_authorized_in_session(
-            &session,
-            &supplier,
-            &ViewAction,
-            invoices
-                .into_iter()
-                .map(|invoice| (invoice, ()))
-                .collect::<Vec<_>>(),
-            |(invoice, context)| (invoice, context),
-        )
+        .bind(&session, &supplier, &ViewAction, &())
+        .filter(invoices)
         .await;
     let right_calls = hierarchy.calls();
     let batch_calls = load_many_calls.load(Ordering::SeqCst);

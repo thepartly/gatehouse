@@ -49,11 +49,20 @@ impl AdminAction {
     }
 }
 
+struct AdminDomain;
+
+impl PolicyDomain for AdminDomain {
+    type Subject = StaffUser;
+    type Action = AdminAction;
+    type Resource = Organization;
+    type Context = ();
+}
+
 /// Grants when the user holds the scope the action requires *on this
 /// organization*. The predicate reads three axes (subject, action, resource),
 /// which is exactly the cross-axis case `.when()` exists for.
-fn scoped_permission_policy() -> Box<dyn Policy<StaffUser, AdminAction, Organization, ()>> {
-    PolicyBuilder::new("ScopedPermission")
+fn scoped_permission_policy() -> Box<dyn Policy<AdminDomain>> {
+    PolicyBuilder::<AdminDomain>::new("ScopedPermission")
         .when(
             |user: &StaffUser, action: &AdminAction, org: &Organization, _ctx: &()| {
                 user.permissions
@@ -66,15 +75,15 @@ fn scoped_permission_policy() -> Box<dyn Policy<StaffUser, AdminAction, Organiza
 
 /// Grants on a single axis — the subject — so it uses `.subjects()` rather
 /// than `.when()`: single-axis predicates batch better and read clearer.
-fn global_admin_policy() -> Box<dyn Policy<StaffUser, AdminAction, Organization, ()>> {
-    PolicyBuilder::new("GlobalAdmin")
+fn global_admin_policy() -> Box<dyn Policy<AdminDomain>> {
+    PolicyBuilder::<AdminDomain>::new("GlobalAdmin")
         .subjects(|user: &StaffUser| user.permissions.iter().any(|p| p.scope == "global_admin"))
         .build()
 }
 
 #[tokio::main]
 async fn main() {
-    let mut checker = PermissionChecker::<StaffUser, AdminAction, Organization, ()>::new();
+    let mut checker = PermissionChecker::<AdminDomain>::new();
     checker.add_policy(scoped_permission_policy());
     checker.add_policy(global_admin_policy());
 
@@ -121,7 +130,8 @@ async fn main() {
     ];
 
     for (user, action, org, expected_granted) in cases {
-        let decision = checker.check(user, &action, org, &()).await;
+        let session = EvaluationSession::empty();
+        let decision = checker.bind(&session, user, &action, &()).check(org).await;
         println!(
             "{:<12} {:?} on {}: {}",
             user.name,
@@ -139,8 +149,10 @@ async fn main() {
     // The trace names the policy that decided; for a denial it shows every
     // policy that was consulted and why each said no.
     println!("\nWhy org2-admin cannot edit user settings on org-1:");
+    let session = EvaluationSession::empty();
     let decision = checker
-        .check(&org2_admin, &AdminAction::EditUserSettings, &org1, &())
+        .bind(&session, &org2_admin, &AdminAction::EditUserSettings, &())
+        .check(&org1)
         .await;
     println!("{}", decision.display_trace());
 }

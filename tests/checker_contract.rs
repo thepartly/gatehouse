@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use gatehouse::{
     AccessEvaluation, AndPolicy, BatchEvalCtx, DelegatingPolicy, Effect, EvalCtx,
     EvaluationSession, FactLoadResult, FactSource, NotPolicy, OrPolicy, PermissionChecker, Policy,
-    PolicyBatchItem, PolicyBuilder, PolicyEvalResult, RebacPolicy, RelationshipQuery,
+    PolicyBatchItem, PolicyBuilder, PolicyDomain, PolicyEvalResult, RebacPolicy, RelationshipQuery,
 };
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -24,6 +24,63 @@ struct Resource {
     id: u8,
 }
 
+struct Domain;
+
+impl PolicyDomain for Domain {
+    type Subject = Subject;
+    type Action = Action;
+    type Resource = Resource;
+    type Context = Ctx;
+}
+
+struct UnitContextDomain;
+
+impl PolicyDomain for UnitContextDomain {
+    type Subject = Subject;
+    type Action = Action;
+    type Resource = Resource;
+    type Context = ();
+}
+
+fn bind<'a>(
+    checker: &'a PermissionChecker<Domain>,
+    session: &'a EvaluationSession,
+) -> gatehouse::BoundEvaluator<'a, Domain> {
+    checker.bind(session, &Subject, &Action, &Ctx)
+}
+
+async fn check_resource(
+    checker: &PermissionChecker<Domain>,
+    session: &EvaluationSession,
+    resource: &Resource,
+) -> AccessEvaluation {
+    bind(checker, session).check(resource).await
+}
+
+async fn evaluate_resources<I>(
+    checker: &PermissionChecker<Domain>,
+    session: &EvaluationSession,
+    resources: I,
+) -> Vec<(I::Item, AccessEvaluation)>
+where
+    I: IntoIterator,
+    I::Item: std::borrow::Borrow<Resource>,
+{
+    bind(checker, session).evaluate(resources).await
+}
+
+async fn filter_resources<I>(
+    checker: &PermissionChecker<Domain>,
+    session: &EvaluationSession,
+    resources: I,
+) -> Vec<I::Item>
+where
+    I: IntoIterator,
+    I::Item: std::borrow::Borrow<Resource>,
+{
+    bind(checker, session).filter(resources).await
+}
+
 struct BatchGrantPolicy {
     name: &'static str,
     batch_calls: Arc<AtomicUsize>,
@@ -33,18 +90,15 @@ struct BatchGrantPolicy {
 }
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for BatchGrantPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
-    ) -> PolicyEvalResult {
+impl Policy<Domain> for BatchGrantPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
         self.single_calls.fetch_add(1, Ordering::SeqCst);
         self.result_for(ctx.resource.id)
     }
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, Subject, Action, Resource, Ctx>,
+        ctx: &BatchEvalCtx<'item, Domain>,
     ) -> Vec<PolicyEvalResult> {
         self.batch_calls.fetch_add(1, Ordering::SeqCst);
         self.seen_batches.lock().unwrap().push(
@@ -82,17 +136,14 @@ struct RandomStackPolicy {
 }
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for RandomStackPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
-    ) -> PolicyEvalResult {
+impl Policy<Domain> for RandomStackPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
         self.result_for(ctx.resource.id)
     }
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, Subject, Action, Resource, Ctx>,
+        ctx: &BatchEvalCtx<'item, Domain>,
     ) -> Vec<PolicyEvalResult> {
         ctx.items
             .iter()
@@ -132,18 +183,15 @@ struct NeverConsultedPolicy {
 }
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for NeverConsultedPolicy {
-    async fn evaluate(
-        &self,
-        _ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
-    ) -> PolicyEvalResult {
+impl Policy<Domain> for NeverConsultedPolicy {
+    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
         PolicyEvalResult::not_applicable(self.policy_type().to_string(), "single called")
     }
 
     async fn evaluate_batch<'item>(
         &self,
-        _ctx: &BatchEvalCtx<'item, Subject, Action, Resource, Ctx>,
+        _ctx: &BatchEvalCtx<'item, Domain>,
     ) -> Vec<PolicyEvalResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Vec::new()
@@ -163,15 +211,7 @@ async fn empty_batch_returns_empty_and_does_not_consult_policies() {
     });
 
     let session = EvaluationSession::empty();
-    let results = checker
-        .evaluate_batch_in_session(
-            &session,
-            &Subject,
-            &Action,
-            Vec::<(Resource, Ctx)>::new(),
-            |item| (&item.0, &item.1),
-        )
-        .await;
+    let results = evaluate_resources(&checker, &session, Vec::<Resource>::new()).await;
 
     assert!(results.is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -188,16 +228,10 @@ async fn single_item_batch_matches_single_evaluation() {
         grant: Arc::new(|resource_id| resource_id % 2 == 0),
     });
     let session = EvaluationSession::empty();
-    let item = (Resource { id: 4 }, Ctx);
+    let item = Resource { id: 4 };
 
-    let single = checker
-        .evaluate_in_session(&session, &Subject, &Action, &item.0, &item.1)
-        .await
-        .is_granted();
-    let batch = checker
-        .evaluate_batch_in_session(&session, &Subject, &Action, vec![item], |item| {
-            (&item.0, &item.1)
-        })
+    let single = check_resource(&checker, &session, &item).await.is_granted();
+    let batch = evaluate_resources(&checker, &session, vec![item])
         .await
         .into_iter()
         .map(|(_item, evaluation)| evaluation.is_granted())
@@ -208,22 +242,21 @@ async fn single_item_batch_matches_single_evaluation() {
 
 #[tokio::test]
 async fn resource_batch_uses_unit_context() {
-    let mut checker = PermissionChecker::<Subject, Action, Resource, ()>::new();
+    let mut checker = PermissionChecker::<UnitContextDomain>::new();
     checker.add_policy(
-        PolicyBuilder::<Subject, Action, Resource, ()>::new("even-resource")
+        PolicyBuilder::<UnitContextDomain>::new("even-resource")
             .resources(|resource: &Resource| resource.id % 2 == 0)
             .build(),
     );
 
     let session = EvaluationSession::empty();
-    let results = checker
-        .evaluate_batch_in_session(
-            &session,
-            &Subject,
-            &Action,
-            vec![Resource { id: 1 }, Resource { id: 2 }, Resource { id: 3 }],
-            |resource| (resource, &()),
-        )
+    let bound = checker.bind(&session, &Subject, &Action, &());
+    let results = bound
+        .evaluate(vec![
+            Resource { id: 1 },
+            Resource { id: 2 },
+            Resource { id: 3 },
+        ])
         .await;
 
     let decisions = results
@@ -232,14 +265,12 @@ async fn resource_batch_uses_unit_context() {
         .collect::<Vec<_>>();
     assert_eq!(decisions, vec![(1, false), (2, true), (3, false)]);
 
-    let visible = checker
-        .filter_authorized_in_session(
-            &session,
-            &Subject,
-            &Action,
-            vec![Resource { id: 1 }, Resource { id: 2 }, Resource { id: 3 }],
-            |resource| (resource, &()),
-        )
+    let visible = bound
+        .filter(vec![
+            Resource { id: 1 },
+            Resource { id: 2 },
+            Resource { id: 3 },
+        ])
         .await;
     assert_eq!(
         visible
@@ -273,30 +304,23 @@ async fn delegating_policy_preserves_child_batch_evaluation() {
         |_subject: &Subject, _action: &Action, resource: &Resource, _context: &Ctx| Resource {
             id: resource.id + 1,
         },
-        |_subject: &Subject, _action: &Action, _resource: &Resource, _context: &Ctx| Ctx,
+        |_subject: &Subject, _action: &Action, _context: &Ctx| Ctx,
     );
 
     let mut checker = PermissionChecker::new();
     checker.add_policy(delegating_policy);
 
     let session = EvaluationSession::empty();
-    let results = checker
-        .evaluate_batch_in_session(
-            &session,
-            &Subject,
-            &Action,
-            vec![
-                (Resource { id: 0 }, Ctx),
-                (Resource { id: 1 }, Ctx),
-                (Resource { id: 2 }, Ctx),
-            ],
-            |(resource, context)| (resource, context),
-        )
-        .await;
+    let results = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 0 }, Resource { id: 1 }, Resource { id: 2 }],
+    )
+    .await;
 
     let decisions = results
         .iter()
-        .map(|((resource, _context), evaluation)| (resource.id, evaluation.is_granted()))
+        .map(|(resource, evaluation)| (resource.id, evaluation.is_granted()))
         .collect::<Vec<_>>();
     assert_eq!(decisions, vec![(0, false), (1, true), (2, false)]);
     assert_eq!(child_batch_calls.load(Ordering::SeqCst), 1);
@@ -338,13 +362,9 @@ async fn or_batch_does_not_re_evaluate_items_granted_by_earlier_policy() {
         grant: Arc::new(|_| true),
     });
 
-    let items = (0..6).map(|id| (Resource { id }, Ctx)).collect::<Vec<_>>();
+    let items = (0..6).map(|id| Resource { id }).collect::<Vec<_>>();
     let session = EvaluationSession::empty();
-    let results = checker
-        .evaluate_batch_in_session(&session, &Subject, &Action, items, |item| {
-            (&item.0, &item.1)
-        })
-        .await;
+    let results = evaluate_resources(&checker, &session, items).await;
 
     assert!(results
         .iter()
@@ -359,7 +379,7 @@ async fn or_batch_does_not_re_evaluate_items_granted_by_earlier_policy() {
 async fn boxed_dyn_policy_dispatches_evaluate_batch_override() {
     let batch_calls = Arc::new(AtomicUsize::new(0));
     let single_calls = Arc::new(AtomicUsize::new(0));
-    let boxed: Box<dyn Policy<Subject, Action, Resource, Ctx>> = Box::new(BatchGrantPolicy {
+    let boxed: Box<dyn Policy<Domain>> = Box::new(BatchGrantPolicy {
         name: "boxed",
         batch_calls: Arc::clone(&batch_calls),
         single_calls: Arc::clone(&single_calls),
@@ -367,10 +387,10 @@ async fn boxed_dyn_policy_dispatches_evaluate_batch_override() {
         grant: Arc::new(|resource_id| resource_id == 1),
     });
     let session = EvaluationSession::empty();
-    let owned_items = [(Resource { id: 1 }, Ctx), (Resource { id: 2 }, Ctx)];
+    let owned_items = [Resource { id: 1 }, Resource { id: 2 }];
     let batch_items = owned_items
         .iter()
-        .map(|(resource, context)| PolicyBatchItem { resource, context })
+        .map(|resource| PolicyBatchItem { resource })
         .collect::<Vec<_>>();
 
     let results = boxed
@@ -378,6 +398,7 @@ async fn boxed_dyn_policy_dispatches_evaluate_batch_override() {
             session: &session,
             subject: &Subject,
             action: &Action,
+            context: &Ctx,
             items: &batch_items,
             policy_type: boxed.policy_type(),
         })
@@ -412,23 +433,19 @@ async fn batch_decisions_match_naive_loop_for_simple_policy_stack() {
         grant: Arc::new(|resource_id| resource_id > 4),
     });
 
-    let items = (0..10).map(|id| (Resource { id }, Ctx)).collect::<Vec<_>>();
+    let items = (0..10).map(|id| Resource { id }).collect::<Vec<_>>();
     let session = EvaluationSession::empty();
-    let batch = checker
-        .evaluate_batch_in_session(&session, &Subject, &Action, items.clone(), |item| {
-            (&item.0, &item.1)
-        })
+    let batch = evaluate_resources(&checker, &session, items.clone())
         .await
         .into_iter()
         .map(|(_item, evaluation)| evaluation.is_granted())
         .collect::<Vec<_>>();
 
     let mut naive = Vec::new();
-    for (resource, context) in &items {
+    for resource in &items {
         let session = EvaluationSession::empty();
         naive.push(
-            checker
-                .evaluate_in_session(&session, &Subject, &Action, resource, context)
+            check_resource(&checker, &session, resource)
                 .await
                 .is_granted(),
         );
@@ -453,23 +470,11 @@ async fn batch_decisions_match_naive_loop_for_empty_and_mixed_items() {
     });
 
     let session = EvaluationSession::empty();
-    let empty = checker
-        .evaluate_batch_in_session(
-            &session,
-            &Subject,
-            &Action,
-            Vec::<(Resource, Ctx)>::new(),
-            |item| (&item.0, &item.1),
-        )
-        .await;
+    let empty = evaluate_resources(&checker, &session, Vec::<Resource>::new()).await;
     assert!(empty.is_empty());
 
-    let items = vec![(Resource { id: 1 }, Ctx), (Resource { id: 2 }, Ctx)];
-    let batch = checker
-        .evaluate_batch_in_session(&session, &Subject, &Action, items, |item| {
-            (&item.0, &item.1)
-        })
-        .await;
+    let items = vec![Resource { id: 1 }, Resource { id: 2 }];
+    let batch = evaluate_resources(&checker, &session, items).await;
     assert_granted(&batch[0].1, true);
     assert_granted(&batch[1].1, false);
 }
@@ -500,21 +505,13 @@ proptest! {
             });
         }
 
-        let subject = Subject;
-        let action = Action;
         let items = resource_ids
             .iter()
             .copied()
-            .map(|id| (Resource { id }, Ctx))
+            .map(|id| Resource { id })
             .collect::<Vec<_>>();
         let batch_session = EvaluationSession::empty();
-        let batch = tokio_test::block_on(checker.evaluate_batch_in_session(
-            &batch_session,
-            &subject,
-            &action,
-            items.clone(),
-            |item| (&item.0, &item.1),
-        ))
+        let batch = tokio_test::block_on(evaluate_resources(&checker, &batch_session, items.clone()))
         .into_iter()
         .map(|(_item, evaluation)| {
             (
@@ -525,15 +522,9 @@ proptest! {
         .collect::<Vec<_>>();
 
         let mut naive = Vec::new();
-        for (resource, context) in &items {
+        for resource in &items {
             let session = EvaluationSession::empty();
-            let evaluation = tokio_test::block_on(checker.evaluate_in_session(
-                &session,
-                &subject,
-                &action,
-                resource,
-                context,
-            ));
+            let evaluation = tokio_test::block_on(check_resource(&checker, &session, resource));
             naive.push((
                 evaluation.is_granted(),
                 evaluation.forbidden_by().map(str::to_owned),
@@ -557,6 +548,15 @@ struct MixedResource {
 
 struct MixedAction;
 struct MixedCtx;
+
+struct MixedDomain;
+
+impl PolicyDomain for MixedDomain {
+    type Subject = MixedSubject;
+    type Action = MixedAction;
+    type Resource = MixedResource;
+    type Context = MixedCtx;
+}
 
 type MixedRelationshipQuery = RelationshipQuery<u8, u8, &'static str>;
 type MixedRelationshipCalls = Arc<Mutex<Vec<Vec<MixedRelationshipQuery>>>>;
@@ -592,45 +592,35 @@ async fn mixed_policy_stack_uses_in_memory_policy_and_rebac_session() {
         .build()
         .session();
 
-    let mut checker = PermissionChecker::new();
+    let mut checker = PermissionChecker::<MixedDomain>::new();
     checker.add_policy(
-        PolicyBuilder::<MixedSubject, MixedAction, MixedResource, MixedCtx>::new("PublicResource")
+        PolicyBuilder::<MixedDomain>::new("PublicResource")
             .resources(|resource| resource.public)
             .build(),
     );
-    checker.add_policy(RebacPolicy::new(
+    checker.add_policy(RebacPolicy::<MixedDomain, u8, u8, &'static str>::new(
         |subject: &MixedSubject| subject.id,
         |resource: &MixedResource| resource.id,
         "viewer",
     ));
 
     let items = vec![
-        (
-            MixedResource {
-                id: 1,
-                public: true,
-            },
-            MixedCtx,
-        ),
-        (
-            MixedResource {
-                id: 2,
-                public: false,
-            },
-            MixedCtx,
-        ),
-        (
-            MixedResource {
-                id: 3,
-                public: false,
-            },
-            MixedCtx,
-        ),
+        MixedResource {
+            id: 1,
+            public: true,
+        },
+        MixedResource {
+            id: 2,
+            public: false,
+        },
+        MixedResource {
+            id: 3,
+            public: false,
+        },
     ];
     let results = checker
-        .evaluate_batch_in_session(&session, &subject, &MixedAction, items, |item| {
-            (&item.0, &item.1)
-        })
+        .bind(&session, &subject, &MixedAction, &MixedCtx)
+        .evaluate(items)
         .await;
 
     assert_granted(&results[0].1, true);
@@ -655,12 +645,12 @@ async fn mixed_policy_stack_uses_in_memory_policy_and_rebac_session() {
 
 // ---- deny-overrides semantics -------------------------------------
 
-fn allow_everything(name: &str) -> Box<dyn Policy<Subject, Action, Resource, Ctx>> {
-    PolicyBuilder::<Subject, Action, Resource, Ctx>::new(name.to_string()).build()
+fn allow_everything(name: &str) -> Box<dyn Policy<Domain>> {
+    PolicyBuilder::<Domain>::new(name.to_string()).build()
 }
 
-fn forbid_odd_resources(name: &str) -> Box<dyn Policy<Subject, Action, Resource, Ctx>> {
-    PolicyBuilder::<Subject, Action, Resource, Ctx>::new(name.to_string())
+fn forbid_odd_resources(name: &str) -> Box<dyn Policy<Domain>> {
+    PolicyBuilder::<Domain>::new(name.to_string())
         .resources(|resource: &Resource| resource.id % 2 == 1)
         .forbid()
         .build()
@@ -675,16 +665,12 @@ async fn batch_forbid_overrides_grants_regardless_of_registration_order() {
     checker.add_policy(forbid_odd_resources("OddBlock"));
 
     let session = EvaluationSession::empty();
-    let items = (0..4).map(|id| (Resource { id }, Ctx)).collect::<Vec<_>>();
-    let results = checker
-        .evaluate_batch_in_session(&session, &Subject, &Action, items, |item| {
-            (&item.0, &item.1)
-        })
-        .await;
+    let items = (0..4).map(|id| Resource { id }).collect::<Vec<_>>();
+    let results = evaluate_resources(&checker, &session, items).await;
 
     let decisions = results
         .iter()
-        .map(|((resource, _ctx), evaluation)| {
+        .map(|(resource, evaluation)| {
             (
                 resource.id,
                 evaluation.is_granted(),
@@ -704,19 +690,16 @@ async fn batch_forbid_overrides_grants_regardless_of_registration_order() {
 
     // The filter convenience (and therefore the lookup pipeline built on
     // it) honors the forbid identically.
-    let visible = checker
-        .filter_authorized_in_session(
-            &session,
-            &Subject,
-            &Action,
-            (0..4).map(|id| (Resource { id }, Ctx)).collect::<Vec<_>>(),
-            |(resource, context)| (resource, context),
-        )
-        .await;
+    let visible = filter_resources(
+        &checker,
+        &session,
+        (0..4).map(|id| Resource { id }).collect::<Vec<_>>(),
+    )
+    .await;
     assert_eq!(
         visible
             .iter()
-            .map(|(resource, _context)| resource.id)
+            .map(|resource| resource.id)
             .collect::<Vec<_>>(),
         vec![0, 2]
     );
@@ -730,17 +713,8 @@ async fn single_and_batch_forbid_decisions_agree() {
 
     let session = EvaluationSession::empty();
     for id in 0..4 {
-        let single = checker
-            .evaluate_in_session(&session, &Subject, &Action, &Resource { id }, &Ctx)
-            .await;
-        let batch = checker
-            .evaluate_batch_in_session(
-                &session,
-                &Subject,
-                &Action,
-                vec![(Resource { id }, Ctx)],
-                |item| (&item.0, &item.1),
-            )
+        let single = check_resource(&checker, &session, &Resource { id }).await;
+        let batch = evaluate_resources(&checker, &session, vec![Resource { id }])
             .await
             .remove(0)
             .1;
@@ -765,9 +739,7 @@ async fn forbid_inside_combinators_acts_as_plain_denial() {
     .unwrap();
     let mut or_checker = PermissionChecker::new();
     or_checker.add_policy(or_gate);
-    let or_result = or_checker
-        .evaluate_in_session(&session, &Subject, &Action, &blocked, &Ctx)
-        .await;
+    let or_result = check_resource(&or_checker, &session, &blocked).await;
     assert!(or_result.is_granted());
     assert_eq!(or_result.forbidden_by(), None);
 
@@ -780,9 +752,7 @@ async fn forbid_inside_combinators_acts_as_plain_denial() {
     .unwrap();
     let mut and_checker = PermissionChecker::new();
     and_checker.add_policy(and_gate);
-    let and_result = and_checker
-        .evaluate_in_session(&session, &Subject, &Action, &blocked, &Ctx)
-        .await;
+    let and_result = check_resource(&and_checker, &session, &blocked).await;
     assert!(!and_result.is_granted());
     assert_eq!(and_result.forbidden_by(), None);
 
@@ -791,9 +761,7 @@ async fn forbid_inside_combinators_acts_as_plain_denial() {
     // NOT.
     let mut not_checker = PermissionChecker::new();
     not_checker.add_policy(NotPolicy::new(forbid_odd_resources("OddBlock")));
-    let not_result = not_checker
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 0 }, &Ctx)
-        .await;
+    let not_result = check_resource(&not_checker, &session, &Resource { id: 0 }).await;
     assert!(
         not_result.is_granted(),
         "NOT(non-matching deny) is granted, as for any non-granting child"
@@ -802,9 +770,8 @@ async fn forbid_inside_combinators_acts_as_plain_denial() {
 
 /// Identity-mapped delegating policy whose child checker grants everything
 /// except odd resource ids, which it forbids.
-fn delegating_forbid_policy(
-) -> DelegatingPolicy<Subject, Action, Resource, Ctx, Subject, Action, Resource, Ctx> {
-    let mut child: PermissionChecker<Subject, Action, Resource, Ctx> = PermissionChecker::new();
+fn delegating_forbid_policy() -> DelegatingPolicy<Domain, Domain> {
+    let mut child: PermissionChecker<Domain> = PermissionChecker::new();
     child.add_policy(allow_everything("ChildAllow"));
     child.add_policy(forbid_odd_resources("ChildBlock"));
     DelegatingPolicy::new(
@@ -815,7 +782,7 @@ fn delegating_forbid_policy(
         |_subject: &Subject, _action: &Action, resource: &Resource, _ctx: &Ctx| Resource {
             id: resource.id,
         },
-        |_subject: &Subject, _action: &Action, _resource: &Resource, _ctx: &Ctx| Ctx,
+        |_subject: &Subject, _action: &Action, _ctx: &Ctx| Ctx,
     )
 }
 
@@ -829,9 +796,7 @@ async fn delegated_child_forbid_is_scoped_to_the_child_checker() {
     parent.add_policy(allow_everything("ParentAllow"));
 
     let session = EvaluationSession::empty();
-    let result = parent
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 1 }, &Ctx)
-        .await;
+    let result = check_resource(&parent, &session, &Resource { id: 1 }).await;
 
     // The child checker forbids id 1, so the delegate denies — but the
     // veto does not propagate: the parent's own allow still grants.
@@ -841,9 +806,7 @@ async fn delegated_child_forbid_is_scoped_to_the_child_checker() {
     // denial, not a parent-level forbid.
     let mut parent_without_allow = PermissionChecker::new();
     parent_without_allow.add_policy(delegating_forbid_policy());
-    let denied = parent_without_allow
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 1 }, &Ctx)
-        .await;
+    let denied = check_resource(&parent_without_allow, &session, &Resource { id: 1 }).await;
     assert!(!denied.is_granted());
     assert_eq!(denied.forbidden_by(), None);
 }
@@ -853,11 +816,8 @@ async fn delegated_child_forbid_is_scoped_to_the_child_checker() {
 struct SuspendedSubjectPolicy;
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for SuspendedSubjectPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
-    ) -> PolicyEvalResult {
+impl Policy<Domain> for SuspendedSubjectPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
         if ctx.resource.id == 1 {
             ctx.forbid("resource 1 is frozen")
         } else {
@@ -881,27 +841,20 @@ async fn custom_policy_forbid_via_ctx_forbid_is_honored() {
     checker.add_policy(SuspendedSubjectPolicy);
 
     let session = EvaluationSession::empty();
-    let blocked = checker
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 1 }, &Ctx)
-        .await;
+    let blocked = check_resource(&checker, &session, &Resource { id: 1 }).await;
     blocked.assert_forbidden_by("SuspendedSubjectPolicy");
 
-    let granted = checker
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 0 }, &Ctx)
-        .await;
+    let granted = check_resource(&checker, &session, &Resource { id: 0 }).await;
     granted.assert_granted_by("AllowAll");
 
     // Default evaluate_batch forwards to evaluate, so the batch path
     // observes the same forbids.
-    let results = checker
-        .evaluate_batch_in_session(
-            &session,
-            &Subject,
-            &Action,
-            vec![(Resource { id: 0 }, Ctx), (Resource { id: 1 }, Ctx)],
-            |item| (&item.0, &item.1),
-        )
-        .await;
+    let results = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 0 }, Resource { id: 1 }],
+    )
+    .await;
     assert!(results[0].1.is_granted());
     assert_eq!(results[1].1.forbidden_by(), Some("SuspendedSubjectPolicy"));
 }
@@ -911,11 +864,8 @@ async fn custom_policy_forbid_via_ctx_forbid_is_honored() {
 struct MisbehavingForbidPolicy;
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for MisbehavingForbidPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
-    ) -> PolicyEvalResult {
+impl Policy<Domain> for MisbehavingForbidPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
         ctx.grant("grant from a forbid-effect policy")
     }
 
@@ -934,29 +884,17 @@ async fn grant_from_forbid_declared_policy_is_treated_as_not_applicable() {
     let mut checker = PermissionChecker::new();
     checker.add_policy(MisbehavingForbidPolicy);
     let session = EvaluationSession::empty();
-    let alone = checker
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 0 }, &Ctx)
-        .await;
+    let alone = check_resource(&checker, &session, &Resource { id: 0 }).await;
     assert!(!alone.is_granted());
     assert_eq!(alone.forbidden_by(), None);
 
     // Alongside a real allow policy, the sibling grant still decides.
     checker.add_policy(allow_everything("AllowAll"));
-    let with_allow = checker
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 0 }, &Ctx)
-        .await;
+    let with_allow = check_resource(&checker, &session, &Resource { id: 0 }).await;
     with_allow.assert_granted_by("AllowAll");
 
     // Same fail-closed handling on the batch path.
-    let batch = checker
-        .evaluate_batch_in_session(
-            &session,
-            &Subject,
-            &Action,
-            vec![(Resource { id: 0 }, Ctx)],
-            |item| (&item.0, &item.1),
-        )
-        .await;
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }]).await;
     assert!(batch[0].1.is_granted());
 }
 
@@ -967,11 +905,8 @@ async fn grant_from_forbid_declared_policy_is_treated_as_not_applicable() {
 struct UndeclaredForbidPolicy;
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for UndeclaredForbidPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
-    ) -> PolicyEvalResult {
+impl Policy<Domain> for UndeclaredForbidPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
         ctx.forbid("forbid without declaring Effect::Forbid")
     }
 
@@ -988,9 +923,7 @@ async fn undeclared_forbid_is_honored_when_observed_but_not_scheduled_first() {
     let mut forbid_first = PermissionChecker::new();
     forbid_first.add_policy(UndeclaredForbidPolicy);
     forbid_first.add_policy(allow_everything("AllowAll"));
-    let blocked = forbid_first
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 0 }, &Ctx)
-        .await;
+    let blocked = check_resource(&forbid_first, &session, &Resource { id: 0 }).await;
     blocked.assert_forbidden_by("UndeclaredForbidPolicy");
 
     // Grant short-circuits first: the undeclared forbid is never reached.
@@ -999,9 +932,7 @@ async fn undeclared_forbid_is_honored_when_observed_but_not_scheduled_first() {
     let mut grant_first = PermissionChecker::new();
     grant_first.add_policy(allow_everything("AllowAll"));
     grant_first.add_policy(UndeclaredForbidPolicy);
-    let granted = grant_first
-        .evaluate_in_session(&session, &Subject, &Action, &Resource { id: 0 }, &Ctx)
-        .await;
+    let granted = check_resource(&grant_first, &session, &Resource { id: 0 }).await;
     granted.assert_granted_by("AllowAll");
 }
 
@@ -1011,17 +942,14 @@ async fn undeclared_forbid_is_honored_when_observed_but_not_scheduled_first() {
 struct WrongLengthForbidPolicy;
 
 #[async_trait]
-impl Policy<Subject, Action, Resource, Ctx> for WrongLengthForbidPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
-    ) -> PolicyEvalResult {
+impl Policy<Domain> for WrongLengthForbidPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
         ctx.not_applicable("not applicable")
     }
 
     async fn evaluate_batch<'item>(
         &self,
-        _ctx: &BatchEvalCtx<'item, Subject, Action, Resource, Ctx>,
+        _ctx: &BatchEvalCtx<'item, Domain>,
     ) -> Vec<PolicyEvalResult> {
         Vec::new()
     }
@@ -1042,15 +970,12 @@ async fn wrong_length_batch_from_forbid_policy_fails_closed() {
     checker.add_policy(WrongLengthForbidPolicy);
 
     let session = EvaluationSession::empty();
-    let results = checker
-        .evaluate_batch_in_session(
-            &session,
-            &Subject,
-            &Action,
-            vec![(Resource { id: 0 }, Ctx), (Resource { id: 1 }, Ctx)],
-            |item| (&item.0, &item.1),
-        )
-        .await;
+    let results = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 0 }, Resource { id: 1 }],
+    )
+    .await;
 
     for (_item, evaluation) in &results {
         assert!(

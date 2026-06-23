@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 use dashmap::DashSet;
 use gatehouse::{
-    EvaluationSession, FactLoadResult, FactRegistry, FactSource, PermissionChecker, RebacPolicy,
-    RelationshipQuery,
+    EvaluationSession, FactLoadResult, FactRegistry, FactSource, PermissionChecker, PolicyDomain,
+    RebacPolicy, RelationshipQuery,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -30,6 +30,15 @@ struct Document {
 
 #[derive(Debug, Clone)]
 struct View;
+
+struct DocumentDomain;
+
+impl PolicyDomain for DocumentDomain {
+    type Subject = User;
+    type Action = View;
+    type Resource = Document;
+    type Context = ();
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Relation {
@@ -74,9 +83,9 @@ fn request_session(registry: &FactRegistry) -> EvaluationSession {
     registry.session()
 }
 
-fn build_checker() -> PermissionChecker<User, View, Document, ()> {
+fn build_checker() -> PermissionChecker<DocumentDomain> {
     let mut checker = PermissionChecker::new();
-    checker.add_policy(RebacPolicy::new(
+    checker.add_policy(RebacPolicy::<DocumentDomain, Uuid, Uuid, Relation>::new(
         |user: &User| user.id,
         |document: &Document| document.id,
         Relation::Viewer,
@@ -119,23 +128,14 @@ async fn main() {
 
     let first_request = request_session(&registry);
     let visible = checker
-        .filter_authorized_in_session(
-            &first_request,
-            &user,
-            &View,
-            documents
-                .clone()
-                .into_iter()
-                .map(|document| (document, context))
-                .collect::<Vec<_>>(),
-            |(document, context)| (document, context),
-        )
+        .bind(&first_request, &user, &View, &context)
+        .filter(documents.clone())
         .await;
     println!(
         "batch list — visible documents: {:?}",
         visible
             .iter()
-            .map(|(document, _context)| document.title)
+            .map(|document| document.title)
             .collect::<Vec<_>>()
     );
 
@@ -143,7 +143,8 @@ async fn main() {
     // relationship on the finance plan, so this denies.
     let second_request = request_session(&registry);
     let can_view_finance = checker
-        .evaluate_in_session(&second_request, &user, &View, &documents[2], &context)
+        .bind(&second_request, &user, &View, &context)
+        .check(&documents[2])
         .await;
     println!(
         "single check — can view '{}'? {}",
@@ -167,16 +168,8 @@ async fn main() {
                 let session = request_session(&registry);
                 let context = ();
                 checker
-                    .filter_authorized_in_session(
-                        &session,
-                        &user,
-                        &View,
-                        documents
-                            .into_iter()
-                            .map(|document| (document, context))
-                            .collect::<Vec<_>>(),
-                        |(document, context)| (document, context),
-                    )
+                    .bind(&session, &user, &View, &context)
+                    .filter(documents)
                     .await
                     .len()
             })

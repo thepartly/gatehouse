@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use gatehouse::{
     EvaluationSession, FactLoadError, FactLoadResult, FactRegistry, FactSource, PermissionChecker,
-    PolicyBuilder, RebacPolicy, RelationshipQuery,
+    PolicyBuilder, PolicyDomain, RebacPolicy, RelationshipQuery,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -34,6 +34,15 @@ struct Post {
 }
 
 struct View;
+
+struct PostDomain;
+
+impl PolicyDomain for PostDomain {
+    type Subject = User;
+    type Action = View;
+    type Resource = Post;
+    type Context = ();
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Relation {
@@ -138,11 +147,11 @@ async fn assert_point_and_bulk_agree(source: &PgRelationshipSource, keys: &[Rela
     }
 }
 
-fn build_checker() -> PermissionChecker<User, View, Post, ()> {
-    let public_posts = PolicyBuilder::<User, View, Post, ()>::new("PublicPost")
+fn build_checker() -> PermissionChecker<PostDomain> {
+    let public_posts = PolicyBuilder::<PostDomain>::new("PublicPost")
         .resources(|post| post.public)
         .build();
-    let viewer_relationship = RebacPolicy::new(
+    let viewer_relationship = RebacPolicy::<PostDomain, Uuid, Uuid, Relation>::new(
         |user: &User| user.id,
         |post: &Post| post.id,
         Relation::Viewer,
@@ -309,7 +318,8 @@ async fn main() {
             for post in &sample {
                 let session = session_with(&source);
                 if checker
-                    .evaluate_in_session(&session, &subject, &View, post, &())
+                    .bind(&session, &subject, &View, &())
+                    .check(post)
                     .await
                     .is_granted()
                 {
@@ -323,17 +333,8 @@ async fn main() {
         let bulk = measure(|| async {
             let session = session_with(&source);
             checker
-                .filter_authorized_in_session(
-                    &session,
-                    &subject,
-                    &View,
-                    sample
-                        .clone()
-                        .into_iter()
-                        .map(|post| (post, ()))
-                        .collect::<Vec<_>>(),
-                    |(post, context)| (post, context),
-                )
+                .bind(&session, &subject, &View, &())
+                .filter(sample.clone())
                 .await
                 .len()
         })

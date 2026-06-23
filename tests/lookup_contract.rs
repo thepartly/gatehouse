@@ -1,5 +1,5 @@
 //! Contract tests for the [`LookupSource`] / [`Hydrator`] /
-//! `PermissionChecker::lookup_authorized*` pipeline.
+//! `BoundEvaluator::lookup_page` pipeline.
 //!
 //! These tests pin down the protocol agreed in #24: the source enumerates
 //! a candidate superset, the hydrator resolves IDs to resources (with
@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use gatehouse::{
     EvalCtx, EvaluationSession, Hydrator, LookupAuthorizedError, LookupPage, LookupSource,
-    PermissionChecker, Policy, PolicyEvalResult,
+    PermissionChecker, Policy, PolicyDomain, PolicyEvalResult,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -43,6 +43,15 @@ struct ReadAction;
 #[derive(Clone, Debug)]
 struct Ctx;
 
+struct AuthDomain;
+
+impl PolicyDomain for AuthDomain {
+    type Subject = User;
+    type Action = ReadAction;
+    type Resource = Doc;
+    type Context = Ctx;
+}
+
 // --- Policies ----------------------------------------------------------
 
 /// Grants when the user is a designated owner of the doc id. Models a
@@ -52,8 +61,8 @@ struct OwnerPolicy {
 }
 
 #[async_trait]
-impl Policy<User, ReadAction, Doc, Ctx> for OwnerPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, User, ReadAction, Doc, Ctx>) -> PolicyEvalResult {
+impl Policy<AuthDomain> for OwnerPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, AuthDomain>) -> PolicyEvalResult {
         match self.owns.get(&ctx.resource.id) {
             Some(owner) if *owner == ctx.subject.id => PolicyEvalResult::granted(
                 self.policy_type().to_string(),
@@ -79,8 +88,8 @@ impl Policy<User, ReadAction, Doc, Ctx> for OwnerPolicy {
 struct PublicDocPolicy;
 
 #[async_trait]
-impl Policy<User, ReadAction, Doc, Ctx> for PublicDocPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, User, ReadAction, Doc, Ctx>) -> PolicyEvalResult {
+impl Policy<AuthDomain> for PublicDocPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, AuthDomain>) -> PolicyEvalResult {
         if ctx.resource.public {
             PolicyEvalResult::granted(self.policy_type().to_string(), Some("public doc".into()))
         } else {
@@ -111,10 +120,7 @@ impl fmt::Display for OwnerLookupError {
 impl std::error::Error for OwnerLookupError {}
 
 #[async_trait]
-impl LookupSource for OwnerLookup {
-    type Subject = User;
-    type Action = ReadAction;
-    type Context = Ctx;
+impl LookupSource<AuthDomain> for OwnerLookup {
     type Id = u32;
     type Error = OwnerLookupError;
 
@@ -193,7 +199,7 @@ impl Hydrator<u32> for CatalogHydrator {
 // --- Helpers -----------------------------------------------------------
 
 async fn run_collected(
-    checker: &PermissionChecker<User, ReadAction, Doc, Ctx>,
+    checker: &PermissionChecker<AuthDomain>,
     subject: &User,
     lookup: &OwnerLookup,
     hydrator: &impl Hydrator<u32, Resource = Doc, Error = HydrateError>,
@@ -201,19 +207,11 @@ async fn run_collected(
     let session = EvaluationSession::empty();
     let mut cursor = None;
     let mut authorized = Vec::new();
+    let bound = checker.bind(&session, subject, &ReadAction, &Ctx);
 
     loop {
-        let page = checker
-            .lookup_authorized_page(
-                &session,
-                subject,
-                &ReadAction,
-                &Ctx,
-                lookup,
-                cursor.as_deref(),
-                page_size(),
-                hydrator,
-            )
+        let page = bound
+            .lookup_page(lookup, hydrator, cursor.as_deref(), page_size())
             .await?;
         authorized.extend(page.resources);
         match page.next_cursor {
@@ -224,43 +222,35 @@ async fn run_collected(
 }
 
 async fn run_collected_with<L>(
-    checker: &PermissionChecker<User, ReadAction, Doc, Ctx>,
+    checker: &PermissionChecker<AuthDomain>,
     subject: &User,
     lookup: &L,
     hydrator: &impl Hydrator<u32, Resource = Doc, Error = HydrateError>,
 ) -> Result<Vec<Doc>, LookupAuthorizedError<L::Error, HydrateError>>
 where
-    L: LookupSource<Subject = User, Action = ReadAction, Context = Ctx, Id = u32>,
+    L: LookupSource<AuthDomain, Id = u32>,
 {
     run_collected_with_page_size(checker, subject, lookup, page_size(), hydrator).await
 }
 
 async fn run_collected_with_page_size<L>(
-    checker: &PermissionChecker<User, ReadAction, Doc, Ctx>,
+    checker: &PermissionChecker<AuthDomain>,
     subject: &User,
     lookup: &L,
     limit: NonZeroUsize,
     hydrator: &impl Hydrator<u32, Resource = Doc, Error = HydrateError>,
 ) -> Result<Vec<Doc>, LookupAuthorizedError<L::Error, HydrateError>>
 where
-    L: LookupSource<Subject = User, Action = ReadAction, Context = Ctx, Id = u32>,
+    L: LookupSource<AuthDomain, Id = u32>,
 {
     let session = EvaluationSession::empty();
     let mut cursor = None;
     let mut authorized = Vec::new();
+    let bound = checker.bind(&session, subject, &ReadAction, &Ctx);
 
     loop {
-        let page = checker
-            .lookup_authorized_page(
-                &session,
-                subject,
-                &ReadAction,
-                &Ctx,
-                lookup,
-                cursor.as_deref(),
-                limit,
-                hydrator,
-            )
+        let page = bound
+            .lookup_page(lookup, hydrator, cursor.as_deref(), limit)
             .await?;
         authorized.extend(page.resources);
         match page.next_cursor {
@@ -278,7 +268,7 @@ async fn empty_page_yields_empty_authorized() {
         per_user: HashMap::new(),
         calls: AtomicUsize::new(0),
     };
-    let mut checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let mut checker = PermissionChecker::<AuthDomain>::new();
     checker.add_policy(OwnerPolicy {
         owns: HashMap::new(),
     });
@@ -311,7 +301,7 @@ async fn paginates_until_exhausted() {
             )
         })
         .collect();
-    let mut checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let mut checker = PermissionChecker::<AuthDomain>::new();
     checker.add_policy(OwnerPolicy {
         owns: ids.iter().map(|id| (*id, 1)).collect(),
     });
@@ -329,10 +319,7 @@ async fn paginates_until_exhausted() {
 async fn cursor_stuck_is_detected() {
     struct Stuck;
     #[async_trait]
-    impl LookupSource for Stuck {
-        type Subject = User;
-        type Action = ReadAction;
-        type Context = Ctx;
+    impl LookupSource<AuthDomain> for Stuck {
         type Id = u32;
         type Error = OwnerLookupError;
 
@@ -351,7 +338,7 @@ async fn cursor_stuck_is_detected() {
             })
         }
     }
-    let checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let checker = PermissionChecker::<AuthDomain>::new();
     let hydrate = CatalogHydrator::new(HashMap::new());
 
     let result = run_collected_with(&checker, &User { id: 1 }, &Stuck, &hydrate).await;
@@ -363,17 +350,14 @@ async fn cursor_stuck_is_detected() {
 
 #[tokio::test]
 async fn page_mode_cursor_stuck_is_detected() {
-    // A streaming caller drives `lookup_authorized_page` directly. The
+    // A streaming caller drives `lookup_page` directly. The
     // source echoes the input cursor back as `next_cursor`, so any
     // "loop until next_cursor is None" caller would spin forever. The
     // page primitive must catch this on the very first call after the
     // initial advance, not leave detection to the collecting helper.
     struct Echo;
     #[async_trait]
-    impl LookupSource for Echo {
-        type Subject = User;
-        type Action = ReadAction;
-        type Context = Ctx;
+    impl LookupSource<AuthDomain> for Echo {
         type Id = u32;
         type Error = OwnerLookupError;
 
@@ -394,23 +378,16 @@ async fn page_mode_cursor_stuck_is_detected() {
         }
     }
 
-    let checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let checker = PermissionChecker::<AuthDomain>::new();
     let hydrate = CatalogHydrator::new(HashMap::new());
     let session = EvaluationSession::empty();
     let limit = page_size();
+    let user = User { id: 1 };
+    let bound = checker.bind(&session, &user, &ReadAction, &Ctx);
 
     // First call: cursor None, source returns Some("x") -> legitimate advance.
-    let first = checker
-        .lookup_authorized_page(
-            &session,
-            &User { id: 1 },
-            &ReadAction,
-            &Ctx,
-            &Echo,
-            None,
-            limit,
-            &hydrate,
-        )
+    let first = bound
+        .lookup_page(&Echo, &hydrate, None, limit)
         .await
         .expect("first page legitimately advances");
     let cursor = first
@@ -418,17 +395,8 @@ async fn page_mode_cursor_stuck_is_detected() {
         .expect("first call must yield next_cursor");
 
     // Second call: cursor Some("x"), source echoes Some("x") -> stuck.
-    let second = checker
-        .lookup_authorized_page(
-            &session,
-            &User { id: 1 },
-            &ReadAction,
-            &Ctx,
-            &Echo,
-            Some(&cursor),
-            limit,
-            &hydrate,
-        )
+    let second = bound
+        .lookup_page(&Echo, &hydrate, Some(&cursor), limit)
         .await;
     match second {
         Err(LookupAuthorizedError::LookupCursorStuck) => {}
@@ -470,7 +438,7 @@ async fn duplicate_ids_across_pages_are_preserved() {
             },
         ),
     ]);
-    let mut checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let mut checker = PermissionChecker::<AuthDomain>::new();
     checker.add_policy(OwnerPolicy {
         owns: HashMap::from([(10, 1), (11, 1), (12, 1)]),
     });
@@ -517,7 +485,7 @@ async fn hydration_misses_are_silently_skipped() {
             },
         ),
     ]);
-    let mut checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let mut checker = PermissionChecker::<AuthDomain>::new();
     checker.add_policy(OwnerPolicy {
         owns: ids.iter().map(|id| (*id, 1)).collect(),
     });
@@ -534,10 +502,7 @@ async fn hydration_misses_are_silently_skipped() {
 async fn lookup_error_propagates_as_lookup_variant() {
     struct Boom;
     #[async_trait]
-    impl LookupSource for Boom {
-        type Subject = User;
-        type Action = ReadAction;
-        type Context = Ctx;
+    impl LookupSource<AuthDomain> for Boom {
         type Id = u32;
         type Error = OwnerLookupError;
         async fn lookup_page(
@@ -551,7 +516,7 @@ async fn lookup_error_propagates_as_lookup_variant() {
             Err(OwnerLookupError("backend down"))
         }
     }
-    let checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let checker = PermissionChecker::<AuthDomain>::new();
     let hydrate = CatalogHydrator::new(HashMap::new());
 
     let result = run_collected_with(&checker, &User { id: 1 }, &Boom, &hydrate).await;
@@ -567,7 +532,7 @@ async fn hydrator_error_propagates_as_hydrate_variant() {
         per_user: HashMap::from([(1, vec![7u32])]),
         calls: AtomicUsize::new(0),
     };
-    let mut checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let mut checker = PermissionChecker::<AuthDomain>::new();
     checker.add_policy(OwnerPolicy {
         owns: HashMap::from([(7, 1)]),
     });
@@ -589,7 +554,7 @@ async fn hydrator_length_mismatch_is_contract_violation() {
         per_user: HashMap::from([(1, vec![1u32, 2, 3])]),
         calls: AtomicUsize::new(0),
     };
-    let mut checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let mut checker = PermissionChecker::<AuthDomain>::new();
     checker.add_policy(OwnerPolicy {
         owns: HashMap::from([(1, 1), (2, 1), (3, 1)]),
     });
@@ -627,7 +592,7 @@ async fn composition_with_non_lookup_policy_extends_authorized_set() {
     // source did *not* enumerate. That is exactly the "incomplete result"
     // failure mode the trait docs warn about.
     //
-    // We assert the *consumer-visible* behavior: lookup_authorized returns
+    // We assert the *consumer-visible* behavior: lookup_page returns
     // only what its source enumerated (correctly authorized through the
     // full policy stack). A point check against a public doc the source
     // omitted still grants — proving the policy is alive in the checker,
@@ -658,7 +623,7 @@ async fn composition_with_non_lookup_policy_extends_authorized_set() {
         ), // also public; lookup also catches it
         (99, public_doc_outside_lookup.clone()),
     ]);
-    let mut checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let mut checker = PermissionChecker::<AuthDomain>::new();
     checker.add_policy(OwnerPolicy {
         owns: HashMap::from([(10, 1), (11, 1)]),
     });
@@ -677,14 +642,10 @@ async fn composition_with_non_lookup_policy_extends_authorized_set() {
     // The non-lookup policy is still alive in the checker: a point check
     // grants the public doc that the source did NOT enumerate.
     let session = EvaluationSession::empty();
+    let user = User { id: 1 };
     let direct = checker
-        .evaluate_in_session(
-            &session,
-            &User { id: 1 },
-            &ReadAction,
-            &public_doc_outside_lookup,
-            &Ctx,
-        )
+        .bind(&session, &user, &ReadAction, &Ctx)
+        .check(&public_doc_outside_lookup)
         .await;
     assert!(
         direct.is_granted(),
@@ -694,7 +655,7 @@ async fn composition_with_non_lookup_policy_extends_authorized_set() {
 
 #[tokio::test]
 async fn page_oriented_api_lets_caller_stream() {
-    // Demonstrates that callers can drive lookup_authorized_page in their
+    // Demonstrates that callers can drive lookup_page in their
     // own loop, observing per-candidate-page boundaries. Pre-empts a
     // pager regression.
     let ids: Vec<u32> = (1..=5).collect();
@@ -714,28 +675,21 @@ async fn page_oriented_api_lets_caller_stream() {
             )
         })
         .collect();
-    let mut checker = PermissionChecker::<User, ReadAction, Doc, Ctx>::new();
+    let mut checker = PermissionChecker::<AuthDomain>::new();
     checker.add_policy(OwnerPolicy {
         owns: ids.iter().map(|id| (*id, 1)).collect(),
     });
     let hydrate = CatalogHydrator::new(catalog);
     let session = EvaluationSession::empty();
     let page_size = NonZeroUsize::new(2).unwrap();
+    let user = User { id: 1 };
+    let bound = checker.bind(&session, &user, &ReadAction, &Ctx);
 
     let mut cursor: Option<Vec<u8>> = None;
     let pages = Arc::new(Mutex::new(Vec::new()));
     loop {
-        let page = checker
-            .lookup_authorized_page(
-                &session,
-                &User { id: 1 },
-                &ReadAction,
-                &Ctx,
-                &lookup,
-                cursor.as_deref(),
-                page_size,
-                &hydrate,
-            )
+        let page = bound
+            .lookup_page(&lookup, &hydrate, cursor.as_deref(), page_size)
             .await
             .expect("ok");
         pages
