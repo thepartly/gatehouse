@@ -1,7 +1,7 @@
 //! # Role-Based Access Control Policy Example
 //!
 //! The built-in `RbacPolicy` takes two resolver closures: which roles the
-//! (resource, action) pair requires, and which roles the subject holds.
+//! (action, resource) pair requires, and which roles the subject holds.
 //! Access is granted when at least one required role is held.
 //!
 //! The role identifier type is generic — this example uses a domain enum so
@@ -60,11 +60,11 @@ async fn main() {
     // second extracts the subject's roles. The role type (`Role`) is inferred
     // from the closures' return types.
     let rbac_policy = RbacPolicy::new(
-        |doc: &Document, _action: &ReadAction| doc.required_roles.iter().copied().collect(),
+        |_action: &ReadAction, doc: &Document| doc.required_roles.iter().copied().collect(),
         |user: &User| user.roles.iter().copied().collect(),
     );
 
-    let mut checker = PermissionChecker::<User, Document, ReadAction, ()>::new();
+    let mut checker = PermissionChecker::<User, ReadAction, Document, ()>::new();
     checker.add_policy(rbac_policy);
 
     let admin = user("admin", [Role::Admin]);

@@ -1,6 +1,6 @@
 //! Lookup-style authorization with an in-memory backend.
 //!
-//! Demonstrates `PermissionChecker::lookup_authorized*` against an in-RAM
+//! Demonstrates `PermissionChecker::lookup_authorized_page` against an in-RAM
 //! `LookupSource` and a `Hydrator`, composed with a non-lookup policy
 //! (admin override) — the production shape #24 was scoped to enable.
 //!
@@ -49,12 +49,12 @@ struct View;
 struct AdminPolicy;
 
 #[async_trait]
-impl Policy<User, Document, View, ()> for AdminPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, View, ()>) -> PolicyEvalResult {
+impl Policy<User, View, Document, ()> for AdminPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, User, View, Document, ()>) -> PolicyEvalResult {
         if ctx.subject.is_admin {
             ctx.grant("admin override")
         } else {
-            ctx.deny("not admin")
+            ctx.not_applicable("not admin")
         }
     }
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -69,8 +69,8 @@ struct ViewerPolicy {
 }
 
 #[async_trait]
-impl Policy<User, Document, View, ()> for ViewerPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, View, ()>) -> PolicyEvalResult {
+impl Policy<User, View, Document, ()> for ViewerPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, User, View, Document, ()>) -> PolicyEvalResult {
         let granted = self
             .viewers
             .get(&ctx.resource.id)
@@ -79,7 +79,7 @@ impl Policy<User, Document, View, ()> for ViewerPolicy {
         if granted {
             ctx.grant("viewer relation")
         } else {
-            ctx.deny("no viewer relation")
+            ctx.not_applicable("no viewer relation")
         }
     }
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -111,12 +111,16 @@ impl std::error::Error for ViewerLookupError {}
 #[async_trait]
 impl LookupSource for InMemoryViewerLookup {
     type Subject = User;
+    type Action = View;
+    type Context = ();
     type Id = Uuid;
     type Error = ViewerLookupError;
 
     async fn lookup_page(
         &self,
         subject: &User,
+        _action: &View,
+        _context: &(),
         cursor: Option<&[u8]>,
         limit: NonZeroUsize,
     ) -> Result<LookupPage<Uuid>, ViewerLookupError> {
@@ -146,6 +150,40 @@ impl LookupSource for InMemoryViewerLookup {
             ids: all[offset..end].to_vec(),
             next_cursor,
         })
+    }
+}
+
+async fn collect_authorized<H>(
+    checker: &PermissionChecker<User, View, Document, ()>,
+    session: &EvaluationSession,
+    subject: &User,
+    lookup: &InMemoryViewerLookup,
+    page_size: NonZeroUsize,
+    hydrator: &H,
+) -> Result<Vec<Document>, gatehouse::LookupAuthorizedError<ViewerLookupError, H::Error>>
+where
+    H: gatehouse::Hydrator<Uuid, Resource = Document>,
+{
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut authorized = Vec::new();
+    loop {
+        let page = checker
+            .lookup_authorized_page(
+                session,
+                subject,
+                &View,
+                &(),
+                lookup,
+                cursor.as_deref(),
+                page_size,
+                hydrator,
+            )
+            .await?;
+        authorized.extend(page.resources);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(authorized),
+        }
     }
 }
 
@@ -211,18 +249,18 @@ async fn main() {
     // Compose policies: admin override OR viewer relation. The lookup
     // source only enumerates the viewer axis — admin overrides apply only
     // to point checks.
-    let mut checker = PermissionChecker::<User, Document, View, ()>::new();
+    let mut checker = PermissionChecker::<User, View, Document, ()>::new();
     checker.add_policy(AdminPolicy);
     checker.add_policy(ViewerPolicy { viewers });
 
     let session = EvaluationSession::empty();
     let page_size = NonZeroUsize::new(2).unwrap();
 
-    // (1) Alice lists her visible documents via lookup_authorized.
-    let alice_visible = checker
-        .lookup_authorized(&session, &alice, &View, &(), &lookup, page_size, &hydrator)
-        .await
-        .expect("lookup ok");
+    // (1) Alice lists her visible documents by collecting lookup pages.
+    let alice_visible =
+        collect_authorized(&checker, &session, &alice, &lookup, page_size, &hydrator)
+            .await
+            .expect("lookup ok");
     println!("Alice sees {} document(s):", alice_visible.len());
     for doc in &alice_visible {
         println!("  - {} ({})", doc.title, doc.id);
@@ -240,10 +278,10 @@ async fn main() {
     // "everything an admin can see", the production code would either
     // route admin requests to a different source or simply skip the
     // lookup path and list directly.
-    let admin_via_lookup = checker
-        .lookup_authorized(&session, &admin, &View, &(), &lookup, page_size, &hydrator)
-        .await
-        .expect("lookup ok");
+    let admin_via_lookup =
+        collect_authorized(&checker, &session, &admin, &lookup, page_size, &hydrator)
+            .await
+            .expect("lookup ok");
     println!(
         "\nAdmin via the viewer-lookup sees {} document(s) — this is bounded \
          by what the source enumerates; admin grants still apply at point checks.",
@@ -301,7 +339,7 @@ async fn main() {
         }
     }
     // 3 candidate ids paged 2-at-a-time: two candidate pages, same total as
-    // the collecting `lookup_authorized` call above.
+    // the helper loop above.
     assert_eq!(page_index, 2);
     assert_eq!(streamed_total, viewer_doc_ids.len());
 }

@@ -9,8 +9,8 @@ use std::sync::Arc;
 /// child is treated like a denial inside the combinator; deny-overrides vetoes
 /// are honored by [`crate::PermissionChecker`] when a forbidding policy is
 /// registered directly on the checker.
-pub struct AndPolicy<S, R, A, C> {
-    policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
+pub struct AndPolicy<S, A, R, C> {
+    policies: Vec<Arc<dyn Policy<S, A, R, C>>>,
 }
 
 /// Error returned when no policies are provided to a combinator policy.
@@ -25,11 +25,11 @@ impl std::fmt::Display for EmptyPoliciesError {
 
 impl std::error::Error for EmptyPoliciesError {}
 
-impl<S, R, A, C> AndPolicy<S, R, A, C> {
+impl<S, A, R, C> AndPolicy<S, A, R, C> {
     /// Creates a new `AndPolicy` from a non-empty list of policies.
     ///
     /// Returns [`EmptyPoliciesError`] if `policies` is empty.
-    pub fn try_new(policies: Vec<Arc<dyn Policy<S, R, A, C>>>) -> Result<Self, EmptyPoliciesError> {
+    pub fn try_new(policies: Vec<Arc<dyn Policy<S, A, R, C>>>) -> Result<Self, EmptyPoliciesError> {
         if policies.is_empty() {
             Err(EmptyPoliciesError(
                 "AndPolicy must have at least one policy",
@@ -41,7 +41,7 @@ impl<S, R, A, C> AndPolicy<S, R, A, C> {
 }
 
 #[async_trait]
-impl<S, R, A, C> Policy<S, R, A, C> for AndPolicy<S, R, A, C>
+impl<S, A, R, C> Policy<S, A, R, C> for AndPolicy<S, A, R, C>
 where
     S: Sync + Send,
     R: Sync + Send,
@@ -53,7 +53,7 @@ where
         std::borrow::Cow::Borrowed("AndPolicy")
     }
 
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
@@ -91,7 +91,7 @@ where
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+        ctx: &BatchEvalCtx<'item, S, A, R, C>,
     ) -> Vec<PolicyEvalResult> {
         let mut children_by_item = vec![Vec::new(); ctx.items.len()];
         let mut results = vec![None; ctx.items.len()];
@@ -120,7 +120,7 @@ where
 
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
-                    children_by_item[index].push(PolicyEvalResult::denied(
+                    children_by_item[index].push(PolicyEvalResult::not_applicable(
                         policy.policy_type(),
                         "Policy batch result count did not match input count",
                     ));
@@ -166,7 +166,10 @@ where
             .into_iter()
             .map(|result| {
                 result.unwrap_or_else(|| {
-                    PolicyEvalResult::denied(self.policy_type(), "Batch item was not evaluated")
+                    PolicyEvalResult::not_applicable(
+                        self.policy_type(),
+                        "Batch item was not evaluated",
+                    )
                 })
             })
             .collect()
@@ -180,15 +183,15 @@ where
 /// is treated like a denial inside the combinator; deny-overrides vetoes are
 /// honored by [`crate::PermissionChecker`] when a forbidding policy is
 /// registered directly on the checker.
-pub struct OrPolicy<S, R, A, C> {
-    policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
+pub struct OrPolicy<S, A, R, C> {
+    policies: Vec<Arc<dyn Policy<S, A, R, C>>>,
 }
 
-impl<S, R, A, C> OrPolicy<S, R, A, C> {
+impl<S, A, R, C> OrPolicy<S, A, R, C> {
     /// Creates a new `OrPolicy` from a non-empty list of policies.
     ///
     /// Returns [`EmptyPoliciesError`] if `policies` is empty.
-    pub fn try_new(policies: Vec<Arc<dyn Policy<S, R, A, C>>>) -> Result<Self, EmptyPoliciesError> {
+    pub fn try_new(policies: Vec<Arc<dyn Policy<S, A, R, C>>>) -> Result<Self, EmptyPoliciesError> {
         if policies.is_empty() {
             Err(EmptyPoliciesError("OrPolicy must have at least one policy"))
         } else {
@@ -198,7 +201,7 @@ impl<S, R, A, C> OrPolicy<S, R, A, C> {
 }
 
 #[async_trait]
-impl<S, R, A, C> Policy<S, R, A, C> for OrPolicy<S, R, A, C>
+impl<S, A, R, C> Policy<S, A, R, C> for OrPolicy<S, A, R, C>
 where
     S: Sync + Send,
     R: Sync + Send,
@@ -209,7 +212,7 @@ where
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("OrPolicy")
     }
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
 
         for policy in &self.policies {
@@ -247,7 +250,7 @@ where
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+        ctx: &BatchEvalCtx<'item, S, A, R, C>,
     ) -> Vec<PolicyEvalResult> {
         let mut children_by_item = vec![Vec::new(); ctx.items.len()];
         let mut results = vec![None; ctx.items.len()];
@@ -276,7 +279,7 @@ where
 
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
-                    children_by_item[index].push(PolicyEvalResult::denied(
+                    children_by_item[index].push(PolicyEvalResult::not_applicable(
                         policy.policy_type(),
                         "Policy batch result count did not match input count",
                     ));
@@ -322,7 +325,10 @@ where
             .into_iter()
             .map(|result| {
                 result.unwrap_or_else(|| {
-                    PolicyEvalResult::denied(self.policy_type(), "Batch item was not evaluated")
+                    PolicyEvalResult::not_applicable(
+                        self.policy_type(),
+                        "Batch item was not evaluated",
+                    )
                 })
             })
             .collect()
@@ -333,13 +339,13 @@ where
 ///
 /// If the inner policy grants access, `NotPolicy` denies it; otherwise it
 /// grants. A [`PolicyEvalResult::Forbidden`] child is treated like any other
-/// non-grant inside the combinator. Use a flat [`crate::Effect::Deny`] policy
+/// non-grant inside the combinator. Use a flat [`crate::Effect::Forbid`] policy
 /// on [`crate::PermissionChecker`] when the intent is a global veto.
-pub struct NotPolicy<S, R, A, C> {
-    policy: Arc<dyn Policy<S, R, A, C>>,
+pub struct NotPolicy<S, A, R, C> {
+    policy: Arc<dyn Policy<S, A, R, C>>,
 }
 
-impl<S, R, A, C> NotPolicy<S, R, A, C>
+impl<S, A, R, C> NotPolicy<S, A, R, C>
 where
     S: Sync,
     R: Sync,
@@ -347,7 +353,7 @@ where
     C: Sync,
 {
     /// Creates a new `NotPolicy` that inverts the given policy's decision.
-    pub fn new(policy: impl Policy<S, R, A, C> + 'static) -> Self {
+    pub fn new(policy: impl Policy<S, A, R, C> + 'static) -> Self {
         Self {
             policy: Arc::new(policy),
         }
@@ -355,7 +361,7 @@ where
 }
 
 #[async_trait]
-impl<S, R, A, C> Policy<S, R, A, C> for NotPolicy<S, R, A, C>
+impl<S, A, R, C> Policy<S, A, R, C> for NotPolicy<S, A, R, C>
 where
     S: Sync + Send,
     R: Sync + Send,
@@ -367,7 +373,7 @@ where
         std::borrow::Cow::Borrowed("NotPolicy")
     }
 
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
         let inner_ctx = EvalCtx {
             session: ctx.session,
             subject: ctx.subject,
@@ -380,7 +386,7 @@ where
         let is_granted = inner_result.is_granted();
 
         PolicyEvalResult::Combined {
-            policy_type: Policy::<S, R, A, C>::policy_type(self),
+            policy_type: Policy::<S, A, R, C>::policy_type(self),
             operation: CombineOp::Not,
             children: vec![inner_result],
             outcome: !is_granted,
@@ -389,10 +395,10 @@ where
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+        ctx: &BatchEvalCtx<'item, S, A, R, C>,
     ) -> Vec<PolicyEvalResult> {
         // Rebuild the BatchEvalCtx with the inner policy's name so any
-        // result built via `ctx.grant`/`ctx.deny` (or the default
+        // result built via `ctx.grant`/`ctx.not_applicable` (or the default
         // evaluate_batch impl, which forwards through per-item EvalCtx)
         // is tagged with the wrapped policy, not "NotPolicy". Matches the
         // single-item path and the AndPolicy/OrPolicy batch paths.
@@ -410,7 +416,7 @@ where
                 .items
                 .iter()
                 .map(|_| {
-                    PolicyEvalResult::denied(
+                    PolicyEvalResult::not_applicable(
                         self.policy_type(),
                         "Policy batch result count did not match input count",
                     )

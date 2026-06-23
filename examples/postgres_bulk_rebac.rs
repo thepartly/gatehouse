@@ -11,8 +11,8 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    EvaluationSession, FactLoadError, FactLoadResult, FactSource, PermissionChecker, PolicyBuilder,
-    RebacPolicy, RelationshipQuery,
+    EvaluationSession, FactLoadError, FactLoadResult, FactRegistry, FactSource, PermissionChecker,
+    PolicyBuilder, RebacPolicy, RelationshipQuery,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -138,8 +138,8 @@ async fn assert_point_and_bulk_agree(source: &PgRelationshipSource, keys: &[Rela
     }
 }
 
-fn build_checker() -> PermissionChecker<User, Post, View, ()> {
-    let public_posts = PolicyBuilder::<User, Post, View, ()>::new("PublicPost")
+fn build_checker() -> PermissionChecker<User, View, Post, ()> {
+    let public_posts = PolicyBuilder::<User, View, Post, ()>::new("PublicPost")
         .resources(|post| post.public)
         .build();
     let viewer_relationship = RebacPolicy::new(
@@ -155,9 +155,10 @@ fn build_checker() -> PermissionChecker<User, Post, View, ()> {
 }
 
 fn session_with(source: &Arc<dyn FactSource<RelationshipKey>>) -> EvaluationSession {
-    EvaluationSession::builder()
+    FactRegistry::builder()
         .with_arc::<RelationshipKey>(Arc::clone(source))
         .build()
+        .session()
 }
 
 #[tokio::main]
@@ -322,13 +323,16 @@ async fn main() {
         let bulk = measure(|| async {
             let session = session_with(&source);
             checker
-                .filter_authorized_in_session_by_resource(
+                .filter_authorized_in_session(
                     &session,
                     &subject,
                     &View,
-                    sample.clone(),
-                    &(),
-                    |post| post,
+                    sample
+                        .clone()
+                        .into_iter()
+                        .map(|post| (post, ()))
+                        .collect::<Vec<_>>(),
+                    |(post, context)| (post, context),
                 )
                 .await
                 .len()

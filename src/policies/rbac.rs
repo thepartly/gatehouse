@@ -4,7 +4,7 @@ use async_trait::async_trait;
 /// A role-based access control policy.
 ///
 /// `required_roles_resolver` is a closure that determines which roles are required
-/// for the given (resource, action). `user_roles_resolver` extracts the subject's roles.
+/// for the given (action, resource). `user_roles_resolver` extracts the subject's roles.
 /// Access is granted if the subject holds at least one of the required roles.
 ///
 /// The role identifier type is generic — any `PartialEq` type works. Use a
@@ -32,7 +32,7 @@ use async_trait::async_trait;
 ///
 /// let rbac = RbacPolicy::new(
 ///     // required_roles_resolver: which roles can access this resource/action?
-///     move |_resource: &Resource, _action: &Action| vec![editor_role],
+///     move |_action: &Action, _resource: &Resource| vec![editor_role],
 ///     // user_roles_resolver: which roles does this user have?
 ///     |user: &User| user.role_ids.clone(),
 /// );
@@ -64,7 +64,7 @@ use async_trait::async_trait;
 /// # struct Action;
 ///
 /// let rbac = RbacPolicy::new(
-///     |_resource: &Resource, _action: &Action| vec![Role::Admin, Role::Editor],
+///     |_action: &Action, _resource: &Resource| vec![Role::Admin, Role::Editor],
 ///     |user: &User| user.roles.clone(),
 /// );
 ///
@@ -97,25 +97,25 @@ impl<S, F1, F2> RbacPolicy<S, F1, F2> {
 // pinned only by the resolver closures' `-> Vec<RoleId>` return types, so it is
 // inferred at the call site instead of being fixed when the policy is stored.
 #[async_trait]
-impl<S, R, A, C, F1, F2, RoleId> Policy<S, R, A, C> for RbacPolicy<S, F1, F2>
+impl<S, A, R, C, F1, F2, RoleId> Policy<S, A, R, C> for RbacPolicy<S, F1, F2>
 where
     S: Sync + Send,
     R: Sync + Send,
     A: Sync + Send,
     C: Sync + Send,
     RoleId: PartialEq,
-    F1: Fn(&R, &A) -> Vec<RoleId> + Sync + Send,
+    F1: Fn(&A, &R) -> Vec<RoleId> + Sync + Send,
     F2: Fn(&S) -> Vec<RoleId> + Sync + Send,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
-        let required_roles = (self.required_roles_resolver)(ctx.resource, ctx.action);
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
+        let required_roles = (self.required_roles_resolver)(ctx.action, ctx.resource);
         let user_roles = (self.user_roles_resolver)(ctx.subject);
         let has_role = required_roles.iter().any(|role| user_roles.contains(role));
 
         if has_role {
             ctx.grant("User has required role")
         } else {
-            ctx.deny("User doesn't have required role")
+            ctx.not_applicable("User doesn't have required role")
         }
     }
 

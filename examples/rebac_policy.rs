@@ -1,10 +1,9 @@
 //! # Relationship-Based Access Control Policy Example
 //!
-//! This example demonstrates ReBAC in the v0.3 shape: `RebacPolicy` extracts
-//! flat IDs and loads relationship facts through a request-scoped
-//! `EvaluationSession`. The happy path declares sources with
-//! `EvaluationSession::builder()` so all request-scoped dependencies are
-//! visible in one place.
+//! This example demonstrates ReBAC: `RebacPolicy` extracts flat IDs and loads
+//! relationship facts through a request-scoped `EvaluationSession`. The happy
+//! path declares sources once in a `FactRegistry`, then creates a fresh session
+//! from that registry for each request.
 //!
 //! Relations are a domain enum (`Relation::Owner`), not strings: the session
 //! deduplicates and caches by the typed `RelationshipQuery` key, the compiler
@@ -145,13 +144,14 @@ async fn main() {
         },
     ]);
 
-    let session = EvaluationSession::builder()
+    let registry = FactRegistry::builder()
         .with::<ProjectRelationship, _>(ProjectRelationshipSource::new(relationships.clone()))
         .build();
+    let session = registry.session();
 
     // Editing requires an owner OR contributor relationship; a viewer
     // relationship exists in the store but grants nothing here.
-    let mut checker = PermissionChecker::<User, Project, EditAction, ()>::new();
+    let mut checker = PermissionChecker::<User, EditAction, Project, ()>::new();
     checker.add_policy(RebacPolicy::new(
         |user: &User| user.id,
         |project: &Project| project.id,
@@ -201,9 +201,10 @@ async fn main() {
 
     // A failing store must never grant: the load error is carried into the
     // trace and the decision fails closed to denial — even for the owner.
-    let error_session = EvaluationSession::builder()
+    let error_registry = FactRegistry::builder()
         .with::<ProjectRelationship, _>(ProjectRelationshipSource::new(relationships).with_error())
         .build();
+    let error_session = error_registry.session();
     let decision = checker
         .evaluate_in_session(&error_session, &owner, &EditAction, &project, &())
         .await;

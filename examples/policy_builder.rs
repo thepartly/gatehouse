@@ -52,7 +52,7 @@ impl AdminAction {
 /// Grants when the user holds the scope the action requires *on this
 /// organization*. The predicate reads three axes (subject, action, resource),
 /// which is exactly the cross-axis case `.when()` exists for.
-fn scoped_permission_policy() -> Box<dyn Policy<StaffUser, Organization, AdminAction, ()>> {
+fn scoped_permission_policy() -> Box<dyn Policy<StaffUser, AdminAction, Organization, ()>> {
     PolicyBuilder::new("ScopedPermission")
         .when(
             |user: &StaffUser, action: &AdminAction, org: &Organization, _ctx: &()| {
@@ -66,7 +66,7 @@ fn scoped_permission_policy() -> Box<dyn Policy<StaffUser, Organization, AdminAc
 
 /// Grants on a single axis — the subject — so it uses `.subjects()` rather
 /// than `.when()`: single-axis predicates batch better and read clearer.
-fn global_admin_policy() -> Box<dyn Policy<StaffUser, Organization, AdminAction, ()>> {
+fn global_admin_policy() -> Box<dyn Policy<StaffUser, AdminAction, Organization, ()>> {
     PolicyBuilder::new("GlobalAdmin")
         .subjects(|user: &StaffUser| user.permissions.iter().any(|p| p.scope == "global_admin"))
         .build()
@@ -74,7 +74,7 @@ fn global_admin_policy() -> Box<dyn Policy<StaffUser, Organization, AdminAction,
 
 #[tokio::main]
 async fn main() {
-    let mut checker = PermissionChecker::<StaffUser, Organization, AdminAction, ()>::new();
+    let mut checker = PermissionChecker::<StaffUser, AdminAction, Organization, ()>::new();
     checker.add_policy(scoped_permission_policy());
     checker.add_policy(global_admin_policy());
 

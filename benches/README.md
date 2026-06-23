@@ -24,7 +24,7 @@ Single-item `evaluate_in_session` throughput, varying policy count.
 This group injects a fixed async delay per source call so the gap between per-item and batched loading is visible. **The pair below is the regression test for the FactSource N→1 win.** If a refactor accidentally reverts to per-item fact loads, `checker_batch_one_session` regresses toward the `naive_per_item_sessions` baseline.
 
 - **`naive_per_item_sessions / N`** — `N` separate `EvaluationSession`s, one per resource, each running its own checker evaluation. Models the failure mode where an author calls `Arc<dyn HierarchyService>` directly from `Policy::evaluate` and pays one round trip per item.
-- **`checker_batch_one_session / N`** — one session, one batched `filter_authorized_in_session_by_resource` call. The session deduplicates and the fact source sees one `load_many` covering all `N` keys.
+- **`checker_batch_one_session / N`** — one session, one batched `filter_authorized_in_session` call. The session deduplicates and the fact source sees one `load_many` covering all `N` keys.
 - **`independent_same_keys_4_tasks / N`** — four parallel tasks each building their own session and requesting the same `N` keys. Models the worst case where coalescing across tasks doesn't help.
 - **`coalesced_same_keys_4_tasks / N`** — four parallel tasks sharing one session, requesting the same `N` keys. Protects: when keys collide, the second loader joins the in-flight load instead of issuing a redundant call.
 

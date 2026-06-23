@@ -16,11 +16,11 @@ fn forbid_summary(policy_type: &str, reason: Option<&str>) -> String {
     }
 }
 
-/// Leaf reason recorded when a deny-declared policy violates its contract by
+/// Leaf reason recorded when a forbid-declared policy violates its contract by
 /// returning a grant; the checker fails closed and treats the result as not
 /// applicable. See [`Policy::effect`].
-const DENY_EFFECT_GRANT_REASON: &str =
-    "Deny-effect policy returned a grant; treated as not applicable";
+const FORBID_EFFECT_GRANT_REASON: &str =
+    "Forbid-effect policy returned a grant; treated as not applicable";
 
 /// Builds the checker's root trace node: a deny-overrides combine over the
 /// policy results evaluated so far.
@@ -37,13 +37,13 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 /// **deny-overrides** semantics:
 ///
 /// 1. any policy that **forbids** ([`PolicyEvalResult::Forbidden`], produced
-///    by [`crate::Effect::Deny`] policies whose predicate matches) denies the
+///    by [`crate::Effect::Forbid`] policies whose predicate matches) denies the
 ///    request, overriding every grant;
 /// 2. otherwise any policy that grants, grants (OR semantics, short-circuits
 ///    on the first grant);
 /// 3. otherwise the request is denied (default deny).
 ///
-/// Policies declaring [`crate::Effect::Deny`] are evaluated before allow
+/// Policies declaring [`crate::Effect::Forbid`] are evaluated before allow
 /// policies so a veto is always observed before the grant short-circuit.
 /// The semantics are fixed — there is no combining-algorithm knob — and the
 /// effect is declared on the policy itself, so a policy's behaviour is
@@ -55,9 +55,9 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 ///
 /// `PermissionChecker` is parameterised by `Resource` (the `R` generic).
 /// Every policy in the checker sees the same `R`, so the idiomatic shape is
-/// **one checker per resource type**: a `PermissionChecker<User, Document,
-/// ReadAction, Ctx>` for documents, a separate `PermissionChecker<User,
-/// Invoice, InvoiceAction, Ctx>` for invoices, and so on.
+/// **one checker per resource type**: a `PermissionChecker<User, ReadAction,
+/// Document, Ctx>` for documents, a separate `PermissionChecker<User,
+/// InvoiceAction, Invoice, Ctx>` for invoices, and so on.
 ///
 /// The anti-pattern is a single mega-checker whose `R` is a tag enum:
 ///
@@ -67,7 +67,7 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 ///
 /// async fn evaluate(&self, ctx: &EvalCtx<'_, _, BillingResource, _, _>) -> PolicyEvalResult {
 ///     if !matches!(ctx.resource, BillingResource::Event) {
-///         return ctx.deny("resource mismatch");   // tag dispatch in every policy
+///         return ctx.not_applicable("resource mismatch");   // tag dispatch in every policy
 ///     }
 ///     // ... real per-event logic, with the actual event data fished out of `ctx.context`
 /// }
@@ -83,7 +83,7 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 ///
 /// Cross-cutting policies that apply to multiple resource types (a global
 /// admin override, for example) can be implemented once as a generic
-/// `Policy<S, R, A, C>` and added to each per-resource checker, or be
+/// `Policy<S, A, R, C>` and added to each per-resource checker, or be
 /// expressed as separate [`crate::DelegatingPolicy`] children.
 ///
 /// Projects with many resource types typically end up wrapping their
@@ -112,11 +112,11 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 /// ```ignore
 /// // Scope/list authorization: "can this user list within this scope?"
 /// type InvoiceScopeChecker =
-///     PermissionChecker<User, OrgScope, ListInvoicesAction, RequestCtx>;
+///     PermissionChecker<User, ListInvoicesAction, OrgScope, RequestCtx>;
 ///
 /// // Per-item authorization: "can this user view this specific invoice?"
 /// type InvoiceItemChecker =
-///     PermissionChecker<User, Invoice, ViewInvoiceAction, RequestCtx>;
+///     PermissionChecker<User, ViewInvoiceAction, Invoice, RequestCtx>;
 ///
 /// async fn list_invoices(
 ///     scope_checker: &InvoiceScopeChecker,
@@ -125,9 +125,16 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 ///     org: &OrgScope,
 ///     ctx: &RequestCtx,
 ///     session: &EvaluationSession,
-///     lookup: &impl LookupSource<Subject = User, Id = InvoiceId>,
+///     lookup: &impl LookupSource<
+///         Subject = User,
+///         Action = ViewInvoiceAction,
+///         Context = RequestCtx,
+///         Id = InvoiceId,
+///     >,
 ///     hydrator: &impl Hydrator<InvoiceId, Resource = Invoice>,
-/// ) -> Result<Vec<Invoice>, ListError> {
+///     cursor: Option<&[u8]>,
+///     page_size: NonZeroUsize,
+/// ) -> Result<LookupAuthorizedPage<Invoice>, ListError> {
 ///     // 1. Coarse gate: may the user list anything in this scope at all?
 ///     scope_checker
 ///         .check(user, &ListInvoicesAction, org, ctx)
@@ -139,9 +146,9 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 ///     //    so the candidate set is already scoped; the item checker
 ///     //    applies any remaining axes (sharing, admin override, etc).
 ///     item_checker
-///         .lookup_authorized(
+///         .lookup_authorized_page(
 ///             session, user, &ViewInvoiceAction, ctx,
-///             lookup, page_size, hydrator,
+///             lookup, cursor, page_size, hydrator,
 ///         )
 ///         .await
 ///         .map_err(ListError::from)
@@ -156,22 +163,22 @@ fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalRes
 /// org_id = ?` filter — the per-item checker still validates each
 /// hydrated row, so authorization is not smeared into the data layer.
 #[derive(Clone)]
-pub struct PermissionChecker<S, R, A, C> {
+pub struct PermissionChecker<S, A, R, C> {
     name: Option<std::borrow::Cow<'static, str>>,
-    /// Policies in evaluation order: deny-effect policies first, then allow
+    /// Policies in evaluation order: forbid-effect policies first, then allow
     /// policies, each group in registration order. [`Self::add_policy`]
     /// maintains this invariant using the policy's declared
     /// [`Policy::effect`], so evaluation iterates this list directly with no
-    /// per-call partitioning. Deny-first scheduling is what makes
+    /// per-call partitioning. Forbid-first scheduling is what makes
     /// deny-overrides deterministic: every policy that can veto runs before
     /// the allow phase, where a grant short-circuits the evaluation.
-    policies: Vec<Arc<dyn Policy<S, R, A, C>>>,
-    /// Number of deny-effect policies at the front of `policies`.
-    deny_count: usize,
+    policies: Vec<Arc<dyn Policy<S, A, R, C>>>,
+    /// Number of forbid-effect policies at the front of `policies`.
+    forbid_count: usize,
     max_batch_size: Option<NonZeroUsize>,
 }
 
-impl<S, R, A, C> Default for PermissionChecker<S, R, A, C>
+impl<S, A, R, C> Default for PermissionChecker<S, A, R, C>
 where
     S: Sync,
     R: Sync,
@@ -183,7 +190,7 @@ where
     }
 }
 
-impl<S, R, A, C> PermissionChecker<S, R, A, C>
+impl<S, A, R, C> PermissionChecker<S, A, R, C>
 where
     S: Sync,
     R: Sync,
@@ -195,7 +202,7 @@ where
         Self {
             name: None,
             policies: Vec::new(),
-            deny_count: 0,
+            forbid_count: 0,
             max_batch_size: None,
         }
     }
@@ -214,7 +221,7 @@ where
         Self {
             name: Some(name.into()),
             policies: Vec::new(),
-            deny_count: 0,
+            forbid_count: 0,
             max_batch_size: None,
         }
     }
@@ -236,7 +243,7 @@ where
 
     /// Adds a policy to the checker.
     ///
-    /// The policy's [`Policy::effect`] is read once here: deny-effect
+    /// The policy's [`Policy::effect`] is read once here: forbid-effect
     /// policies are scheduled ahead of allow policies so a veto is always
     /// observed before the grant short-circuit (see the type-level docs).
     /// Within each group, registration order is preserved.
@@ -244,26 +251,37 @@ where
     /// # Arguments
     ///
     /// * `policy` - A type implementing [`Policy`]. It is stored as an `Arc` for shared ownership.
-    pub fn add_policy<P: Policy<S, R, A, C> + 'static>(&mut self, policy: P) {
-        if policy.effect() == Effect::Deny {
-            self.policies.insert(self.deny_count, Arc::new(policy));
-            self.deny_count += 1;
+    pub fn add_policy<P: Policy<S, A, R, C> + 'static>(&mut self, policy: P) {
+        if policy.effect() == Effect::Forbid {
+            self.policies.insert(self.forbid_count, Arc::new(policy));
+            self.forbid_count += 1;
         } else {
             self.policies.push(Arc::new(policy));
         }
     }
 
+    /// Adds a hand-written policy that can actively forbid access.
+    ///
+    /// This schedules the policy before ordinary allow policies even if the
+    /// policy's [`Policy::effect`] implementation is left at its default.
+    /// Builder policies created with [`crate::PolicyBuilder::forbid`] can use
+    /// [`Self::add_policy`] because the builder declares the effect for you.
+    pub fn add_forbid_policy<P: Policy<S, A, R, C> + 'static>(&mut self, policy: P) {
+        self.policies.insert(self.forbid_count, Arc::new(policy));
+        self.forbid_count += 1;
+    }
+
     /// The effect a policy declared when it was added, derived from its
     /// position in the deny-first `policies` ordering.
     fn declared_effect(&self, policy_index: usize) -> Effect {
-        if policy_index < self.deny_count {
-            Effect::Deny
+        if policy_index < self.forbid_count {
+            Effect::Forbid
         } else {
             Effect::Allow
         }
     }
 
-    /// Convenience for RBAC/ABAC-only callers: evaluates against the
+    /// Convenience for fact-free callers: evaluates against the
     /// process-wide [`EvaluationSession::shared_empty`] session.
     ///
     /// Equivalent to:
@@ -327,8 +345,10 @@ where
         if self.policies.is_empty() {
             tracing::Span::current().record("outcome", "denied");
             tracing::debug!("No policies configured");
-            let result =
-                PolicyEvalResult::denied(PERMISSION_CHECKER_POLICY_TYPE, "No policies configured");
+            let result = PolicyEvalResult::not_applicable(
+                PERMISSION_CHECKER_POLICY_TYPE,
+                "No policies configured",
+            );
 
             return AccessEvaluation::Denied {
                 trace: EvalTrace::with_root(result),
@@ -358,13 +378,15 @@ where
                 policy_type: policy.policy_type(),
             };
             let mut result = policy.evaluate(&ctx).await;
-            if declared_effect == Effect::Deny && result.is_granted() {
+            if declared_effect == Effect::Forbid && result.is_granted() {
                 tracing::warn!(
                     policy.type = ctx.policy_type.as_ref(),
-                    "{DENY_EFFECT_GRANT_REASON}"
+                    "{FORBID_EFFECT_GRANT_REASON}"
                 );
-                result =
-                    PolicyEvalResult::denied(ctx.policy_type.clone(), DENY_EFFECT_GRANT_REASON);
+                result = PolicyEvalResult::not_applicable(
+                    ctx.policy_type.clone(),
+                    FORBID_EFFECT_GRANT_REASON,
+                );
             }
             let result_passes = result.is_granted();
             let result_forbids = result.is_forbidden();
@@ -384,7 +406,7 @@ where
             let event_outcome = if result_passes { "success" } else { "failure" };
             let policy_effect = match declared_effect {
                 Effect::Allow => "allow",
-                Effect::Deny => "deny",
+                Effect::Forbid => "deny",
             };
 
             tracing::trace!(
@@ -488,23 +510,32 @@ where
     /// ];
     ///
     /// let mut checker = PermissionChecker::new();
-    /// checker.add_policy(AbacPolicy::new(
-    ///     |user: &User, document: &Document, _action: &Read, _context: &RequestContext| {
-    ///         user.id == document.owner_id
-    ///     },
-    /// ));
+    /// checker.add_policy(
+    ///     PolicyBuilder::<User, Read, Document, RequestContext>::new("OwnerOnly")
+    ///         .when(|user: &User, _action: &Read, document: &Document, _context: &RequestContext| {
+    ///             user.id == document.owner_id
+    ///         })
+    ///         .build(),
+    /// );
     ///
     /// let visible = checker
-    ///     .filter_authorized_in_session_by_resource(&session, &user, &Read, documents, &context, |document| {
-    ///         document
-    ///     })
+    ///     .filter_authorized_in_session(
+    ///         &session,
+    ///         &user,
+    ///         &Read,
+    ///         documents
+    ///             .into_iter()
+    ///             .map(|document| (document, context.clone()))
+    ///             .collect::<Vec<_>>(),
+    ///         |(document, context)| (document, context),
+    ///     )
     ///     .await;
     ///
     /// assert_eq!(visible.len(), 1);
     /// # });
     /// ```
     #[tracing::instrument(skip_all, fields(checker.name = tracing::field::Empty, item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
-    pub async fn evaluate_batch_in_session_by<I, F>(
+    pub async fn evaluate_batch_in_session<I, F>(
         &self,
         session: &EvaluationSession,
         subject: &S,
@@ -535,7 +566,7 @@ where
                 .into_iter()
                 .map(|item| {
                     denied_count += 1;
-                    let result = PolicyEvalResult::denied(
+                    let result = PolicyEvalResult::not_applicable(
                         PERMISSION_CHECKER_POLICY_TYPE,
                         "No policies configured",
                     );
@@ -587,7 +618,7 @@ where
                     policy.type = policy_type_str,
                     policy.effect = match declared_effect {
                         Effect::Allow => "allow",
-                        Effect::Deny => "deny",
+                        Effect::Forbid => "deny",
                     },
                     policy.pending_count = pending_chunk.len(),
                     policy.chunk_index = chunk_index,
@@ -623,7 +654,7 @@ where
                 if policy_results.len() != pending_chunk.len() {
                     for &index in pending_chunk {
                         policy_denied_count += 1;
-                        let policy_result = PolicyEvalResult::denied(
+                        let policy_result = PolicyEvalResult::not_applicable(
                             policy_type.clone(),
                             "Policy batch result count did not match input count",
                         );
@@ -643,10 +674,12 @@ where
 
                 for (&index, result) in pending_chunk.iter().zip(policy_results) {
                     let mut result = result;
-                    if declared_effect == Effect::Deny && result.is_granted() {
+                    if declared_effect == Effect::Forbid && result.is_granted() {
                         contract_violation_count += 1;
-                        result =
-                            PolicyEvalResult::denied(policy_type.clone(), DENY_EFFECT_GRANT_REASON);
+                        result = PolicyEvalResult::not_applicable(
+                            policy_type.clone(),
+                            FORBID_EFFECT_GRANT_REASON,
+                        );
                     }
                     let result_passes = result.is_granted();
                     let result_forbids = result.is_forbidden();
@@ -680,7 +713,7 @@ where
                     tracing::warn!(
                         policy.type = policy_type_str,
                         item_count = contract_violation_count,
-                        "{DENY_EFFECT_GRANT_REASON}"
+                        "{FORBID_EFFECT_GRANT_REASON}"
                     );
                 }
                 policy_span.record("policy.granted_count", policy_granted_count);
@@ -706,7 +739,7 @@ where
             .zip(evaluations.into_iter())
             .map(|(item, evaluation)| {
                 let evaluation = evaluation.unwrap_or_else(|| {
-                    let result = PolicyEvalResult::denied(
+                    let result = PolicyEvalResult::not_applicable(
                         PERMISSION_CHECKER_POLICY_TYPE,
                         "Batch item was not evaluated",
                     );
@@ -727,8 +760,8 @@ where
         results
     }
 
-    /// Returns only the items granted by [`Self::evaluate_batch_in_session_by`].
-    pub async fn filter_authorized_in_session_by<I, F>(
+    /// Returns only the items granted by [`Self::evaluate_batch_in_session`].
+    pub async fn filter_authorized_in_session<I, F>(
         &self,
         session: &EvaluationSession,
         subject: &S,
@@ -740,84 +773,20 @@ where
         I: IntoIterator,
         F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C),
     {
-        self.evaluate_batch_in_session_by(session, subject, action, items, parts)
+        self.evaluate_batch_in_session(session, subject, action, items, parts)
             .await
             .into_iter()
             .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
             .collect()
     }
 
-    /// Evaluates caller-owned items that all share one context value.
-    ///
-    /// `resource` extracts `&R` from each item; the same `context` is used
-    /// for every evaluation. Compare with
-    /// [`Self::evaluate_batch_in_session_by`], which extracts both
-    /// `(&R, &C)` per item.
-    pub async fn evaluate_batch_in_session_by_resource<I, F>(
-        &self,
-        session: &EvaluationSession,
-        subject: &S,
-        action: &A,
-        items: I,
-        context: &C,
-        resource: F,
-    ) -> Vec<(I::Item, AccessEvaluation)>
-    where
-        I: IntoIterator,
-        F: for<'item> Fn(&'item I::Item) -> &'item R,
-    {
-        let wrapped_items = items
-            .into_iter()
-            .map(|item| (item, context))
-            .collect::<Vec<_>>();
-
-        self.evaluate_batch_in_session_by(
-            session,
-            subject,
-            action,
-            wrapped_items,
-            |(item, context)| (resource(item), *context),
-        )
-        .await
-        .into_iter()
-        .map(|((item, _context), evaluation)| (item, evaluation))
-        .collect()
-    }
-
-    /// Returns only authorized items with a shared context.
-    ///
-    /// Filter analogue of [`Self::evaluate_batch_in_session_by_resource`].
-    pub async fn filter_authorized_in_session_by_resource<I, F>(
-        &self,
-        session: &EvaluationSession,
-        subject: &S,
-        action: &A,
-        items: I,
-        context: &C,
-        resource: F,
-    ) -> Vec<I::Item>
-    where
-        I: IntoIterator,
-        F: for<'item> Fn(&'item I::Item) -> &'item R,
-    {
-        self.evaluate_batch_in_session_by_resource(
-            session, subject, action, items, context, resource,
-        )
-        .await
-        .into_iter()
-        .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
-        .collect()
-    }
-
     /// Look up one page of candidate IDs from `lookup`, hydrate them via
     /// `hydrator`, and return only the resources that the full policy
     /// stack authorizes.
     ///
-    /// This is the page-oriented primitive behind
-    /// [`Self::lookup_authorized`]. Use it directly when you need
-    /// candidate-page-grained streaming — for example, a list endpoint
-    /// that emits results as they are confirmed without buffering the
-    /// whole authorized population.
+    /// This is the page-oriented primitive for candidate-page-grained
+    /// streaming — for example, a list endpoint that emits results as they
+    /// are confirmed without buffering the whole authorized population.
     ///
     /// `next_cursor` paginates the **candidate** stream from `lookup`,
     /// not the authorized output. A `Some(cursor)` with an empty
@@ -825,12 +794,11 @@ where
     /// denied by the policy stack. Continue paging until `next_cursor`
     /// is `None`.
     ///
-    /// Cursor-progress is enforced here, not just in
-    /// [`Self::lookup_authorized`]: if the source returns a `next_cursor`
-    /// equal to the cursor that was just consumed, this method aborts
-    /// with [`LookupAuthorizedError::LookupCursorStuck`] rather than
-    /// returning a page that would lead a streaming caller into an
-    /// infinite loop.
+    /// Cursor-progress is enforced here: if the source returns a
+    /// `next_cursor` equal to the cursor that was just consumed, this method
+    /// aborts with [`LookupAuthorizedError::LookupCursorStuck`] rather than
+    /// returning a page that would lead a streaming caller into an infinite
+    /// loop.
     ///
     /// See [`LookupSource`] for the completeness contract: the source
     /// must enumerate a superset of every resource that any policy in
@@ -854,7 +822,7 @@ where
         hydrator: &H,
     ) -> Result<LookupAuthorizedPage<R>, LookupAuthorizedError<L::Error, H::Error>>
     where
-        L: LookupSource<Subject = S>,
+        L: LookupSource<Subject = S, Action = A, Context = C>,
         H: Hydrator<L::Id, Resource = R>,
         R: Send,
     {
@@ -864,7 +832,7 @@ where
             lookup.has_cursor = cursor.is_some(),
         );
         let page = lookup
-            .lookup_page(subject, cursor, limit)
+            .lookup_page(subject, action, context, cursor, limit)
             .instrument(lookup_span)
             .await
             .map_err(LookupAuthorizedError::Lookup)?;
@@ -902,131 +870,27 @@ where
             });
         }
 
-        let resources: Vec<R> = hydrated.into_iter().flatten().collect();
+        let resources = hydrated
+            .into_iter()
+            .flatten()
+            .map(|resource| (resource, context))
+            .collect::<Vec<_>>();
         let authorized = self
-            .filter_authorized_in_session_by_resource(
+            .filter_authorized_in_session(
                 session,
                 subject,
                 action,
                 resources,
-                context,
-                |resource| resource,
+                |(resource, context)| (resource, *context),
             )
-            .await;
+            .await
+            .into_iter()
+            .map(|(resource, _context)| resource)
+            .collect();
 
         Ok(LookupAuthorizedPage {
             resources: authorized,
             next_cursor: page.next_cursor,
         })
-    }
-
-    /// Drive [`Self::lookup_authorized_page`] until the source is
-    /// exhausted, collecting every authorized resource into a single
-    /// `Vec`.
-    ///
-    /// This is the all-or-error convenience: any backend error from the
-    /// lookup source or hydrator aborts the whole operation; the caller
-    /// does not see partial results. For very large authorized
-    /// populations, prefer [`Self::lookup_authorized_page`] and stream
-    /// results page by page.
-    ///
-    /// Cursor-progress is enforced: if the source returns a `next_cursor`
-    /// equal to the cursor that was just consumed, gatehouse aborts with
-    /// [`LookupAuthorizedError::LookupCursorStuck`] rather than loop
-    /// forever.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "see lookup_authorized_page for the rationale."
-    )]
-    pub async fn lookup_authorized<L, H>(
-        &self,
-        session: &EvaluationSession,
-        subject: &S,
-        action: &A,
-        context: &C,
-        lookup: &L,
-        page_size: NonZeroUsize,
-        hydrator: &H,
-    ) -> Result<Vec<R>, LookupAuthorizedError<L::Error, H::Error>>
-    where
-        L: LookupSource<Subject = S>,
-        H: Hydrator<L::Id, Resource = R>,
-        R: Send,
-    {
-        let mut authorized = Vec::new();
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = self
-                .lookup_authorized_page(
-                    session,
-                    subject,
-                    action,
-                    context,
-                    lookup,
-                    cursor.as_deref(),
-                    page_size,
-                    hydrator,
-                )
-                .await?;
-            authorized.extend(page.resources);
-            // Cursor-progress is enforced inside `lookup_authorized_page`,
-            // so we just trust the returned `next_cursor` here.
-            match page.next_cursor {
-                None => return Ok(authorized),
-                Some(next) => cursor = Some(next),
-            }
-        }
-    }
-}
-
-impl<S, R, A> PermissionChecker<S, R, A, ()>
-where
-    S: Sync,
-    R: Sync,
-    A: Sync,
-{
-    /// Evaluates a batch where each caller-owned item is the resource and the
-    /// context type is `()`.
-    ///
-    /// This is the ergonomic shortcut for list-like checks that do not need a
-    /// per-item context value.
-    pub async fn evaluate_batch_resources_in_session<I>(
-        &self,
-        session: &EvaluationSession,
-        subject: &S,
-        action: &A,
-        resources: I,
-    ) -> Vec<(R, AccessEvaluation)>
-    where
-        I: IntoIterator<Item = R>,
-    {
-        self.evaluate_batch_in_session_by_resource(
-            session,
-            subject,
-            action,
-            resources,
-            &(),
-            |resource| resource,
-        )
-        .await
-    }
-
-    /// Returns only resources granted by
-    /// [`Self::evaluate_batch_resources_in_session`].
-    pub async fn filter_authorized_resources_in_session<I>(
-        &self,
-        session: &EvaluationSession,
-        subject: &S,
-        action: &A,
-        resources: I,
-    ) -> Vec<R>
-    where
-        I: IntoIterator<Item = R>,
-    {
-        self.evaluate_batch_resources_in_session(session, subject, action, resources)
-            .await
-            .into_iter()
-            .filter_map(|(resource, evaluation)| evaluation.is_granted().then_some(resource))
-            .collect()
     }
 }

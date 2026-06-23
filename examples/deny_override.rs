@@ -3,8 +3,8 @@
 //! Almost every real authorization system eventually needs a rule that
 //! overrides all the others: a suspended account is locked out regardless of
 //! role, a document under legal hold is frozen even for its owner and for
-//! admins. In gatehouse this is exactly what [`Effect::Deny`] does: a policy
-//! built with `.effect(Effect::Deny)` **forbids** the request when its
+//! admins. In gatehouse this is exactly what [`Effect::Forbid`] does: a policy
+//! built with `.forbid()` **forbids** the request when its
 //! predicate matches, and [`PermissionChecker`] honors a forbid over any
 //! grant from sibling policies — deny-overrides semantics, in the style of
 //! Cedar and AWS IAM.
@@ -13,7 +13,7 @@
 //! `add_policy`, in natural polarity (predicate matches ⇒ forbidden), in any
 //! order. The decision rule is fixed:
 //!
-//! 1. any matching `Effect::Deny` policy ⇒ **denied** (the trace names it);
+//! 1. any matching `Effect::Forbid` policy ⇒ **denied** (the trace names it);
 //! 2. otherwise any granting policy ⇒ **granted**;
 //! 3. otherwise ⇒ **denied** (default deny).
 //!
@@ -28,7 +28,7 @@
 //! cargo run --example deny_override
 //! ```
 
-use gatehouse::{AndPolicy, Effect, NotPolicy, PermissionChecker, Policy, PolicyBuilder};
+use gatehouse::{AndPolicy, NotPolicy, PermissionChecker, Policy, PolicyBuilder};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -56,18 +56,18 @@ struct Access;
 // No request-scoped facts here, so the context is the unit type. (`()` is the
 // idiomatic "no context" — reserve a context struct for data that genuinely
 // varies per request, as in the mfa_freshness_context example.)
-type DocPolicy = Box<dyn Policy<User, Document, Access, ()>>;
+type DocPolicy = Box<dyn Policy<User, Access, Document, ()>>;
 
 // ---- the allow set -------------------------------------------------
 
 fn admin_override() -> DocPolicy {
-    PolicyBuilder::<User, Document, Access, ()>::new("AdminOverride")
+    PolicyBuilder::<User, Access, Document, ()>::new("AdminOverride")
         .subjects(|user| user.is_admin)
         .build()
 }
 
 fn document_owner() -> DocPolicy {
-    PolicyBuilder::<User, Document, Access, ()>::new("DocumentOwner")
+    PolicyBuilder::<User, Access, Document, ()>::new("DocumentOwner")
         .when(|user, _action, document, _ctx| user.id == document.owner_id)
         .build()
 }
@@ -78,25 +78,25 @@ fn document_owner() -> DocPolicy {
 /// effect travels with the policy, so this reads exactly as it behaves —
 /// no inverted polarity, no special registration call.
 fn account_suspended() -> DocPolicy {
-    PolicyBuilder::<User, Document, Access, ()>::new("AccountSuspended")
+    PolicyBuilder::<User, Access, Document, ()>::new("AccountSuspended")
         .subjects(|user| user.suspended)
-        .effect(Effect::Deny)
+        .forbid()
         .build()
 }
 
 /// Legal hold: a frozen document is blocked for everyone, owner and admin
 /// included.
 fn legal_hold() -> DocPolicy {
-    PolicyBuilder::<User, Document, Access, ()>::new("LegalHold")
+    PolicyBuilder::<User, Access, Document, ()>::new("LegalHold")
         .resources(|document| document.legal_hold)
-        .effect(Effect::Deny)
+        .forbid()
         .build()
 }
 
-fn document_checker() -> PermissionChecker<User, Document, Access, ()> {
+fn document_checker() -> PermissionChecker<User, Access, Document, ()> {
     let mut checker = PermissionChecker::named("DocumentChecker");
     // Flat registration, any order: the deny policies' effect is declared
-    // on the policies themselves, and the checker evaluates deny-effect
+    // on the policies themselves, and the checker evaluates forbid-effect
     // policies first so a veto can never be raced by a grant.
     checker.add_policy(admin_override());
     checker.add_policy(document_owner());
@@ -188,7 +188,7 @@ async fn main() {
     stranger_decision.assert_denied();
     assert_eq!(stranger_decision.forbidden_by(), None);
 
-    // Show the mechanism on the headline case: the deny-effect policy is
+    // Show the mechanism on the headline case: the forbid-effect policy is
     // evaluated first and ends the evaluation; the allow set is never
     // consulted.
     println!("\nWhy 'admin, LEGAL-HOLD doc' is blocked:");
@@ -200,7 +200,7 @@ async fn main() {
 
 // ---- scoped exclusion: a deny that gates only one grant path --------
 
-/// `Effect::Deny` is a *global* veto: it blocks every grant path in the
+/// `Effect::Forbid` is a *global* veto: it blocks every grant path in the
 /// checker. When a block rule should only gate one grant path — here,
 /// muted users lose collaborator access but owners and admins keep
 /// theirs — scope it with combinators instead:
@@ -216,26 +216,26 @@ async fn scoped_exclusion_demo() {
     #[derive(Debug, Clone)]
     struct Thread;
 
-    let owner_policy = PolicyBuilder::<Member, Thread, Access, ()>::new("ThreadOwner")
+    let owner_policy = PolicyBuilder::<Member, Access, Thread, ()>::new("ThreadOwner")
         .subjects(|member| member.is_owner)
         .build();
-    let collaborator_policy: Arc<dyn Policy<Member, Thread, Access, ()>> = Arc::from(
-        PolicyBuilder::<Member, Thread, Access, ()>::new("Collaborator")
+    let collaborator_policy: Arc<dyn Policy<Member, Access, Thread, ()>> = Arc::from(
+        PolicyBuilder::<Member, Access, Thread, ()>::new("Collaborator")
             .subjects(|member| member.is_collaborator)
             .build(),
     );
     // The block rule for the scoped case *grants when it matches* so that
     // `NotPolicy` can invert it into a local gate. Compare with the
-    // checker-level rules above, where `Effect::Deny` keeps natural
+    // checker-level rules above, where `Effect::Forbid` keeps natural
     // polarity — this inversion is the price of scoping, which is why a
-    // global block should prefer `Effect::Deny`.
-    let muted = PolicyBuilder::<Member, Thread, Access, ()>::new("Muted")
+    // global block should prefer `Effect::Forbid`.
+    let muted = PolicyBuilder::<Member, Access, Thread, ()>::new("Muted")
         .subjects(|member| member.muted)
         .build();
 
     let collaborator_unless_muted = AndPolicy::try_new(vec![
         collaborator_policy,
-        Arc::new(NotPolicy::new(muted)) as Arc<dyn Policy<Member, Thread, Access, ()>>,
+        Arc::new(NotPolicy::new(muted)) as Arc<dyn Policy<Member, Access, Thread, ()>>,
     ])
     .expect("gate has the grant arm and the guard");
 
@@ -259,7 +259,7 @@ async fn scoped_exclusion_demo() {
         .check(&muted_collaborator, &Access, &Thread, &())
         .await
         .assert_denied();
-    // ...the owner path is untouched, which a global Effect::Deny mute
+    // ...the owner path is untouched, which a global Effect::Forbid mute
     // could not express.
     checker
         .check(&muted_owner, &Access, &Thread, &())

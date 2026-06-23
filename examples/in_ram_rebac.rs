@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use dashmap::DashSet;
 use gatehouse::{
-    EvaluationSession, FactLoadResult, FactSource, PermissionChecker, RebacPolicy,
+    EvaluationSession, FactLoadResult, FactRegistry, FactSource, PermissionChecker, RebacPolicy,
     RelationshipQuery,
 };
 use std::fmt;
@@ -70,13 +70,11 @@ impl FactSource<RelationshipKey> for InRamRelationships {
     }
 }
 
-fn request_session(relationships: &Arc<dyn FactSource<RelationshipKey>>) -> EvaluationSession {
-    EvaluationSession::builder()
-        .with_arc::<RelationshipKey>(Arc::clone(relationships))
-        .build()
+fn request_session(registry: &FactRegistry) -> EvaluationSession {
+    registry.session()
 }
 
-fn build_checker() -> PermissionChecker<User, Document, View, ()> {
+fn build_checker() -> PermissionChecker<User, View, Document, ()> {
     let mut checker = PermissionChecker::new();
     checker.add_policy(RebacPolicy::new(
         |user: &User| user.id,
@@ -112,32 +110,38 @@ async fn main() {
     // and is here to show the source and the policy stack are decoupled.
     store.grant(user.id, documents[1].id, Relation::Editor);
     let relationships: Arc<dyn FactSource<RelationshipKey>> = store;
+    let registry = FactRegistry::builder()
+        .with_arc::<RelationshipKey>(Arc::clone(&relationships))
+        .build();
 
     let checker = build_checker();
     let context = ();
 
-    let first_request = request_session(&relationships);
+    let first_request = request_session(&registry);
     let visible = checker
-        .filter_authorized_in_session_by_resource(
+        .filter_authorized_in_session(
             &first_request,
             &user,
             &View,
-            documents.clone(),
-            &context,
-            |document| document,
+            documents
+                .clone()
+                .into_iter()
+                .map(|document| (document, context))
+                .collect::<Vec<_>>(),
+            |(document, context)| (document, context),
         )
         .await;
     println!(
         "batch list — visible documents: {:?}",
         visible
             .iter()
-            .map(|document| document.title)
+            .map(|(document, _context)| document.title)
             .collect::<Vec<_>>()
     );
 
     // A fresh session for a single-resource check. The user has no viewer
     // relationship on the finance plan, so this denies.
-    let second_request = request_session(&relationships);
+    let second_request = request_session(&registry);
     let can_view_finance = checker
         .evaluate_in_session(&second_request, &user, &View, &documents[2], &context)
         .await;
@@ -152,24 +156,26 @@ async fn main() {
     );
     assert!(!can_view_finance.is_granted());
 
-    let shared = Arc::clone(&relationships);
+    let shared = registry.clone();
     let concurrent_requests = (0..4)
         .map(|_| {
             let checker = checker.clone();
             let user = user.clone();
             let documents = documents.clone();
-            let relationships = Arc::clone(&shared);
+            let registry = shared.clone();
             tokio::spawn(async move {
-                let session = request_session(&relationships);
+                let session = request_session(&registry);
                 let context = ();
                 checker
-                    .filter_authorized_in_session_by_resource(
+                    .filter_authorized_in_session(
                         &session,
                         &user,
                         &View,
-                        documents,
-                        &context,
-                        |document| document,
+                        documents
+                            .into_iter()
+                            .map(|document| (document, context))
+                            .collect::<Vec<_>>(),
+                        |(document, context)| (document, context),
                     )
                     .await
                     .len()

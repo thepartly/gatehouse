@@ -26,10 +26,13 @@ fn delegated_evaluation_to_result(
         AccessEvaluation::Denied { reason, trace } => PolicyEvalResult::Combined {
             policy_type,
             operation: CombineOp::Delegate,
-            children: vec![trace.root().cloned().unwrap_or(PolicyEvalResult::denied(
-                PERMISSION_CHECKER_POLICY_TYPE,
-                reason,
-            ))],
+            children: vec![trace
+                .root()
+                .cloned()
+                .unwrap_or(PolicyEvalResult::not_applicable(
+                    PERMISSION_CHECKER_POLICY_TYPE,
+                    reason,
+                ))],
             outcome: false,
         },
     }
@@ -49,23 +52,23 @@ fn delegated_evaluation_to_result(
 ///
 /// `DelegatingPolicy` does not detect cycles or self-delegation; avoid wiring a
 /// child checker that can delegate back into the same decision path.
-pub struct DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext> {
+pub struct DelegatingPolicy<S, A, R, C, ChildSubject, ChildAction, ChildResource, ChildContext> {
     policy_type: std::borrow::Cow<'static, str>,
     security_rule: SecurityRuleMetadata,
-    checker: PermissionChecker<ChildSubject, ChildResource, ChildAction, ChildContext>,
+    checker: PermissionChecker<ChildSubject, ChildAction, ChildResource, ChildContext>,
     subject: Arc<dyn Fn(&S) -> ChildSubject + Send + Sync>,
     action: Arc<dyn Fn(&A) -> ChildAction + Send + Sync>,
-    resource: Arc<dyn Fn(&S, &R, &A, &C) -> ChildResource + Send + Sync>,
-    context: Arc<dyn Fn(&S, &R, &A, &C) -> ChildContext + Send + Sync>,
+    resource: Arc<dyn Fn(&S, &A, &R, &C) -> ChildResource + Send + Sync>,
+    context: Arc<dyn Fn(&S, &A, &R, &C) -> ChildContext + Send + Sync>,
 }
 
-impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
-    DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
+impl<S, A, R, C, ChildSubject, ChildAction, ChildResource, ChildContext>
+    DelegatingPolicy<S, A, R, C, ChildSubject, ChildAction, ChildResource, ChildContext>
 {
     /// Creates a delegating policy from a child checker and mapping functions.
     pub fn new<SubjectFn, ActionFn, ResourceFn, ContextFn>(
         policy_type: impl Into<std::borrow::Cow<'static, str>>,
-        checker: PermissionChecker<ChildSubject, ChildResource, ChildAction, ChildContext>,
+        checker: PermissionChecker<ChildSubject, ChildAction, ChildResource, ChildContext>,
         subject: SubjectFn,
         action: ActionFn,
         resource: ResourceFn,
@@ -74,8 +77,8 @@ impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
     where
         SubjectFn: Fn(&S) -> ChildSubject + Send + Sync + 'static,
         ActionFn: Fn(&A) -> ChildAction + Send + Sync + 'static,
-        ResourceFn: Fn(&S, &R, &A, &C) -> ChildResource + Send + Sync + 'static,
-        ContextFn: Fn(&S, &R, &A, &C) -> ChildContext + Send + Sync + 'static,
+        ResourceFn: Fn(&S, &A, &R, &C) -> ChildResource + Send + Sync + 'static,
+        ContextFn: Fn(&S, &A, &R, &C) -> ChildContext + Send + Sync + 'static,
     {
         Self {
             policy_type: policy_type.into(),
@@ -96,8 +99,8 @@ impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
 }
 
 #[async_trait]
-impl<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext> Policy<S, R, A, C>
-    for DelegatingPolicy<S, R, A, C, ChildSubject, ChildResource, ChildAction, ChildContext>
+impl<S, A, R, C, ChildSubject, ChildAction, ChildResource, ChildContext> Policy<S, A, R, C>
+    for DelegatingPolicy<S, A, R, C, ChildSubject, ChildAction, ChildResource, ChildContext>
 where
     S: Send + Sync,
     R: Send + Sync,
@@ -108,11 +111,11 @@ where
     ChildAction: Send + Sync,
     ChildContext: Send + Sync,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
         let child_subject = (self.subject)(ctx.subject);
         let child_action = (self.action)(ctx.action);
-        let child_resource = (self.resource)(ctx.subject, ctx.resource, ctx.action, ctx.context);
-        let child_context = (self.context)(ctx.subject, ctx.resource, ctx.action, ctx.context);
+        let child_resource = (self.resource)(ctx.subject, ctx.action, ctx.resource, ctx.context);
+        let child_context = (self.context)(ctx.subject, ctx.action, ctx.resource, ctx.context);
         let evaluation = self
             .checker
             .evaluate_in_session(
@@ -129,7 +132,7 @@ where
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+        ctx: &BatchEvalCtx<'item, S, A, R, C>,
     ) -> Vec<PolicyEvalResult> {
         let child_subject = (self.subject)(ctx.subject);
         let child_action = (self.action)(ctx.action);
@@ -138,14 +141,14 @@ where
             .iter()
             .map(|item| {
                 (
-                    (self.resource)(ctx.subject, item.resource, ctx.action, item.context),
-                    (self.context)(ctx.subject, item.resource, ctx.action, item.context),
+                    (self.resource)(ctx.subject, ctx.action, item.resource, item.context),
+                    (self.context)(ctx.subject, ctx.action, item.resource, item.context),
                 )
             })
             .collect::<Vec<_>>();
 
         self.checker
-            .evaluate_batch_in_session_by(
+            .evaluate_batch_in_session(
                 ctx.session,
                 &child_subject,
                 &child_action,

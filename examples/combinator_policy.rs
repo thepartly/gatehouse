@@ -46,10 +46,10 @@ struct CountingPolicy {
 }
 
 #[async_trait]
-impl Policy<User, Document, ViewAction, ()> for CountingPolicy {
+impl Policy<User, ViewAction, Document, ()> for CountingPolicy {
     async fn evaluate(
         &self,
-        ctx: &EvalCtx<'_, User, Document, ViewAction, ()>,
+        ctx: &EvalCtx<'_, User, ViewAction, Document, ()>,
     ) -> PolicyEvalResult {
         // Increment evaluation counter
         self.counter.fetch_add(1, Ordering::SeqCst);
@@ -58,7 +58,7 @@ impl Policy<User, Document, ViewAction, ()> for CountingPolicy {
         if self.allow {
             ctx.grant(format!("{} grants access", self.name))
         } else {
-            ctx.deny(format!("{} denies access", self.name))
+            ctx.not_applicable(format!("{} denies access", self.name))
         }
     }
 
@@ -74,7 +74,7 @@ async fn main() {
     let action = ViewAction;
     let context = ();
     // These policies have no fact sources, so we add each combinator to a
-    // `PermissionChecker` and call `check` — the everyday RBAC/ABAC entry point,
+    // `PermissionChecker` and call `check` — the everyday fact-free entry point,
     // with no `EvaluationSession` to thread through. The checker contributes its
     // own `OR` root to the trace; the combinator's short-circuit behaviour (what
     // this example measures) happens inside it regardless.
@@ -83,7 +83,7 @@ async fn main() {
     {
         let counter = Arc::new(AtomicUsize::new(0));
 
-        // Create an AND policy with a deny policy first
+        // Create an AND policy with a non-grant policy first
         let and_policy = AndPolicy::try_new(vec![
             Arc::new(CountingPolicy {
                 allow: false,

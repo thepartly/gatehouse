@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use gatehouse::{
-    EvaluationSession, FactKey, FactLoadError, FactLoadResult, FactSource,
-    FactSourceRegistrationError,
+    EvaluationSession, FactKey, FactLoadError, FactLoadResult, FactRegistry, FactSource,
 };
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -259,9 +258,10 @@ fn new_calls() -> TestCalls {
 }
 
 fn session_with_source(source: impl FactSource<TestKey> + 'static) -> EvaluationSession {
-    let session = EvaluationSession::new();
-    session.register::<TestKey, _>(source);
-    session
+    FactRegistry::builder()
+        .with::<TestKey, _>(source)
+        .build()
+        .session()
 }
 
 fn assert_found(result: &FactLoadResult<u16>, expected: u16) {
@@ -320,16 +320,6 @@ fn assert_load_cancelled(result: &FactLoadResult<u16>) {
             assert_eq!(*fact_name, TestKey::NAME);
         }
         other => panic!("expected LoaderCancelled, got {other:?}"),
-    }
-}
-
-fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else if let Some(message) = panic.downcast_ref::<&'static str>() {
-        message.to_string()
-    } else {
-        "<non-string panic>".to_string()
     }
 }
 
@@ -429,14 +419,11 @@ async fn shared_source_serves_concurrent_sessions_with_separate_caches() {
     let calls = new_calls();
     let source: Arc<dyn FactSource<TestKey>> = Arc::new(RecordingSource::echo(Arc::clone(&calls)));
     let keys = vec![TestKey(1), TestKey(2), TestKey(1)];
+    let registry = FactRegistry::builder()
+        .with_arc::<TestKey>(Arc::clone(&source))
+        .build();
 
-    let sessions = (0..3)
-        .map(|_| {
-            EvaluationSession::builder()
-                .with_arc::<TestKey>(Arc::clone(&source))
-                .build()
-        })
-        .collect::<Vec<_>>();
+    let sessions = (0..3).map(|_| registry.session()).collect::<Vec<_>>();
 
     let handles = sessions
         .clone()
@@ -582,7 +569,8 @@ async fn missing_sources_fail_closed_and_source_registration_is_explicit() {
     let session = EvaluationSession::new();
     let cached_missing = session.get(TestKey(1)).await;
     assert_source_not_registered(&cached_missing, TestKey::NAME);
-    session.register::<TestKey, _>(RecordingSource::echo(new_calls()));
+
+    let session = session_with_source(RecordingSource::echo(new_calls()));
     assert_found(&session.get(TestKey(1)).await, 1);
     let missing_other = session.get(OtherKey(1)).await;
     assert_source_not_registered(&missing_other, OtherKey::NAME);
@@ -597,109 +585,38 @@ async fn missing_sources_fail_closed_and_source_registration_is_explicit() {
     assert_found(&session.get(TestKey(1)).await, 1);
 
     let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        session.register::<TestKey, _>(RecordingSource::new(
-            Arc::clone(&second_calls),
-            None,
-            |_keys| vec![FactLoadResult::Found(2)],
-        ));
+        FactRegistry::builder()
+            .with::<TestKey, _>(RecordingSource::new(
+                Arc::clone(&first_calls),
+                None,
+                |_keys| vec![FactLoadResult::Found(1)],
+            ))
+            .with::<TestKey, _>(RecordingSource::new(
+                Arc::clone(&second_calls),
+                None,
+                |_keys| vec![FactLoadResult::Found(2)],
+            ))
+            .build();
     }));
     assert!(
         duplicate.is_err(),
-        "duplicate registration should fail fast"
+        "duplicate registry entries should fail fast"
     );
-    assert!(matches!(
-        session.try_register::<TestKey, _>(RecordingSource::new(
-            Arc::clone(&second_calls),
-            None,
-            |_keys| vec![FactLoadResult::Found(2)],
-        )),
-        Err(FactSourceRegistrationError::AlreadyRegistered {
-            fact_name: TestKey::NAME
-        })
-    ));
     assert_found(&session.get(TestKey(1)).await, 1);
     assert_eq!(second_calls.lock().unwrap().len(), 0);
 
-    session.replace::<TestKey, _>(RecordingSource::new(
-        Arc::clone(&second_calls),
-        None,
-        |_keys| vec![FactLoadResult::Found(2)],
-    ));
-    assert_found(&session.get(TestKey(1)).await, 2);
-    assert_eq!(first_calls.lock().unwrap().len(), 1);
-    assert_eq!(second_calls.lock().unwrap().len(), 1);
-
-    let other_session = EvaluationSession::builder()
+    let other_session = FactRegistry::builder()
         .with::<OtherKey, _>(OtherSource)
-        .build();
+        .build()
+        .session();
     assert_found(&other_session.get(OtherKey(5)).await, 5);
 }
 
-#[tokio::test]
-async fn source_registration_and_replacement_reject_in_flight_loads() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let session = session_with_source(BlockingErrorSource {
-        calls: Arc::clone(&calls),
-        started: Arc::clone(&started),
-        release: Arc::clone(&release),
-    });
-
-    let leader_session = session.clone();
-    let leader = tokio::spawn(async move { leader_session.get(TestKey(8)).await });
-    started.notified().await;
-
-    let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        session.register::<TestKey, _>(RecordingSource::echo(new_calls()));
-    }))
-    .expect_err("duplicate registration should panic before inspecting in-flight loads");
-    assert!(
-        panic_message(duplicate).contains("already registered"),
-        "duplicate registration should keep the actionable duplicate-source message"
-    );
-
-    let replacement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        session.replace::<TestKey, _>(RecordingSource::echo(new_calls()));
-    }))
-    .expect_err("replacement during in-flight load should panic");
-    assert!(
-        panic_message(replacement).contains("registered or replaced while loads"),
-        "replacement panic should describe both public source-registration verbs"
-    );
-    assert!(matches!(
-        session.try_replace::<TestKey, _>(RecordingSource::echo(new_calls())),
-        Err(FactSourceRegistrationError::InFlight {
-            fact_name: TestKey::NAME
-        })
-    ));
-
-    release.notify_one();
-    let leader_result = leader.await.unwrap();
-    assert_backend_error_contains(&leader_result, "down");
-}
-
 #[test]
-fn shared_empty_session_is_static_and_rejects_source_registration() {
+fn shared_empty_session_is_static() {
     let first = EvaluationSession::shared_empty() as *const EvaluationSession;
     let second = EvaluationSession::shared_empty() as *const EvaluationSession;
     assert_eq!(first, second);
-
-    let duplicate = std::panic::catch_unwind(|| {
-        EvaluationSession::shared_empty()
-            .register::<TestKey, _>(RecordingSource::echo(new_calls()));
-    });
-    assert!(
-        duplicate.is_err(),
-        "shared empty sessions must not become mutable source registries"
-    );
-    assert!(matches!(
-        EvaluationSession::shared_empty()
-            .try_register::<TestKey, _>(RecordingSource::echo(new_calls())),
-        Err(FactSourceRegistrationError::SharedEmptySession {
-            fact_name: TestKey::NAME
-        })
-    ));
 }
 
 #[tokio::test]
@@ -785,9 +702,10 @@ async fn chunking_with_duplicates_expands_to_original_positions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unrelated_fact_keys_do_not_contend_on_one_session_lock() {
     let blocker = Arc::new(HashBlocker::new());
-    let session = EvaluationSession::builder()
+    let session = FactRegistry::builder()
         .with::<BlockingHashKey, _>(BlockingHashSource)
-        .build();
+        .build()
+        .session();
 
     let leader_session = session.clone();
     let leader_blocker = Arc::clone(&blocker);
@@ -817,10 +735,11 @@ async fn unrelated_fact_keys_do_not_contend_on_one_session_lock() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unrelated_fact_types_do_not_contend_on_one_session_lock() {
     let blocker = Arc::new(HashBlocker::new());
-    let session = EvaluationSession::builder()
+    let session = FactRegistry::builder()
         .with::<BlockingHashKey, _>(BlockingHashSource)
         .with::<OtherKey, _>(OtherSource)
-        .build();
+        .build()
+        .session();
 
     let leader_session = session.clone();
     let leader_blocker = Arc::clone(&blocker);

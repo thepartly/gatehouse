@@ -92,8 +92,10 @@ use std::sync::Arc;
 ///     relation: relationship.clone(),
 /// }]);
 ///
-/// let session = EvaluationSession::new();
-/// session.register::<RelationshipQuery<Uuid, Uuid, String>, _>(ProjectRelationships { grants });
+/// let registry = FactRegistry::builder()
+///     .with::<RelationshipQuery<Uuid, Uuid, String>, _>(ProjectRelationships { grants })
+///     .build();
+/// let session = registry.session();
 ///
 /// let rebac_policy = RebacPolicy::new(
 ///     |employee: &Employee| employee.id,
@@ -101,7 +103,7 @@ use std::sync::Arc;
 ///     relationship,
 /// );
 ///
-/// let mut checker = PermissionChecker::<Employee, Project, AccessAction, EmptyContext>::new();
+/// let mut checker = PermissionChecker::<Employee, AccessAction, Project, EmptyContext>::new();
 /// checker.add_policy(rebac_policy);
 ///
 /// # tokio_test::block_on(async {
@@ -111,15 +113,15 @@ use std::sync::Arc;
 ///     .is_granted());
 /// # });
 /// ```
-pub struct RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation> {
+pub struct RebacPolicy<S, A, R, C, SubjectId, ResourceId, Relation> {
     subject_id: Arc<dyn Fn(&S) -> SubjectId + Send + Sync>,
     resource_id: Arc<dyn Fn(&R) -> ResourceId + Send + Sync>,
     relation: Relation,
     _marker: std::marker::PhantomData<(A, C)>,
 }
 
-impl<S, R, A, C, SubjectId, ResourceId, Relation>
-    RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation>
+impl<S, A, R, C, SubjectId, ResourceId, Relation>
+    RebacPolicy<S, A, R, C, SubjectId, ResourceId, Relation>
 {
     /// Creates a ReBAC policy from subject/resource ID extractors and a relation.
     pub fn new<SubjectIdFn, ResourceIdFn>(
@@ -141,8 +143,8 @@ impl<S, R, A, C, SubjectId, ResourceId, Relation>
 }
 
 #[async_trait]
-impl<S, R, A, C, SubjectId, ResourceId, Relation> Policy<S, R, A, C>
-    for RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation>
+impl<S, A, R, C, SubjectId, ResourceId, Relation> Policy<S, A, R, C>
+    for RebacPolicy<S, A, R, C, SubjectId, ResourceId, Relation>
 where
     S: Sync + Send,
     R: Sync + Send,
@@ -152,7 +154,7 @@ where
     ResourceId: Eq + Hash + Clone + Send + Sync + fmt::Debug + 'static,
     Relation: Eq + Hash + Clone + Send + Sync + fmt::Display + 'static,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
         // Capture the FactKey::NAME here so `result_from_fact` does not need
         // to carry the full FactKey trait bound on its impl block.
         let fact_name = <RelationshipQuery<SubjectId, ResourceId, Relation> as FactKey>::NAME;
@@ -167,7 +169,7 @@ where
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+        ctx: &BatchEvalCtx<'item, S, A, R, C>,
     ) -> Vec<PolicyEvalResult> {
         let fact_name = <RelationshipQuery<SubjectId, ResourceId, Relation> as FactKey>::NAME;
         let subject_id = (self.subject_id)(ctx.subject);
@@ -187,7 +189,7 @@ where
                 .items
                 .iter()
                 .map(|_| {
-                    PolicyEvalResult::denied(
+                    PolicyEvalResult::not_applicable(
                         self.policy_type(),
                         "Relationship fact source returned the wrong number of results",
                     )
@@ -206,8 +208,8 @@ where
     }
 }
 
-impl<S, R, A, C, SubjectId, ResourceId, Relation>
-    RebacPolicy<S, R, A, C, SubjectId, ResourceId, Relation>
+impl<S, A, R, C, SubjectId, ResourceId, Relation>
+    RebacPolicy<S, A, R, C, SubjectId, ResourceId, Relation>
 where
     SubjectId: fmt::Debug,
     ResourceId: fmt::Debug,
@@ -248,7 +250,7 @@ where
                 )),
                 provenance,
             ),
-            FactLoadResult::Found(false) => PolicyEvalResult::denied_with_facts(
+            FactLoadResult::Found(false) => PolicyEvalResult::not_applicable_with_facts(
                 "RebacPolicy",
                 format!(
                     "Subject does not have '{}' relationship with resource",
@@ -256,12 +258,12 @@ where
                 ),
                 provenance,
             ),
-            FactLoadResult::Missing => PolicyEvalResult::denied_with_facts(
+            FactLoadResult::Missing => PolicyEvalResult::not_applicable_with_facts(
                 "RebacPolicy",
                 format!("Relationship '{}' fact is missing", self.relation),
                 provenance,
             ),
-            FactLoadResult::Error(error) => PolicyEvalResult::denied_with_facts(
+            FactLoadResult::Error(error) => PolicyEvalResult::not_applicable_with_facts(
                 "RebacPolicy",
                 format!("Relationship '{}' fact load failed: {error}", self.relation),
                 provenance,

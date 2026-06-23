@@ -13,7 +13,7 @@
 //!
 //! That last bit is what `Context` is for. We carry `mfa_verified_at`
 //! and the request's wall-clock time on `ApprovalContext`. The
-//! high-value rule is a deny-effect policy that **forbids** the approval
+//! high-value rule is a forbid-effect policy that **forbids** the approval
 //! when MFA freshness has lapsed; the role policy ignores the field
 //! entirely. Same subject, same resource, different calls → different
 //! decisions.
@@ -64,15 +64,15 @@ struct ApprovalContext {
 struct FinanceCanApproveRefunds;
 
 #[async_trait]
-impl Policy<User, RefundRequest, Approve, ApprovalContext> for FinanceCanApproveRefunds {
+impl Policy<User, Approve, RefundRequest, ApprovalContext> for FinanceCanApproveRefunds {
     async fn evaluate(
         &self,
-        ctx: &EvalCtx<'_, User, RefundRequest, Approve, ApprovalContext>,
+        ctx: &EvalCtx<'_, User, Approve, RefundRequest, ApprovalContext>,
     ) -> PolicyEvalResult {
         if ctx.subject.roles.iter().any(|r| r == "finance") {
             ctx.grant("subject has the finance role")
         } else {
-            ctx.deny("subject lacks the finance role")
+            ctx.not_applicable("subject lacks the finance role")
         }
     }
     fn policy_type(&self) -> Cow<'static, str> {
@@ -83,10 +83,10 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for FinanceCanApprove
 /// Deny rule: a high-value refund without fresh MFA is **forbidden**.
 ///
 /// This is the policy that *does* care about `Context`, and it is a
-/// deny-effect policy in natural polarity: it matches exactly when the
+/// forbid-effect policy in natural polarity: it matches exactly when the
 /// approval must be blocked, and returns `ctx.forbid(...)` for that
 /// case. Everything else — small refunds, fresh MFA — is "not
-/// applicable" (`ctx.deny`), which never blocks and never grants.
+/// applicable" (`ctx.not_applicable`), which never blocks and never grants.
 ///
 /// Registered flat on the [`PermissionChecker`], the forbid overrides
 /// every grant under deny-overrides semantics. That is the right
@@ -95,7 +95,7 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for FinanceCanApprove
 /// cannot approve a high-value refund through it.
 ///
 /// Note the [`Policy::effect`] override below — a hand-written policy
-/// that can forbid must declare [`Effect::Deny`] so the checker
+/// that can forbid must declare [`Effect::Forbid`] so the checker
 /// schedules it ahead of the grant short-circuit.
 struct HighValueRequiresFreshMfa {
     threshold_cents: u64,
@@ -103,15 +103,15 @@ struct HighValueRequiresFreshMfa {
 }
 
 #[async_trait]
-impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequiresFreshMfa {
+impl Policy<User, Approve, RefundRequest, ApprovalContext> for HighValueRequiresFreshMfa {
     async fn evaluate(
         &self,
-        ctx: &EvalCtx<'_, User, RefundRequest, Approve, ApprovalContext>,
+        ctx: &EvalCtx<'_, User, Approve, RefundRequest, ApprovalContext>,
     ) -> PolicyEvalResult {
         // Rule doesn't apply below the threshold: not applicable, and a
-        // non-matching deny-effect policy blocks nothing.
+        // non-matching forbid-effect policy blocks nothing.
         if ctx.resource.amount_cents < self.threshold_cents {
-            return ctx.deny("amount below high-value threshold; rule not applicable");
+            return ctx.not_applicable("amount below high-value threshold; rule not applicable");
         }
 
         let Some(verified_at) = ctx.context.mfa_verified_at else {
@@ -127,7 +127,7 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequires
             .duration_since(verified_at)
             .unwrap_or_default();
         if age <= self.max_age {
-            ctx.deny(format!(
+            ctx.not_applicable(format!(
                 "MFA reasserted {}s ago, within freshness window; rule not applicable",
                 age.as_secs(),
             ))
@@ -143,11 +143,11 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequires
         Cow::Borrowed("HighValueRequiresFreshMfa")
     }
     fn effect(&self) -> Effect {
-        Effect::Deny
+        Effect::Forbid
     }
 }
 
-fn build_checker() -> PermissionChecker<User, RefundRequest, Approve, ApprovalContext> {
+fn build_checker() -> PermissionChecker<User, Approve, RefundRequest, ApprovalContext> {
     // Flat registration: the role grant and the MFA veto are siblings.
     // The checker's deny-overrides rule does the combining — any forbid
     // wins, otherwise any grant wins, otherwise default deny.

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use gatehouse::{
-    BatchEvalCtx, Effect, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
+    BatchEvalCtx, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
     PolicyEvalResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,17 +32,17 @@ struct Resource {
 struct TracePolicy;
 
 #[async_trait]
-impl Policy<Subject, Resource, Action, Ctx> for TracePolicy {
+impl Policy<Subject, Action, Resource, Ctx> for TracePolicy {
     async fn evaluate(
         &self,
-        ctx: &EvalCtx<'_, Subject, Resource, Action, Ctx>,
+        ctx: &EvalCtx<'_, Subject, Action, Resource, Ctx>,
     ) -> PolicyEvalResult {
         result_for(ctx.resource.allowed)
     }
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, Subject, Resource, Action, Ctx>,
+        ctx: &BatchEvalCtx<'item, Subject, Action, Resource, Ctx>,
     ) -> Vec<PolicyEvalResult> {
         ctx.items
             .iter()
@@ -59,7 +59,7 @@ fn result_for(allowed: bool) -> PolicyEvalResult {
     if allowed {
         PolicyEvalResult::granted("TracePolicy", Some("allowed".to_string()))
     } else {
-        PolicyEvalResult::denied("TracePolicy", "denied")
+        PolicyEvalResult::not_applicable("TracePolicy", "denied")
     }
 }
 
@@ -234,7 +234,7 @@ fn assert_value(span: &CapturedSpan, field: &str, expected: &str) {
     );
 }
 
-fn checker_with_policy() -> PermissionChecker<Subject, Resource, Action, Ctx> {
+fn checker_with_policy() -> PermissionChecker<Subject, Action, Resource, Ctx> {
     let mut checker = PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(2).unwrap());
     checker.add_policy(TracePolicy);
     checker
@@ -266,7 +266,7 @@ fn tracing_fields_are_recorded_for_granted_decisions() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
+            .evaluate_batch_in_session(
                 &session,
                 &Subject,
                 &Action,
@@ -276,7 +276,7 @@ fn tracing_fields_are_recorded_for_granted_decisions() {
             .await
     });
 
-    let batch = span(&spans, "evaluate_batch_in_session_by");
+    let batch = span(&spans, "evaluate_batch_in_session");
     assert_fields(
         batch,
         &[
@@ -319,7 +319,7 @@ fn tracing_records_one_batch_policy_span_per_chunk() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
+            .evaluate_batch_in_session(
                 &session,
                 &Subject,
                 &Action,
@@ -377,7 +377,7 @@ fn tracing_fields_are_recorded_for_denied_decisions() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
+            .evaluate_batch_in_session(
                 &session,
                 &Subject,
                 &Action,
@@ -387,7 +387,7 @@ fn tracing_fields_are_recorded_for_denied_decisions() {
             .await
     });
 
-    let batch = span(&spans, "evaluate_batch_in_session_by");
+    let batch = span(&spans, "evaluate_batch_in_session");
     assert_fields(
         batch,
         &[
@@ -407,7 +407,7 @@ fn tracing_fields_are_recorded_for_denied_decisions() {
 
 #[test]
 fn tracing_fields_are_recorded_for_empty_policy_decisions() {
-    let checker = PermissionChecker::<Subject, Resource, Action, Ctx>::new();
+    let checker = PermissionChecker::<Subject, Action, Resource, Ctx>::new();
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
@@ -426,12 +426,12 @@ fn tracing_fields_are_recorded_for_empty_policy_decisions() {
     assert_value(single, "policy_count", "0");
     assert_value(single, "outcome", "denied");
 
-    let checker = PermissionChecker::<Subject, Resource, Action, Ctx>::new()
+    let checker = PermissionChecker::<Subject, Action, Resource, Ctx>::new()
         .with_max_batch_size(NonZeroUsize::new(2).unwrap());
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
+            .evaluate_batch_in_session(
                 &session,
                 &Subject,
                 &Action,
@@ -441,7 +441,7 @@ fn tracing_fields_are_recorded_for_empty_policy_decisions() {
             .await
     });
 
-    let batch = span(&spans, "evaluate_batch_in_session_by");
+    let batch = span(&spans, "evaluate_batch_in_session");
     assert_fields(
         batch,
         &[
@@ -462,7 +462,7 @@ fn tracing_fields_are_recorded_for_empty_policy_decisions() {
 #[test]
 fn named_checker_records_name_on_evaluate_span() {
     let mut checker =
-        PermissionChecker::<Subject, Resource, Action, Ctx>::named("InvoiceItemChecker");
+        PermissionChecker::<Subject, Action, Resource, Ctx>::named("InvoiceItemChecker");
     checker.add_policy(TracePolicy);
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
@@ -510,12 +510,12 @@ fn unnamed_checker_omits_checker_name_field() {
 #[test]
 fn named_checker_records_name_on_batch_span() {
     let mut checker =
-        PermissionChecker::<Subject, Resource, Action, Ctx>::named("InvoiceItemChecker");
+        PermissionChecker::<Subject, Action, Resource, Ctx>::named("InvoiceItemChecker");
     checker.add_policy(TracePolicy);
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
+            .evaluate_batch_in_session(
                 &session,
                 &Subject,
                 &Action,
@@ -525,18 +525,18 @@ fn named_checker_records_name_on_batch_span() {
             .await
     });
 
-    let batch = span(&spans, "evaluate_batch_in_session_by");
+    let batch = span(&spans, "evaluate_batch_in_session");
     assert_value(batch, "checker.name", "InvoiceItemChecker");
 }
 
 #[test]
 fn tracing_fields_are_recorded_for_forbidden_decisions() {
-    // An allow policy that would grant, vetoed by a deny-effect policy.
+    // An allow policy that would grant, vetoed by a forbid-effect policy.
     let mut checker = PermissionChecker::new();
     checker.add_policy(TracePolicy);
     checker.add_policy(
-        PolicyBuilder::<Subject, Resource, Action, Ctx>::new("GlobalFreeze")
-            .effect(Effect::Deny)
+        PolicyBuilder::<Subject, Action, Resource, Ctx>::new("GlobalFreeze")
+            .forbid()
             .build(),
     );
 
@@ -562,7 +562,7 @@ fn tracing_fields_are_recorded_for_forbidden_decisions() {
     // The batch policy span carries the declared effect and the forbid count.
     let (_results, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
+            .evaluate_batch_in_session(
                 &session,
                 &Subject,
                 &Action,
@@ -572,7 +572,7 @@ fn tracing_fields_are_recorded_for_forbidden_decisions() {
             .await
     });
 
-    // Deny-first scheduling: the first batch_policy span is the deny policy.
+    // Forbid-first scheduling: the first batch_policy span is the forbid policy.
     let policy = span(&spans, "gatehouse.batch_policy");
     assert_value(policy, "policy.type", "GlobalFreeze");
     assert_value(policy, "policy.effect", "deny");

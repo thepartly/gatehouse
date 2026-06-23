@@ -216,13 +216,13 @@ impl From<Invoice> for InvoiceSummary {
 // 2) Shared application state
 // --------------------------
 
-/// The long-lived pieces are built once at startup: the checker and the
-/// relationship source. Each request derives a fresh `EvaluationSession` from
-/// the source.
+/// The long-lived pieces are built once at startup: the checker and fact
+/// registry. Each request derives a fresh `EvaluationSession` from the
+/// registry.
 #[derive(Clone)]
 pub struct AppState {
-    checker: PermissionChecker<User, Invoice, Action, RequestContext>,
-    invoice_relationships: Arc<dyn FactSource<InvoiceRelationship>>,
+    checker: PermissionChecker<User, Action, Invoice, RequestContext>,
+    fact_registry: FactRegistry,
     invoices: Arc<Vec<Invoice>>,
 }
 
@@ -243,15 +243,15 @@ impl AppState {
 
         Self {
             checker: build_permission_checker(),
-            invoice_relationships: Arc::new(InMemoryRelationshipSource::new(grants)),
+            fact_registry: FactRegistry::builder()
+                .with_arc::<InvoiceRelationship>(Arc::new(InMemoryRelationshipSource::new(grants)))
+                .build(),
             invoices,
         }
     }
 
     fn request_session(&self) -> EvaluationSession {
-        EvaluationSession::builder()
-            .with_arc::<InvoiceRelationship>(Arc::clone(&self.invoice_relationships))
-            .build()
+        self.fact_registry.session()
     }
 }
 
@@ -292,8 +292,8 @@ fn demo_invoices() -> Vec<Invoice> {
 // Each policy handles a slice of the logic; the checker ORs them together.
 
 /// (A) Admins may do anything — the cross-cutting override.
-fn admin_override_policy() -> Box<dyn Policy<User, Invoice, Action, RequestContext>> {
-    PolicyBuilder::<User, Invoice, Action, RequestContext>::new("AdminOverridePolicy")
+fn admin_override_policy() -> Box<dyn Policy<User, Action, Invoice, RequestContext>> {
+    PolicyBuilder::<User, Action, Invoice, RequestContext>::new("AdminOverridePolicy")
         .when(|user, _action, _invoice, _ctx| user.roles.contains(&"admin".to_string()))
         .build()
 }
@@ -301,13 +301,13 @@ fn admin_override_policy() -> Box<dyn Policy<User, Invoice, Action, RequestConte
 /// (B) A user with a `viewer` relationship may view the invoice. The
 /// relationship is loaded through the request-scoped `EvaluationSession`; in a
 /// real service the source wraps a database pool or graph client.
-fn invoice_viewer_policy() -> Box<dyn Policy<User, Invoice, Action, RequestContext>> {
-    let is_view: Arc<dyn Policy<User, Invoice, Action, RequestContext>> = Arc::from(
-        PolicyBuilder::<User, Invoice, Action, RequestContext>::new("IsView")
+fn invoice_viewer_policy() -> Box<dyn Policy<User, Action, Invoice, RequestContext>> {
+    let is_view: Arc<dyn Policy<User, Action, Invoice, RequestContext>> = Arc::from(
+        PolicyBuilder::<User, Action, Invoice, RequestContext>::new("IsView")
             .when(|_user, action, _invoice, _ctx| matches!(action, Action::View))
             .build(),
     );
-    let viewer_relationship: Arc<dyn Policy<User, Invoice, Action, RequestContext>> =
+    let viewer_relationship: Arc<dyn Policy<User, Action, Invoice, RequestContext>> =
         Arc::new(RebacPolicy::new(
             |user: &User| user.id,
             |invoice: &Invoice| invoice.id,
@@ -323,23 +323,23 @@ fn invoice_viewer_policy() -> Box<dyn Policy<User, Invoice, Action, RequestConte
 /// (C) The owner may edit the invoice if it is unlocked and under 30 days old.
 /// Built from small sub-policies AND-ed together, so a denial trace names the
 /// sub-policy that failed.
-fn invoice_editing_policy() -> Box<dyn Policy<User, Invoice, Action, RequestContext>> {
-    let is_edit = PolicyBuilder::<User, Invoice, Action, RequestContext>::new("IsEdit")
+fn invoice_editing_policy() -> Box<dyn Policy<User, Action, Invoice, RequestContext>> {
+    let is_edit = PolicyBuilder::<User, Action, Invoice, RequestContext>::new("IsEdit")
         .when(|_user, action, _invoice, _ctx| matches!(action, Action::Edit))
         .build();
 
-    let is_owner = PolicyBuilder::<User, Invoice, Action, RequestContext>::new("IsOwnerOfInvoice")
+    let is_owner = PolicyBuilder::<User, Action, Invoice, RequestContext>::new("IsOwnerOfInvoice")
         .when(|user, _action, invoice, _ctx| user.id == invoice.owner_id)
         .build();
 
     let invoice_not_locked =
-        PolicyBuilder::<User, Invoice, Action, RequestContext>::new("InvoiceNotLocked")
+        PolicyBuilder::<User, Action, Invoice, RequestContext>::new("InvoiceNotLocked")
             .when(|_user, _action, invoice, _ctx| !invoice.locked)
             .build();
 
     const THIRTY_DAYS: u64 = 30 * 24 * 60 * 60;
     let invoice_age_under_30_days =
-        PolicyBuilder::<User, Invoice, Action, RequestContext>::new("InvoiceAgeUnder30Days")
+        PolicyBuilder::<User, Action, Invoice, RequestContext>::new("InvoiceAgeUnder30Days")
             .when(move |_user, _action, invoice, ctx| {
                 ctx.current_time
                     .duration_since(invoice.created_at)
@@ -361,9 +361,9 @@ fn invoice_editing_policy() -> Box<dyn Policy<User, Invoice, Action, RequestCont
 }
 
 /// (D) Combine the policies into a single `PermissionChecker`. With no
-/// deny-effect policies registered, deny-overrides reduces to OR semantics:
+/// forbid-effect policies registered, deny-overrides reduces to OR semantics:
 /// if any policy grants, access is allowed (and evaluation short-circuits).
-pub fn build_permission_checker() -> PermissionChecker<User, Invoice, Action, RequestContext> {
+pub fn build_permission_checker() -> PermissionChecker<User, Action, Invoice, RequestContext> {
     let mut checker = PermissionChecker::named("InvoiceChecker");
     checker.add_policy(admin_override_policy());
     checker.add_policy(invoice_viewer_policy());
@@ -413,23 +413,26 @@ pub async fn list_invoices_handler(
 ) -> impl IntoResponse {
     let session = state.request_session();
     let candidates = state.invoices.as_ref().clone();
+    let context = RequestContext::now();
 
     // The session is request-scoped: app state owns the source, this request
     // registers it, and the batch authorization call uses it for every invoice
     // — relationship loads are batched and deduplicated.
     let visible = state
         .checker
-        .filter_authorized_in_session_by_resource(
+        .filter_authorized_in_session(
             &session,
             &user,
             &Action::View,
-            candidates,
-            &RequestContext::now(),
-            |invoice| invoice,
+            candidates
+                .into_iter()
+                .map(|invoice| (invoice, context.clone()))
+                .collect::<Vec<_>>(),
+            |(invoice, context)| (invoice, context),
         )
         .await
         .into_iter()
-        .map(InvoiceSummary::from)
+        .map(|(invoice, _context)| InvoiceSummary::from(invoice))
         .collect::<Vec<_>>();
 
     Json(visible).into_response()

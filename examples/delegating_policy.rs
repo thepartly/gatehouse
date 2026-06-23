@@ -42,11 +42,11 @@ struct EditDoc;
 /// The document domain owns its own access rules — the owner can edit, and so
 /// can an admin. This checker is the single source of truth for "can edit this
 /// document"; the comment domain borrows it rather than reimplementing it.
-fn document_checker() -> PermissionChecker<DocUser, Document, EditDoc, ()> {
-    let owner = PolicyBuilder::<DocUser, Document, EditDoc, ()>::new("DocumentOwner")
+fn document_checker() -> PermissionChecker<DocUser, EditDoc, Document, ()> {
+    let owner = PolicyBuilder::<DocUser, EditDoc, Document, ()>::new("DocumentOwner")
         .when(|user, _action, document, _ctx| user.id == document.owner_id)
         .build();
-    let admin = PolicyBuilder::<DocUser, Document, EditDoc, ()>::new("DocumentAdmin")
+    let admin = PolicyBuilder::<DocUser, EditDoc, Document, ()>::new("DocumentAdmin")
         .subjects(|user| user.is_admin)
         .build();
 
@@ -79,15 +79,15 @@ struct EditComment;
 struct AuthorCanEditComment;
 
 #[async_trait]
-impl Policy<Principal, Comment, EditComment, ()> for AuthorCanEditComment {
+impl Policy<Principal, EditComment, Comment, ()> for AuthorCanEditComment {
     async fn evaluate(
         &self,
-        ctx: &EvalCtx<'_, Principal, Comment, EditComment, ()>,
+        ctx: &EvalCtx<'_, Principal, EditComment, Comment, ()>,
     ) -> PolicyEvalResult {
         if ctx.subject.user_id == ctx.resource.author_id {
             ctx.grant("subject is the comment author")
         } else {
-            ctx.deny("subject is not the comment author")
+            ctx.not_applicable("subject is not the comment author")
         }
     }
     fn policy_type(&self) -> Cow<'static, str> {
@@ -97,7 +97,7 @@ impl Policy<Principal, Comment, EditComment, ()> for AuthorCanEditComment {
 
 /// The comment checker: edit your own comment OR inherit edit rights from the
 /// parent document via delegation.
-fn comment_checker() -> PermissionChecker<Principal, Comment, EditComment, ()> {
+fn comment_checker() -> PermissionChecker<Principal, EditComment, Comment, ()> {
     // The four mappers are the entire bridge between the comment domain and the
     // document domain. Subject and action map once per batch; resource and
     // context map once per item.
@@ -109,10 +109,10 @@ fn comment_checker() -> PermissionChecker<Principal, Comment, EditComment, ()> {
             is_admin: principal.is_admin,
         },
         |_action: &EditComment| EditDoc,
-        |_subject: &Principal, comment: &Comment, _action: &EditComment, _ctx: &()| {
+        |_subject: &Principal, _action: &EditComment, comment: &Comment, _ctx: &()| {
             comment.document.clone()
         },
-        |_subject, _comment, _action, _ctx| (),
+        |_subject, _action, _comment, _ctx| (),
     );
 
     let mut checker = PermissionChecker::named("CommentChecker");

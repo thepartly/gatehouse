@@ -5,20 +5,20 @@ use std::borrow::Cow;
 /// The declared effect of a policy: whether a match grants or forbids access.
 ///
 /// `Allow` (the default everywhere) means the policy grants access when it
-/// matches. `Deny` means the policy **forbids** access when it matches — a
-/// matched deny produces [`PolicyEvalResult::Forbidden`], which
+/// matches. `Forbid` means the policy **forbids** access when it matches — a
+/// matched forbid produces [`PolicyEvalResult::Forbidden`], which
 /// [`crate::PermissionChecker`] honors over any grant from sibling policies
 /// (deny-overrides semantics).
 ///
 /// The effect travels with the policy: set it via
-/// [`crate::PolicyBuilder::effect`], or declare it on a hand-written policy
+/// [`crate::PolicyBuilder::forbid`], or declare it on a hand-written policy
 /// by overriding [`Policy::effect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
     /// The policy grants access when its predicates pass.
     Allow,
     /// The policy forbids access when its predicates pass.
-    Deny,
+    Forbid,
 }
 
 /// A borrowed resource/context pair passed to batch policy evaluators.
@@ -33,7 +33,7 @@ pub struct PolicyBatchItem<'a, Resource, Context> {
 }
 
 /// Per-item policy evaluation context.
-pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
+pub struct EvalCtx<'a, Subject, Action, Resource, Context> {
     /// Request-scoped fact session.
     pub session: &'a EvaluationSession,
     /// Entity requesting access.
@@ -63,11 +63,11 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     /// checker before dispatch. On the single-item path
     /// ([`crate::PermissionChecker::evaluate_in_session`]) the checker
     /// captures it exactly once and moves it into this field; on the
-    /// batch path ([`crate::PermissionChecker::evaluate_batch_in_session_by`]
-    /// and siblings) the checker captures it once per policy and clones
-    /// it into each `BatchEvalCtx` chunk. Used by [`Self::grant`] /
-    /// [`Self::deny`] so policy bodies don't need to re-pass
-    /// `self.policy_type()` on every result.
+    /// batch path ([`crate::PermissionChecker::evaluate_batch_in_session`])
+    /// the checker captures it once per policy and clones it into each
+    /// `BatchEvalCtx` chunk. Used by [`Self::grant`] /
+    /// [`Self::not_applicable`] / [`Self::forbid`] so policy bodies don't need
+    /// to re-pass `self.policy_type()` on every result.
     ///
     /// Stored as [`Cow<'static, str>`] so the shortcut path is truly
     /// zero-allocation for policies that return `Cow::Borrowed("Name")`
@@ -77,7 +77,7 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     /// name policy does. On the single-item path the checker calls
     /// `policy.policy_type()` (alloc 1, the `String` inside the
     /// `Cow::Owned`) and moves the `Cow` straight into the `EvalCtx`,
-    /// and then `ctx.grant` / `ctx.deny` clones it into the result
+    /// and then `ctx.grant` / `ctx.not_applicable` clones it into the result
     /// (alloc 2). On the batch path the checker keeps the local
     /// `Cow` alive across chunks and clones it into each
     /// `BatchEvalCtx`, so the cost rises further with the number of
@@ -90,10 +90,10 @@ pub struct EvalCtx<'a, Subject, Resource, Action, Context> {
     pub policy_type: Cow<'static, str>,
 }
 
-impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
+impl<'a, S, A, R, C> EvalCtx<'a, S, A, R, C> {
     /// Shorthand for `PolicyEvalResult::granted(ctx.policy_type, Some(reason))`.
     ///
-    /// Symmetric with [`Self::deny`]: both take the reason as a string. The
+    /// Symmetric with [`Self::not_applicable`]: both take the reason as a string. The
     /// underlying [`PolicyEvalResult::Granted`] variant allows a `None`
     /// reason, but in practice grants almost always carry one, so the
     /// shortcut requires it; for the rare no-reason case call
@@ -102,17 +102,17 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
         PolicyEvalResult::granted(self.policy_type.clone(), Some(reason.into()))
     }
 
-    /// Shorthand for `PolicyEvalResult::denied(ctx.policy_type, reason)`.
-    pub fn deny(&self, reason: impl Into<String>) -> PolicyEvalResult {
-        PolicyEvalResult::denied(self.policy_type.clone(), reason)
+    /// Shorthand for `PolicyEvalResult::not_applicable(ctx.policy_type, reason)`.
+    pub fn not_applicable(&self, reason: impl Into<String>) -> PolicyEvalResult {
+        PolicyEvalResult::not_applicable(self.policy_type.clone(), reason)
     }
 
     /// Shorthand for `PolicyEvalResult::forbidden(ctx.policy_type, reason)`.
     ///
     /// Use this for an **active veto** — "this request is forbidden" — as
-    /// opposed to [`Self::deny`]'s "this policy does not grant". A policy
+    /// opposed to [`Self::not_applicable`]'s "this policy does not grant". A policy
     /// that can return a forbid should also override [`Policy::effect`] to
-    /// return [`Effect::Deny`] so [`crate::PermissionChecker`] evaluates it
+    /// return [`Effect::Forbid`] so [`crate::PermissionChecker`] evaluates it
     /// before grant short-circuiting can skip it.
     pub fn forbid(&self, reason: impl Into<String>) -> PolicyEvalResult {
         PolicyEvalResult::forbidden(self.policy_type.clone(), reason)
@@ -133,14 +133,14 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
         )
     }
 
-    /// Shorthand for [`PolicyEvalResult::denied_with_facts`] tagged with
+    /// Shorthand for [`PolicyEvalResult::not_applicable_with_facts`] tagged with
     /// `ctx.policy_type`.
-    pub fn deny_with_facts(
+    pub fn not_applicable_with_facts(
         &self,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
     ) -> PolicyEvalResult {
-        PolicyEvalResult::denied_with_facts(self.policy_type.clone(), reason, provenance)
+        PolicyEvalResult::not_applicable_with_facts(self.policy_type.clone(), reason, provenance)
     }
 
     /// Shorthand for [`PolicyEvalResult::forbidden_with_facts`] tagged with
@@ -168,7 +168,7 @@ impl<'a, S, R, A, C> EvalCtx<'a, S, R, A, C> {
 /// If items need different actions, either group them and run one batch per
 /// action, or carry the per-item action inside `Context` and have the policy
 /// read it from there.
-pub struct BatchEvalCtx<'a, Subject, Resource, Action, Context> {
+pub struct BatchEvalCtx<'a, Subject, Action, Resource, Context> {
     /// Request-scoped fact session.
     pub session: &'a EvaluationSession,
     /// Entity requesting access.
@@ -190,7 +190,7 @@ pub struct BatchEvalCtx<'a, Subject, Resource, Action, Context> {
 /// The input types must be [`Sync`] because policies receive borrowed inputs
 /// across async evaluation, including [`BatchEvalCtx`] batch evaluation.
 #[async_trait]
-pub trait Policy<Subject, Resource, Action, Context>: Send + Sync
+pub trait Policy<Subject, Action, Resource, Context>: Send + Sync
 where
     Subject: Sync,
     Resource: Sync,
@@ -213,7 +213,7 @@ where
     /// facts.
     async fn evaluate(
         &self,
-        ctx: &EvalCtx<'_, Subject, Resource, Action, Context>,
+        ctx: &EvalCtx<'_, Subject, Action, Resource, Context>,
     ) -> PolicyEvalResult;
 
     /// Evaluates access for a batch of resource/context pairs.
@@ -239,7 +239,7 @@ where
     /// predicates and use traces to audit the policy-ordered batch behavior.
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, Subject, Resource, Action, Context>,
+        ctx: &BatchEvalCtx<'item, Subject, Action, Resource, Context>,
     ) -> Vec<PolicyEvalResult> {
         let mut results = Vec::with_capacity(ctx.items.len());
         for item in ctx.items {
@@ -261,12 +261,12 @@ where
     /// Returns [`Cow<'static, str>`] so the common static-name case
     /// (`Cow::Borrowed("MyPolicy")`) is zero-allocation end-to-end —
     /// the checker captures this once per evaluation into
-    /// [`EvalCtx::policy_type`], and [`EvalCtx::grant`] / [`EvalCtx::deny`]
+    /// [`EvalCtx::policy_type`], and [`EvalCtx::grant`] / [`EvalCtx::not_applicable`]
     /// clone the [`Cow`] (which is a no-op for `Borrowed`).
     ///
     /// Dynamic-name policies return `Cow::Owned(self.name.clone())`
     /// and pay one allocation here, plus one more on the single-item
-    /// `ctx.grant` / `ctx.deny` helper path (the batch path also clones
+    /// `ctx.grant` / `ctx.not_applicable` helper path (the batch path also clones
     /// into each `BatchEvalCtx` chunk) — see
     /// [`EvalCtx::policy_type`] for the full accounting. This is a
     /// regression from the pre-`Cow` trait shape where
@@ -280,19 +280,19 @@ where
     ///
     /// [`crate::PermissionChecker`] reads this declaration **once, when the
     /// policy is added**, to schedule evaluation: policies declaring
-    /// [`Effect::Deny`] run **before** the allow policies, so a matched
+    /// [`Effect::Forbid`] run **before** the allow policies, so a matched
     /// forbid is always observed before the grant short-circuit can end the
     /// evaluation. The declaration must therefore be constant for the
     /// policy's lifetime. Policies built with
-    /// [`crate::PolicyBuilder::effect`] declare this automatically.
+    /// [`crate::PolicyBuilder::forbid`] declare this automatically.
     ///
     /// **Contract:** a hand-written policy that can return
     /// [`PolicyEvalResult::Forbidden`] must override this to return
-    /// [`Effect::Deny`]. The checker still honors a forbid it happens to
+    /// [`Effect::Forbid`]. The checker still honors a forbid it happens to
     /// observe from an undeclared policy, but without the declaration a
     /// sibling's grant can short-circuit evaluation before the forbid is
     /// reached — the veto would then depend on registration order.
-    /// Conversely, a policy declaring `Effect::Deny` must not return
+    /// Conversely, a policy declaring `Effect::Forbid` must not return
     /// `Granted`; the checker treats such a result as not applicable
     /// (fail-closed) and logs a warning.
     fn effect(&self) -> Effect {
@@ -312,20 +312,20 @@ where
 // Tell the compiler that a Box<dyn Policy> implements the Policy trait so we can keep
 // our internal policy type private.
 #[async_trait]
-impl<S, R, A, C> Policy<S, R, A, C> for Box<dyn Policy<S, R, A, C>>
+impl<S, A, R, C> Policy<S, A, R, C> for Box<dyn Policy<S, A, R, C>>
 where
     S: Sync,
     R: Sync,
     A: Sync,
     C: Sync,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
         (**self).evaluate(ctx).await
     }
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+        ctx: &BatchEvalCtx<'item, S, A, R, C>,
     ) -> Vec<PolicyEvalResult> {
         (**self).evaluate_batch(ctx).await
     }

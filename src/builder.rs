@@ -7,7 +7,7 @@ use async_trait::async_trait;
 /// single closure so [`Policy::evaluate_batch`] can short-circuit the batch-
 /// shared axes (subject and action) once instead of once per item. See the
 /// `evaluate_batch` impl below.
-struct InternalPolicy<S, R, A, C> {
+struct InternalPolicy<S, A, R, C> {
     name: String,
     effect: Effect,
     subject_pred: Option<Box<dyn Fn(&S) -> bool + Send + Sync>>,
@@ -17,7 +17,7 @@ struct InternalPolicy<S, R, A, C> {
     when_pred: Option<Box<dyn Fn(&S, &A, &R, &C) -> bool + Send + Sync>>,
 }
 
-impl<S, R, A, C> InternalPolicy<S, R, A, C> {
+impl<S, A, R, C> InternalPolicy<S, A, R, C> {
     /// Build the result a single evaluation would emit given the
     /// combined predicate outcome.
     fn build_result(&self, all_axes_pass: bool) -> PolicyEvalResult {
@@ -27,27 +27,27 @@ impl<S, R, A, C> InternalPolicy<S, R, A, C> {
                     self.name.clone(),
                     Some("Policy allowed access".into()),
                 ),
-                Effect::Deny => {
+                Effect::Forbid => {
                     PolicyEvalResult::forbidden(self.name.clone(), "Policy forbids access")
                 }
             }
         } else {
             // A non-match is "not applicable", never a veto — even for
-            // Effect::Deny policies.
-            PolicyEvalResult::denied(self.name.clone(), "Policy predicate did not match")
+            // Effect::Forbid policies.
+            PolicyEvalResult::not_applicable(self.name.clone(), "Policy predicate did not match")
         }
     }
 }
 
 #[async_trait]
-impl<S, R, A, C> Policy<S, R, A, C> for InternalPolicy<S, R, A, C>
+impl<S, A, R, C> Policy<S, A, R, C> for InternalPolicy<S, A, R, C>
 where
     S: Send + Sync,
     R: Send + Sync,
     A: Send + Sync,
     C: Send + Sync,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, S, R, A, C>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, S, A, R, C>) -> PolicyEvalResult {
         let pass = self.subject_pred.as_ref().is_none_or(|f| f(ctx.subject))
             && self.action_pred.as_ref().is_none_or(|f| f(ctx.action))
             && self.resource_pred.as_ref().is_none_or(|f| f(ctx.resource))
@@ -66,7 +66,7 @@ where
     /// evaluated once for the whole batch — if either rejects, the policy
     /// cannot grant for any item, and we broadcast that single result
     /// rather than re-running the closures `N` times. The win is the
-    /// reduced trace volume in [`PermissionChecker::evaluate_batch_in_session_by`]:
+    /// reduced trace volume in [`PermissionChecker::evaluate_batch_in_session`]:
     /// per-item `gatehouse::security` events collapse to one outcome for
     /// the batch when the discriminating axis is subject- or action-only.
     ///
@@ -74,7 +74,7 @@ where
     /// once per item, since they can vary across the batch.
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, S, R, A, C>,
+        ctx: &BatchEvalCtx<'item, S, A, R, C>,
     ) -> Vec<PolicyEvalResult> {
         let n = ctx.items.len();
 
@@ -131,8 +131,8 @@ where
 /// [`PolicyBuilder`] is designed for synchronous predicate logic. If your policy
 /// needs to perform async I/O or external lookups, implement [`Policy`] directly.
 ///
-/// [`PolicyBuilder::effect`] declares whether a match grants or forbids.
-/// With [`Effect::Deny`], a match returns [`PolicyEvalResult::Forbidden`],
+/// [`PolicyBuilder::forbid`] declares that a match forbids instead of grants.
+/// With [`PolicyBuilder::forbid`], a match returns [`PolicyEvalResult::Forbidden`],
 /// which [`crate::PermissionChecker`] honors over any sibling grant
 /// (deny-overrides). A non-match is "not applicable" either way and never
 /// blocks anything.
@@ -163,7 +163,7 @@ where
 /// #[derive(Debug, Clone)]
 /// struct Ctx;
 ///
-/// let policy = PolicyBuilder::<User, Document, Action, Ctx>::new("OwnerEditors")
+/// let policy = PolicyBuilder::<User, Action, Document, Ctx>::new("OwnerEditors")
 ///     .subjects(|user: &User| user.roles.iter().any(|r| r == "editor"))
 ///     .actions(|action: &Action| action.0 == "edit")
 ///     .resources(|doc: &Document| doc.classification != "top-secret")
@@ -192,7 +192,7 @@ where
 ///
 /// # Type-inference notes
 ///
-/// `PolicyBuilder::new` is generic over `<S, R, A, C>`. Rust can usually
+/// `PolicyBuilder::new` is generic over `<S, A, R, C>`. Rust can usually
 /// infer all four type parameters from the surrounding context, but a
 /// few patterns need a little help. Listed in order from cheapest fix to
 /// most explicit:
@@ -203,7 +203,7 @@ where
 ///    ```rust
 ///    # use gatehouse::*;
 ///    # struct User; struct Doc; struct Read; struct Ctx;
-///    # fn make() -> Box<dyn Policy<User, Doc, Read, Ctx>> {
+///    # fn make() -> Box<dyn Policy<User, Read, Doc, Ctx>> {
 ///    PolicyBuilder::new("AdminOnly")
 ///        .subjects(|_user: &User| true)
 ///        .resources(|_doc: &Doc| true)
@@ -225,14 +225,14 @@ where
 ///    on `::new`) tends to win on noise grounds.
 ///
 /// 2. **Anchor through the bind site.** If only some of the predicates
-///    use typed closures (or if you use `.effect()` and `.build()` with
+///    use typed closures (or if you use `.forbid()` and `.build()` with
 ///    no predicates), give the bind site or the return type a concrete
-///    `PolicyBuilder<S, R, A, C>` annotation:
+///    `PolicyBuilder<S, A, R, C>` annotation:
 ///    ```rust
 ///    # use gatehouse::*;
 ///    # struct User; struct Doc; struct Read; struct Ctx;
-///    let b: PolicyBuilder<User, Doc, Read, Ctx> = PolicyBuilder::new("X");
-///    let _policy = b.effect(Effect::Deny).build();
+///    let b: PolicyBuilder<User, Read, Doc, Ctx> = PolicyBuilder::new("X");
+///    let _policy = b.forbid().build();
 ///    ```
 ///
 /// 3. **Reach for the turbofish.** When neither of the above applies —
@@ -242,9 +242,9 @@ where
 ///    ```rust
 ///    # use gatehouse::*;
 ///    # struct User; struct Doc; struct Read; struct Ctx;
-///    # fn make() -> Box<dyn Policy<User, Doc, Read, Ctx>> {
-///    PolicyBuilder::<User, Doc, Read, Ctx>::new("AdminOnly")
-///        .effect(Effect::Deny)
+///    # fn make() -> Box<dyn Policy<User, Read, Doc, Ctx>> {
+///    PolicyBuilder::<User, Read, Doc, Ctx>::new("AdminOnly")
+///        .forbid()
 ///        .build()
 ///    # }
 ///    ```
@@ -252,7 +252,7 @@ where
 /// If you see the compiler complain about needing type annotations on
 /// `&_` inside one of the predicate closures, the missing piece is on
 /// `PolicyBuilder::new` itself — the closure error is a red herring. Use
-/// one of the three patterns above to anchor `<S, R, A, C>` and the
+/// one of the three patterns above to anchor `<S, A, R, C>` and the
 /// closure error goes away on its own.
 ///
 /// ## The specific failure that needs the turbofish
@@ -261,7 +261,7 @@ where
 /// own combines three ingredients:
 ///
 /// ```text
-/// fn factory() -> Box<dyn Policy<MySubject, MyResource, MyAction, ()>> {
+/// fn factory() -> Box<dyn Policy<MySubject, MyAction, MyResource, ()>> {
 ///     PolicyBuilder::new("Name")          // <- no anchor yet
 ///         .when(move |subject, _, _, _| {  // <- placeholder closure args
 ///             subject.method_on_subject()  // <- method needs known type
@@ -302,7 +302,7 @@ where
 /// Returning `impl Policy<…>` instead of `Box<dyn Policy<…>>` also
 /// anchors inference (the concrete return type propagates back), but
 /// loses the trait-object addability that the boxed `dyn` provides.
-pub struct PolicyBuilder<S, R, A, C>
+pub struct PolicyBuilder<S, A, R, C>
 where
     S: Send + Sync + 'static,
     R: Send + Sync + 'static,
@@ -319,7 +319,7 @@ where
     extra_condition: Option<Box<dyn Fn(&S, &A, &R, &C) -> bool + Send + Sync>>,
 }
 
-impl<Subject, Resource, Action, Context> PolicyBuilder<Subject, Resource, Action, Context>
+impl<Subject, Action, Resource, Context> PolicyBuilder<Subject, Action, Resource, Context>
 where
     Subject: Send + Sync + 'static,
     Resource: Send + Sync + 'static,
@@ -339,30 +339,28 @@ where
         }
     }
 
-    /// Sets the effect (Allow or Deny) for the policy.
+    /// Makes this policy forbid when its combined predicate matches.
     ///
-    /// Defaults to [`Effect::Allow`].
-    ///
-    /// With [`Effect::Deny`], the built policy returns
-    /// [`PolicyEvalResult::Forbidden`] when its combined predicate matches:
-    /// it reads exactly as it behaves — "predicate matches ⇒ this request is
-    /// forbidden". Inside a [`crate::PermissionChecker`] a forbid overrides
-    /// every grant, regardless of registration order. A non-match is "not
-    /// applicable" and blocks nothing.
+    /// By default a matching builder policy grants access. With [`Self::forbid`],
+    /// a match returns [`PolicyEvalResult::Forbidden`]: it reads exactly as it
+    /// behaves — "predicate matches ⇒ this request is forbidden". Inside a
+    /// [`crate::PermissionChecker`] a forbid overrides every grant, regardless
+    /// of registration order. A non-match is "not applicable" and blocks
+    /// nothing.
     ///
     /// ```rust
     /// # use gatehouse::*;
     /// # #[derive(Clone)] struct User { is_suspended: bool }
     /// # struct Doc; struct Read; struct Ctx;
-    /// let suspended = PolicyBuilder::<User, Doc, Read, Ctx>::new("SuspendedAccount")
+    /// let suspended = PolicyBuilder::<User, Read, Doc, Ctx>::new("SuspendedAccount")
     ///     .subjects(|user| user.is_suspended)
-    ///     .effect(Effect::Deny)
+    ///     .forbid()
     ///     .build();
     /// // checker.add_policy(suspended);  — a suspended user is now locked
     /// // out even when an admin-override or owner policy would grant.
     /// ```
-    pub fn effect(mut self, effect: Effect) -> Self {
-        self.effect = effect;
+    pub fn forbid(mut self) -> Self {
+        self.effect = Effect::Forbid;
         self
     }
 
@@ -434,7 +432,7 @@ where
     /// so that [`Policy::evaluate_batch`] can short-circuit subject- and
     /// action-axis checks once for the batch rather than re-evaluating them
     /// per item.
-    pub fn build(self) -> Box<dyn Policy<Subject, Resource, Action, Context>> {
+    pub fn build(self) -> Box<dyn Policy<Subject, Action, Resource, Context>> {
         Box::new(InternalPolicy {
             name: self.name,
             effect: self.effect,
