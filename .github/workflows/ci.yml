@@ -59,7 +59,7 @@ jobs:
     needs: build-and-test
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -90,6 +90,7 @@ jobs:
           --all-features
           --
           --test checker_contract
+          --test tracing_contract
         env:
           PROPTEST_CASES: 128
       - name: Upload mutation test report

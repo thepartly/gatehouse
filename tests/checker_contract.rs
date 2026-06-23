@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use gatehouse::{
     AccessEvaluation, AndPolicy, BatchEvalCtx, DelegatingPolicy, Effect, EvalCtx,
-    EvaluationSession, FactLoadResult, FactSource, NotPolicy, OrPolicy, PermissionChecker, Policy,
-    PolicyBatchItem, PolicyBuilder, PolicyDomain, PolicyEvalResult, RebacPolicy, RelationshipQuery,
+    EvaluationSession, FactLoadResult, FactSource, Hydrator, LookupAuthorizedError, LookupPage,
+    LookupSource, NotPolicy, OrPolicy, PermissionChecker, Policy, PolicyBatchItem, PolicyBuilder,
+    PolicyDomain, PolicyEvalResult, RebacPolicy, RelationshipQuery,
 };
 use proptest::prelude::*;
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -942,6 +944,200 @@ fn forbid_odd_resources(name: &str) -> Box<dyn Policy<Domain>> {
         .build()
 }
 
+fn grant_even_resources(name: &str) -> impl Policy<Domain> {
+    PolicyBuilder::<Domain>::new(name.to_string())
+        .resources(|resource: &Resource| resource.id % 2 == 0)
+        .build()
+}
+
+struct NamedNoopPolicy {
+    name: &'static str,
+}
+
+#[async_trait]
+impl Policy<Domain> for NamedNoopPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.not_applicable("not applicable")
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(self.name)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WideRow {
+    row_id: &'static str,
+    authz_resource: Resource,
+}
+
+struct StaticLookup {
+    ids: Vec<u8>,
+    next_cursor: Option<Vec<u8>>,
+}
+
+#[async_trait]
+impl LookupSource<Domain> for StaticLookup {
+    type Id = u8;
+    type Error = Infallible;
+
+    async fn lookup_page(
+        &self,
+        _subject: &Subject,
+        _action: &Action,
+        _context: &Ctx,
+        _cursor: Option<&[u8]>,
+        _limit: NonZeroUsize,
+    ) -> Result<LookupPage<Self::Id>, Self::Error> {
+        Ok(LookupPage {
+            ids: self.ids.clone(),
+            next_cursor: self.next_cursor.clone(),
+        })
+    }
+}
+
+struct ResourceHydrator;
+
+#[async_trait]
+impl Hydrator<u8> for ResourceHydrator {
+    type Resource = Resource;
+    type Error = Infallible;
+
+    async fn hydrate(&self, ids: &[u8]) -> Result<Vec<Option<Self::Resource>>, Self::Error> {
+        Ok(ids.iter().map(|id| Some(Resource { id: *id })).collect())
+    }
+}
+
+#[tokio::test]
+async fn checker_clone_preserves_name_batching_and_policies() {
+    let mut checker =
+        PermissionChecker::named("NamedChecker").with_max_batch_size(NonZeroUsize::new(1).unwrap());
+    checker.add_policy(grant_even_resources("EvenResource"));
+
+    assert_eq!(checker.name(), Some("NamedChecker"));
+
+    let cloned = checker.clone();
+    assert_eq!(cloned.name(), Some("NamedChecker"));
+
+    let session = EvaluationSession::empty();
+    let results = evaluate_resources(
+        &cloned,
+        &session,
+        vec![Resource { id: 1 }, Resource { id: 2 }],
+    )
+    .await;
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|(resource, evaluation)| (resource.id, evaluation.is_granted()))
+            .collect::<Vec<_>>(),
+        vec![(1, false), (2, true)]
+    );
+}
+
+#[tokio::test]
+async fn add_forbid_policy_declares_and_stably_orders_veto_capable_policies() {
+    let session = EvaluationSession::empty();
+
+    let mut veto_checker = PermissionChecker::new();
+    veto_checker.add_policy(allow_everything("AllowAll"));
+    veto_checker.add_forbid_policy(UndeclaredForbidPolicy);
+
+    let blocked = check_resource(&veto_checker, &session, &Resource { id: 0 }).await;
+    blocked.assert_forbidden_by("UndeclaredForbidPolicy");
+
+    let mut order_checker = PermissionChecker::new();
+    order_checker.add_forbid_policy(NamedNoopPolicy {
+        name: "FirstVetoSlot",
+    });
+    order_checker.add_forbid_policy(NamedNoopPolicy {
+        name: "SecondVetoSlot",
+    });
+    order_checker.add_policy(allow_everything("AllowAll"));
+
+    let granted = check_resource(&order_checker, &session, &Resource { id: 0 }).await;
+    granted.assert_granted_by("AllowAll");
+    let trace = granted.trace().format();
+    let first = trace.find("FirstVetoSlot").unwrap();
+    let second = trace.find("SecondVetoSlot").unwrap();
+    let allow = trace.find("AllowAll").unwrap();
+    assert!(
+        first < second && second < allow,
+        "veto-capable insertion should preserve registration order before allow-only policies:\n{trace}"
+    );
+}
+
+#[tokio::test]
+async fn projected_row_helpers_evaluate_and_filter_original_items() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(grant_even_resources("EvenResource"));
+    let session = EvaluationSession::empty();
+    let rows = vec![
+        WideRow {
+            row_id: "one",
+            authz_resource: Resource { id: 1 },
+        },
+        WideRow {
+            row_id: "two",
+            authz_resource: Resource { id: 2 },
+        },
+        WideRow {
+            row_id: "four",
+            authz_resource: Resource { id: 4 },
+        },
+    ];
+
+    let bound = bind(&checker, &session);
+    let decisions = bound
+        .evaluate_by(rows.clone(), |row| &row.authz_resource)
+        .await;
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|(row, evaluation)| (row.row_id, evaluation.is_granted()))
+            .collect::<Vec<_>>(),
+        vec![("one", false), ("two", true), ("four", true)]
+    );
+
+    let authorized = bound.filter_by(rows, |row| &row.authz_resource).await;
+    assert_eq!(
+        authorized.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+        vec!["two", "four"]
+    );
+}
+
+#[tokio::test]
+async fn lookup_page_accepts_exhausted_initial_page_and_rejects_stuck_cursor() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(allow_everything("AllowAll"));
+    let session = EvaluationSession::empty();
+    let bound = bind(&checker, &session);
+    let page_size = NonZeroUsize::new(10).unwrap();
+
+    let exhausted = StaticLookup {
+        ids: Vec::new(),
+        next_cursor: None,
+    };
+    let empty_page = bound
+        .lookup_page(&exhausted, &ResourceHydrator, None, page_size)
+        .await
+        .unwrap();
+    assert!(empty_page.resources.is_empty());
+    assert_eq!(empty_page.next_cursor, None);
+
+    let cursor = b"same".to_vec();
+    let stuck = StaticLookup {
+        ids: vec![1],
+        next_cursor: Some(cursor.clone()),
+    };
+    let err = bound
+        .lookup_page(&stuck, &ResourceHydrator, Some(&cursor), page_size)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LookupAuthorizedError::LookupCursorStuck));
+}
+
 struct MixedGrantPolicy;
 
 #[async_trait]
@@ -1099,6 +1295,73 @@ async fn forbid_inside_combinators_vetoes_access() {
     );
     let not_blocked = check_resource(&not_checker, &session, &blocked).await;
     not_blocked.assert_forbidden_by("OddBlock");
+}
+
+#[tokio::test]
+async fn combinator_effects_preserve_nested_forbid_capability_for_checker_scheduling() {
+    let allow_only_or = OrPolicy::try_new(vec![
+        Arc::from(allow_everything("AllowA")),
+        Arc::from(allow_everything("AllowB")),
+    ])
+    .unwrap();
+    assert_eq!(allow_only_or.effect(), Effect::Allow);
+
+    let allow_or_forbid = OrPolicy::try_new(vec![
+        Arc::from(allow_everything("NestedAllow")),
+        Arc::from(forbid_odd_resources("NestedBlock")),
+    ])
+    .unwrap();
+    assert_eq!(allow_or_forbid.effect(), Effect::AllowOrForbid);
+
+    let forbid_only_and = AndPolicy::try_new(vec![
+        Arc::from(allow_everything("RequiredAllow")),
+        Arc::from(forbid_odd_resources("RequiredBlock")),
+    ])
+    .unwrap();
+    assert_eq!(forbid_only_and.effect(), Effect::Forbid);
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(allow_everything("ParentAllow"));
+    checker.add_policy(allow_or_forbid);
+
+    let session = EvaluationSession::empty();
+    let blocked = check_resource(&checker, &session, &Resource { id: 1 }).await;
+    blocked.assert_forbidden_by("NestedBlock");
+}
+
+#[tokio::test]
+async fn and_policy_requires_each_child_to_grant_across_veto_boundary() {
+    let session = EvaluationSession::empty();
+
+    let grant_then_required_non_grant = AndPolicy::try_new(vec![
+        Arc::new(MixedGrantPolicy) as Arc<dyn Policy<Domain>>,
+        Arc::new(NamedNoopPolicy {
+            name: "RequiredAllow",
+        }) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(grant_then_required_non_grant);
+    let denied = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    assert!(!denied.is_granted());
+    assert!(denied.trace().format().contains("RequiredAllow"));
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }]).await;
+    assert!(!batch[0].1.is_granted());
+
+    let forbid_only_non_match_then_grant = AndPolicy::try_new(vec![
+        Arc::from(forbid_odd_resources("OddBlock")),
+        Arc::from(allow_everything("AllowAll")),
+    ])
+    .unwrap();
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(forbid_only_non_match_then_grant);
+    let denied = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    assert!(
+        !denied.is_granted(),
+        "a forbid-only child that does not match still does not satisfy AND"
+    );
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }]).await;
+    assert!(!batch[0].1.is_granted());
 }
 
 /// Identity-mapped delegating policy whose child checker grants everything

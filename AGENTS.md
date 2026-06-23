@@ -11,7 +11,7 @@ cargo clippy --all-targets --all-features -- -D warnings       # lint (CI uses -
 cargo test --all-targets --all-features                        # all tests
 cargo test <test_name>                                         # single test
 git diff origin/main...HEAD -- src/checker.rs src/combinators.rs > mutants.diff
-cargo mutants --in-place --in-diff=mutants.diff --file src/checker.rs --file src/combinators.rs --all-features -- --test checker_contract
+cargo mutants --in-place --in-diff=mutants.diff --file src/checker.rs --file src/combinators.rs --all-features -- --test checker_contract --test tracing_contract
 cargo bench                                                    # criterion benchmarks
 cargo run --example axum                                       # HTTP server on :8000
 cargo run --example actix_web                                  # HTTP server on :8080
