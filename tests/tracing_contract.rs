@@ -783,4 +783,27 @@ fn tracing_records_allow_effect_contract_violation_warning() {
         }),
         "policies declaring their forbid effect must not emit contract-violation warnings: {clean_events:#?}"
     );
+
+    // Single path, well-behaved: a plain `Effect::Allow` policy that does not
+    // forbid must emit no contract-violation warning. This pins that *both*
+    // operands matter — an `Allow` declaration alone (without a forbid result)
+    // is not enough to warn — so the guard cannot weaken from `&&` to `||`.
+    let mut allow_checker = PermissionChecker::new();
+    allow_checker.add_policy(TracePolicy);
+    let (granted, _spans, allow_events) = capture_async_with_events(|| async {
+        allow_checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(granted.is_granted());
+    assert!(
+        allow_events.iter().all(|event| {
+            !event
+                .values
+                .get("message")
+                .is_some_and(|message| message.contains("Allow-effect policy returned a forbid"))
+        }),
+        "an allow policy that does not forbid must not emit the contract-violation warning: {allow_events:#?}"
+    );
 }
