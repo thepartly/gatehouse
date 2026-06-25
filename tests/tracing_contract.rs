@@ -88,6 +88,37 @@ impl Policy<Domain> for GrantingForbidPolicy {
     }
 }
 
+struct ForbiddingAllowPolicy;
+
+#[async_trait]
+impl Policy<Domain> for ForbiddingAllowPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.forbid("forbid without declaring an effect")
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        ctx.items
+            .iter()
+            .map(|_| {
+                PolicyEvalResult::forbidden(
+                    self.policy_type(),
+                    "forbid without declaring an effect",
+                )
+            })
+            .collect()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ForbiddingAllowPolicy")
+    }
+
+    // Intentionally no `effect()` override: defaults to `Effect::Allow`, so
+    // forbidding here is the contract violation the checker should warn about.
+}
+
 struct WrongLengthTracePolicy;
 
 #[async_trait]
@@ -685,5 +716,71 @@ fn tracing_records_forbid_effect_contract_violation_warning() {
                 .is_some_and(|message| message.contains("Forbid-effect policy returned a grant"))
         }),
         "well-behaved forbid policies must not emit contract-violation warnings: {clean_events:#?}"
+    );
+}
+
+#[test]
+fn tracing_records_allow_effect_contract_violation_warning() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(ForbiddingAllowPolicy);
+    let session = EvaluationSession::empty();
+
+    // Batch path: the veto is still honored (fail-safe, not silently dropped)
+    // and a single warning records the contract violation with its count.
+    let (results, _spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
+            .await
+    });
+    assert!(!results[0].1.is_granted());
+
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.level == "WARN"
+                && event.values.get("message").is_some_and(|message| {
+                    message.contains("Allow-effect policy returned a forbid")
+                })
+        })
+        .unwrap_or_else(|| panic!("missing contract-violation warning; events: {events:#?}"));
+    assert_event_value(warning, "policy.type", "ForbiddingAllowPolicy");
+    assert_event_value(warning, "item_count", "1");
+
+    // Single path: the same warning fires, and access is still denied.
+    let (single, _spans, single_events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(!single.is_granted());
+    assert!(
+        single_events.iter().any(|event| {
+            event.level == "WARN"
+                && event.values.get("message").is_some_and(|message| {
+                    message.contains("Allow-effect policy returned a forbid")
+                })
+        }),
+        "single-path evaluation must emit the contract-violation warning: {single_events:#?}"
+    );
+
+    // A policy that declares its forbid effect is well-behaved: no warning.
+    let mut clean_checker = PermissionChecker::new();
+    clean_checker.add_policy(PolicyBuilder::<Domain>::new("CleanForbid").forbid().build());
+    let (_results, _spans, clean_events) = capture_async_with_events(|| async {
+        clean_checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
+            .await
+    });
+    assert!(
+        clean_events.iter().all(|event| {
+            !event
+                .values
+                .get("message")
+                .is_some_and(|message| message.contains("Allow-effect policy returned a forbid"))
+        }),
+        "policies declaring their forbid effect must not emit contract-violation warnings: {clean_events:#?}"
     );
 }

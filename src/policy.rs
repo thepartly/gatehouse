@@ -213,6 +213,13 @@ pub trait Policy<D: PolicyDomain>: Send + Sync {
     /// added. Policies declaring [`Effect::Forbid`] or
     /// [`Effect::AllowOrForbid`] run before allow-only policies, so a matched
     /// forbid is observed before a grant can short-circuit.
+    ///
+    /// A policy that returns [`PolicyEvalResult::Forbidden`] while leaving this
+    /// at the default [`Effect::Allow`] still vetoes wherever it is observed,
+    /// but the checker emits a contract-violation `WARN`: the veto is not
+    /// scheduled ahead of grants and an earlier grant can short-circuit before
+    /// it is reached. Declare [`Effect::Forbid`] or [`Effect::AllowOrForbid`]
+    /// for an order-independent veto.
     fn effect(&self) -> Effect {
         Effect::Allow
     }

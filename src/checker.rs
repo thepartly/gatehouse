@@ -18,6 +18,9 @@ fn forbid_summary(policy_type: &str, reason: Option<&str>) -> String {
 const FORBID_EFFECT_GRANT_REASON: &str =
     "Forbid-effect policy returned a grant; treated as not applicable";
 
+const ALLOW_EFFECT_FORBID_REASON: &str =
+    "Allow-effect policy returned a forbid; the veto is honored but only where observed, so declare Effect::Forbid or Effect::AllowOrForbid to schedule it ahead of grants";
+
 fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalResult {
     PolicyEvalResult::Combined {
         policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
@@ -202,6 +205,12 @@ impl<D: PolicyDomain> PermissionChecker<D> {
 
             let result_passes = result.is_granted();
             let result_forbids = result.is_forbidden();
+            if declared_effect == Effect::Allow && result_forbids {
+                tracing::warn!(
+                    policy.type = ctx.policy_type.as_ref(),
+                    "{ALLOW_EFFECT_FORBID_REASON}"
+                );
+            }
             let policy_type_str: &str = ctx.policy_type.as_ref();
             let metadata = policy.security_rule();
             let reason = result.reason();
@@ -373,6 +382,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                 let mut policy_denied_count = 0usize;
                 let mut policy_forbidden_count = 0usize;
                 let mut contract_violation_count = 0usize;
+                let mut allow_forbid_violation_count = 0usize;
                 let batch_items = pending_chunk
                     .iter()
                     .map(|&index| PolicyBatchItem {
@@ -425,6 +435,9 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     }
                     let result_passes = result.is_granted();
                     let result_forbids = result.is_forbidden();
+                    if declared_effect == Effect::Allow && result_forbids {
+                        allow_forbid_violation_count += 1;
+                    }
                     let reason = result.reason();
                     let forbidden = result_forbids.then(|| {
                         result
@@ -477,6 +490,13 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                         policy.type = policy_type_str,
                         item_count = contract_violation_count,
                         "{FORBID_EFFECT_GRANT_REASON}"
+                    );
+                }
+                if allow_forbid_violation_count > 0 {
+                    tracing::warn!(
+                        policy.type = policy_type_str,
+                        item_count = allow_forbid_violation_count,
+                        "{ALLOW_EFFECT_FORBID_REASON}"
                     );
                 }
                 policy_span.record("policy.granted_count", policy_granted_count);

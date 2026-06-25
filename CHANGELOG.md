@@ -61,6 +61,11 @@ no-session checker shortcut, and uses explicit policy-level
   `Effect::AllowOrForbid`.
 - `AccessEvaluation::forbidden_by()` and `assert_forbidden_by`.
 - Batch telemetry fields `policy.effect` and `policy.forbidden_count`.
+- Contract-violation `WARN` when an `Effect::Allow` policy returns a
+  `Forbidden` result. The veto is still honored (fail-safe), but its ordering
+  is not guaranteed; the warning points to declaring `Effect::Forbid` /
+  `Effect::AllowOrForbid`. Mirrors the existing warning for a `Forbid`-effect
+  policy that grants.
 - Optional `serde` feature for serializing decision and trace types used in
   audit logging.
 - `#![forbid(unsafe_code)]`.
