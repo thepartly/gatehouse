@@ -1,6 +1,6 @@
-# Migrating from 0.4 to the next major release
+# Migrating from 0.4 to 0.5
 
-The next major Gatehouse release intentionally breaks the public API to make the authorization surface smaller and harder to misuse. The main changes are:
+Gatehouse 0.5 intentionally breaks the public API to make the authorization surface smaller and harder to misuse. The main changes are:
 
 - policies are parameterized by one `PolicyDomain` instead of four repeated generics;
 - every checker call goes through a session-bound evaluator;
