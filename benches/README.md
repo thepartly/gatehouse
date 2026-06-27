@@ -49,9 +49,9 @@ Current (`cargo bench --bench permission_checker -- policy_builder_subject_only_
 
 | N | `builder_overridden` | `manual_dynamic_serial_default` | `manual_static_serial_default` |
 |---|---:|---:|---:|
-| 1   | ~486 ns   | ~558 ns   | ~483 ns  |
-| 10  | ~1.65 µs  | ~2.01 µs  | ~1.33 µs |
-| 25  | ~3.49 µs  | ~3.70 µs  | ~2.64 µs |
-| 100 | ~11.30 µs | ~16.55 µs | ~9.69 µs |
+| 1   | ~484 ns   | ~476 ns   | ~406 ns  |
+| 10  | ~1.46 µs  | ~1.65 µs  | ~1.18 µs |
+| 25  | ~2.85 µs  | ~3.45 µs  | ~2.35 µs |
+| 100 | ~10.31 µs | ~13.07 µs | ~8.30 µs |
 
-The optimization wins 13–32% over the same shape through the serial default, growing with batch size. Static-name hand-written policies remain fastest; adopters who can use a `'static` name table should.
+At batch size 1 the shortcut and the serial default are a wash — there is nothing to amortize across a single item. From N=10 the shortcut pulls ahead, winning ~11–21% over the same shape through the serial default and growing with batch size. Static-name hand-written policies remain fastest; adopters who can use a `'static` name table should.
