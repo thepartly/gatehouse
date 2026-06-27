@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-27
+
 This is a semver-major API cleanup. Gatehouse now centers public authorization
 APIs around a `PolicyDomain` marker and a session-bound evaluator, removes the
 no-session checker shortcut, and uses explicit policy-level
