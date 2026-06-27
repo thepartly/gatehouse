@@ -12,7 +12,8 @@ cargo run --example actix_web   # HTTP server on :8080
 git diff origin/main...HEAD -- src/checker.rs src/combinators.rs > mutants.diff
 cargo mutants --in-place --in-diff=mutants.diff \
   --file src/checker.rs --file src/combinators.rs \
-  --baseline=skip --timeout=60 --build-timeout=300 --all-features
+  --baseline=skip --timeout=60 --build-timeout=300 --all-features \
+  -- --test checker_contract --test tracing_contract
 ```
 
 ## CI gates that bite
