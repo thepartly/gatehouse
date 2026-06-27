@@ -1,10 +1,9 @@
 //! Lookup-style enumeration for "what can this subject see?" authorization.
 //!
-//! The point-check API (`evaluate_in_session`) and the batch filter
-//! (`filter_authorized_in_session_by_resource`) both require the caller
-//! to already hold every candidate resource. That breaks down for list and
-//! scope endpoints where the candidate population may be millions of rows
-//! and the visible subset is tiny.
+//! [`crate::BoundEvaluator::check`] and [`crate::BoundEvaluator::filter`] both
+//! require the caller to already hold every candidate resource. That breaks
+//! down for list and scope endpoints where the candidate population may be
+//! millions of rows and the visible subset is tiny.
 //!
 //! [`LookupSource`] solves this by enumerating a *candidate superset* of
 //! resources the subject may have access to, page by page; the consuming
@@ -18,6 +17,7 @@
 //!
 //! [`PermissionChecker`]: crate::PermissionChecker
 
+use crate::PolicyDomain;
 use async_trait::async_trait;
 use std::fmt;
 use std::future::Future;
@@ -40,7 +40,7 @@ use std::num::NonZeroUsize;
 /// grants (deny-overrides over OR). If you compose policies whose grant
 /// axes are independent (for example, "I own it" OR "it is public" OR
 /// "the admin override applies"), the `LookupSource` must enumerate the
-/// union of every grant axis. Deny-effect policies only *remove* results,
+/// union of every grant axis. Forbid-effect policies only *remove* results,
 /// so they never widen what the source must enumerate. Lookup is the
 /// scaling story for the narrow case where one axis dominates; it is
 /// **not** a way to express policy logic inside the data layer.
@@ -65,9 +65,7 @@ use std::num::NonZeroUsize;
 ///
 /// [`PermissionChecker`]: crate::PermissionChecker
 #[async_trait]
-pub trait LookupSource: Send + Sync {
-    /// The subject domain type the source enumerates against.
-    type Subject: Sync + ?Sized;
+pub trait LookupSource<D: PolicyDomain>: Send + Sync {
     /// The ID type the source enumerates. The caller-provided
     /// [`Hydrator`] resolves these to resources.
     type Id: Send + Sync + Clone;
@@ -77,7 +75,9 @@ pub trait LookupSource: Send + Sync {
     /// Return one page of candidate IDs.
     async fn lookup_page(
         &self,
-        subject: &Self::Subject,
+        subject: &D::Subject,
+        action: &D::Action,
+        context: &D::Context,
         cursor: Option<&[u8]>,
         limit: NonZeroUsize,
     ) -> Result<LookupPage<Self::Id>, Self::Error>;
@@ -151,15 +151,12 @@ where
     }
 }
 
-/// Failure modes for [`PermissionChecker::lookup_authorized`] and
-/// [`PermissionChecker::lookup_authorized_page`].
+/// Failure modes for [`crate::BoundEvaluator::lookup_page`].
 ///
 /// The generic parameters carry the source's and hydrator's own error
 /// types, so callers retain full backend context on the wrapped variants.
-///
-/// [`PermissionChecker::lookup_authorized`]: crate::PermissionChecker::lookup_authorized
-/// [`PermissionChecker::lookup_authorized_page`]: crate::PermissionChecker::lookup_authorized_page
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LookupAuthorizedError<LookupErr, HydrateErr> {
     /// The [`LookupSource`] returned an error for the current page.
     Lookup(LookupErr),

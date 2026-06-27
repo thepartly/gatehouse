@@ -1,6 +1,6 @@
 //! Lookup-style authorization with an in-memory backend.
 //!
-//! Demonstrates `PermissionChecker::lookup_authorized*` against an in-RAM
+//! Demonstrates `BoundEvaluator::lookup_page` against an in-RAM
 //! `LookupSource` and a `Hydrator`, composed with a non-lookup policy
 //! (admin override) — the production shape #24 was scoped to enable.
 //!
@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    EvalCtx, EvaluationSession, LookupPage, LookupSource, PermissionChecker, Policy,
+    EvalCtx, EvaluationSession, LookupPage, LookupSource, PermissionChecker, Policy, PolicyDomain,
     PolicyEvalResult,
 };
 use std::collections::HashMap;
@@ -43,18 +43,27 @@ struct Document {
 #[derive(Clone, Debug)]
 struct View;
 
+struct DocumentDomain;
+
+impl PolicyDomain for DocumentDomain {
+    type Subject = User;
+    type Action = View;
+    type Resource = Document;
+    type Context = ();
+}
+
 // --- Policies ----------------------------------------------------------
 
 /// Grants admins access to any document, regardless of relationships.
 struct AdminPolicy;
 
 #[async_trait]
-impl Policy<User, Document, View, ()> for AdminPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, View, ()>) -> PolicyEvalResult {
+impl Policy<DocumentDomain> for AdminPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, DocumentDomain>) -> PolicyEvalResult {
         if ctx.subject.is_admin {
             ctx.grant("admin override")
         } else {
-            ctx.deny("not admin")
+            ctx.not_applicable("not admin")
         }
     }
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -69,8 +78,8 @@ struct ViewerPolicy {
 }
 
 #[async_trait]
-impl Policy<User, Document, View, ()> for ViewerPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, View, ()>) -> PolicyEvalResult {
+impl Policy<DocumentDomain> for ViewerPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, DocumentDomain>) -> PolicyEvalResult {
         let granted = self
             .viewers
             .get(&ctx.resource.id)
@@ -79,7 +88,7 @@ impl Policy<User, Document, View, ()> for ViewerPolicy {
         if granted {
             ctx.grant("viewer relation")
         } else {
-            ctx.deny("no viewer relation")
+            ctx.not_applicable("no viewer relation")
         }
     }
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -109,14 +118,15 @@ impl fmt::Display for ViewerLookupError {
 impl std::error::Error for ViewerLookupError {}
 
 #[async_trait]
-impl LookupSource for InMemoryViewerLookup {
-    type Subject = User;
+impl LookupSource<DocumentDomain> for InMemoryViewerLookup {
     type Id = Uuid;
     type Error = ViewerLookupError;
 
     async fn lookup_page(
         &self,
         subject: &User,
+        _action: &View,
+        _context: &(),
         cursor: Option<&[u8]>,
         limit: NonZeroUsize,
     ) -> Result<LookupPage<Uuid>, ViewerLookupError> {
@@ -146,6 +156,32 @@ impl LookupSource for InMemoryViewerLookup {
             ids: all[offset..end].to_vec(),
             next_cursor,
         })
+    }
+}
+
+async fn collect_authorized<H>(
+    checker: &PermissionChecker<DocumentDomain>,
+    session: &EvaluationSession,
+    subject: &User,
+    lookup: &InMemoryViewerLookup,
+    page_size: NonZeroUsize,
+    hydrator: &H,
+) -> Result<Vec<Document>, gatehouse::LookupAuthorizedError<ViewerLookupError, H::Error>>
+where
+    H: gatehouse::Hydrator<Uuid, Resource = Document>,
+{
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut authorized = Vec::new();
+    let bound = checker.bind(session, subject, &View, &());
+    loop {
+        let page = bound
+            .lookup_page(lookup, hydrator, cursor.as_deref(), page_size)
+            .await?;
+        authorized.extend(page.resources);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(authorized),
+        }
     }
 }
 
@@ -211,18 +247,18 @@ async fn main() {
     // Compose policies: admin override OR viewer relation. The lookup
     // source only enumerates the viewer axis — admin overrides apply only
     // to point checks.
-    let mut checker = PermissionChecker::<User, Document, View, ()>::new();
+    let mut checker = PermissionChecker::<DocumentDomain>::new();
     checker.add_policy(AdminPolicy);
     checker.add_policy(ViewerPolicy { viewers });
 
     let session = EvaluationSession::empty();
     let page_size = NonZeroUsize::new(2).unwrap();
 
-    // (1) Alice lists her visible documents via lookup_authorized.
-    let alice_visible = checker
-        .lookup_authorized(&session, &alice, &View, &(), &lookup, page_size, &hydrator)
-        .await
-        .expect("lookup ok");
+    // (1) Alice lists her visible documents by collecting lookup pages.
+    let alice_visible =
+        collect_authorized(&checker, &session, &alice, &lookup, page_size, &hydrator)
+            .await
+            .expect("lookup ok");
     println!("Alice sees {} document(s):", alice_visible.len());
     for doc in &alice_visible {
         println!("  - {} ({})", doc.title, doc.id);
@@ -240,10 +276,10 @@ async fn main() {
     // "everything an admin can see", the production code would either
     // route admin requests to a different source or simply skip the
     // lookup path and list directly.
-    let admin_via_lookup = checker
-        .lookup_authorized(&session, &admin, &View, &(), &lookup, page_size, &hydrator)
-        .await
-        .expect("lookup ok");
+    let admin_via_lookup =
+        collect_authorized(&checker, &session, &admin, &lookup, page_size, &hydrator)
+            .await
+            .expect("lookup ok");
     println!(
         "\nAdmin via the viewer-lookup sees {} document(s) — this is bounded \
          by what the source enumerates; admin grants still apply at point checks.",
@@ -258,7 +294,8 @@ async fn main() {
     // the admin has no viewer relation on.
     let any_doc = &docs[0];
     let admin_point = checker
-        .evaluate_in_session(&session, &admin, &View, any_doc, &())
+        .bind(&session, &admin, &View, &())
+        .check(any_doc)
         .await;
     println!(
         "\nAdmin point check on '{}': {}",
@@ -278,20 +315,12 @@ async fn main() {
     let mut cursor: Option<Vec<u8>> = None;
     let mut page_index = 0;
     let mut streamed_total = 0;
+    let alice_bound = checker.bind(&session, &alice, &View, &());
     loop {
-        let page = checker
-            .lookup_authorized_page(
-                &session,
-                &alice,
-                &View,
-                &(),
-                &lookup,
-                cursor.as_deref(),
-                page_size,
-                &hydrator,
-            )
+        let page = alice_bound
+            .lookup_page(&lookup, &hydrator, cursor.as_deref(), page_size)
             .await
-            .expect("lookup_authorized_page ok");
+            .expect("lookup_page ok");
         println!("  page {page_index}: {} authorized", page.resources.len());
         page_index += 1;
         streamed_total += page.resources.len();
@@ -301,7 +330,7 @@ async fn main() {
         }
     }
     // 3 candidate ids paged 2-at-a-time: two candidate pages, same total as
-    // the collecting `lookup_authorized` call above.
+    // the helper loop above.
     assert_eq!(page_index, 2);
     assert_eq!(streamed_total, viewer_doc_ids.len());
 }

@@ -13,13 +13,16 @@
 //!
 //! That last bit is what `Context` is for. We carry `mfa_verified_at`
 //! and the request's wall-clock time on `ApprovalContext`. The
-//! high-value rule is a deny-effect policy that **forbids** the approval
+//! high-value rule is a forbid-effect policy that **forbids** the approval
 //! when MFA freshness has lapsed; the role policy ignores the field
 //! entirely. Same subject, same resource, different calls → different
 //! decisions.
 
 use async_trait::async_trait;
-use gatehouse::{AccessEvaluation, Effect, EvalCtx, PermissionChecker, Policy, PolicyEvalResult};
+use gatehouse::{
+    AccessEvaluation, Effect, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyDomain,
+    PolicyEvalResult,
+};
 use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -58,21 +61,27 @@ struct ApprovalContext {
     mfa_verified_at: Option<SystemTime>,
 }
 
+struct RefundApprovalDomain;
+
+impl PolicyDomain for RefundApprovalDomain {
+    type Subject = User;
+    type Action = Approve;
+    type Resource = RefundRequest;
+    type Context = ApprovalContext;
+}
+
 /// Finance approvers can approve refunds. No MFA requirement at this
 /// rule's level — the rule only checks the role on the subject and
 /// ignores `Context` entirely.
 struct FinanceCanApproveRefunds;
 
 #[async_trait]
-impl Policy<User, RefundRequest, Approve, ApprovalContext> for FinanceCanApproveRefunds {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, User, RefundRequest, Approve, ApprovalContext>,
-    ) -> PolicyEvalResult {
+impl Policy<RefundApprovalDomain> for FinanceCanApproveRefunds {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, RefundApprovalDomain>) -> PolicyEvalResult {
         if ctx.subject.roles.iter().any(|r| r == "finance") {
             ctx.grant("subject has the finance role")
         } else {
-            ctx.deny("subject lacks the finance role")
+            ctx.not_applicable("subject lacks the finance role")
         }
     }
     fn policy_type(&self) -> Cow<'static, str> {
@@ -83,10 +92,10 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for FinanceCanApprove
 /// Deny rule: a high-value refund without fresh MFA is **forbidden**.
 ///
 /// This is the policy that *does* care about `Context`, and it is a
-/// deny-effect policy in natural polarity: it matches exactly when the
+/// forbid-effect policy in natural polarity: it matches exactly when the
 /// approval must be blocked, and returns `ctx.forbid(...)` for that
 /// case. Everything else — small refunds, fresh MFA — is "not
-/// applicable" (`ctx.deny`), which never blocks and never grants.
+/// applicable" (`ctx.not_applicable`), which never blocks and never grants.
 ///
 /// Registered flat on the [`PermissionChecker`], the forbid overrides
 /// every grant under deny-overrides semantics. That is the right
@@ -95,7 +104,7 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for FinanceCanApprove
 /// cannot approve a high-value refund through it.
 ///
 /// Note the [`Policy::effect`] override below — a hand-written policy
-/// that can forbid must declare [`Effect::Deny`] so the checker
+/// that can forbid must declare [`Effect::Forbid`] so the checker
 /// schedules it ahead of the grant short-circuit.
 struct HighValueRequiresFreshMfa {
     threshold_cents: u64,
@@ -103,15 +112,12 @@ struct HighValueRequiresFreshMfa {
 }
 
 #[async_trait]
-impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequiresFreshMfa {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, User, RefundRequest, Approve, ApprovalContext>,
-    ) -> PolicyEvalResult {
+impl Policy<RefundApprovalDomain> for HighValueRequiresFreshMfa {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, RefundApprovalDomain>) -> PolicyEvalResult {
         // Rule doesn't apply below the threshold: not applicable, and a
-        // non-matching deny-effect policy blocks nothing.
+        // non-matching forbid-effect policy blocks nothing.
         if ctx.resource.amount_cents < self.threshold_cents {
-            return ctx.deny("amount below high-value threshold; rule not applicable");
+            return ctx.not_applicable("amount below high-value threshold; rule not applicable");
         }
 
         let Some(verified_at) = ctx.context.mfa_verified_at else {
@@ -127,7 +133,7 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequires
             .duration_since(verified_at)
             .unwrap_or_default();
         if age <= self.max_age {
-            ctx.deny(format!(
+            ctx.not_applicable(format!(
                 "MFA reasserted {}s ago, within freshness window; rule not applicable",
                 age.as_secs(),
             ))
@@ -143,11 +149,11 @@ impl Policy<User, RefundRequest, Approve, ApprovalContext> for HighValueRequires
         Cow::Borrowed("HighValueRequiresFreshMfa")
     }
     fn effect(&self) -> Effect {
-        Effect::Deny
+        Effect::Forbid
     }
 }
 
-fn build_checker() -> PermissionChecker<User, RefundRequest, Approve, ApprovalContext> {
+fn build_checker() -> PermissionChecker<RefundApprovalDomain> {
     // Flat registration: the role grant and the MFA veto are siblings.
     // The checker's deny-overrides rule does the combining — any forbid
     // wins, otherwise any grant wins, otherwise default deny.
@@ -177,6 +183,7 @@ async fn main() {
 
     let now = SystemTime::now();
     let checker = build_checker();
+    let session = EvaluationSession::empty();
 
     // Case 1: small refund, no MFA at all. Granted — the high-value
     // rule doesn't apply below the threshold, so the role grant decides.
@@ -185,7 +192,8 @@ async fn main() {
         mfa_verified_at: None,
     };
     let r = checker
-        .check(&alice, &Approve, &small_refund, &small_no_mfa)
+        .bind(&session, &alice, &Approve, &small_no_mfa)
+        .check(&small_refund)
         .await;
     report("small refund, no MFA", &r);
     r.assert_granted_by("FinanceCanApproveRefunds");
@@ -193,7 +201,8 @@ async fn main() {
     // Case 2: large refund, no MFA. Forbidden by the freshness rule —
     // the veto overrides Alice's role grant.
     let r = checker
-        .check(&alice, &Approve, &large_refund, &small_no_mfa)
+        .bind(&session, &alice, &Approve, &small_no_mfa)
+        .check(&large_refund)
         .await;
     report("large refund, no MFA", &r);
     r.assert_forbidden_by("HighValueRequiresFreshMfa");
@@ -203,7 +212,10 @@ async fn main() {
         current_time: now,
         mfa_verified_at: Some(now - Duration::from_secs(8 * 60)),
     };
-    let r = checker.check(&alice, &Approve, &large_refund, &stale).await;
+    let r = checker
+        .bind(&session, &alice, &Approve, &stale)
+        .check(&large_refund)
+        .await;
     report("large refund, MFA 8m old", &r);
     r.assert_forbidden_by("HighValueRequiresFreshMfa");
 
@@ -213,7 +225,10 @@ async fn main() {
         current_time: now,
         mfa_verified_at: Some(now - Duration::from_secs(30)),
     };
-    let r = checker.check(&alice, &Approve, &large_refund, &fresh).await;
+    let r = checker
+        .bind(&session, &alice, &Approve, &fresh)
+        .check(&large_refund)
+        .await;
     report("large refund, MFA 30s old", &r);
     r.assert_granted_by("FinanceCanApproveRefunds");
 

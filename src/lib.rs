@@ -1,356 +1,230 @@
+#![forbid(unsafe_code)]
+
 //! An in-process authorization engine for Rust.
 //!
-//! Gatehouse composes role-based (RBAC), attribute-based (ABAC), and
-//! relationship-based (ReBAC) policies while keeping authorization logic in
-//! Rust. Relationship facts are loaded through request-scoped
-//! [`EvaluationSession`] values, so list endpoints can batch, deduplicate, and
-//! coalesce backend calls without moving policy logic into the data layer.
+//! Gatehouse keeps authorization logic in Rust while giving policy code a
+//! request-scoped fact session for relationship and backend-loaded data. The
+//! public API is centered on one [`PolicyDomain`] marker per authorization
+//! domain, a [`PermissionChecker`] that owns that domain's policy stack, and a
+//! [`BoundEvaluator`] created for one request/session/subject/action/context.
 //!
 //! # Overview
 //!
-//! A *Policy* is an asynchronous decision unit that checks if a given subject may
-//! perform an action on a resource within a given context. Policies implement the
-//! [`Policy`] trait. A [`PermissionChecker`] aggregates multiple policies with
-//! deny-overrides semantics: any matching [`Effect::Deny`] policy denies access;
-//! otherwise, if any policy grants access, then access is allowed.
-//! The [`PolicyBuilder`] offers a builder pattern for creating custom policies.
-//! Custom [`Policy`] implementations must provide both [`Policy::evaluate`]
-//! and [`Policy::policy_type`].
+//! A [`Policy`] is an asynchronous decision unit for one [`PolicyDomain`]. The
+//! domain names the four Rust types involved in a decision:
 //!
-//! ## Decision Semantics
+//! - `Subject`: the caller.
+//! - `Action`: the operation being attempted.
+//! - `Resource`: the target resource or scope resource.
+//! - `Context`: request-scoped inputs such as current time, MFA freshness,
+//!   network zone, tenant config, or feature flags.
 //!
-//! `gatehouse` deliberately keeps decision semantics simple, explicit, and
-//! fixed — there is no combining-algorithm knob:
+//! Relationship data and other backend-loaded authorization facts do not
+//! belong in `Context`; expose them as [`FactKey`] values loaded by an
+//! [`EvaluationSession`]. The session batches, deduplicates, caches, and
+//! coalesces fact loads for one request.
 //!
-//! - [`PermissionChecker`] applies **deny-overrides**: any policy that
-//!   *forbids* (an [`Effect::Deny`] policy whose predicate matches, producing
-//!   [`PolicyEvalResult::Forbidden`]) denies the request, overriding every
-//!   grant. Otherwise the policies combine with OR semantics and
-//!   short-circuit on the first grant. Otherwise the request is denied.
-//! - Deny-effect policies are evaluated before allow policies, so a veto is
-//!   never skipped by the grant short-circuit. Registration order does not
-//!   change the decision.
-//! - An empty [`PermissionChecker`] denies access with the reason
-//!   `"No policies configured"`.
-//! - [`AndPolicy`] short-circuits on the first non-grant.
-//! - [`OrPolicy`] short-circuits on the first grant.
-//! - [`NotPolicy`] inverts the decision of its inner policy.
-//! - Inside combinators a `Forbidden` child behaves exactly like `Denied`:
-//!   forbids are honored at the checker level, not propagated through
-//!   combinator trees. Register forbidding policies directly on the checker;
-//!   use `AndPolicy[grant, NotPolicy(block)]` when an exclusion should gate
-//!   only one grant path (see `examples/deny_override.rs`).
-//! - [`PolicyBuilder`] combines all configured predicates with AND logic.
-//!   [`PolicyBuilder::effect`] declares whether a match grants or forbids; a
-//!   non-match is "not applicable" either way and never blocks anything.
-//! - Hand-written policies that can return `Forbidden` (via
-//!   [`EvalCtx::forbid`]) must override [`Policy::effect`] to declare
-//!   [`Effect::Deny`]; see [`Policy::effect`] for the contract.
+//! # Quick Start
 //!
-//! Denials from [`AccessEvaluation`] are intentionally summary-level: a veto
-//! reports `"Forbidden by <policy>: <reason>"` (also exposed structurally via
-//! [`AccessEvaluation::forbidden_by`]), and a no-grant denial reports
-//! `"All policies denied access"`. Use the attached [`EvalTrace`] to inspect
-//! the individual policy reasons that led to that outcome.
-//!
-//! ## Trace Semantics
-//!
-//! [`EvalTrace`] records the policies and combinator branches that were actually
-//! evaluated. Because [`PermissionChecker`], [`AndPolicy`], and [`OrPolicy`]
-//! short-circuit, the trace tree does not include policies that were never run.
-//! The checker's root node is a `DENY_OVERRIDES` combine node whose children
-//! appear in evaluation order: deny-effect policies first, then allow
-//! policies. A forbid ends the evaluation, so a vetoed request's trace shows
-//! the forbidding policy as its last child. The exception is a checker with
-//! no policies at all, whose trace is the single `"No policies configured"`
-//! denial leaf with no combine node around it.
-//!
-//! ## When to populate the Context type
-//!
-//! `Context` carries **request-scoped inputs the decision depends on but
-//! that don't belong on the subject or resource and aren't fact-loadable
-//! relationships**. The current wall-clock time, the MFA freshness on
-//! the auth session, the caller's network zone, the request's tenant
-//! config — all properties of the *call*, not of the user or the thing
-//! being authorized. A few shapes show up repeatedly:
-//!
-//! - **Time-of-day / business hours.** "Finance approvers can issue refunds
-//!   between 09:00 and 17:00 in the company timezone, except admins."
-//!   The current wall-clock time isn't a property of the user or the
-//!   invoice — it's a property of the *call*. Put a `current_time: SystemTime`
-//!   (or `OffsetDateTime`, or a `Clock` trait object for testability) on
-//!   `Context` and have the policy compare against the resource's
-//!   business-hours window. The `examples/actix_web.rs` `RequestContext`
-//!   uses exactly this shape for the draft-recency policy.
-//!
-//! - **Authentication / MFA freshness.** "Approving a payment over $10k
-//!   requires an MFA assertion within the last 5 minutes." MFA freshness
-//!   lives on the request (the session token records when MFA was last
-//!   reasserted), not on the user record. A `mfa_verified_at:
-//!   Option<SystemTime>` on `Context` lets a deny-effect high-value
-//!   policy forbid the request when freshness has lapsed without forcing
-//!   every policy to plumb the auth-session through their own arguments.
-//!   See `examples/mfa_freshness_context.rs` for the full end-to-end
-//!   shape.
-//!
-//! - **Device / network trust posture.** "Production database access
-//!   requires the request to come from a managed device on the corporate
-//!   VPN." `device_trust_score: u8`, `network_zone: NetworkZone`, or
-//!   `client_ip: IpAddr` on `Context` are the typical shape. Policies
-//!   that don't care about posture simply ignore the field.
-//!
-//! - **Request-wide parameters shared across actions.** When the same
-//!   per-request input shapes the decision for many different actions
-//!   — `export_destination: ExportDestination`, `purpose: AccessPurpose`,
-//!   `client_app_version: SemVer` — `Context` is the right home for it.
-//!   Per-action attributes that only one action cares about belong on
-//!   the action enum instead.
-//!
-//! - **Tenant / feature-flag overrides.** A `tenant_config:
-//!   &'a TenantPolicyConfig` reference lets policies read tenant-level
-//!   toggles ("this tenant has BYOK enabled", "this tenant requires
-//!   approval for refunds over $X") without each policy looking the
-//!   tenant up itself. Distinct from [`FactSource`]-loaded facts: those
-//!   are looked up by key during evaluation; the tenant config is
-//!   already resolved at request entry.
-//!
-//! `Context = ()` is the right call when every decision boils down to
-//! "does the subject have role X" — pure RBAC, no time, no posture,
-//! no per-request flags. Reach for a real `Context` struct as soon as
-//! a policy needs to compare against something time-varying or
-//! per-request that isn't a property of the subject, the resource, or
-//! a fact-loadable relationship.
-//!
-//! `Context` is **not** the place for relationship data ("who has
-//! viewer access on this document"). That lives behind a
-//! [`FactSource`] and gets loaded through the [`EvaluationSession`] so
-//! batch evaluation can deduplicate and coalesce.
-//!
-//! ## Fact-Loaded Authorization
-//!
-//! Gatehouse treats non-trivial authorization as computation over facts loaded
-//! for one request. [`FactSource::load_many`] receives unique fact keys and
-//! returns exactly one result per key; [`EvaluationSession`] expands duplicate
-//! caller inputs, preserves caller order, caches results for the request, and
-//! joins concurrent in-flight loads for the same key.
-//!
-//! [`FactSource`] is Gatehouse's **request-scoped DataLoader-style primitive**:
-//! the session deduplicates and caches keys before calling the source, then
-//! chunks the unique key set according to
-//! [`FactSource::max_batch_size`] — so the source may receive one or more
-//! batched calls per request, each over a slice of the unique keys. If your
-//! application already uses a DataLoader implementation (for example
-//! `async_graphql::dataloader` from the `async-graphql` crate, or the
-//! `ultra-batch` crate), call it directly from inside
-//! [`FactSource::load_many`] — gatehouse does not need its own batching
-//! layer for the data fetch, only for the per-request fact graph. The same
-//! composition pattern applies to the [`Hydrator`] used by lookup-style
-//! listings (`Hydrator::hydrate`).
-//!
-//! [`RebacPolicy`] is the first built-in policy backed by this model. It
-//! extracts flat subject/resource IDs, builds [`RelationshipQuery`] keys, and
-//! asks the session for relationship facts.
-//!
-//! ## Quick Start
-//!
-//! The fastest way to define a policy is with [`PolicyBuilder`]:
+//! The fastest way to define a synchronous predicate policy is
+//! [`PolicyBuilder`]:
 //!
 //! ```rust
 //! # use gatehouse::*;
 //! #[derive(Debug, Clone)]
-//! struct User { roles: Vec<String> }
+//! struct User {
+//!     id: u64,
+//!     roles: Vec<&'static str>,
+//! }
 //! #[derive(Debug, Clone)]
-//! struct Document;
+//! struct Document {
+//!     owner_id: u64,
+//! }
 //! #[derive(Debug, Clone)]
 //! struct ReadAction;
-//! #[derive(Debug, Clone)]
-//! struct AppContext;
 //!
-//! let policy = PolicyBuilder::<User, Document, ReadAction, AppContext>::new("AdminOnly")
-//!     .subjects(|user: &User| user.roles.iter().any(|r| r == "admin"))
+//! struct Documents;
+//! impl PolicyDomain for Documents {
+//!     type Subject = User;
+//!     type Action = ReadAction;
+//!     type Resource = Document;
+//!     type Context = ();
+//! }
+//!
+//! let admin_policy = PolicyBuilder::<Documents>::new("AdminOnly")
+//!     .subjects(|user: &User| user.roles.contains(&"admin"))
 //!     .build();
 //!
-//! let mut checker = PermissionChecker::new();
-//! checker.add_policy(policy);
+//! let owner_policy = PolicyBuilder::<Documents>::new("OwnerOnly")
+//!     .when(|user: &User, _action: &ReadAction, document: &Document, _ctx: &()| {
+//!         user.id == document.owner_id
+//!     })
+//!     .build();
+//!
+//! let mut checker = PermissionChecker::<Documents>::new();
+//! checker.add_policy(admin_policy);
+//! checker.add_policy(owner_policy);
 //!
 //! # tokio_test::block_on(async {
-//! let admin = User { roles: vec!["admin".into()] };
-//! assert!(checker.check(&admin, &ReadAction, &Document, &AppContext).await.is_granted());
+//! let session = EvaluationSession::empty();
+//! let document = Document { owner_id: 7 };
+//! let admin = User { id: 1, roles: vec!["admin"] };
+//! let owner = User { id: 7, roles: vec!["user"] };
+//! let guest = User { id: 2, roles: vec!["user"] };
 //!
-//! let guest = User { roles: vec!["guest".into()] };
-//! assert!(!checker.check(&guest, &ReadAction, &Document, &AppContext).await.is_granted());
+//! assert!(checker.bind(&session, &admin, &ReadAction, &()).check(&document).await.is_granted());
+//! assert!(checker.bind(&session, &owner, &ReadAction, &()).check(&document).await.is_granted());
+//! assert!(!checker.bind(&session, &guest, &ReadAction, &()).check(&document).await.is_granted());
 //! # });
 //! ```
 //!
-//! `check` is the everyday entry point for policies that don't need
-//! [`FactSource`]-loaded relationship data. For fact-backed checkers
-//! (RBAC/ABAC alongside [`RebacPolicy`], or any policy reading from an
-//! [`EvaluationSession`]), use [`PermissionChecker::evaluate_in_session`]
-//! and pass a session loaded for the request.
+//! # Core Flows
 //!
-//! ## Built-in Policies
+//! Bind request-wide inputs once, then evaluate resources through the bound
+//! evaluator:
 //!
-//! The library provides several built-in policies:
-//!  - [`RbacPolicy`]: A role-based access control policy.
-//!  - [`AbacPolicy`]: An attribute-based access control policy.
-//!  - [`RebacPolicy`]: A relationship-based access control policy backed by
-//!    [`FactSource`] and [`EvaluationSession`].
+//! ```rust,ignore
+//! let session = registry.session();
+//! let bound = checker.bind(&session, &subject, &action, &request_context);
 //!
-//! ## Custom Policies
+//! let decision = bound.check(&resource).await;
+//! let decisions = bound.evaluate(resources.clone()).await;
+//! let authorized = bound.filter(resources).await;
+//! let authorized_rows = bound.filter_by(rows, |row| &row.authz_resource).await;
+//! let page = bound.lookup_page(&lookup, &hydrator, cursor.as_deref(), limit).await?;
+//! ```
 //!
-//! For full control, implement the [`Policy`] trait directly. Below we define a simple
-//! system where a user may read a document if they are an admin (via a role-based policy)
-//! or if they are the owner of the document (via an attribute-based policy).
+//! Use [`EvaluationSession::empty`] for fact-free decisions. Use a session from
+//! [`FactRegistry::session`] when any policy calls `ctx.session.get(...)`, such
+//! as [`RebacPolicy`] or a custom fact-backed policy.
+//!
+//! [`BoundEvaluator::evaluate`] preserves input order and returns one
+//! [`AccessEvaluation`] per input resource. [`BoundEvaluator::filter`] keeps
+//! only granted resources. [`BoundEvaluator::evaluate_by`] and
+//! [`BoundEvaluator::filter_by`] are for wide caller-owned rows where
+//! authorization uses a projected resource. [`BoundEvaluator::lookup_page`] is
+//! for list endpoints where the application cannot load every possible
+//! candidate first; the [`LookupSource`] enumerates candidate IDs, a
+//! [`Hydrator`] resolves them, and the full policy stack authorizes the
+//! hydrated resources.
+//!
+//! # Decision Semantics
+//!
+//! Gatehouse deliberately keeps combining semantics fixed:
+//!
+//! - [`PermissionChecker`] applies deny-overrides. Any evaluated result
+//!   containing [`PolicyEvalResult::Forbidden`] denies the request and
+//!   overrides grants.
+//! - Policies declaring [`Effect::Forbid`] or [`Effect::AllowOrForbid`] are
+//!   evaluated before allow-only policies so a veto cannot be skipped by grant
+//!   short-circuiting.
+//! - If no policy forbids, the first grant wins.
+//! - If nothing grants, the checker denies with `"All policies denied access"`.
+//! - An empty checker denies with `"No policies configured"`.
+//! - [`PolicyEvalResult::NotApplicable`] means the policy did not grant.
+//!   [`PolicyEvalResult::Forbidden`] means the policy actively vetoed.
+//! - [`PolicyBuilder`] combines configured predicates with AND logic.
+//!   [`PolicyBuilder::forbid`] makes a matching built policy forbid; a
+//!   non-match remains not applicable and does not block.
+//! - [`AndPolicy`] and [`OrPolicy`] evaluate veto-capable children before
+//!   allow-only children, then short-circuit normally. [`NotPolicy`] inverts
+//!   grants and non-grants, but never turns `Forbidden` into a grant.
+//! - `Forbidden` propagates through [`AndPolicy`], [`OrPolicy`], [`NotPolicy`],
+//!   and [`DelegatingPolicy`].
+//! - [`NotPolicy`] does not neutralize a veto. `admin.or(blocked.not())` still
+//!   denies when `blocked` returns `Forbidden`. For "grant unless blocked", use
+//!   an allow-only `blocked` predicate under `not()`, or register an explicit
+//!   forbid policy when the block should be global.
+//! - `grant.and(forbid_only)` can never grant: a forbid-only child does not
+//!   satisfy AND's "all children grant" rule. Use
+//!   `grant.and(blocked_allow_predicate.not())` for a local exclusion.
+//!
+//! Denials from [`AccessEvaluation`] are summary-level. Use
+//! [`AccessEvaluation::display_trace`] or the attached [`EvalTrace`] to inspect
+//! individual policy reasons and fact provenance.
+//!
+//! # Fact-Loaded Authorization
+//!
+//! [`FactSource::load_many`] receives unique fact keys and must return exactly
+//! one result per key in the same order. [`EvaluationSession`] expands
+//! duplicate caller inputs, preserves caller order, caches results for the
+//! request, chunks loads according to [`FactSource::max_batch_size`], and joins
+//! concurrent in-flight loads for the same key.
+//!
+//! [`RebacPolicy`] is the built-in fact-backed policy. It extracts flat
+//! subject/resource IDs, builds [`RelationshipQuery`] keys, and grants only
+//! when the request session loads a `Found(true)` relationship fact. Missing
+//! sources, missing facts, backend errors, and fact-source contract violations
+//! fail closed to denied ReBAC decisions.
+//!
+//! # Long-Lived Streams
+//!
+//! [`EvaluationSession`] caches are scoped to one authorization pass. For SSE,
+//! WebSocket, and other long-lived streams, do not hold one fact-backed session
+//! for the stream lifetime.
+//!
+//! If your product contract authorizes once at stream open, create a fresh
+//! session, compute the visible ID set with [`BoundEvaluator::filter`] or
+//! [`BoundEvaluator::filter_by`], drop the session, and only emit frames for
+//! that set. If the stream must observe mid-stream permission revocation, run
+//! periodic reauthorization with a fresh [`FactRegistry::session`] and re-bind
+//! the checker for that pass.
+//!
+//! # Built-In Policies
+//!
+//! - [`RbacPolicy`]: role-based access control from caller roles and required
+//!   roles for the `(action, resource)` pair.
+//! - [`RebacPolicy`]: relationship-based access control backed by
+//!   [`FactSource`] and [`EvaluationSession`].
+//! - [`DelegatingPolicy`]: maps the current inputs into another
+//!   [`PolicyDomain`] and delegates to a child [`PermissionChecker`].
+//!
+//! Use [`PolicyBuilder::when`] for attribute-style predicates that compare
+//! subject, action, resource, and context in one synchronous closure.
+//!
+//! # Custom Policies
+//!
+//! Implement [`Policy`] directly when a rule needs async work, custom batching,
+//! custom telemetry metadata, or hand-written forbid behavior:
 //!
 //! ```rust
-//! # use uuid::Uuid;
 //! # use async_trait::async_trait;
-//! # use std::sync::Arc;
+//! # use std::borrow::Cow;
 //! # use gatehouse::*;
-//!
-//! // Define our core types.
-//! #[derive(Debug, Clone)]
-//! pub struct User {
-//!     pub id: Uuid,
-//!     pub roles: Vec<String>,
-//! }
-//!
-//! #[derive(Debug, Clone)]
-//! pub struct Document {
-//!     pub id: Uuid,
-//!     pub owner_id: Uuid,
-//! }
-//!
-//! #[derive(Debug, Clone)]
-//! pub struct ReadAction;
-//!
-//! #[derive(Debug, Clone)]
-//! pub struct EmptyContext;
-//!
-//! // A simple RBAC policy: grant access if the user has the "admin" role.
-//! struct AdminPolicy;
-//! #[async_trait]
-//! impl Policy<User, Document, ReadAction, EmptyContext> for AdminPolicy {
-//!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
-//!         if ctx.subject.roles.contains(&"admin".to_string()) {
-//!             ctx.grant("User is admin")
-//!         } else {
-//!             ctx.deny("User is not admin")
-//!         }
-//!     }
-//!     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-//!         std::borrow::Cow::Borrowed("AdminPolicy")
-//!     }
-//! }
-//!
-//! // An ABAC policy: grant access if the user is the owner of the document.
+//! # #[derive(Debug, Clone)] struct User { id: u64 }
+//! # #[derive(Debug, Clone)] struct Document { owner_id: u64 }
+//! # #[derive(Debug, Clone)] struct ReadAction;
+//! # struct Documents;
+//! # impl PolicyDomain for Documents {
+//! #     type Subject = User;
+//! #     type Action = ReadAction;
+//! #     type Resource = Document;
+//! #     type Context = ();
+//! # }
 //! struct OwnerPolicy;
 //!
 //! #[async_trait]
-//! impl Policy<User, Document, ReadAction, EmptyContext> for OwnerPolicy {
-//!     async fn evaluate(&self, ctx: &EvalCtx<'_, User, Document, ReadAction, EmptyContext>) -> PolicyEvalResult {
+//! impl Policy<Documents> for OwnerPolicy {
+//!     async fn evaluate(&self, ctx: &EvalCtx<'_, Documents>) -> PolicyEvalResult {
 //!         if ctx.subject.id == ctx.resource.owner_id {
-//!             ctx.grant("User is the owner")
+//!             ctx.grant("subject owns the document")
 //!         } else {
-//!             ctx.deny("User is not the owner")
+//!             ctx.not_applicable("subject does not own the document")
 //!         }
 //!     }
-//!     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-//!         std::borrow::Cow::Borrowed("OwnerPolicy")
+//!
+//!     fn policy_type(&self) -> Cow<'static, str> {
+//!         Cow::Borrowed("OwnerPolicy")
 //!     }
 //! }
-//!
-//! // Create a PermissionChecker (deny-overrides over the registered policies;
-//! // with no deny-effect policies this is simply OR) and add both policies.
-//! fn create_document_checker() -> PermissionChecker<User, Document, ReadAction, EmptyContext> {
-//!     let mut checker = PermissionChecker::new();
-//!     checker.add_policy(AdminPolicy);
-//!     checker.add_policy(OwnerPolicy);
-//!     checker
-//! }
-//!
-//! # tokio_test::block_on(async {
-//! let admin_user = User {
-//!     id: Uuid::new_v4(),
-//!     roles: vec!["admin".into()],
-//! };
-//!
-//! let owner_user = User {
-//!     id: Uuid::new_v4(),
-//!     roles: vec!["user".into()],
-//! };
-//!
-//! let document = Document {
-//!     id: Uuid::new_v4(),
-//!     owner_id: owner_user.id,
-//! };
-//!
-//! let checker = create_document_checker();
-//!
-//! // An admin should have access.
-//! assert!(checker.check(&admin_user, &ReadAction, &document, &EmptyContext).await.is_granted());
-//!
-//! // The owner should have access.
-//! assert!(checker.check(&owner_user, &ReadAction, &document, &EmptyContext).await.is_granted());
-//!
-//! // A random user should be denied access.
-//! let random_user = User {
-//!     id: Uuid::new_v4(),
-//!     roles: vec!["user".into()],
-//! };
-//! assert!(!checker.check(&random_user, &ReadAction, &document, &EmptyContext).await.is_granted());
-//! # });
 //! ```
 //!
-//! ## Evaluation Tracing
+//! # Tracing
 //!
-//! The permission system provides detailed tracing of policy decisions, see [`AccessEvaluation`]
-//! for an example.
-//!
-//! ## Tracing And Telemetry
-//!
-//! When trace-level events are enabled, [`PermissionChecker::evaluate_in_session`]
-//! creates an instrumented span and each evaluated policy records a `trace!`
-//! event on the `gatehouse::security` target. Batch evaluation records
-//! aggregate item counts on [`PermissionChecker::evaluate_batch_in_session_by`]
-//! and per-policy counts on nested `gatehouse.batch_policy` spans.
-//!
-//! Emitted fields:
-//!
-//! - `security_rule.name`
-//! - `security_rule.category`
-//! - `security_rule.description`
-//! - `security_rule.reference`
-//! - `security_rule.ruleset.name`
-//! - `security_rule.uuid`
-//! - `security_rule.version`
-//! - `security_rule.license`
-//! - `event.outcome`
-//! - `policy.type`
-//! - `policy.result.reason`
-//!
-//! When [`Policy::security_rule`] is not overridden, tracing falls back to:
-//!
-//! - `security_rule.name = policy_type()`
-//! - `security_rule.category = "Access Control"`
-//! - `security_rule.ruleset.name = "PermissionChecker"`
-//!
-//! ## Combinators
-//!
-//! Sometimes you may want to require that several policies pass (AND), require that
-//! at least one passes (OR), or even invert a policy (NOT). `gatehouse` provides
-//! combinators for this purpose:
-//!
-//! - [`AndPolicy`]: Grants access only if all inner policies allow access. Otherwise,
-//!   returns a combined error.
-//! - [`OrPolicy`]: Grants access if any inner policy allows access; otherwise returns a
-//!   combined error.
-//! - [`NotPolicy`]: Inverts the decision of an inner policy.
-//! - [`DelegatingPolicy`]: Maps the current inputs into another authorization
-//!   domain and delegates to a child [`PermissionChecker`] while preserving
-//!   batching.
-//!
-//!
+//! When trace-level events are enabled, checker evaluation records spans for
+//! single-resource and batch evaluation, and each evaluated policy records a
+//! `trace!` event on the `gatehouse::security` target. Batch evaluation also
+//! records per-policy counts on nested `gatehouse.batch_policy` spans.
 
 #![warn(missing_docs)]
 #![allow(clippy::type_complexity)]
@@ -367,21 +241,18 @@ mod results;
 mod session;
 
 pub use builder::PolicyBuilder;
-pub use checker::PermissionChecker;
-pub use combinators::{AndPolicy, EmptyPoliciesError, NotPolicy, OrPolicy};
-pub use facts::{
-    FactKey, FactLoadError, FactLoadResult, FactSource, FactSourceRegistrationError,
-    RelationshipQuery,
-};
+pub use checker::{BoundEvaluator, PermissionChecker};
+pub use combinators::{AndPolicy, EmptyPoliciesError, NotPolicy, OrPolicy, PolicyExt};
+pub use facts::{FactKey, FactLoadError, FactLoadResult, FactSource, RelationshipQuery};
 pub use lookup::{Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupPage, LookupSource};
 pub use metadata::SecurityRuleMetadata;
 pub(crate) use metadata::{DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE};
-pub use policies::{AbacPolicy, DelegatingPolicy, RbacPolicy, RebacPolicy};
-pub use policy::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyBatchItem};
+pub use policies::{DelegatingPolicy, RbacPolicy, RebacPolicy};
+pub use policy::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyBatchItem, PolicyDomain};
 pub use results::{
     AccessEvaluation, CombineOp, EvalTrace, FactOutcome, FactProvenance, PolicyEvalResult,
 };
-pub use session::{EvaluationSession, EvaluationSessionBuilder};
+pub use session::{EvaluationSession, FactRegistry, FactRegistryBuilder};
 
 // The shared unit-test module pulls in tokio-based async tests via dev-deps
 // that are intentionally loom-incompatible (`tokio::net`, axum, hyper, etc.).

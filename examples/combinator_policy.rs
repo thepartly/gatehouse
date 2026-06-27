@@ -38,6 +38,15 @@ impl Document {
 #[derive(Debug, Clone)]
 struct ViewAction;
 
+struct DocumentDomain;
+
+impl PolicyDomain for DocumentDomain {
+    type Subject = User;
+    type Action = ViewAction;
+    type Resource = Document;
+    type Context = ();
+}
+
 // A policy that records when it's evaluated
 struct CountingPolicy {
     allow: bool,
@@ -46,11 +55,8 @@ struct CountingPolicy {
 }
 
 #[async_trait]
-impl Policy<User, Document, ViewAction, ()> for CountingPolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, User, Document, ViewAction, ()>,
-    ) -> PolicyEvalResult {
+impl Policy<DocumentDomain> for CountingPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, DocumentDomain>) -> PolicyEvalResult {
         // Increment evaluation counter
         self.counter.fetch_add(1, Ordering::SeqCst);
         println!("Evaluating policy: {}", self.name);
@@ -58,7 +64,7 @@ impl Policy<User, Document, ViewAction, ()> for CountingPolicy {
         if self.allow {
             ctx.grant(format!("{} grants access", self.name))
         } else {
-            ctx.deny(format!("{} denies access", self.name))
+            ctx.not_applicable(format!("{} denies access", self.name))
         }
     }
 
@@ -73,36 +79,36 @@ async fn main() {
     let document = Document::new();
     let action = ViewAction;
     let context = ();
-    // These policies have no fact sources, so we add each combinator to a
-    // `PermissionChecker` and call `check` — the everyday RBAC/ABAC entry point,
-    // with no `EvaluationSession` to thread through. The checker contributes its
-    // own `OR` root to the trace; the combinator's short-circuit behaviour (what
-    // this example measures) happens inside it regardless.
+    // These policies have no fact sources, so each evaluation binds
+    // `EvaluationSession::empty()`. The checker contributes its own `OR` root
+    // to the trace; the combinator's short-circuit behaviour (what this example
+    // measures) happens inside it regardless.
 
     println!("=== AND Policy Short-Circuit Example ===");
     {
         let counter = Arc::new(AtomicUsize::new(0));
 
-        // Create an AND policy with a deny policy first
-        let and_policy = AndPolicy::try_new(vec![
-            Arc::new(CountingPolicy {
-                allow: false,
-                name: "DenyFirst".to_string(),
-                counter: counter.clone(),
-            }),
-            Arc::new(CountingPolicy {
-                allow: true,
-                name: "AllowSecond".to_string(),
-                counter: counter.clone(),
-            }),
-        ])
-        .expect("Unable to create and-policy policy");
+        // Create an AND policy with a non-grant policy first
+        let and_policy = CountingPolicy {
+            allow: false,
+            name: "DenyFirst".to_string(),
+            counter: counter.clone(),
+        }
+        .and(CountingPolicy {
+            allow: true,
+            name: "AllowSecond".to_string(),
+            counter: counter.clone(),
+        });
 
-        let mut checker = PermissionChecker::new();
+        let mut checker = PermissionChecker::<DocumentDomain>::new();
         checker.add_policy(and_policy);
 
         println!("Evaluating AND(DenyFirst, AllowSecond):");
-        let result = checker.check(&user, &action, &document, &context).await;
+        let session = EvaluationSession::empty();
+        let result = checker
+            .bind(&session, &user, &action, &context)
+            .check(&document)
+            .await;
         println!(
             "Result: {}",
             if result.is_granted() {
@@ -123,25 +129,26 @@ async fn main() {
         let counter = Arc::new(AtomicUsize::new(0));
 
         // Create an OR policy with an allow policy first
-        let or_policy = OrPolicy::try_new(vec![
-            Arc::new(CountingPolicy {
-                allow: true,
-                name: "AllowFirst".to_string(),
-                counter: counter.clone(),
-            }),
-            Arc::new(CountingPolicy {
-                allow: false,
-                name: "DenySecond".to_string(),
-                counter: counter.clone(),
-            }),
-        ])
-        .expect("Unable to create or-policy policy");
+        let or_policy = CountingPolicy {
+            allow: true,
+            name: "AllowFirst".to_string(),
+            counter: counter.clone(),
+        }
+        .or(CountingPolicy {
+            allow: false,
+            name: "DenySecond".to_string(),
+            counter: counter.clone(),
+        });
 
-        let mut checker = PermissionChecker::new();
+        let mut checker = PermissionChecker::<DocumentDomain>::new();
         checker.add_policy(or_policy);
 
         println!("Evaluating OR(AllowFirst, DenySecond):");
-        let result = checker.check(&user, &action, &document, &context).await;
+        let session = EvaluationSession::empty();
+        let result = checker
+            .bind(&session, &user, &action, &context)
+            .check(&document)
+            .await;
         println!(
             "Result: {}",
             if result.is_granted() {
@@ -162,35 +169,32 @@ async fn main() {
         let counter = Arc::new(AtomicUsize::new(0));
 
         // Create a complex nested policy: OR(AND(Deny, Allow), Allow)
-        let inner_and = AndPolicy::try_new(vec![
-            Arc::new(CountingPolicy {
-                allow: false,
-                name: "DenyInner".to_string(),
-                counter: counter.clone(),
-            }),
-            Arc::new(CountingPolicy {
-                allow: true,
-                name: "AllowInner".to_string(),
-                counter: counter.clone(),
-            }),
-        ])
-        .expect("Unable to create and-policy policy");
+        let inner_and = CountingPolicy {
+            allow: false,
+            name: "DenyInner".to_string(),
+            counter: counter.clone(),
+        }
+        .and(CountingPolicy {
+            allow: true,
+            name: "AllowInner".to_string(),
+            counter: counter.clone(),
+        });
 
-        let complex_policy = OrPolicy::try_new(vec![
-            Arc::new(inner_and),
-            Arc::new(CountingPolicy {
-                allow: true,
-                name: "AllowOuter".to_string(),
-                counter: counter.clone(),
-            }),
-        ])
-        .expect("Unable to create or-policy policy");
+        let complex_policy = inner_and.or(CountingPolicy {
+            allow: true,
+            name: "AllowOuter".to_string(),
+            counter: counter.clone(),
+        });
 
-        let mut checker = PermissionChecker::new();
+        let mut checker = PermissionChecker::<DocumentDomain>::new();
         checker.add_policy(complex_policy);
 
         println!("Evaluating OR(AND(DenyInner, AllowInner), AllowOuter):");
-        let result = checker.check(&user, &action, &document, &context).await;
+        let session = EvaluationSession::empty();
+        let result = checker
+            .bind(&session, &user, &action, &context)
+            .check(&document)
+            .await;
         println!(
             "Result: {} for document with ID {} for user with ID {}",
             if result.is_granted() {

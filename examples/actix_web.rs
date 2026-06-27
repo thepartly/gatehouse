@@ -30,8 +30,8 @@
 //
 // Each handler pulls the shared `AppState` from Actix Web's `Data` extractor,
 // builds a request-scoped `EvaluationSession`, and evaluates with
-// `evaluate_in_session` (single resource) or
-// `filter_authorized_in_session_by_resource` (the list endpoint).
+// `bind(...).check(...)` (single resource) or
+// `bind(...).filter(...)` (the list endpoint).
 //
 // Note: on denial these handlers echo the evaluation trace back in the HTTP
 // response so you can see the decision from `curl`. That is a demo convenience,
@@ -42,8 +42,9 @@ use actix_web::{
 };
 use async_trait::async_trait;
 use gatehouse::{
-    AccessEvaluation, AndPolicy, EvalTrace, EvaluationSession, FactLoadResult, FactSource,
-    PermissionChecker, Policy, PolicyBuilder, RebacPolicy, RelationshipQuery,
+    AccessEvaluation, AndPolicy, EvalTrace, EvaluationSession, FactLoadResult, FactRegistry,
+    FactSource, PermissionChecker, Policy, PolicyBuilder, PolicyDomain, RebacPolicy,
+    RelationshipQuery,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -162,6 +163,15 @@ impl RequestContext {
     }
 }
 
+pub struct BlogDomain;
+
+impl PolicyDomain for BlogDomain {
+    type Subject = User;
+    type Action = Action;
+    type Resource = BlogPost;
+    type Context = RequestContext;
+}
+
 // A typed relation set, even though the in-memory store could use strings. The
 // session deduplicates and caches by the typed `RelationshipQuery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -207,13 +217,13 @@ impl FactSource<PostRelationship> for InMemoryRelationshipSource {
 // 2) Shared application state
 // --------------------------
 
-/// The long-lived pieces: the checker and the relationship source are built
-/// once at startup and shared across requests. Each request derives a fresh
-/// `EvaluationSession` from the source.
+/// The long-lived pieces: the checker and fact registry are built once at
+/// startup and shared across requests. Each request derives a fresh
+/// `EvaluationSession` from the registry.
 #[derive(Clone)]
 pub struct AppState {
-    checker: Arc<PermissionChecker<User, BlogPost, Action, RequestContext>>,
-    relationships: Arc<dyn FactSource<PostRelationship>>,
+    checker: Arc<PermissionChecker<BlogDomain>>,
+    fact_registry: FactRegistry,
     posts: Arc<Vec<BlogPost>>,
 }
 
@@ -232,15 +242,15 @@ impl AppState {
 
         Self {
             checker: Arc::new(build_permission_checker()),
-            relationships: Arc::new(InMemoryRelationshipSource::new(grants)),
+            fact_registry: FactRegistry::builder()
+                .with_arc::<PostRelationship>(Arc::new(InMemoryRelationshipSource::new(grants)))
+                .build(),
             posts: Arc::new(posts),
         }
     }
 
     fn request_session(&self) -> EvaluationSession {
-        EvaluationSession::builder()
-            .with_arc::<PostRelationship>(Arc::clone(&self.relationships))
-            .build()
+        self.fact_registry.session()
     }
 }
 
@@ -278,17 +288,17 @@ fn demo_posts(author_id: Uuid) -> Vec<BlogPost> {
 // 3) Building Our Policies
 // --------------------------
 
-fn admin_override_policy() -> Box<dyn Policy<User, BlogPost, Action, RequestContext>> {
-    PolicyBuilder::<User, BlogPost, Action, RequestContext>::new("AdminOverride")
+fn admin_override_policy() -> Box<dyn Policy<BlogDomain>> {
+    PolicyBuilder::<BlogDomain>::new("AdminOverride")
         .when(|user, _action, _post, _ctx| user.roles.iter().any(|role| role == "admin"))
         .build()
 }
 
 /// Editing rule for the author: edit your own unpublished, unlocked draft that
 /// is still inside the 30-day window.
-fn author_can_edit_policy() -> Box<dyn Policy<User, BlogPost, Action, RequestContext>> {
+fn author_can_edit_policy() -> Box<dyn Policy<BlogDomain>> {
     const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-    PolicyBuilder::<User, BlogPost, Action, RequestContext>::new("AuthorCanEdit")
+    PolicyBuilder::<BlogDomain>::new("AuthorCanEdit")
         .when(|user, action, post, ctx| {
             matches!(action, Action::Edit)
                 && user.id == post.author_id
@@ -307,14 +317,14 @@ fn author_can_edit_policy() -> Box<dyn Policy<User, BlogPost, Action, RequestCon
 /// loaded through the session) may view and edit the post, author or not. The
 /// guard restricts the relationship check to the View/Edit actions; publishing
 /// stays role-gated below.
-fn collaborator_policy() -> Box<dyn Policy<User, BlogPost, Action, RequestContext>> {
-    let is_view_or_edit: Arc<dyn Policy<User, BlogPost, Action, RequestContext>> = Arc::from(
-        PolicyBuilder::<User, BlogPost, Action, RequestContext>::new("IsViewOrEdit")
+fn collaborator_policy() -> Box<dyn Policy<BlogDomain>> {
+    let is_view_or_edit: Arc<dyn Policy<BlogDomain>> = Arc::from(
+        PolicyBuilder::<BlogDomain>::new("IsViewOrEdit")
             .when(|_user, action, _post, _ctx| matches!(action, Action::View | Action::Edit))
             .build(),
     );
-    let has_editor_relationship: Arc<dyn Policy<User, BlogPost, Action, RequestContext>> =
-        Arc::new(RebacPolicy::new(
+    let has_editor_relationship: Arc<dyn Policy<BlogDomain>> =
+        Arc::new(RebacPolicy::<BlogDomain, Uuid, Uuid, Relation>::new(
             |user: &User| user.id,
             |post: &BlogPost| post.id,
             Relation::Editor,
@@ -326,8 +336,8 @@ fn collaborator_policy() -> Box<dyn Policy<User, BlogPost, Action, RequestContex
     )
 }
 
-fn editors_can_publish_policy() -> Box<dyn Policy<User, BlogPost, Action, RequestContext>> {
-    PolicyBuilder::<User, BlogPost, Action, RequestContext>::new("EditorsCanPublish")
+fn editors_can_publish_policy() -> Box<dyn Policy<BlogDomain>> {
+    PolicyBuilder::<BlogDomain>::new("EditorsCanPublish")
         .when(|user, action, post, _ctx| {
             matches!(action, Action::Publish)
                 && !post.locked
@@ -339,8 +349,8 @@ fn editors_can_publish_policy() -> Box<dyn Policy<User, BlogPost, Action, Reques
         .build()
 }
 
-fn published_posts_are_public_policy() -> Box<dyn Policy<User, BlogPost, Action, RequestContext>> {
-    PolicyBuilder::<User, BlogPost, Action, RequestContext>::new("PublishedPostsArePublic")
+fn published_posts_are_public_policy() -> Box<dyn Policy<BlogDomain>> {
+    PolicyBuilder::<BlogDomain>::new("PublishedPostsArePublic")
         .when(|user, action, post, _ctx| {
             matches!(action, Action::View)
                 && (post.published_at.is_some() || user.id == post.author_id)
@@ -348,7 +358,7 @@ fn published_posts_are_public_policy() -> Box<dyn Policy<User, BlogPost, Action,
         .build()
 }
 
-pub fn build_permission_checker() -> PermissionChecker<User, BlogPost, Action, RequestContext> {
+pub fn build_permission_checker() -> PermissionChecker<BlogDomain> {
     let mut checker = PermissionChecker::named("BlogPostChecker");
     checker.add_policy(admin_override_policy());
     checker.add_policy(author_can_edit_policy());
@@ -436,14 +446,8 @@ pub async fn list_posts(
 
     let visible = state
         .checker
-        .filter_authorized_in_session_by_resource(
-            &session,
-            &user,
-            &Action::View,
-            candidates,
-            &context,
-            |post| post,
-        )
+        .bind(&session, &user, &Action::View, &context)
+        .filter(candidates)
         .await;
 
     let summaries = visible.iter().map(PostSummary::from).collect::<Vec<_>>();
@@ -458,22 +462,19 @@ pub async fn view_post(
 ) -> impl Responder {
     let post = load_post(&state, *path, &PostOverrides::from_request(&req));
     let session = state.request_session();
+    let context = RequestContext::now();
 
     match state
         .checker
-        .evaluate_in_session(
-            &session,
-            &user,
-            &Action::View,
-            &post,
-            &RequestContext::now(),
-        )
+        .bind(&session, &user, &Action::View, &context)
+        .check(&post)
         .await
     {
         AccessEvaluation::Granted { .. } => {
             HttpResponse::Ok().body(format!("Viewing '{}'", post.title))
         }
         AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
+        _ => HttpResponse::Forbidden().body("Access denied"),
     }
 }
 
@@ -485,20 +486,17 @@ pub async fn edit_post(
 ) -> impl Responder {
     let post = load_post(&state, *path, &PostOverrides::from_request(&req));
     let session = state.request_session();
+    let context = RequestContext::now();
 
     match state
         .checker
-        .evaluate_in_session(
-            &session,
-            &user,
-            &Action::Edit,
-            &post,
-            &RequestContext::now(),
-        )
+        .bind(&session, &user, &Action::Edit, &context)
+        .check(&post)
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post updated"),
         AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
+        _ => HttpResponse::Forbidden().body("Access denied"),
     }
 }
 
@@ -510,20 +508,17 @@ pub async fn publish_post(
 ) -> impl Responder {
     let post = load_post(&state, *path, &PostOverrides::from_request(&req));
     let session = state.request_session();
+    let context = RequestContext::now();
 
     match state
         .checker
-        .evaluate_in_session(
-            &session,
-            &user,
-            &Action::Publish,
-            &post,
-            &RequestContext::now(),
-        )
+        .bind(&session, &user, &Action::Publish, &context)
+        .check(&post)
         .await
     {
         AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post published"),
         AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
+        _ => HttpResponse::Forbidden().body("Access denied"),
     }
 }
 

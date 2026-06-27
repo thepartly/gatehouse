@@ -42,6 +42,7 @@ impl std::error::Error for MessageError {}
 
 /// Error raised while loading a fact.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum FactLoadError {
     /// No source is registered for the requested fact key type.
     SourceNotRegistered {
@@ -125,6 +126,7 @@ impl std::error::Error for FactLoadError {}
 /// distinction that matters for fail-closed authorization — and so the type can
 /// gain variants later without breaking a `Result` alias callers rely on.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum FactLoadResult<V> {
     /// The fact exists and has the given value.
     Found(V),
@@ -200,13 +202,13 @@ pub enum FactLoadResult<V> {
 /// ```rust,ignore
 /// async fn evaluate(
 ///     &self,
-///     ctx: &EvalCtx<'_, OrgAuth, Invoice, Read, ()>,
+///     ctx: &EvalCtx<'_, InvoiceAccess>,
 /// ) -> PolicyEvalResult {
 ///     match ctx.session.get(CustomerForOrg(ctx.subject.org_id)).await {
 ///         FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
 ///             ctx.grant("subject's org bills under the invoice's customer")
 ///         }
-///         _ => ctx.deny("not the billing customer"),
+///         _ => ctx.not_applicable("not the billing customer"),
 ///     }
 /// }
 /// ```
@@ -242,9 +244,9 @@ where
     }
 }
 
-/// Error returned by non-panicking fact-source registration helpers.
+/// Error raised while installing fact sources into a request session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FactSourceRegistrationError {
+pub(crate) enum FactSourceRegistrationError {
     /// The session is the process-wide empty session and cannot accept sources.
     SharedEmptySession {
         /// Diagnostic fact name from [`FactKey::NAME`].
@@ -267,11 +269,11 @@ impl fmt::Display for FactSourceRegistrationError {
         match self {
             Self::SharedEmptySession { .. } => write!(
                 f,
-                "EvaluationSession::shared_empty() cannot register fact sources; use EvaluationSession::new() or EvaluationSession::builder()",
+                "EvaluationSession::shared_empty() cannot install fact sources; use FactRegistry::session() for fact-backed checks",
             ),
             Self::AlreadyRegistered { fact_name } => write!(
                 f,
-                "fact source for '{fact_name}' is already registered; use replace or replace_arc to overwrite it",
+                "fact source for '{fact_name}' is already registered in this FactRegistry",
             ),
             Self::InFlight { .. } => write!(
                 f,

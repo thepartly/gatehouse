@@ -17,43 +17,38 @@ mod core_tests {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::Registry;
 
-    trait TestPolicyExt<S, R, A, C>: Policy<S, R, A, C>
+    trait TestPolicyExt<D>: Policy<D>
     where
-        S: Send + Sync,
-        R: Send + Sync,
-        A: Send + Sync,
-        C: Send + Sync,
+        D: PolicyDomain,
     {
         fn evaluate_access<'a>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
-            resource: &'a R,
-            context: &'a C,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            resource: &'a D::Resource,
+            context: &'a D::Context,
         ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>>;
 
         fn evaluate_access_batch<'a>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
-            items: &'a [PolicyBatchItem<'a, R, C>],
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            context: &'a D::Context,
+            items: &'a [PolicyBatchItem<'a, D>],
         ) -> Pin<Box<dyn Future<Output = Vec<PolicyEvalResult>> + Send + 'a>>;
     }
 
-    impl<T, S, R, A, C> TestPolicyExt<S, R, A, C> for T
+    impl<T, D> TestPolicyExt<D> for T
     where
-        T: Policy<S, R, A, C>,
-        S: Send + Sync,
-        R: Send + Sync,
-        A: Send + Sync,
-        C: Send + Sync,
+        T: Policy<D>,
+        D: PolicyDomain,
     {
         fn evaluate_access<'a>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
-            resource: &'a R,
-            context: &'a C,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            resource: &'a D::Resource,
+            context: &'a D::Context,
         ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
@@ -72,9 +67,10 @@ mod core_tests {
 
         fn evaluate_access_batch<'a>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
-            items: &'a [PolicyBatchItem<'a, R, C>],
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            context: &'a D::Context,
+            items: &'a [PolicyBatchItem<'a, D>],
         ) -> Pin<Box<dyn Future<Output = Vec<PolicyEvalResult>> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
@@ -83,6 +79,7 @@ mod core_tests {
                     session: &session,
                     subject,
                     action,
+                    context,
                     items,
                     policy_type,
                 };
@@ -91,102 +88,117 @@ mod core_tests {
         }
     }
 
-    trait TestCheckerExt<S, R, A, C>
+    trait TestCheckerExt<D>
     where
-        S: Sync,
-        R: Sync,
-        A: Sync,
-        C: Sync,
+        D: PolicyDomain,
     {
         fn evaluate_access<'a>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
-            resource: &'a R,
-            context: &'a C,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            resource: &'a D::Resource,
+            context: &'a D::Context,
         ) -> Pin<Box<dyn Future<Output = AccessEvaluation> + Send + 'a>>;
 
         fn evaluate_batch_by<'a, I, F>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
             items: I,
             parts: F,
         ) -> Pin<Box<dyn Future<Output = Vec<(I::Item, AccessEvaluation)>> + Send + 'a>>
         where
             I: IntoIterator + Send + 'a,
             I::Item: Send + 'a,
-            F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C) + Send + 'a;
+            F: for<'item> Fn(&'item I::Item) -> (&'item D::Resource, &'item D::Context) + Send + 'a;
 
         fn filter_authorized_by<'a, I, F>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
             items: I,
             parts: F,
         ) -> Pin<Box<dyn Future<Output = Vec<I::Item>> + Send + 'a>>
         where
             I: IntoIterator + Send + 'a,
             I::Item: Send + 'a,
-            F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C) + Send + 'a;
+            F: for<'item> Fn(&'item I::Item) -> (&'item D::Resource, &'item D::Context) + Send + 'a;
     }
 
-    impl<S, R, A, C> TestCheckerExt<S, R, A, C> for PermissionChecker<S, R, A, C>
+    impl<D> TestCheckerExt<D> for PermissionChecker<D>
     where
-        S: Sync,
-        R: Sync,
-        A: Sync,
-        C: Sync,
+        D: PolicyDomain,
     {
         fn evaluate_access<'a>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
-            resource: &'a R,
-            context: &'a C,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            resource: &'a D::Resource,
+            context: &'a D::Context,
         ) -> Pin<Box<dyn Future<Output = AccessEvaluation> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::empty();
-                self.evaluate_in_session(&session, subject, action, resource, context)
+                self.bind(&session, subject, action, context)
+                    .check(resource)
                     .await
             })
         }
 
         fn evaluate_batch_by<'a, I, F>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
             items: I,
             parts: F,
         ) -> Pin<Box<dyn Future<Output = Vec<(I::Item, AccessEvaluation)>> + Send + 'a>>
         where
             I: IntoIterator + Send + 'a,
             I::Item: Send + 'a,
-            F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C) + Send + 'a,
+            F: for<'item> Fn(&'item I::Item) -> (&'item D::Resource, &'item D::Context) + Send + 'a,
         {
             Box::pin(async move {
                 let session = EvaluationSession::empty();
-                self.evaluate_batch_in_session_by(&session, subject, action, items, parts)
+                let items = items.into_iter().collect::<Vec<_>>();
+                let mut context = None;
+                let mut resources = Vec::with_capacity(items.len());
+                for item in &items {
+                    let (resource, item_context) = parts(item);
+                    context.get_or_insert(item_context);
+                    resources.push(resource);
+                }
+                let Some(context) = context else {
+                    return Vec::new();
+                };
+                let evaluations = self
+                    .bind(&session, subject, action, context)
+                    .evaluate(resources)
                     .await
+                    .into_iter()
+                    .map(|(_, evaluation)| evaluation)
+                    .collect::<Vec<_>>();
+
+                items.into_iter().zip(evaluations).collect()
             })
         }
 
         fn filter_authorized_by<'a, I, F>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
             items: I,
             parts: F,
         ) -> Pin<Box<dyn Future<Output = Vec<I::Item>> + Send + 'a>>
         where
             I: IntoIterator + Send + 'a,
             I::Item: Send + 'a,
-            F: for<'item> Fn(&'item I::Item) -> (&'item R, &'item C) + Send + 'a,
+            F: for<'item> Fn(&'item I::Item) -> (&'item D::Resource, &'item D::Context) + Send + 'a,
         {
             Box::pin(async move {
-                let session = EvaluationSession::empty();
-                self.filter_authorized_in_session_by(&session, subject, action, items, parts)
+                self.evaluate_batch_by(subject, action, items, parts)
                     .await
+                    .into_iter()
+                    .filter_map(|(item, evaluation)| evaluation.is_granted().then_some(item))
+                    .collect()
             })
         }
     }
@@ -206,6 +218,15 @@ mod core_tests {
 
     #[derive(Debug, Clone)]
     pub struct TestContext;
+
+    struct TestDomain;
+
+    impl PolicyDomain for TestDomain {
+        type Subject = TestSubject;
+        type Action = TestAction;
+        type Resource = TestResource;
+        type Context = TestContext;
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RecordedEvent {
@@ -344,11 +365,8 @@ mod core_tests {
     struct AlwaysAllowPolicy;
 
     #[async_trait]
-    impl Policy<TestSubject, TestResource, TestAction, TestContext> for AlwaysAllowPolicy {
-        async fn evaluate(
-            &self,
-            _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
-        ) -> PolicyEvalResult {
+    impl Policy<TestDomain> for AlwaysAllowPolicy {
+        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
             PolicyEvalResult::granted(
                 self.policy_type().to_string(),
                 Some("Always allow policy".to_string()),
@@ -364,12 +382,9 @@ mod core_tests {
     struct AlwaysDenyPolicy(&'static str);
 
     #[async_trait]
-    impl Policy<TestSubject, TestResource, TestAction, TestContext> for AlwaysDenyPolicy {
-        async fn evaluate(
-            &self,
-            _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
-        ) -> PolicyEvalResult {
-            PolicyEvalResult::denied(self.policy_type().to_string(), self.0)
+    impl Policy<TestDomain> for AlwaysDenyPolicy {
+        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
+            PolicyEvalResult::not_applicable(self.policy_type().to_string(), self.0)
         }
 
         fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -383,11 +398,8 @@ mod core_tests {
     }
 
     #[async_trait]
-    impl Policy<TestSubject, TestResource, TestAction, TestContext> for EvenResourceBatchPolicy {
-        async fn evaluate(
-            &self,
-            ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
-        ) -> PolicyEvalResult {
+    impl Policy<TestDomain> for EvenResourceBatchPolicy {
+        async fn evaluate(&self, ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
             self.single_calls.fetch_add(1, Ordering::SeqCst);
             if ctx.resource.id.as_u128() % 2 == 0 {
                 PolicyEvalResult::granted(
@@ -395,13 +407,13 @@ mod core_tests {
                     Some("even resource".to_string()),
                 )
             } else {
-                PolicyEvalResult::denied(self.policy_type().to_string(), "odd resource")
+                PolicyEvalResult::not_applicable(self.policy_type().to_string(), "odd resource")
             }
         }
 
         async fn evaluate_batch<'item>(
             &self,
-            ctx: &BatchEvalCtx<'item, TestSubject, TestResource, TestAction, TestContext>,
+            ctx: &BatchEvalCtx<'item, TestDomain>,
         ) -> Vec<PolicyEvalResult> {
             self.batch_calls.fetch_add(1, Ordering::SeqCst);
             let mut results = Vec::with_capacity(ctx.items.len());
@@ -411,7 +423,7 @@ mod core_tests {
                     subject: ctx.subject,
                     action: ctx.action,
                     resource: item.resource,
-                    context: item.context,
+                    context: ctx.context,
                     policy_type: ctx.policy_type.clone(),
                 };
                 results.push(self.evaluate(&item_ctx).await);
@@ -427,11 +439,8 @@ mod core_tests {
     struct MismatchedBatchPolicy;
 
     #[async_trait]
-    impl Policy<TestSubject, TestResource, TestAction, TestContext> for MismatchedBatchPolicy {
-        async fn evaluate(
-            &self,
-            _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
-        ) -> PolicyEvalResult {
+    impl Policy<TestDomain> for MismatchedBatchPolicy {
+        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
             PolicyEvalResult::granted(
                 self.policy_type().to_string(),
                 Some("single item fallback".to_string()),
@@ -440,7 +449,7 @@ mod core_tests {
 
         async fn evaluate_batch<'item>(
             &self,
-            ctx: &BatchEvalCtx<'item, TestSubject, TestResource, TestAction, TestContext>,
+            ctx: &BatchEvalCtx<'item, TestDomain>,
         ) -> Vec<PolicyEvalResult> {
             ctx.items
                 .iter()
@@ -462,12 +471,12 @@ mod core_tests {
     struct CustomMetadataDenyPolicy;
 
     #[async_trait]
-    impl Policy<TestSubject, TestResource, TestAction, TestContext> for CustomMetadataDenyPolicy {
-        async fn evaluate(
-            &self,
-            _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
-        ) -> PolicyEvalResult {
-            PolicyEvalResult::denied(self.policy_type().to_string(), "Blocked by custom rule")
+    impl Policy<TestDomain> for CustomMetadataDenyPolicy {
+        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
+            PolicyEvalResult::not_applicable(
+                self.policy_type().to_string(),
+                "Blocked by custom rule",
+            )
         }
 
         fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -489,8 +498,7 @@ mod core_tests {
 
     #[tokio::test]
     async fn test_no_policies() {
-        let checker =
-            PermissionChecker::<TestSubject, TestResource, TestAction, TestContext>::new();
+        let checker = PermissionChecker::<TestDomain>::new();
 
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
@@ -603,6 +611,79 @@ mod core_tests {
                 .collect::<Vec<_>>(),
             vec![2, 4]
         );
+    }
+
+    #[tokio::test]
+    async fn bound_filter_by_returns_wide_rows_projected_to_resources() {
+        #[derive(Debug)]
+        struct InvoiceRow {
+            row_id: u128,
+            authz_resource: TestResource,
+            total_cents: u64,
+        }
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let subject = TestSubject {
+            id: uuid::Uuid::new_v4(),
+        };
+        let rows = vec![
+            InvoiceRow {
+                row_id: 10,
+                authz_resource: TestResource {
+                    id: uuid::Uuid::from_u128(3),
+                },
+                total_cents: 100,
+            },
+            InvoiceRow {
+                row_id: 11,
+                authz_resource: TestResource {
+                    id: uuid::Uuid::from_u128(2),
+                },
+                total_cents: 200,
+            },
+            InvoiceRow {
+                row_id: 12,
+                authz_resource: TestResource {
+                    id: uuid::Uuid::from_u128(4),
+                },
+                total_cents: 300,
+            },
+        ];
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls,
+        });
+
+        let session = EvaluationSession::empty();
+        let bound = checker.bind(&session, &subject, &TestAction, &TestContext);
+
+        let decisions = bound.evaluate_by(rows, |row| &row.authz_resource).await;
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|(row, evaluation)| (row.row_id, evaluation.is_granted()))
+                .collect::<Vec<_>>(),
+            vec![(10, false), (11, true), (12, true)]
+        );
+
+        let rows = decisions
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect::<Vec<_>>();
+        let authorized = bound.filter_by(rows, |row| &row.authz_resource).await;
+
+        assert_eq!(
+            authorized
+                .into_iter()
+                .map(|row| (row.row_id, row.total_cents))
+                .collect::<Vec<_>>(),
+            vec![(11, 200), (12, 300)]
+        );
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -739,11 +820,10 @@ mod core_tests {
                 )
             })
             .collect::<Vec<_>>();
-        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
-            Arc::new(EvenResourceBatchPolicy {
-                batch_calls: Arc::clone(&batch_calls),
-                single_calls: Arc::clone(&single_calls),
-            });
+        let inner: Arc<dyn Policy<TestDomain>> = Arc::new(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        });
         let policy = AndPolicy::try_new(vec![inner]).unwrap();
         let mut checker = PermissionChecker::new();
         checker.add_policy(policy);
@@ -774,14 +854,13 @@ mod core_tests {
             .collect::<Vec<_>>();
         let batch_items = owned_items
             .iter()
-            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .map(|(resource, _context)| PolicyBatchItem { resource })
             .collect::<Vec<_>>();
-        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
-            Arc::new(MismatchedBatchPolicy);
+        let inner: Arc<dyn Policy<TestDomain>> = Arc::new(MismatchedBatchPolicy);
         let policy = AndPolicy::try_new(vec![inner]).unwrap();
 
         let results = policy
-            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .evaluate_access_batch(&subject, &TestAction, &TestContext, &batch_items)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -808,11 +887,10 @@ mod core_tests {
                 )
             })
             .collect::<Vec<_>>();
-        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
-            Arc::new(EvenResourceBatchPolicy {
-                batch_calls: Arc::clone(&batch_calls),
-                single_calls: Arc::clone(&single_calls),
-            });
+        let inner: Arc<dyn Policy<TestDomain>> = Arc::new(EvenResourceBatchPolicy {
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        });
         let policy = OrPolicy::try_new(vec![inner]).unwrap();
         let mut checker = PermissionChecker::new();
         checker.add_policy(policy);
@@ -843,14 +921,13 @@ mod core_tests {
             .collect::<Vec<_>>();
         let batch_items = owned_items
             .iter()
-            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .map(|(resource, _context)| PolicyBatchItem { resource })
             .collect::<Vec<_>>();
-        let inner: Arc<dyn Policy<TestSubject, TestResource, TestAction, TestContext>> =
-            Arc::new(MismatchedBatchPolicy);
+        let inner: Arc<dyn Policy<TestDomain>> = Arc::new(MismatchedBatchPolicy);
         let policy = OrPolicy::try_new(vec![inner]).unwrap();
 
         let results = policy
-            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .evaluate_access_batch(&subject, &TestAction, &TestContext, &batch_items)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -898,26 +975,23 @@ mod core_tests {
         // Regression test: NotPolicy::evaluate_batch must construct a fresh
         // BatchEvalCtx with the inner policy's policy_type before
         // forwarding, so any leaf the inner policy produces via
-        // `ctx.grant` / `ctx.deny` (or via the default evaluate_batch
+        // `ctx.grant` / `ctx.not_applicable` (or via the default evaluate_batch
         // that fans out per-item EvalCtx) is tagged with the inner's
         // name, not "NotPolicy".
         //
-        // We pair NotPolicy with AbacPolicy, which builds its result via
-        // `ctx.deny(...)` — i.e. it reads ctx.policy_type. The inner
-        // leaf in the resulting trace tree must be tagged "AbacPolicy",
+        // We pair NotPolicy with a local policy that builds its result via
+        // `ctx.not_applicable(...)` — i.e. it reads ctx.policy_type. The inner
+        // leaf in the resulting trace tree must be tagged with the inner policy,
         // not "NotPolicy".
 
         struct OddResourcePolicy;
         #[async_trait]
-        impl Policy<TestSubject, TestResource, TestAction, TestContext> for OddResourcePolicy {
-            async fn evaluate(
-                &self,
-                ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
-            ) -> PolicyEvalResult {
+        impl Policy<TestDomain> for OddResourcePolicy {
+            async fn evaluate(&self, ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
                 if ctx.resource.id.as_u128() % 2 == 1 {
                     ctx.grant("odd id")
                 } else {
-                    ctx.deny("even id")
+                    ctx.not_applicable("even id")
                 }
             }
             fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -940,12 +1014,12 @@ mod core_tests {
             .collect::<Vec<_>>();
         let batch_items = owned_items
             .iter()
-            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .map(|(resource, _context)| PolicyBatchItem { resource })
             .collect::<Vec<_>>();
         let policy = NotPolicy::new(OddResourcePolicy);
 
         let results = policy
-            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .evaluate_access_batch(&subject, &TestAction, &TestContext, &batch_items)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -957,7 +1031,7 @@ mod core_tests {
                     assert_eq!(children.len(), 1, "NotPolicy wraps exactly one child");
                     match &children[0] {
                         PolicyEvalResult::Granted { policy_type, .. }
-                        | PolicyEvalResult::Denied { policy_type, .. } => {
+                        | PolicyEvalResult::NotApplicable { policy_type, .. } => {
                             assert_eq!(
                                 policy_type.as_ref(),
                                 "OddResourcePolicy",
@@ -990,12 +1064,12 @@ mod core_tests {
             .collect::<Vec<_>>();
         let batch_items = owned_items
             .iter()
-            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .map(|(resource, _context)| PolicyBatchItem { resource })
             .collect::<Vec<_>>();
         let policy = NotPolicy::new(MismatchedBatchPolicy);
 
         let results = policy
-            .evaluate_access_batch(&subject, &TestAction, &batch_items)
+            .evaluate_access_batch(&subject, &TestAction, &TestContext, &batch_items)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -1397,15 +1471,7 @@ mod core_tests {
 
     fn relationship_policy(
         relationship: String,
-    ) -> RebacPolicy<
-        TestSubject,
-        TestResource,
-        TestAction,
-        TestContext,
-        uuid::Uuid,
-        uuid::Uuid,
-        String,
-    > {
+    ) -> RebacPolicy<TestDomain, uuid::Uuid, uuid::Uuid, String> {
         RebacPolicy::new(
             |subject: &TestSubject| subject.id,
             |resource: &TestResource| resource.id,
@@ -1420,9 +1486,8 @@ mod core_tests {
         let relationship = "manager".to_string();
         let subject = TestSubject { id: subject_id };
         let resource = TestResource { id: resource_id };
-        let session = EvaluationSession::new();
-        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
-            TestRelationshipSource {
+        let session = FactRegistry::builder()
+            .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(TestRelationshipSource {
                 grants: HashSet::from([RelationshipQuery {
                     subject_id,
                     resource_id,
@@ -1430,8 +1495,9 @@ mod core_tests {
                 }]),
                 batch_sizes: Arc::new(Mutex::new(Vec::new())),
                 max_batch_size: None,
-            },
-        );
+            })
+            .build()
+            .session();
         let policy = relationship_policy(relationship);
 
         let ctx = EvalCtx {
@@ -1464,10 +1530,10 @@ mod core_tests {
         let resource = TestResource {
             id: uuid::Uuid::new_v4(),
         };
-        let session = EvaluationSession::new();
-        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
-            ErrorRelationshipSource,
-        );
+        let session = FactRegistry::builder()
+            .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(ErrorRelationshipSource)
+            .build()
+            .session();
         let ctx = EvalCtx {
             session: &session,
             subject: &subject,
@@ -1536,14 +1602,14 @@ mod core_tests {
                 relation: relationship.clone(),
             })
             .collect::<HashSet<_>>();
-        let session = EvaluationSession::new();
-        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
-            TestRelationshipSource {
+        let session = FactRegistry::builder()
+            .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(TestRelationshipSource {
                 grants,
                 batch_sizes: Arc::clone(&batch_sizes),
                 max_batch_size: NonZeroUsize::new(2),
-            },
-        );
+            })
+            .build()
+            .session();
         let owned_items = [
             (resources[0].clone(), TestContext),
             (resources[1].clone(), TestContext),
@@ -1553,13 +1619,14 @@ mod core_tests {
         ];
         let batch_items = owned_items
             .iter()
-            .map(|(resource, context)| PolicyBatchItem { resource, context })
+            .map(|(resource, _context)| PolicyBatchItem { resource })
             .collect::<Vec<_>>();
         let policy = relationship_policy(relationship);
         let ctx = BatchEvalCtx {
             session: &session,
             subject: &subject,
             action: &TestAction,
+            context: &TestContext,
             items: &batch_items,
             policy_type: policy.policy_type(),
         };
@@ -1584,14 +1651,16 @@ mod core_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let session = EvaluationSession::new();
-        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
-            BlockingRelationshipSource {
-                calls: Arc::clone(&calls),
-                started: Arc::clone(&started),
-                release: Arc::clone(&release),
-            },
-        );
+        let session = FactRegistry::builder()
+            .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+                BlockingRelationshipSource {
+                    calls: Arc::clone(&calls),
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                },
+            )
+            .build()
+            .session();
         let key = RelationshipQuery {
             subject_id: uuid::Uuid::new_v4(),
             resource_id: uuid::Uuid::new_v4(),
@@ -1628,24 +1697,30 @@ mod core_tests {
 
         for (session, expected_reason) in [
             {
-                let session = EvaluationSession::new();
-                session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
-                    MissingRelationshipSource,
-                );
+                let session = FactRegistry::builder()
+                    .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+                        MissingRelationshipSource,
+                    )
+                    .build()
+                    .session();
                 (session, "fact is missing")
             },
             {
-                let session = EvaluationSession::new();
-                session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
-                    ErrorRelationshipSource,
-                );
+                let session = FactRegistry::builder()
+                    .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+                        ErrorRelationshipSource,
+                    )
+                    .build()
+                    .session();
                 (session, "database unavailable")
             },
             {
-                let session = EvaluationSession::new();
-                session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
-                    MismatchedRelationshipSource,
-                );
+                let session = FactRegistry::builder()
+                    .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
+                        MismatchedRelationshipSource,
+                    )
+                    .build()
+                    .session();
                 (session, "returned")
             },
         ] {
@@ -1709,18 +1784,20 @@ mod core_tests {
         let subject = TestSubject { id: subject_id };
         let resource = TestResource { id: resource_id };
 
-        let session = EvaluationSession::new();
-        session.register::<RelationshipQuery<uuid::Uuid, uuid::Uuid, TestRelation>, _>(
-            EnumRelationshipSource {
-                grants: HashSet::from([RelationshipQuery {
-                    subject_id,
-                    resource_id,
-                    relation: TestRelation::Manager,
-                }]),
-            },
-        );
+        let session = FactRegistry::builder()
+            .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, TestRelation>, _>(
+                EnumRelationshipSource {
+                    grants: HashSet::from([RelationshipQuery {
+                        subject_id,
+                        resource_id,
+                        relation: TestRelation::Manager,
+                    }]),
+                },
+            )
+            .build()
+            .session();
 
-        let policy = RebacPolicy::new(
+        let policy = RebacPolicy::<TestDomain, uuid::Uuid, uuid::Uuid, TestRelation>::new(
             |subject: &TestSubject| subject.id,
             |resource: &TestResource| resource.id,
             TestRelation::Manager,
@@ -1741,7 +1818,7 @@ mod core_tests {
             "Access should be granted for matching enum relationship"
         );
 
-        let viewer_policy = RebacPolicy::new(
+        let viewer_policy = RebacPolicy::<TestDomain, uuid::Uuid, uuid::Uuid, TestRelation>::new(
             |subject: &TestSubject| subject.id,
             |resource: &TestResource| resource.id,
             TestRelation::Viewer,
@@ -1910,14 +1987,12 @@ mod core_tests {
     #[tokio::test]
     async fn test_empty_policies_in_combinators() {
         // Test AndPolicy with no policies
-        let and_policy_result =
-            AndPolicy::<TestSubject, TestResource, TestAction, TestContext>::try_new(vec![]);
+        let and_policy_result = AndPolicy::<TestDomain>::try_new(vec![]);
 
         assert!(and_policy_result.is_err());
 
         // Test OrPolicy with no policies
-        let or_policy_result =
-            OrPolicy::<TestSubject, TestResource, TestAction, TestContext>::try_new(vec![]);
+        let or_policy_result = OrPolicy::<TestDomain>::try_new(vec![]);
         assert!(or_policy_result.is_err());
     }
 
@@ -1964,21 +2039,30 @@ mod core_tests {
         feature_enabled: bool,
     }
 
+    struct FeatureFlagDomain;
+
+    impl PolicyDomain for FeatureFlagDomain {
+        type Subject = TestSubject;
+        type Action = TestAction;
+        type Resource = TestResource;
+        type Context = FeatureFlagContext;
+    }
+
     struct FeatureFlagPolicy;
 
     #[async_trait]
-    impl Policy<TestSubject, TestResource, TestAction, FeatureFlagContext> for FeatureFlagPolicy {
-        async fn evaluate(
-            &self,
-            ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, FeatureFlagContext>,
-        ) -> PolicyEvalResult {
+    impl Policy<FeatureFlagDomain> for FeatureFlagPolicy {
+        async fn evaluate(&self, ctx: &EvalCtx<'_, FeatureFlagDomain>) -> PolicyEvalResult {
             if ctx.context.feature_enabled {
                 PolicyEvalResult::granted(
                     self.policy_type().to_string(),
                     Some("Feature flag enabled".to_string()),
                 )
             } else {
-                PolicyEvalResult::denied(self.policy_type().to_string(), "Feature flag disabled")
+                PolicyEvalResult::not_applicable(
+                    self.policy_type().to_string(),
+                    "Feature flag disabled",
+                )
             }
         }
 
@@ -2016,16 +2100,18 @@ mod core_tests {
         assert!(!result.is_granted());
     }
 
-    // ==================== AbacPolicy Tests ====================
+    // ==================== PolicyBuilder Closure Tests ====================
 
     #[tokio::test]
-    async fn test_abac_policy_grants_when_condition_true() {
-        let policy = AbacPolicy::new(
-            |_subject: &TestSubject,
-             _resource: &TestResource,
-             _action: &TestAction,
-             _context: &TestContext| { true },
-        );
+    async fn test_builder_when_grants_when_condition_true() {
+        let policy = PolicyBuilder::<TestDomain>::new("WhenPolicy")
+            .when(
+                |_subject: &TestSubject,
+                 _action: &TestAction,
+                 _resource: &TestResource,
+                 _context: &TestContext| { true },
+            )
+            .build();
 
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
@@ -2040,19 +2126,21 @@ mod core_tests {
 
         assert!(
             result.is_granted(),
-            "AbacPolicy should grant when condition returns true"
+            "PolicyBuilder::when should grant when condition returns true"
         );
-        assert_eq!(policy.policy_type(), "AbacPolicy");
+        assert_eq!(policy.policy_type(), "WhenPolicy");
     }
 
     #[tokio::test]
-    async fn test_abac_policy_denies_when_condition_false() {
-        let policy = AbacPolicy::new(
-            |_subject: &TestSubject,
-             _resource: &TestResource,
-             _action: &TestAction,
-             _context: &TestContext| { false },
-        );
+    async fn test_builder_when_is_not_applicable_when_condition_false() {
+        let policy = PolicyBuilder::<TestDomain>::new("WhenPolicy")
+            .when(
+                |_subject: &TestSubject,
+                 _action: &TestAction,
+                 _resource: &TestResource,
+                 _context: &TestContext| { false },
+            )
+            .build();
 
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
@@ -2067,30 +2155,32 @@ mod core_tests {
 
         assert!(
             !result.is_granted(),
-            "AbacPolicy should deny when condition returns false"
+            "PolicyBuilder::when should not apply when condition returns false"
         );
         match result {
-            PolicyEvalResult::Denied {
+            PolicyEvalResult::NotApplicable {
                 policy_type,
                 reason,
                 ..
             } => {
-                assert_eq!(policy_type, "AbacPolicy");
-                assert!(reason.contains("false"));
+                assert_eq!(policy_type, "WhenPolicy");
+                assert_eq!(reason, "Policy predicate did not match");
             }
-            _ => panic!("Expected Denied result, got {:?}", result),
+            _ => panic!("Expected NotApplicable result, got {:?}", result),
         }
     }
 
     #[tokio::test]
-    async fn test_abac_policy_with_attribute_check() {
+    async fn test_builder_when_with_attribute_check() {
         // Policy that checks if the subject owns the resource
-        let policy = AbacPolicy::new(
-            |subject: &TestSubject,
-             resource: &TestResource,
-             _action: &TestAction,
-             _context: &TestContext| { subject.id == resource.id },
-        );
+        let policy = PolicyBuilder::<TestDomain>::new("OwnerPolicy")
+            .when(
+                |subject: &TestSubject,
+                 _action: &TestAction,
+                 resource: &TestResource,
+                 _context: &TestContext| { subject.id == resource.id },
+            )
+            .build();
 
         let owner_id = uuid::Uuid::new_v4();
         let owner = TestSubject { id: owner_id };
@@ -2129,9 +2219,16 @@ mod core_tests {
         struct RbacUser {
             roles: Vec<uuid::Uuid>,
         }
+        struct RbacDomain;
+        impl PolicyDomain for RbacDomain {
+            type Subject = RbacUser;
+            type Action = TestAction;
+            type Resource = TestResource;
+            type Context = TestContext;
+        }
 
-        let policy = RbacPolicy::new(
-            |_resource: &TestResource, _action: &TestAction| vec![admin_role],
+        let policy = RbacPolicy::<RbacDomain, _, _>::new(
+            |_action: &TestAction, _resource: &TestResource| vec![admin_role],
             |subject: &RbacUser| subject.roles.clone(),
         );
 
@@ -2142,13 +2239,12 @@ mod core_tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult = TestPolicyExt::<
-            RbacUser,
-            TestResource,
-            TestAction,
-            TestContext,
-        >::evaluate_access(
-            &policy, &admin_user, &TestAction, &resource, &TestContext
+        let result: PolicyEvalResult = TestPolicyExt::<RbacDomain>::evaluate_access(
+            &policy,
+            &admin_user,
+            &TestAction,
+            &resource,
+            &TestContext,
         )
         .await;
 
@@ -2156,10 +2252,7 @@ mod core_tests {
             result.is_granted(),
             "User with required role should be granted access"
         );
-        assert_eq!(
-            Policy::<RbacUser, TestResource, TestAction, TestContext>::policy_type(&policy),
-            "RbacPolicy"
-        );
+        assert_eq!(Policy::<RbacDomain>::policy_type(&policy), "RbacPolicy");
     }
 
     #[tokio::test]
@@ -2171,9 +2264,16 @@ mod core_tests {
         struct RbacUser {
             roles: Vec<uuid::Uuid>,
         }
+        struct RbacDomain;
+        impl PolicyDomain for RbacDomain {
+            type Subject = RbacUser;
+            type Action = TestAction;
+            type Resource = TestResource;
+            type Context = TestContext;
+        }
 
-        let policy = RbacPolicy::new(
-            |_resource: &TestResource, _action: &TestAction| vec![admin_role],
+        let policy = RbacPolicy::<RbacDomain, _, _>::new(
+            |_action: &TestAction, _resource: &TestResource| vec![admin_role],
             |subject: &RbacUser| subject.roles.clone(),
         );
 
@@ -2184,22 +2284,21 @@ mod core_tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult =
-            TestPolicyExt::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-                &policy,
-                &regular_user,
-                &TestAction,
-                &resource,
-                &TestContext,
-            )
-            .await;
+        let result: PolicyEvalResult = TestPolicyExt::<RbacDomain>::evaluate_access(
+            &policy,
+            &regular_user,
+            &TestAction,
+            &resource,
+            &TestContext,
+        )
+        .await;
 
         assert!(
             !result.is_granted(),
             "User without required role should be denied"
         );
         match result {
-            PolicyEvalResult::Denied {
+            PolicyEvalResult::NotApplicable {
                 policy_type,
                 reason,
                 ..
@@ -2207,7 +2306,7 @@ mod core_tests {
                 assert_eq!(policy_type, "RbacPolicy");
                 assert!(reason.contains("doesn't have required role"));
             }
-            _ => panic!("Expected Denied result, got {:?}", result),
+            _ => panic!("Expected NotApplicable result, got {:?}", result),
         }
     }
 
@@ -2221,10 +2320,17 @@ mod core_tests {
         struct RbacUser {
             roles: Vec<uuid::Uuid>,
         }
+        struct RbacDomain;
+        impl PolicyDomain for RbacDomain {
+            type Subject = RbacUser;
+            type Action = TestAction;
+            type Resource = TestResource;
+            type Context = TestContext;
+        }
 
         // Policy requires either role1 or role2
-        let policy = RbacPolicy::new(
-            |_resource: &TestResource, _action: &TestAction| vec![role1, role2],
+        let policy = RbacPolicy::<RbacDomain, _, _>::new(
+            |_action: &TestAction, _resource: &TestResource| vec![role1, role2],
             |subject: &RbacUser| subject.roles.clone(),
         );
 
@@ -2236,13 +2342,12 @@ mod core_tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult = TestPolicyExt::<
-            RbacUser,
-            TestResource,
-            TestAction,
-            TestContext,
-        >::evaluate_access(
-            &policy, &user, &TestAction, &resource, &TestContext
+        let result: PolicyEvalResult = TestPolicyExt::<RbacDomain>::evaluate_access(
+            &policy,
+            &user,
+            &TestAction,
+            &resource,
+            &TestContext,
         )
         .await;
 
@@ -2260,9 +2365,16 @@ mod core_tests {
         struct RbacUser {
             roles: Vec<uuid::Uuid>,
         }
+        struct RbacDomain;
+        impl PolicyDomain for RbacDomain {
+            type Subject = RbacUser;
+            type Action = TestAction;
+            type Resource = TestResource;
+            type Context = TestContext;
+        }
 
-        let policy = RbacPolicy::new(
-            |_resource: &TestResource, _action: &TestAction| vec![admin_role],
+        let policy = RbacPolicy::<RbacDomain, _, _>::new(
+            |_action: &TestAction, _resource: &TestResource| vec![admin_role],
             |subject: &RbacUser| subject.roles.clone(),
         );
 
@@ -2271,15 +2383,14 @@ mod core_tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult =
-            TestPolicyExt::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-                &policy,
-                &user_no_roles,
-                &TestAction,
-                &resource,
-                &TestContext,
-            )
-            .await;
+        let result: PolicyEvalResult = TestPolicyExt::<RbacDomain>::evaluate_access(
+            &policy,
+            &user_no_roles,
+            &TestAction,
+            &resource,
+            &TestContext,
+        )
+        .await;
 
         assert!(!result.is_granted(), "User with no roles should be denied");
     }
@@ -2292,10 +2403,17 @@ mod core_tests {
         struct RbacUser {
             roles: Vec<uuid::Uuid>,
         }
+        struct RbacDomain;
+        impl PolicyDomain for RbacDomain {
+            type Subject = RbacUser;
+            type Action = TestAction;
+            type Resource = TestResource;
+            type Context = TestContext;
+        }
 
         // No roles are required (empty list)
-        let policy = RbacPolicy::new(
-            |_resource: &TestResource, _action: &TestAction| vec![],
+        let policy = RbacPolicy::<RbacDomain, _, _>::new(
+            |_action: &TestAction, _resource: &TestResource| vec![],
             |subject: &RbacUser| subject.roles.clone(),
         );
 
@@ -2306,13 +2424,12 @@ mod core_tests {
             id: uuid::Uuid::new_v4(),
         };
 
-        let result: PolicyEvalResult = TestPolicyExt::<
-            RbacUser,
-            TestResource,
-            TestAction,
-            TestContext,
-        >::evaluate_access(
-            &policy, &user, &TestAction, &resource, &TestContext
+        let result: PolicyEvalResult = TestPolicyExt::<RbacDomain>::evaluate_access(
+            &policy,
+            &user,
+            &TestAction,
+            &resource,
+            &TestContext,
         )
         .await;
 
@@ -2337,9 +2454,16 @@ mod core_tests {
         struct RbacUser {
             roles: Vec<Role>,
         }
+        struct RbacDomain;
+        impl PolicyDomain for RbacDomain {
+            type Subject = RbacUser;
+            type Action = TestAction;
+            type Resource = TestResource;
+            type Context = TestContext;
+        }
 
-        let policy = RbacPolicy::new(
-            |_resource: &TestResource, _action: &TestAction| vec![Role::Admin],
+        let policy = RbacPolicy::<RbacDomain, _, _>::new(
+            |_action: &TestAction, _resource: &TestResource| vec![Role::Admin],
             |subject: &RbacUser| subject.roles.clone(),
         );
 
@@ -2350,13 +2474,12 @@ mod core_tests {
         let admin = RbacUser {
             roles: vec![Role::Admin, Role::Editor],
         };
-        let result: PolicyEvalResult = TestPolicyExt::<
-            RbacUser,
-            TestResource,
-            TestAction,
-            TestContext,
-        >::evaluate_access(
-            &policy, &admin, &TestAction, &resource, &TestContext
+        let result: PolicyEvalResult = TestPolicyExt::<RbacDomain>::evaluate_access(
+            &policy,
+            &admin,
+            &TestAction,
+            &resource,
+            &TestContext,
         )
         .await;
         assert!(result.is_granted(), "enum role should match");
@@ -2364,15 +2487,14 @@ mod core_tests {
         let editor_only = RbacUser {
             roles: vec![Role::Editor],
         };
-        let result: PolicyEvalResult =
-            TestPolicyExt::<RbacUser, TestResource, TestAction, TestContext>::evaluate_access(
-                &policy,
-                &editor_only,
-                &TestAction,
-                &resource,
-                &TestContext,
-            )
-            .await;
+        let result: PolicyEvalResult = TestPolicyExt::<RbacDomain>::evaluate_access(
+            &policy,
+            &editor_only,
+            &TestAction,
+            &resource,
+            &TestContext,
+        )
+        .await;
         assert!(!result.is_granted(), "missing enum role should deny");
     }
 
@@ -2390,11 +2512,8 @@ mod core_tests {
         }
 
         #[async_trait]
-        impl Policy<TestSubject, TestResource, TestAction, TestContext> for CountingPolicy {
-            async fn evaluate(
-                &self,
-                _ctx: &EvalCtx<'_, TestSubject, TestResource, TestAction, TestContext>,
-            ) -> PolicyEvalResult {
+        impl Policy<TestDomain> for CountingPolicy {
+            async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
                 self.counter.fetch_add(1, Ordering::SeqCst);
 
                 if self.result {
@@ -2403,7 +2522,7 @@ mod core_tests {
                         Some("Counting policy granted".to_string()),
                     )
                 } else {
-                    PolicyEvalResult::denied(
+                    PolicyEvalResult::not_applicable(
                         self.policy_type().to_string(),
                         "Counting policy denied",
                     )
@@ -2668,7 +2787,7 @@ mod core_tests {
         let mut trace = EvalTrace::new();
         assert!(trace.root().is_none());
 
-        let result = PolicyEvalResult::denied("DenyPolicy", "Denied for testing");
+        let result = PolicyEvalResult::not_applicable("DenyPolicy", "Denied for testing");
         trace.set_root(result);
 
         assert!(
@@ -2677,7 +2796,7 @@ mod core_tests {
         );
         let formatted = trace.format();
         assert!(formatted.contains("DenyPolicy"));
-        assert!(formatted.contains("DENIED"));
+        assert!(formatted.contains("NOT_APPLICABLE"));
     }
 
     #[test]
@@ -2700,7 +2819,7 @@ mod core_tests {
 
     #[test]
     fn test_policy_eval_result_reason_denied() {
-        let result = PolicyEvalResult::denied("TestPolicy", "Deny reason");
+        let result = PolicyEvalResult::not_applicable("TestPolicy", "Deny reason");
         assert_eq!(result.reason(), Some("Deny reason".to_string()));
     }
 
@@ -2738,11 +2857,11 @@ mod core_tests {
 
     #[test]
     fn test_policy_eval_result_display() {
-        let result = PolicyEvalResult::denied("TestPolicy", "Test denial");
+        let result = PolicyEvalResult::not_applicable("TestPolicy", "Test denial");
 
         let display_str = format!("{}", result);
         assert!(display_str.contains("TestPolicy"));
-        assert!(display_str.contains("DENIED"));
+        assert!(display_str.contains("NOT_APPLICABLE"));
         assert!(display_str.contains("Test denial"));
     }
 
@@ -2759,8 +2878,7 @@ mod core_tests {
 
     #[tokio::test]
     async fn test_permission_checker_default() {
-        let checker =
-            PermissionChecker::<TestSubject, TestResource, TestAction, TestContext>::default();
+        let checker = PermissionChecker::<TestDomain>::default();
 
         let subject = TestSubject {
             id: uuid::Uuid::new_v4(),
@@ -2821,8 +2939,7 @@ mod core_tests {
     async fn test_policy_default_security_rule() {
         // Test that the default security_rule implementation returns empty metadata
         let policy = AlwaysAllowPolicy;
-        let metadata =
-            Policy::<TestSubject, TestResource, TestAction, TestContext>::security_rule(&policy);
+        let metadata = <AlwaysAllowPolicy as Policy<TestDomain>>::security_rule(&policy);
 
         assert_eq!(metadata, SecurityRuleMetadata::default());
     }
@@ -2859,13 +2976,13 @@ mod core_tests {
 
     // --- AccessEvaluation test helpers ----------------------------------
 
-    fn allow_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext> {
+    fn allow_checker() -> PermissionChecker<TestDomain> {
         let mut checker = PermissionChecker::new();
         checker.add_policy(AlwaysAllowPolicy);
         checker
     }
 
-    fn deny_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext> {
+    fn deny_checker() -> PermissionChecker<TestDomain> {
         let mut checker = PermissionChecker::new();
         checker.add_policy(AlwaysDenyPolicy("always denied"));
         checker
@@ -2886,7 +3003,7 @@ mod core_tests {
     #[tokio::test]
     async fn assert_granted_by_passes_on_matching_grant() {
         let evaluation = allow_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         evaluation.assert_granted_by("AlwaysAllowPolicy");
     }
@@ -2895,7 +3012,7 @@ mod core_tests {
     #[should_panic(expected = "expected grant by policy `Other`")]
     async fn assert_granted_by_panics_on_wrong_grantor() {
         let evaluation = allow_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         evaluation.assert_granted_by("Other");
     }
@@ -2904,7 +3021,7 @@ mod core_tests {
     #[should_panic(expected = "but access was denied")]
     async fn assert_granted_by_panics_on_denial() {
         let evaluation = deny_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         evaluation.assert_granted_by("AlwaysAllowPolicy");
     }
@@ -2912,7 +3029,7 @@ mod core_tests {
     #[tokio::test]
     async fn assert_denied_with_reason_containing_substring_match() {
         let evaluation = deny_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         // Checker's summary is "All policies denied access".
         evaluation.assert_denied_with_reason_containing("denied");
@@ -2922,7 +3039,7 @@ mod core_tests {
     #[should_panic(expected = "expected denial containing")]
     async fn assert_denied_with_reason_containing_panics_on_grant() {
         let evaluation = allow_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         evaluation.assert_denied_with_reason_containing("anything");
     }
@@ -2930,12 +3047,12 @@ mod core_tests {
     #[tokio::test]
     async fn trace_accessor_returns_tree_for_both_outcomes() {
         let grant = allow_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         assert!(grant.trace().format().contains("AlwaysAllowPolicy"));
 
         let deny = deny_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         assert!(deny.trace().format().contains("AlwaysDenyPolicy"));
     }
@@ -2949,7 +3066,7 @@ mod core_tests {
         let granted_no_reason = PolicyEvalResult::granted("P", None);
         assert_eq!(granted_no_reason.reason_str(), None);
 
-        let denied = PolicyEvalResult::denied("P", "nope");
+        let denied = PolicyEvalResult::not_applicable("P", "nope");
         assert_eq!(denied.reason_str(), Some("nope"));
 
         let combined = PolicyEvalResult::Combined {
@@ -2961,16 +3078,29 @@ mod core_tests {
         assert_eq!(combined.reason_str(), None);
     }
 
+    #[cfg(feature = "serde")]
+    #[test]
+    fn audit_result_types_implement_serde_serialize() {
+        fn assert_serialize<T: serde::Serialize>() {}
+
+        assert_serialize::<AccessEvaluation>();
+        assert_serialize::<EvalTrace>();
+        assert_serialize::<PolicyEvalResult>();
+        assert_serialize::<FactProvenance>();
+        assert_serialize::<FactOutcome>();
+        assert_serialize::<CombineOp>();
+    }
+
     #[tokio::test]
     async fn granted_policy_type_and_denied_reason_accessors() {
         let grant = allow_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         assert_eq!(grant.granted_policy_type(), Some("AlwaysAllowPolicy"));
         assert_eq!(grant.denied_reason(), None);
 
         let deny = deny_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         assert_eq!(deny.granted_policy_type(), None);
         assert!(
@@ -2979,57 +3109,76 @@ mod core_tests {
         );
     }
 
-    // --- Trace-aware helpers (assert_denied_by / assert_trace_contains) -
+    // --- Trace-aware helpers (assert_not_applicable_by / assert_trace_contains) -
 
     /// Checker with two denying policies so we can assert against a
     /// specific one in the trace tree (the top-level summary won't
     /// distinguish them).
-    fn multi_deny_checker() -> PermissionChecker<TestSubject, TestResource, TestAction, TestContext>
-    {
+    fn multi_deny_checker() -> PermissionChecker<TestDomain> {
         let mut checker = PermissionChecker::new();
         checker.add_policy(AlwaysDenyPolicy("first denial reason"));
-        // A second denying policy with a different name and reason. Its
-        // deny-effect predicate never matches, so it lands in the trace as
-        // a not-applicable `Denied` leaf rather than vetoing the whole
+        // A second policy with a different name and reason. Its
+        // forbid-effect predicate never matches, so it lands in the trace as
+        // a not-applicable leaf rather than vetoing the whole
         // evaluation before the first policy is consulted. (The
         // tree-walker checks policy_type, not reason — what we're pinning
         // is that it finds *any* matching leaf.)
-        let custom = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
-            "SupplierBlock",
-        )
-        .effect(Effect::Deny)
-        .subjects(|_subject| false)
-        .build();
+        let custom = PolicyBuilder::<TestDomain>::new("SupplierBlock")
+            .forbid()
+            .subjects(|_subject| false)
+            .build();
         checker.add_policy(custom);
         checker
     }
 
     #[tokio::test]
-    async fn assert_denied_by_finds_specific_leaf_in_multi_policy_trace() {
+    async fn assert_not_applicable_by_finds_specific_leaf_in_multi_policy_trace() {
         let evaluation = multi_deny_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
-        // Both child policies denied; either name should match.
-        evaluation.assert_denied_by("AlwaysDenyPolicy");
-        evaluation.assert_denied_by("SupplierBlock");
+        // Both child policies were not applicable; either name should match.
+        evaluation.assert_not_applicable_by("AlwaysDenyPolicy");
+        evaluation.assert_not_applicable_by("SupplierBlock");
     }
 
     #[tokio::test]
-    #[should_panic(expected = "expected a denying leaf for policy `NeverConsulted`")]
-    async fn assert_denied_by_panics_when_no_matching_leaf() {
+    #[should_panic(expected = "expected a not-applicable leaf for policy `NeverConsulted`")]
+    async fn assert_not_applicable_by_panics_when_no_matching_leaf() {
         let evaluation = multi_deny_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
-        evaluation.assert_denied_by("NeverConsulted");
+        evaluation.assert_not_applicable_by("NeverConsulted");
     }
 
     #[tokio::test]
     #[should_panic(expected = "but access was granted")]
-    async fn assert_denied_by_panics_on_grant() {
+    async fn assert_not_applicable_by_panics_on_grant() {
         let evaluation = allow_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
-        evaluation.assert_denied_by("AlwaysDenyPolicy");
+        evaluation.assert_not_applicable_by("AlwaysDenyPolicy");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected a not-applicable leaf for policy `GlobalFreeze`")]
+    async fn assert_not_applicable_by_does_not_match_forbidden_veto() {
+        struct UnitDomain;
+        impl PolicyDomain for UnitDomain {
+            type Subject = ();
+            type Action = ();
+            type Resource = ();
+            type Context = ();
+        }
+
+        let mut checker = PermissionChecker::<UnitDomain>::new();
+        checker.add_policy(
+            PolicyBuilder::<UnitDomain>::new("GlobalFreeze")
+                .forbid()
+                .build(),
+        );
+        let session = EvaluationSession::empty();
+        let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
+        evaluation.assert_not_applicable_by("GlobalFreeze");
     }
 
     #[tokio::test]
@@ -3039,7 +3188,7 @@ mod core_tests {
         // tree. `assert_trace_contains` is the right hammer for that
         // assertion.
         let evaluation = deny_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         evaluation.assert_trace_contains("always denied");
     }
@@ -3048,7 +3197,7 @@ mod core_tests {
     #[should_panic(expected = "expected evaluation trace to contain")]
     async fn assert_trace_contains_panics_when_substring_absent() {
         let evaluation = deny_checker()
-            .check(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
             .await;
         evaluation.assert_trace_contains("this string is not in the trace");
     }
@@ -3060,35 +3209,29 @@ mod policy_builder_tests {
     use std::pin::Pin;
     use uuid::Uuid;
 
-    trait PolicyBoxExt<S, R, A, C>
+    trait PolicyBoxExt<D>
     where
-        S: Send + Sync,
-        R: Send + Sync,
-        A: Send + Sync,
-        C: Send + Sync,
+        D: PolicyDomain,
     {
         fn evaluate_access<'a>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
-            resource: &'a R,
-            context: &'a C,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            resource: &'a D::Resource,
+            context: &'a D::Context,
         ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>>;
     }
 
-    impl<S, R, A, C> PolicyBoxExt<S, R, A, C> for Box<dyn Policy<S, R, A, C>>
+    impl<D> PolicyBoxExt<D> for Box<dyn Policy<D>>
     where
-        S: Send + Sync,
-        R: Send + Sync,
-        A: Send + Sync,
-        C: Send + Sync,
+        D: PolicyDomain,
     {
         fn evaluate_access<'a>(
             &'a self,
-            subject: &'a S,
-            action: &'a A,
-            resource: &'a R,
-            context: &'a C,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            resource: &'a D::Resource,
+            context: &'a D::Context,
         ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
             Box::pin(async move {
                 let session = EvaluationSession::new();
@@ -3118,13 +3261,19 @@ mod policy_builder_tests {
     #[derive(Debug, Clone)]
     struct TestContext;
 
+    struct TestDomain;
+
+    impl PolicyDomain for TestDomain {
+        type Subject = TestSubject;
+        type Action = TestAction;
+        type Resource = TestResource;
+        type Context = TestContext;
+    }
+
     // Test that with no predicates the builder returns a policy that always "matches"
     #[tokio::test]
     async fn test_policy_builder_allows_when_no_predicates() {
-        let policy = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
-            "NoPredicatesPolicy",
-        )
-        .build();
+        let policy = PolicyBuilder::<TestDomain>::new("NoPredicatesPolicy").build();
 
         let result = policy
             .evaluate_access(
@@ -3143,11 +3292,9 @@ mod policy_builder_tests {
     // Test that a subject predicate is applied correctly.
     #[tokio::test]
     async fn test_policy_builder_with_subject_predicate() {
-        let policy = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
-            "SubjectPolicy",
-        )
-        .subjects(|s: &TestSubject| s.name == "Alice")
-        .build();
+        let policy = PolicyBuilder::<TestDomain>::new("SubjectPolicy")
+            .subjects(|s: &TestSubject| s.name == "Alice")
+            .build();
 
         // Should allow if the subject's name is "Alice"
         let result1 = policy
@@ -3165,7 +3312,7 @@ mod policy_builder_tests {
             "Policy should allow access for subject 'Alice'"
         );
 
-        // Otherwise, it should deny
+        // Otherwise, it should not apply.
         let result2 = policy
             .evaluate_access(
                 &TestSubject { name: "Bob".into() },
@@ -3176,20 +3323,19 @@ mod policy_builder_tests {
             .await;
         assert!(
             !result2.is_granted(),
-            "Policy should deny access for subject not named 'Alice'"
+            "Policy should not grant access for subject not named 'Alice'"
         );
     }
 
-    // Test that setting the effect to Deny overrides an otherwise matching predicate.
+    // Test that `.forbid()` turns an otherwise matching predicate into an active veto.
     #[tokio::test]
-    async fn test_policy_builder_effect_deny() {
-        let policy =
-            PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new("DenyPolicy")
-                .effect(Effect::Deny)
-                .build();
+    async fn test_policy_builder_forbid() {
+        let policy = PolicyBuilder::<TestDomain>::new("ForbidPolicy")
+            .forbid()
+            .build();
 
         // Even though no predicate fails (so predicate returns true),
-        // the effect should result in a Denied outcome.
+        // the forbid effect should result in a Denied outcome.
         let result = policy
             .evaluate_access(
                 &TestSubject {
@@ -3202,50 +3348,44 @@ mod policy_builder_tests {
             .await;
         assert!(
             !result.is_granted(),
-            "Policy with effect Deny should result in denial even if the predicate passes"
+            "forbid policy should not grant even if the predicate passes"
         );
     }
 
-    /// The headline deny-overrides behavior: a matched `Effect::Deny` policy
+    /// The headline deny-overrides behavior: a matched `Effect::Forbid` policy
     /// vetoes a sibling grant, regardless of registration order.
     #[tokio::test]
-    async fn test_policy_builder_effect_deny_overrides_other_grants() {
-        for deny_registered_first in [true, false] {
-            let deny_policy =
-                PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
-                    "BlockAlicePolicy",
-                )
-                .effect(Effect::Deny)
+    async fn test_policy_builder_forbid_overrides_other_grants() {
+        for block_registered_first in [true, false] {
+            let block_policy = PolicyBuilder::<TestDomain>::new("BlockAlicePolicy")
+                .forbid()
                 .subjects(|subject| subject.name == "Alice")
                 .build();
 
-            let allow_policy =
-                PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
-                    "AllowAlicePolicy",
-                )
+            let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
                 .subjects(|subject| subject.name == "Alice")
                 .build();
 
             let mut checker = PermissionChecker::new();
-            if deny_registered_first {
-                checker.add_policy(deny_policy);
+            if block_registered_first {
+                checker.add_policy(block_policy);
                 checker.add_policy(allow_policy);
             } else {
                 checker.add_policy(allow_policy);
-                checker.add_policy(deny_policy);
+                checker.add_policy(block_policy);
             }
 
             let session = EvaluationSession::empty();
             let result = checker
-                .evaluate_in_session(
+                .bind(
                     &session,
                     &TestSubject {
                         name: "Alice".into(),
                     },
                     &TestAction,
-                    &TestResource,
                     &TestContext,
                 )
+                .check(&TestResource)
                 .await;
 
             result.assert_forbidden_by("BlockAlicePolicy");
@@ -3255,16 +3395,16 @@ mod policy_builder_tests {
                 "summary reason should name the forbidding policy"
             );
 
-            // A subject the deny predicate does not match is unaffected:
-            // a non-matching deny policy is "not applicable", never a veto.
+            // A subject the forbid predicate does not match is unaffected:
+            // a non-matching forbid policy is "not applicable", never a veto.
             let bob_result = checker
-                .evaluate_in_session(
+                .bind(
                     &session,
                     &TestSubject { name: "Bob".into() },
                     &TestAction,
-                    &TestResource,
                     &TestContext,
                 )
+                .check(&TestResource)
                 .await;
             assert!(
                 !bob_result.is_granted(),
@@ -3274,21 +3414,79 @@ mod policy_builder_tests {
         }
     }
 
-    /// A non-matching `Effect::Deny` policy contributes nothing: the allow
+    #[tokio::test]
+    async fn forbid_veto_composes_through_fluent_or_policy() {
+        let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+        let block_policy = PolicyBuilder::<TestDomain>::new("BlockAlicePolicy")
+            .forbid()
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(allow_policy.or(block_policy));
+
+        let session = EvaluationSession::empty();
+        let result = checker
+            .bind(
+                &session,
+                &TestSubject {
+                    name: "Alice".into(),
+                },
+                &TestAction,
+                &TestContext,
+            )
+            .check(&TestResource)
+            .await;
+
+        result.assert_forbidden_by("BlockAlicePolicy");
+        result.assert_trace_contains("OrPolicy");
+    }
+
+    #[tokio::test]
+    async fn forbid_veto_composes_through_fluent_and_policy_batch() {
+        let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+        let block_policy = PolicyBuilder::<TestDomain>::new("BlockAlicePolicy")
+            .forbid()
+            .subjects(|subject| subject.name == "Alice")
+            .build();
+
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(allow_policy.and(block_policy));
+
+        let session = EvaluationSession::empty();
+        let results = checker
+            .bind(
+                &session,
+                &TestSubject {
+                    name: "Alice".into(),
+                },
+                &TestAction,
+                &TestContext,
+            )
+            .evaluate(vec![TestResource, TestResource])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        for (_resource, evaluation) in results {
+            evaluation.assert_forbidden_by("BlockAlicePolicy");
+            evaluation.assert_trace_contains("AndPolicy");
+        }
+    }
+
+    /// A non-matching `Effect::Forbid` policy contributes nothing: the allow
     /// set still decides, and the trace root reflects deny-overrides.
     #[tokio::test]
     async fn test_non_matching_deny_policy_does_not_block_grants() {
-        let deny_policy = PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
-            "BlockNobodyPolicy",
-        )
-        .effect(Effect::Deny)
-        .subjects(|_subject| false)
-        .build();
+        let deny_policy = PolicyBuilder::<TestDomain>::new("BlockNobodyPolicy")
+            .forbid()
+            .subjects(|_subject| false)
+            .build();
 
-        let allow_policy =
-            PolicyBuilder::<TestSubject, TestResource, TestAction, TestContext>::new(
-                "AllowAlicePolicy",
-            )
+        let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
             .subjects(|subject| subject.name == "Alice")
             .build();
 
@@ -3298,15 +3496,15 @@ mod policy_builder_tests {
 
         let session = EvaluationSession::empty();
         let result = checker
-            .evaluate_in_session(
+            .bind(
                 &session,
                 &TestSubject {
                     name: "Alice".into(),
                 },
                 &TestAction,
-                &TestResource,
                 &TestContext,
             )
+            .check(&TestResource)
             .await;
 
         result.assert_granted_by("AllowAlicePolicy");
@@ -3329,20 +3527,22 @@ mod policy_builder_tests {
         struct ExtendedAction;
         #[derive(Debug, Clone)]
         struct ExtendedContext;
+        struct ExtendedDomain;
+        impl PolicyDomain for ExtendedDomain {
+            type Subject = ExtendedSubject;
+            type Action = ExtendedAction;
+            type Resource = ExtendedResource;
+            type Context = ExtendedContext;
+        }
 
         // Build a policy that checks:
         //   1. Subject's name is "Alice"
         //   2. And that subject.id == resource.owner_id (via extra condition)
         let subject_id = Uuid::new_v4();
-        let policy = PolicyBuilder::<
-            ExtendedSubject,
-            ExtendedResource,
-            ExtendedAction,
-            ExtendedContext,
-        >::new("AliceOwnerPolicy")
-        .subjects(|s: &ExtendedSubject| s.name == "Alice")
-        .when(|s, _a, r, _c| s.id == r.owner_id)
-        .build();
+        let policy = PolicyBuilder::<ExtendedDomain>::new("AliceOwnerPolicy")
+            .subjects(|s: &ExtendedSubject| s.name == "Alice")
+            .when(|s, _a, r, _c| s.id == r.owner_id)
+            .build();
 
         // Case where both conditions are met.
         let result1 = policy
@@ -3390,12 +3590,17 @@ mod policy_builder_tests {
         struct ActionType {
             pub name: String,
         }
+        struct ActionDomain;
+        impl PolicyDomain for ActionDomain {
+            type Subject = TestSubject;
+            type Action = ActionType;
+            type Resource = TestResource;
+            type Context = TestContext;
+        }
 
-        let policy = PolicyBuilder::<TestSubject, TestResource, ActionType, TestContext>::new(
-            "ActionPolicy",
-        )
-        .actions(|a: &ActionType| a.name == "read")
-        .build();
+        let policy = PolicyBuilder::<ActionDomain>::new("ActionPolicy")
+            .actions(|a: &ActionType| a.name == "read")
+            .build();
 
         // Should allow for "read" action
         let result = policy
@@ -3435,12 +3640,17 @@ mod policy_builder_tests {
         struct ResourceType {
             pub public: bool,
         }
+        struct ResourceDomain;
+        impl PolicyDomain for ResourceDomain {
+            type Subject = TestSubject;
+            type Action = TestAction;
+            type Resource = ResourceType;
+            type Context = TestContext;
+        }
 
-        let policy = PolicyBuilder::<TestSubject, ResourceType, TestAction, TestContext>::new(
-            "ResourcePolicy",
-        )
-        .resources(|r: &ResourceType| r.public)
-        .build();
+        let policy = PolicyBuilder::<ResourceDomain>::new("ResourcePolicy")
+            .resources(|r: &ResourceType| r.public)
+            .build();
 
         // Should allow access to public resource
         let result = policy
@@ -3476,12 +3686,17 @@ mod policy_builder_tests {
         struct RequestContext {
             pub is_internal: bool,
         }
+        struct ContextDomain;
+        impl PolicyDomain for ContextDomain {
+            type Subject = TestSubject;
+            type Action = TestAction;
+            type Resource = TestResource;
+            type Context = RequestContext;
+        }
 
-        let policy = PolicyBuilder::<TestSubject, TestResource, TestAction, RequestContext>::new(
-            "ContextPolicy",
-        )
-        .context(|c: &RequestContext| c.is_internal)
-        .build();
+        let policy = PolicyBuilder::<ContextDomain>::new("ContextPolicy")
+            .context(|c: &RequestContext| c.is_internal)
+            .build();
 
         // Should allow for internal requests
         let result = policy
@@ -3529,15 +3744,21 @@ mod policy_builder_tests {
         struct FullContext {
             pub time_of_day: String,
         }
+        struct FullDomain;
+        impl PolicyDomain for FullDomain {
+            type Subject = FullSubject;
+            type Action = FullAction;
+            type Resource = FullResource;
+            type Context = FullContext;
+        }
 
         // Policy: admin can read documents during business hours
-        let policy =
-            PolicyBuilder::<FullSubject, FullResource, FullAction, FullContext>::new("FullPolicy")
-                .subjects(|s: &FullSubject| s.role == "admin")
-                .actions(|a: &FullAction| a.name == "read")
-                .resources(|r: &FullResource| r.category == "document")
-                .context(|c: &FullContext| c.time_of_day == "business_hours")
-                .build();
+        let policy = PolicyBuilder::<FullDomain>::new("FullPolicy")
+            .subjects(|s: &FullSubject| s.role == "admin")
+            .actions(|a: &FullAction| a.name == "read")
+            .resources(|r: &FullResource| r.category == "document")
+            .context(|c: &FullContext| c.time_of_day == "business_hours")
+            .build();
 
         // All conditions met - should allow
         let result = policy
@@ -3657,16 +3878,19 @@ mod policy_builder_tests {
     #[derive(Debug, Clone)]
     struct BatchContext;
 
-    fn make_items<'a>(
-        resources: &'a [BatchResource],
-        ctx: &'a BatchContext,
-    ) -> Vec<PolicyBatchItem<'a, BatchResource, BatchContext>> {
+    struct BatchDomain;
+
+    impl PolicyDomain for BatchDomain {
+        type Subject = BatchSubject;
+        type Action = BatchAction;
+        type Resource = BatchResource;
+        type Context = BatchContext;
+    }
+
+    fn make_items<'a>(resources: &'a [BatchResource]) -> Vec<PolicyBatchItem<'a, BatchDomain>> {
         resources
             .iter()
-            .map(|r| PolicyBatchItem {
-                resource: r,
-                context: ctx,
-            })
+            .map(|resource| PolicyBatchItem { resource })
             .collect()
     }
 
@@ -3674,12 +3898,14 @@ mod policy_builder_tests {
         session: &'a EvaluationSession,
         subject: &'a BatchSubject,
         action: &'a BatchAction,
-        items: &'a [PolicyBatchItem<'a, BatchResource, BatchContext>],
-    ) -> BatchEvalCtx<'a, BatchSubject, BatchResource, BatchAction, BatchContext> {
+        context: &'a BatchContext,
+        items: &'a [PolicyBatchItem<'a, BatchDomain>],
+    ) -> BatchEvalCtx<'a, BatchDomain> {
         BatchEvalCtx {
             session,
             subject,
             action,
+            context,
             items,
             policy_type: std::borrow::Cow::Borrowed("test"),
         }
@@ -3690,14 +3916,12 @@ mod policy_builder_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_inner = Arc::clone(&calls);
 
-        let policy = PolicyBuilder::<BatchSubject, BatchResource, BatchAction, BatchContext>::new(
-            "StaffOnly",
-        )
-        .subjects(move |s: &BatchSubject| {
-            calls_inner.fetch_add(1, Ordering::SeqCst);
-            s.role == "staff"
-        })
-        .build();
+        let policy = PolicyBuilder::<BatchDomain>::new("StaffOnly")
+            .subjects(move |s: &BatchSubject| {
+                calls_inner.fetch_add(1, Ordering::SeqCst);
+                s.role == "staff"
+            })
+            .build();
 
         let staff = BatchSubject {
             role: "staff".into(),
@@ -3709,10 +3933,10 @@ mod policy_builder_tests {
             })
             .collect();
         let ctx = BatchContext;
-        let items = make_items(&resources, &ctx);
+        let items = make_items(&resources);
 
         let session = EvaluationSession::new();
-        let bctx = batch_ctx(&session, &staff, &action, &items);
+        let bctx = batch_ctx(&session, &staff, &action, &ctx, &items);
         let results = policy.evaluate_batch(&bctx).await;
 
         assert_eq!(results.len(), 25, "one result per batch item");
@@ -3734,18 +3958,16 @@ mod policy_builder_tests {
         let subject_inner = Arc::clone(&subject_calls);
         let resource_inner = Arc::clone(&resource_calls);
 
-        let policy = PolicyBuilder::<BatchSubject, BatchResource, BatchAction, BatchContext>::new(
-            "StaffOnly",
-        )
-        .subjects(move |s: &BatchSubject| {
-            subject_inner.fetch_add(1, Ordering::SeqCst);
-            s.role == "staff"
-        })
-        .resources(move |_r: &BatchResource| {
-            resource_inner.fetch_add(1, Ordering::SeqCst);
-            true
-        })
-        .build();
+        let policy = PolicyBuilder::<BatchDomain>::new("StaffOnly")
+            .subjects(move |s: &BatchSubject| {
+                subject_inner.fetch_add(1, Ordering::SeqCst);
+                s.role == "staff"
+            })
+            .resources(move |_r: &BatchResource| {
+                resource_inner.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .build();
 
         let guest = BatchSubject {
             role: "guest".into(),
@@ -3757,10 +3979,10 @@ mod policy_builder_tests {
             })
             .collect();
         let ctx = BatchContext;
-        let items = make_items(&resources, &ctx);
+        let items = make_items(&resources);
 
         let session = EvaluationSession::new();
-        let bctx = batch_ctx(&session, &guest, &action, &items);
+        let bctx = batch_ctx(&session, &guest, &action, &ctx, &items);
         let results = policy.evaluate_batch(&bctx).await;
 
         assert_eq!(results.len(), 10);
@@ -3781,24 +4003,54 @@ mod policy_builder_tests {
     }
 
     #[tokio::test]
+    async fn context_only_policy_evaluates_context_predicate_once_per_batch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = Arc::clone(&calls);
+
+        let policy = PolicyBuilder::<BatchDomain>::new("InternalOnly")
+            .context(move |_ctx: &BatchContext| {
+                calls_inner.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .build();
+
+        let subject = BatchSubject {
+            role: "guest".into(),
+        };
+        let action = BatchAction;
+        let resources = (0..10)
+            .map(|idx| BatchResource {
+                category: format!("doc-{idx}"),
+            })
+            .collect::<Vec<_>>();
+        let ctx = BatchContext;
+        let items = make_items(&resources);
+
+        let session = EvaluationSession::new();
+        let bctx = batch_ctx(&session, &subject, &action, &ctx, &items);
+        let results = policy.evaluate_batch(&bctx).await;
+
+        assert!(results.iter().all(PolicyEvalResult::is_granted));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn mixed_axis_policy_still_runs_resource_per_item() {
         let subject_calls = Arc::new(AtomicUsize::new(0));
         let resource_calls = Arc::new(AtomicUsize::new(0));
         let subject_inner = Arc::clone(&subject_calls);
         let resource_inner = Arc::clone(&resource_calls);
 
-        let policy = PolicyBuilder::<BatchSubject, BatchResource, BatchAction, BatchContext>::new(
-            "StaffOnDocuments",
-        )
-        .subjects(move |s: &BatchSubject| {
-            subject_inner.fetch_add(1, Ordering::SeqCst);
-            s.role == "staff"
-        })
-        .resources(move |r: &BatchResource| {
-            resource_inner.fetch_add(1, Ordering::SeqCst);
-            r.category.starts_with("doc")
-        })
-        .build();
+        let policy = PolicyBuilder::<BatchDomain>::new("StaffOnDocuments")
+            .subjects(move |s: &BatchSubject| {
+                subject_inner.fetch_add(1, Ordering::SeqCst);
+                s.role == "staff"
+            })
+            .resources(move |r: &BatchResource| {
+                resource_inner.fetch_add(1, Ordering::SeqCst);
+                r.category.starts_with("doc")
+            })
+            .build();
 
         let staff = BatchSubject {
             role: "staff".into(),
@@ -3815,10 +4067,10 @@ mod policy_builder_tests {
             })
             .collect();
         let ctx = BatchContext;
-        let items = make_items(&resources, &ctx);
+        let items = make_items(&resources);
 
         let session = EvaluationSession::new();
-        let bctx = batch_ctx(&session, &staff, &action, &items);
+        let bctx = batch_ctx(&session, &staff, &action, &ctx, &items);
         let results = policy.evaluate_batch(&bctx).await;
 
         assert_eq!(results.len(), 10);
@@ -3838,20 +4090,19 @@ mod policy_builder_tests {
 
     #[tokio::test]
     async fn empty_batch_returns_empty_results() {
-        let policy = PolicyBuilder::<BatchSubject, BatchResource, BatchAction, BatchContext>::new(
-            "AnyStaff",
-        )
-        .subjects(|s: &BatchSubject| s.role == "staff")
-        .build();
+        let policy = PolicyBuilder::<BatchDomain>::new("AnyStaff")
+            .subjects(|s: &BatchSubject| s.role == "staff")
+            .build();
 
         let staff = BatchSubject {
             role: "staff".into(),
         };
         let action = BatchAction;
-        let items: Vec<PolicyBatchItem<'_, BatchResource, BatchContext>> = Vec::new();
+        let ctx = BatchContext;
+        let items: Vec<PolicyBatchItem<'_, BatchDomain>> = Vec::new();
 
         let session = EvaluationSession::new();
-        let bctx = batch_ctx(&session, &staff, &action, &items);
+        let bctx = batch_ctx(&session, &staff, &action, &ctx, &items);
         let results = policy.evaluate_batch(&bctx).await;
 
         assert!(results.is_empty());

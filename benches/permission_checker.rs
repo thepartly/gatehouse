@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use gatehouse::{
-    Effect, EvaluationSession, FactLoadResult, FactSource, PermissionChecker, PolicyBuilder,
-    RebacPolicy, RelationshipQuery,
+    EvaluationSession, FactLoadResult, FactRegistry, FactSource, PermissionChecker, PolicyBuilder,
+    PolicyDomain, RebacPolicy, RelationshipQuery,
 };
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -17,44 +17,42 @@ type Resource = ();
 type Action = ();
 type Context = ();
 
-fn build_all_deny_checker(
-    policy_count: usize,
-) -> PermissionChecker<Subject, Resource, Action, Context> {
+struct UnitDomain;
+
+impl PolicyDomain for UnitDomain {
+    type Subject = Subject;
+    type Action = Action;
+    type Resource = Resource;
+    type Context = Context;
+}
+
+fn build_all_deny_checker(policy_count: usize) -> PermissionChecker<UnitDomain> {
     let mut checker = PermissionChecker::new();
 
     for index in 0..policy_count {
-        let policy = PolicyBuilder::<Subject, Resource, Action, Context>::new(format!(
-            "deny_policy_{index}"
-        ))
-        .effect(Effect::Deny)
-        .build();
+        let policy = PolicyBuilder::<UnitDomain>::new(format!("deny_policy_{index}"))
+            .forbid()
+            .build();
         checker.add_policy(policy);
     }
 
     checker
 }
 
-fn build_trailing_allow_checker(
-    policy_count: usize,
-) -> PermissionChecker<Subject, Resource, Action, Context> {
+fn build_trailing_allow_checker(policy_count: usize) -> PermissionChecker<UnitDomain> {
     assert!(policy_count > 0, "policy count must be greater than zero");
 
     let mut checker = PermissionChecker::new();
 
     for index in 0..(policy_count - 1) {
-        let policy = PolicyBuilder::<Subject, Resource, Action, Context>::new(format!(
-            "deny_policy_{index}"
-        ))
-        .effect(Effect::Deny)
-        .build();
+        let policy = PolicyBuilder::<UnitDomain>::new(format!("deny_policy_{index}"))
+            .forbid()
+            .build();
         checker.add_policy(policy);
     }
 
-    let allow_policy = PolicyBuilder::<Subject, Resource, Action, Context>::new(format!(
-        "allow_policy_{}",
-        policy_count - 1
-    ))
-    .build();
+    let allow_policy =
+        PolicyBuilder::<UnitDomain>::new(format!("allow_policy_{}", policy_count - 1)).build();
     checker.add_policy(allow_policy);
 
     checker
@@ -66,7 +64,7 @@ fn bench_permission_checker(c: &mut Criterion) {
     let action: Action = ();
     let resource: Resource = ();
     let context: Context = ();
-    let mut group = c.benchmark_group("permission_checker_evaluate_in_session");
+    let mut group = c.benchmark_group("permission_checker_bound_check");
 
     for &policy_count in &[1usize, 4, 16, 64] {
         let allow_checker = build_trailing_allow_checker(policy_count);
@@ -78,7 +76,8 @@ fn bench_permission_checker(c: &mut Criterion) {
                     let session = EvaluationSession::empty();
                     let result = runtime.block_on(
                         checker
-                            .evaluate_in_session(&session, &subject, &action, &resource, &context),
+                            .bind(&session, &subject, &action, &context)
+                            .check(&resource),
                     );
                     black_box(result)
                 });
@@ -94,7 +93,8 @@ fn bench_permission_checker(c: &mut Criterion) {
                     let session = EvaluationSession::empty();
                     let result = runtime.block_on(
                         checker
-                            .evaluate_in_session(&session, &subject, &action, &resource, &context),
+                            .bind(&session, &subject, &action, &context)
+                            .check(&resource),
                     );
                     black_box(result)
                 });
@@ -116,7 +116,17 @@ struct BenchResource {
 }
 
 struct BenchAction;
+#[derive(Clone)]
 struct BenchContext;
+
+struct BenchDomain;
+
+impl PolicyDomain for BenchDomain {
+    type Subject = BenchUser;
+    type Action = BenchAction;
+    type Resource = BenchResource;
+    type Context = BenchContext;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BenchRelation {
@@ -205,9 +215,9 @@ impl CoarseReferenceSession {
     }
 }
 
-fn build_rebac_checker() -> PermissionChecker<BenchUser, BenchResource, BenchAction, BenchContext> {
+fn build_rebac_checker() -> PermissionChecker<BenchDomain> {
     let mut checker = PermissionChecker::new();
-    checker.add_policy(RebacPolicy::new(
+    checker.add_policy(RebacPolicy::<BenchDomain, Uuid, Uuid, BenchRelation>::new(
         |user: &BenchUser| user.id,
         |resource: &BenchResource| resource.id,
         BenchRelation::Viewer,
@@ -221,6 +231,9 @@ fn bench_in_ram_fact_source(c: &mut Criterion) {
     let action = BenchAction;
     let context = BenchContext;
     let source: Arc<dyn FactSource<BenchRelationship>> = Arc::new(AlwaysFoundSource);
+    let registry = FactRegistry::builder()
+        .with_arc::<BenchRelationship>(Arc::clone(&source))
+        .build();
     let checker = build_rebac_checker();
     let mut group = c.benchmark_group("in_ram_fact_source");
 
@@ -242,18 +255,14 @@ fn bench_in_ram_fact_source(c: &mut Criterion) {
             &keys,
             |b, keys| {
                 b.iter(|| {
-                    let session = EvaluationSession::builder()
-                        .with_arc::<BenchRelationship>(Arc::clone(&source))
-                        .build();
+                    let session = registry.session();
                     let result = runtime.block_on(session.get_many(black_box(keys)));
                     black_box(result)
                 });
             },
         );
 
-        let cached_session = EvaluationSession::builder()
-            .with_arc::<BenchRelationship>(Arc::clone(&source))
-            .build();
+        let cached_session = registry.session();
         runtime.block_on(cached_session.get_many(&keys));
         group.bench_with_input(
             BenchmarkId::new("session_get_many_cached", item_count),
@@ -271,18 +280,12 @@ fn bench_in_ram_fact_source(c: &mut Criterion) {
             &resources,
             |b, resources| {
                 b.iter(|| {
-                    let session = EvaluationSession::builder()
-                        .with_arc::<BenchRelationship>(Arc::clone(&source))
-                        .build();
-                    let result =
-                        runtime.block_on(checker.filter_authorized_in_session_by_resource(
-                            &session,
-                            &subject,
-                            &action,
-                            black_box(resources.clone()),
-                            &context,
-                            |resource| resource,
-                        ));
+                    let session = registry.session();
+                    let result = runtime.block_on(
+                        checker
+                            .bind(&session, &subject, &action, &context)
+                            .filter(black_box(resources.clone())),
+                    );
                     black_box(result)
                 });
             },
@@ -303,6 +306,12 @@ fn bench_latency_fact_source(c: &mut Criterion) {
         Arc::new(LatencyFoundSource::concurrent(delay));
     let coalescing_source: Arc<dyn FactSource<BenchRelationship>> =
         Arc::new(LatencyFoundSource::serialized(delay));
+    let batch_registry = FactRegistry::builder()
+        .with_arc::<BenchRelationship>(Arc::clone(&batch_source))
+        .build();
+    let coalescing_registry = FactRegistry::builder()
+        .with_arc::<BenchRelationship>(Arc::clone(&coalescing_source))
+        .build();
     let mut group = c.benchmark_group("latency_fact_source");
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(200));
@@ -329,18 +338,10 @@ fn bench_latency_fact_source(c: &mut Criterion) {
                     let result = runtime.block_on(async {
                         let mut authorized = Vec::new();
                         for resource in black_box(resources.clone()) {
-                            let session = EvaluationSession::builder()
-                                .with_arc::<BenchRelationship>(Arc::clone(&batch_source))
-                                .build();
+                            let session = batch_registry.session();
                             let mut visible = checker
-                                .filter_authorized_in_session_by_resource(
-                                    &session,
-                                    &subject,
-                                    &action,
-                                    vec![resource],
-                                    &context,
-                                    |resource| resource,
-                                )
+                                .bind(&session, &subject, &action, &context)
+                                .filter(vec![resource])
                                 .await;
                             authorized.append(&mut visible);
                         }
@@ -356,18 +357,12 @@ fn bench_latency_fact_source(c: &mut Criterion) {
             &resources,
             |b, resources| {
                 b.iter(|| {
-                    let session = EvaluationSession::builder()
-                        .with_arc::<BenchRelationship>(Arc::clone(&batch_source))
-                        .build();
-                    let result =
-                        runtime.block_on(checker.filter_authorized_in_session_by_resource(
-                            &session,
-                            &subject,
-                            &action,
-                            black_box(resources.clone()),
-                            &context,
-                            |resource| resource,
-                        ));
+                    let session = batch_registry.session();
+                    let result = runtime.block_on(
+                        checker
+                            .bind(&session, &subject, &action, &context)
+                            .filter(black_box(resources.clone())),
+                    );
                     black_box(result)
                 });
             },
@@ -379,30 +374,22 @@ fn bench_latency_fact_source(c: &mut Criterion) {
             |b, keys| {
                 b.iter(|| {
                     runtime.block_on(async {
-                        let source = Arc::clone(&coalescing_source);
+                        let registry = coalescing_registry.clone();
                         let (a, b, c, d) = tokio::join!(
                             async {
-                                let session = EvaluationSession::builder()
-                                    .with_arc::<BenchRelationship>(Arc::clone(&source))
-                                    .build();
+                                let session = registry.session();
                                 session.get_many(black_box(keys)).await
                             },
                             async {
-                                let session = EvaluationSession::builder()
-                                    .with_arc::<BenchRelationship>(Arc::clone(&source))
-                                    .build();
+                                let session = registry.session();
                                 session.get_many(black_box(keys)).await
                             },
                             async {
-                                let session = EvaluationSession::builder()
-                                    .with_arc::<BenchRelationship>(Arc::clone(&source))
-                                    .build();
+                                let session = registry.session();
                                 session.get_many(black_box(keys)).await
                             },
                             async {
-                                let session = EvaluationSession::builder()
-                                    .with_arc::<BenchRelationship>(Arc::clone(&source))
-                                    .build();
+                                let session = registry.session();
                                 session.get_many(black_box(keys)).await
                             },
                         );
@@ -417,11 +404,7 @@ fn bench_latency_fact_source(c: &mut Criterion) {
             &keys,
             |b, keys| {
                 b.iter(|| {
-                    let session = Arc::new(
-                        EvaluationSession::builder()
-                            .with_arc::<BenchRelationship>(Arc::clone(&coalescing_source))
-                            .build(),
-                    );
+                    let session = Arc::new(coalescing_registry.session());
                     runtime.block_on(async {
                         let (a, b, c, d) = tokio::join!(
                             async { session.get_many(black_box(keys)).await },
@@ -443,6 +426,9 @@ fn bench_parallel_fact_state(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to create Tokio runtime");
     let subject = BenchUser { id: Uuid::new_v4() };
     let source: Arc<dyn FactSource<BenchRelationship>> = Arc::new(AlwaysFoundSource);
+    let registry = FactRegistry::builder()
+        .with_arc::<BenchRelationship>(Arc::clone(&source))
+        .build();
     let mut group = c.benchmark_group("parallel_in_ram_fact_state");
 
     for &item_count in &[100usize, 1_000, 10_000] {
@@ -491,11 +477,7 @@ fn bench_parallel_fact_state(c: &mut Criterion) {
             },
         );
 
-        let sharded = Arc::new(
-            EvaluationSession::builder()
-                .with_arc::<BenchRelationship>(Arc::clone(&source))
-                .build(),
-        );
+        let sharded = Arc::new(registry.session());
         runtime.block_on(sharded.get_many(&keys));
         group.bench_with_input(
             BenchmarkId::new("sharded_session_cached_4_tasks", item_count),
@@ -551,6 +533,15 @@ struct SubjectOnlyAction;
 #[derive(Clone)]
 struct SubjectOnlyContext;
 
+struct SubjectOnlyDomain;
+
+impl PolicyDomain for SubjectOnlyDomain {
+    type Subject = SubjectOnlyUser;
+    type Action = SubjectOnlyAction;
+    type Resource = SubjectOnlyResource;
+    type Context = SubjectOnlyContext;
+}
+
 /// Mirrors the PolicyBuilder shape — dynamic name in `name: String`,
 /// no `evaluate_batch` override, so it falls through to the trait's
 /// serial-loop default. Makes the comparison with the overridden
@@ -561,23 +552,15 @@ struct ManualSubjectOnlyDynamic {
 }
 
 #[async_trait]
-impl gatehouse::Policy<SubjectOnlyUser, SubjectOnlyResource, SubjectOnlyAction, SubjectOnlyContext>
-    for ManualSubjectOnlyDynamic
-{
+impl gatehouse::Policy<SubjectOnlyDomain> for ManualSubjectOnlyDynamic {
     async fn evaluate(
         &self,
-        ctx: &gatehouse::EvalCtx<
-            '_,
-            SubjectOnlyUser,
-            SubjectOnlyResource,
-            SubjectOnlyAction,
-            SubjectOnlyContext,
-        >,
+        ctx: &gatehouse::EvalCtx<'_, SubjectOnlyDomain>,
     ) -> gatehouse::PolicyEvalResult {
         if ctx.subject.is_staff {
             ctx.grant("staff")
         } else {
-            ctx.deny("not staff")
+            ctx.not_applicable("not staff")
         }
     }
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -592,23 +575,15 @@ impl gatehouse::Policy<SubjectOnlyUser, SubjectOnlyResource, SubjectOnlyAction, 
 struct ManualSubjectOnlyStatic;
 
 #[async_trait]
-impl gatehouse::Policy<SubjectOnlyUser, SubjectOnlyResource, SubjectOnlyAction, SubjectOnlyContext>
-    for ManualSubjectOnlyStatic
-{
+impl gatehouse::Policy<SubjectOnlyDomain> for ManualSubjectOnlyStatic {
     async fn evaluate(
         &self,
-        ctx: &gatehouse::EvalCtx<
-            '_,
-            SubjectOnlyUser,
-            SubjectOnlyResource,
-            SubjectOnlyAction,
-            SubjectOnlyContext,
-        >,
+        ctx: &gatehouse::EvalCtx<'_, SubjectOnlyDomain>,
     ) -> gatehouse::PolicyEvalResult {
         if ctx.subject.is_staff {
             ctx.grant("staff")
         } else {
-            ctx.deny("not staff")
+            ctx.not_applicable("not staff")
         }
     }
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -628,39 +603,19 @@ fn bench_subject_only_batch(c: &mut Criterion) {
         let resources: Vec<SubjectOnlyResource> =
             (0..item_count).map(|_| SubjectOnlyResource).collect();
 
-        let mut builder_checker = PermissionChecker::<
-            SubjectOnlyUser,
-            SubjectOnlyResource,
-            SubjectOnlyAction,
-            SubjectOnlyContext,
-        >::new();
+        let mut builder_checker = PermissionChecker::<SubjectOnlyDomain>::new();
         builder_checker.add_policy(
-            PolicyBuilder::<
-                SubjectOnlyUser,
-                SubjectOnlyResource,
-                SubjectOnlyAction,
-                SubjectOnlyContext,
-            >::new("BuilderSubjectOnly")
-            .subjects(|u: &SubjectOnlyUser| u.is_staff)
-            .build(),
+            PolicyBuilder::<SubjectOnlyDomain>::new("BuilderSubjectOnly")
+                .subjects(|u: &SubjectOnlyUser| u.is_staff)
+                .build(),
         );
 
-        let mut manual_dynamic_checker = PermissionChecker::<
-            SubjectOnlyUser,
-            SubjectOnlyResource,
-            SubjectOnlyAction,
-            SubjectOnlyContext,
-        >::new();
+        let mut manual_dynamic_checker = PermissionChecker::<SubjectOnlyDomain>::new();
         manual_dynamic_checker.add_policy(ManualSubjectOnlyDynamic {
             name: "BuilderSubjectOnly".into(),
         });
 
-        let mut manual_static_checker = PermissionChecker::<
-            SubjectOnlyUser,
-            SubjectOnlyResource,
-            SubjectOnlyAction,
-            SubjectOnlyContext,
-        >::new();
+        let mut manual_static_checker = PermissionChecker::<SubjectOnlyDomain>::new();
         manual_static_checker.add_policy(ManualSubjectOnlyStatic);
 
         // PolicyBuilder path — overrides evaluate_batch to broadcast.
@@ -670,14 +625,11 @@ fn bench_subject_only_batch(c: &mut Criterion) {
             |b, checker| {
                 b.iter(|| {
                     let session = EvaluationSession::empty();
-                    let result = runtime.block_on(checker.evaluate_batch_in_session_by_resource(
-                        &session,
-                        &subject,
-                        &action,
-                        resources.clone(),
-                        &ctx,
-                        |r| r,
-                    ));
+                    let result = runtime.block_on(
+                        checker
+                            .bind(&session, &subject, &action, &ctx)
+                            .evaluate(resources.clone()),
+                    );
                     black_box(result)
                 });
             },
@@ -693,14 +645,11 @@ fn bench_subject_only_batch(c: &mut Criterion) {
             |b, checker| {
                 b.iter(|| {
                     let session = EvaluationSession::empty();
-                    let result = runtime.block_on(checker.evaluate_batch_in_session_by_resource(
-                        &session,
-                        &subject,
-                        &action,
-                        resources.clone(),
-                        &ctx,
-                        |r| r,
-                    ));
+                    let result = runtime.block_on(
+                        checker
+                            .bind(&session, &subject, &action, &ctx)
+                            .evaluate(resources.clone()),
+                    );
                     black_box(result)
                 });
             },
@@ -715,14 +664,11 @@ fn bench_subject_only_batch(c: &mut Criterion) {
             |b, checker| {
                 b.iter(|| {
                     let session = EvaluationSession::empty();
-                    let result = runtime.block_on(checker.evaluate_batch_in_session_by_resource(
-                        &session,
-                        &subject,
-                        &action,
-                        resources.clone(),
-                        &ctx,
-                        |r| r,
-                    ));
+                    let result = runtime.block_on(
+                        checker
+                            .bind(&session, &subject, &action, &ctx)
+                            .evaluate(resources.clone()),
+                    );
                     black_box(result)
                 });
             },

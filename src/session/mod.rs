@@ -1,7 +1,8 @@
 mod core;
 
 use self::core::{FactStripeCore, Registration};
-use crate::{FactKey, FactLoadError, FactLoadResult, FactSource, FactSourceRegistrationError};
+use crate::facts::FactSourceRegistrationError;
+use crate::{FactKey, FactLoadError, FactLoadResult, FactSource};
 use futures_channel::oneshot;
 use std::any::{Any, TypeId};
 use std::collections::hash_map::DefaultHasher;
@@ -235,6 +236,106 @@ where
     }
 }
 
+trait ErasedFactSource: Send + Sync {
+    fn install(&self, session: &EvaluationSession);
+}
+
+struct TypedFactSource<K>
+where
+    K: FactKey,
+{
+    source: Arc<dyn FactSource<K>>,
+}
+
+impl<K> ErasedFactSource for TypedFactSource<K>
+where
+    K: FactKey,
+{
+    fn install(&self, session: &EvaluationSession) {
+        session.install_source::<K>(Arc::clone(&self.source));
+    }
+}
+
+/// Reusable fact-source registry for creating request-scoped sessions.
+///
+/// Build one registry during application setup, then call [`Self::session`] for
+/// each request or authorization pass. Each session gets its own request-local
+/// cache and in-flight load coalescing state while sharing the source objects
+/// registered in the registry.
+#[derive(Clone, Default)]
+pub struct FactRegistry {
+    sources: Arc<Vec<Arc<dyn ErasedFactSource>>>,
+}
+
+impl FactRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Starts building a fact registry.
+    pub fn builder() -> FactRegistryBuilder {
+        FactRegistryBuilder::new()
+    }
+
+    /// Creates a fresh request-scoped session from this registry.
+    pub fn session(&self) -> EvaluationSession {
+        let session = EvaluationSession::new();
+        for source in self.sources.iter() {
+            source.install(&session);
+        }
+        session
+    }
+}
+
+/// Builder for declaring fact sources once at application setup.
+pub struct FactRegistryBuilder {
+    sources: HashMap<TypeId, Arc<dyn ErasedFactSource>>,
+}
+
+impl FactRegistryBuilder {
+    fn new() -> Self {
+        Self {
+            sources: HashMap::new(),
+        }
+    }
+
+    /// Registers a source for one fact key type.
+    ///
+    /// Panics if the same fact key type is registered twice.
+    pub fn with<K, S>(self, source: S) -> Self
+    where
+        K: FactKey,
+        S: FactSource<K> + 'static,
+    {
+        self.with_arc::<K>(Arc::new(source))
+    }
+
+    /// Registers a shared source for one fact key type.
+    ///
+    /// Panics if the same fact key type is registered twice.
+    pub fn with_arc<K>(mut self, source: Arc<dyn FactSource<K>>) -> Self
+    where
+        K: FactKey,
+    {
+        let entry: Arc<dyn ErasedFactSource> = Arc::new(TypedFactSource::<K> { source });
+        if self.sources.insert(TypeId::of::<K>(), entry).is_some() {
+            panic!(
+                "{}",
+                FactSourceRegistrationError::AlreadyRegistered { fact_name: K::NAME }
+            );
+        }
+        self
+    }
+
+    /// Finishes the registry.
+    pub fn build(self) -> FactRegistry {
+        FactRegistry {
+            sources: Arc::new(self.sources.into_values().collect()),
+        }
+    }
+}
+
 /// Request-scoped fact loading and caching state.
 ///
 /// A session is intended to live for one request or one authorization pass. It
@@ -247,7 +348,7 @@ where
 /// session lifetime — drop the session to drop its cache. If you need caching
 /// that outlives a single session (a process-wide cache with a TTL, say), layer
 /// it inside a [`FactSource`] implementation. A source can hold its own
-/// expiring cache and be shared across sessions via [`Self::register_arc`],
+/// expiring cache and be shared across sessions through [`FactRegistry`],
 /// which keeps the session a simple request-scoped layer on top.
 #[derive(Clone, Default)]
 pub struct EvaluationSession {
@@ -263,8 +364,8 @@ impl EvaluationSession {
     /// Creates an explicitly empty request-scoped session.
     ///
     /// This is equivalent to [`Self::new`]. It can make call sites clearer when
-    /// only RBAC/ABAC policies are expected and no fact sources are registered.
-    /// For very hot RBAC/ABAC-only loops, use [`Self::shared_empty`] to avoid
+    /// only fact-free policies are expected and no fact sources are registered.
+    /// For very hot fact-free loops, use [`Self::shared_empty`] to avoid
     /// allocating a new empty session per call.
     pub fn empty() -> Self {
         Self::new()
@@ -273,21 +374,10 @@ impl EvaluationSession {
     /// Returns a process-wide empty session for hot paths that never use fact
     /// sources.
     ///
-    /// This avoids allocating a new empty session for RBAC/ABAC-only checks in
-    /// tight loops. It is only safe when no fact-backed policies are expected:
-    /// calling [`Self::register`], [`Self::register_arc`], [`Self::replace`], or
-    /// [`Self::replace_arc`] on this session panics.
-    ///
-    /// The panic is deliberate. Registering on the shared handle is a
-    /// programming error, not a runtime condition — code that registers sources
-    /// should own a [`Self::new`] session, and this handle exists only for
-    /// fact-free hot paths. The non-panicking [`Self::try_register`] /
-    /// [`Self::try_replace`] family still returns
-    /// [`FactSourceRegistrationError::SharedEmptySession`] here rather than
-    /// panicking, for callers that want to handle it. A type-state split (a
-    /// separate "registrable" type) was considered but would push that
-    /// distinction into every signature that accepts a `&EvaluationSession`,
-    /// defeating the drop-in substitutability that makes this handle useful.
+    /// This avoids allocating a new empty session for fact-free checks in
+    /// tight loops. Only use it when no fact-backed policies are expected.
+    /// Fact-backed paths should build a [`FactRegistry`] during application
+    /// setup and call [`FactRegistry::session`] per request.
     pub fn shared_empty() -> &'static Self {
         static SHARED_EMPTY: OnceLock<EvaluationSession> = OnceLock::new();
         SHARED_EMPTY.get_or_init(|| EvaluationSession {
@@ -298,130 +388,12 @@ impl EvaluationSession {
         })
     }
 
-    /// Starts building a request-scoped session with all fact sources declared
-    /// in one place.
-    pub fn builder() -> EvaluationSessionBuilder {
-        EvaluationSessionBuilder::new()
-    }
-
-    /// Registers a fact source for one key type.
-    ///
-    /// Panics if a source for `K` is already registered. Use [`Self::replace`]
-    /// when replacing a source is intentional. Register sources during session
-    /// setup; registering while loads for the same key type are in flight is
-    /// not a supported operation and will panic.
-    ///
-    /// This panicking form is meant for session setup, where a failed
-    /// registration (a duplicate source, or a load already in flight) is a
-    /// configuration bug that should fail loudly and immediately. Use
-    /// [`Self::try_register`] when registration is driven by runtime input and
-    /// you want to handle [`FactSourceRegistrationError`] rather than panic.
-    pub fn register<K, S>(&self, source: S)
-    where
-        K: FactKey,
-        S: FactSource<K> + 'static,
-    {
-        self.register_arc::<K>(Arc::new(source));
-    }
-
-    /// Registers a shared fact source for one key type.
-    ///
-    /// Panics if a source for `K` is already registered. Register sources
-    /// during session setup; use [`Self::replace_arc`] only when overwriting is
-    /// deliberate. Registering while loads for the same key type are in flight
-    /// is not a supported operation and will panic.
-    ///
-    /// Use this form to share one source instance across many sessions: build
-    /// the `Arc` once and `Arc::clone` it into each request's session (see
-    /// [`EvaluationSessionBuilder::with_arc`]). [`Self::register`] takes the
-    /// source by value and wraps it in a fresh `Arc` per call, so it cannot
-    /// share a single instance; reach for `register_arc` when the source holds
-    /// expensive shared state such as a connection pool or its own cache. Like
-    /// [`Self::register`], it panics on invalid registration; use
-    /// [`Self::try_register_arc`] to handle the error instead.
-    ///
-    /// The registry is keyed by the exact Rust fact key type. If two production
-    /// backends serve the same logical shape, such as the same
-    /// `RelationshipQuery<UserId, ConversationId, ParticipantRelation>`, they
-    /// cannot both be registered under that exact type in one session. Wrap one
-    /// ID/relation type or define distinct fact keys so each backend has a
-    /// separate registry entry.
-    pub fn register_arc<K>(&self, source: Arc<dyn FactSource<K>>)
-    where
-        K: FactKey,
-    {
-        self.try_register_arc::<K>(source)
-            .unwrap_or_else(|error| panic!("{error}"));
-    }
-
-    /// Registers a fact source for one key type, returning an error instead of
-    /// panicking if registration is invalid.
-    pub fn try_register<K, S>(&self, source: S) -> Result<(), FactSourceRegistrationError>
-    where
-        K: FactKey,
-        S: FactSource<K> + 'static,
-    {
-        self.try_register_arc::<K>(Arc::new(source))
-    }
-
-    /// Registers a shared fact source for one key type, returning an error
-    /// instead of panicking if registration is invalid.
-    pub fn try_register_arc<K>(
-        &self,
-        source: Arc<dyn FactSource<K>>,
-    ) -> Result<(), FactSourceRegistrationError>
+    fn install_source<K>(&self, source: Arc<dyn FactSource<K>>)
     where
         K: FactKey,
     {
         self.insert_source::<K>(source, false)
-    }
-
-    /// Explicitly replaces a fact source for one key type.
-    ///
-    /// Replacing a source clears any cached facts for that key type in this
-    /// session. Replacing while loads for the same key type are in flight is
-    /// not a supported operation and will panic.
-    pub fn replace<K, S>(&self, source: S)
-    where
-        K: FactKey,
-        S: FactSource<K> + 'static,
-    {
-        self.replace_arc::<K>(Arc::new(source));
-    }
-
-    /// Explicitly replaces a shared fact source for one key type.
-    ///
-    /// Replacing a source clears any cached facts for that key type in this
-    /// session. Replacing while loads for the same key type are in flight is
-    /// not a supported operation and will panic.
-    pub fn replace_arc<K>(&self, source: Arc<dyn FactSource<K>>)
-    where
-        K: FactKey,
-    {
-        self.try_replace_arc::<K>(source)
             .unwrap_or_else(|error| panic!("{error}"));
-    }
-
-    /// Explicitly replaces a fact source for one key type, returning an error
-    /// instead of panicking if replacement is invalid.
-    pub fn try_replace<K, S>(&self, source: S) -> Result<(), FactSourceRegistrationError>
-    where
-        K: FactKey,
-        S: FactSource<K> + 'static,
-    {
-        self.try_replace_arc::<K>(Arc::new(source))
-    }
-
-    /// Explicitly replaces a shared fact source for one key type, returning an
-    /// error instead of panicking if replacement is invalid.
-    pub fn try_replace_arc<K>(
-        &self,
-        source: Arc<dyn FactSource<K>>,
-    ) -> Result<(), FactSourceRegistrationError>
-    where
-        K: FactKey,
-    {
-        self.insert_source::<K>(source, true)
     }
 
     fn insert_source<K>(
@@ -574,48 +546,6 @@ impl EvaluationSession {
             .downcast_ref::<Arc<FactState<K>>>()
             .expect("fact state type should match registry key")
             .clone()
-    }
-}
-
-/// Builder for declaring all fact sources needed by a request-scoped
-/// [`EvaluationSession`].
-pub struct EvaluationSessionBuilder {
-    session: EvaluationSession,
-}
-
-impl EvaluationSessionBuilder {
-    fn new() -> Self {
-        Self {
-            session: EvaluationSession::new(),
-        }
-    }
-
-    /// Registers a source for one fact key type.
-    ///
-    /// Panics if the same fact key type is registered twice.
-    pub fn with<K, S>(self, source: S) -> Self
-    where
-        K: FactKey,
-        S: FactSource<K> + 'static,
-    {
-        self.session.register::<K, _>(source);
-        self
-    }
-
-    /// Registers a shared source for one fact key type.
-    ///
-    /// Panics if the same fact key type is registered twice.
-    pub fn with_arc<K>(self, source: Arc<dyn FactSource<K>>) -> Self
-    where
-        K: FactKey,
-    {
-        self.session.register_arc::<K>(source);
-        self
-    }
-
-    /// Finishes the session.
-    pub fn build(self) -> EvaluationSession {
-        self.session
     }
 }
 

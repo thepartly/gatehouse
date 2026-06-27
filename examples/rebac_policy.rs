@@ -1,10 +1,9 @@
 //! # Relationship-Based Access Control Policy Example
 //!
-//! This example demonstrates ReBAC in the v0.3 shape: `RebacPolicy` extracts
-//! flat IDs and loads relationship facts through a request-scoped
-//! `EvaluationSession`. The happy path declares sources with
-//! `EvaluationSession::builder()` so all request-scoped dependencies are
-//! visible in one place.
+//! This example demonstrates ReBAC: `RebacPolicy` extracts flat IDs and loads
+//! relationship facts through a request-scoped `EvaluationSession`. The happy
+//! path declares sources once in a `FactRegistry`, then creates a fresh session
+//! from that registry for each request.
 //!
 //! Relations are a domain enum (`Relation::Owner`), not strings: the session
 //! deduplicates and caches by the typed `RelationshipQuery` key, the compiler
@@ -37,6 +36,15 @@ struct Project {
 
 #[derive(Debug, Clone)]
 struct EditAction;
+
+struct ProjectDomain;
+
+impl PolicyDomain for ProjectDomain {
+    type Subject = User;
+    type Action = EditAction;
+    type Resource = Project;
+    type Context = ();
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Relation {
@@ -145,19 +153,20 @@ async fn main() {
         },
     ]);
 
-    let session = EvaluationSession::builder()
+    let registry = FactRegistry::builder()
         .with::<ProjectRelationship, _>(ProjectRelationshipSource::new(relationships.clone()))
         .build();
+    let session = registry.session();
 
     // Editing requires an owner OR contributor relationship; a viewer
     // relationship exists in the store but grants nothing here.
-    let mut checker = PermissionChecker::<User, Project, EditAction, ()>::new();
-    checker.add_policy(RebacPolicy::new(
+    let mut checker = PermissionChecker::<ProjectDomain>::new();
+    checker.add_policy(RebacPolicy::<ProjectDomain, Uuid, Uuid, Relation>::new(
         |user: &User| user.id,
         |project: &Project| project.id,
         Relation::Owner,
     ));
-    checker.add_policy(RebacPolicy::new(
+    checker.add_policy(RebacPolicy::<ProjectDomain, Uuid, Uuid, Relation>::new(
         |user: &User| user.id,
         |project: &Project| project.id,
         Relation::Contributor,
@@ -173,7 +182,8 @@ async fn main() {
     for (user, held, expected_granted) in cases {
         println!("Can {} ({held}) edit {}?", user.name, project.name);
         let decision = checker
-            .evaluate_in_session(&session, user, &EditAction, &project, &())
+            .bind(&session, user, &EditAction, &())
+            .check(&project)
             .await;
         println!(
             "  -> {}\n",
@@ -193,7 +203,8 @@ async fn main() {
     // from the session cache.
     println!("Why {} is denied:", viewer.name);
     let decision = checker
-        .evaluate_in_session(&session, &viewer, &EditAction, &project, &())
+        .bind(&session, &viewer, &EditAction, &())
+        .check(&project)
         .await;
     println!("{}\n", decision.display_trace());
 
@@ -201,11 +212,13 @@ async fn main() {
 
     // A failing store must never grant: the load error is carried into the
     // trace and the decision fails closed to denial — even for the owner.
-    let error_session = EvaluationSession::builder()
+    let error_registry = FactRegistry::builder()
         .with::<ProjectRelationship, _>(ProjectRelationshipSource::new(relationships).with_error())
         .build();
+    let error_session = error_registry.session();
     let decision = checker
-        .evaluate_in_session(&error_session, &owner, &EditAction, &project, &())
+        .bind(&error_session, &owner, &EditAction, &())
+        .check(&project)
         .await;
     println!("{}", decision.display_trace());
     decision.assert_denied();

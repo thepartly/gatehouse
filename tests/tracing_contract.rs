@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use gatehouse::{
-    BatchEvalCtx, Effect, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
-    PolicyEvalResult,
+    BatchEvalCtx, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
+    PolicyDomain, PolicyEvalResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -29,20 +29,26 @@ struct Resource {
     allowed: bool,
 }
 
+struct Domain;
+
+impl PolicyDomain for Domain {
+    type Subject = Subject;
+    type Action = Action;
+    type Resource = Resource;
+    type Context = Ctx;
+}
+
 struct TracePolicy;
 
 #[async_trait]
-impl Policy<Subject, Resource, Action, Ctx> for TracePolicy {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Subject, Resource, Action, Ctx>,
-    ) -> PolicyEvalResult {
+impl Policy<Domain> for TracePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
         result_for(ctx.resource.allowed)
     }
 
     async fn evaluate_batch<'item>(
         &self,
-        ctx: &BatchEvalCtx<'item, Subject, Resource, Action, Ctx>,
+        ctx: &BatchEvalCtx<'item, Domain>,
     ) -> Vec<PolicyEvalResult> {
         ctx.items
             .iter()
@@ -55,11 +61,93 @@ impl Policy<Subject, Resource, Action, Ctx> for TracePolicy {
     }
 }
 
+struct GrantingForbidPolicy;
+
+#[async_trait]
+impl Policy<Domain> for GrantingForbidPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.grant("misbehaving forbid grant")
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        ctx.items
+            .iter()
+            .map(|_| PolicyEvalResult::granted(self.policy_type(), Some("misbehaving".into())))
+            .collect()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("GrantingForbidPolicy")
+    }
+
+    fn effect(&self) -> gatehouse::Effect {
+        gatehouse::Effect::Forbid
+    }
+}
+
+struct ForbiddingAllowPolicy;
+
+#[async_trait]
+impl Policy<Domain> for ForbiddingAllowPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.forbid("forbid without declaring an effect")
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        ctx.items
+            .iter()
+            .map(|_| {
+                PolicyEvalResult::forbidden(
+                    self.policy_type(),
+                    "forbid without declaring an effect",
+                )
+            })
+            .collect()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ForbiddingAllowPolicy")
+    }
+
+    // Intentionally no `effect()` override: defaults to `Effect::Allow`, so
+    // forbidding here is the contract violation the checker should warn about.
+}
+
+struct WrongLengthTracePolicy;
+
+#[async_trait]
+impl Policy<Domain> for WrongLengthTracePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.not_applicable("not applicable")
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        _ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        Vec::new()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("WrongLengthTracePolicy")
+    }
+
+    fn effect(&self) -> gatehouse::Effect {
+        gatehouse::Effect::Forbid
+    }
+}
+
 fn result_for(allowed: bool) -> PolicyEvalResult {
     if allowed {
         PolicyEvalResult::granted("TracePolicy", Some("allowed".to_string()))
     } else {
-        PolicyEvalResult::denied("TracePolicy", "denied")
+        PolicyEvalResult::not_applicable("TracePolicy", "denied")
     }
 }
 
@@ -70,22 +158,36 @@ struct CapturedSpan {
     values: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Default)]
-struct CapturedSpans(Arc<Mutex<Vec<Arc<Mutex<CapturedSpan>>>>>);
+#[derive(Clone, Debug)]
+struct CapturedEvent {
+    target: String,
+    level: String,
+    values: BTreeMap<String, String>,
+}
 
-impl CapturedSpans {
-    fn snapshot(&self) -> Vec<CapturedSpan> {
-        self.0
+#[derive(Clone, Default)]
+struct CapturedTelemetry {
+    spans: Arc<Mutex<Vec<Arc<Mutex<CapturedSpan>>>>>,
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl CapturedTelemetry {
+    fn span_snapshot(&self) -> Vec<CapturedSpan> {
+        self.spans
             .lock()
             .unwrap()
             .iter()
             .map(|span| span.lock().unwrap().clone())
             .collect()
     }
+
+    fn event_snapshot(&self) -> Vec<CapturedEvent> {
+        self.events.lock().unwrap().clone()
+    }
 }
 
 struct CaptureLayer {
-    spans: CapturedSpans,
+    captured: CapturedTelemetry,
 }
 
 impl<S> Layer<S> for CaptureLayer
@@ -109,7 +211,7 @@ where
         if let Some(ctx_span) = ctx.span(id) {
             ctx_span.extensions_mut().insert(Arc::clone(&span));
         }
-        self.spans.0.lock().unwrap().push(span);
+        self.captured.spans.lock().unwrap().push(span);
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: LayerContext<'_, S>) {
@@ -127,6 +229,16 @@ where
         let mut visitor = FieldValues::default();
         values.record(&mut visitor);
         span.lock().unwrap().values.extend(visitor.values);
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) {
+        let mut visitor = FieldValues::default();
+        event.record(&mut visitor);
+        self.captured.events.lock().unwrap().push(CapturedEvent {
+            target: event.metadata().target().to_string(),
+            level: event.metadata().level().to_string(),
+            values: visitor.values,
+        });
     }
 }
 
@@ -197,13 +309,22 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
+    let (output, spans, _events) = capture_async_with_events(f);
+    (output, spans)
+}
+
+fn capture_async_with_events<F, Fut, T>(f: F) -> (T, Vec<CapturedSpan>, Vec<CapturedEvent>)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
     install_permissive_global();
-    let captured = CapturedSpans::default();
+    let captured = CapturedTelemetry::default();
     let subscriber = Registry::default().with(CaptureLayer {
-        spans: captured.clone(),
+        captured: captured.clone(),
     });
     let output = tracing::subscriber::with_default(subscriber, || tokio_test::block_on(f()));
-    (output, captured.snapshot())
+    (output, captured.span_snapshot(), captured.event_snapshot())
 }
 
 fn span<'a>(spans: &'a [CapturedSpan], name: &str) -> &'a CapturedSpan {
@@ -234,7 +355,17 @@ fn assert_value(span: &CapturedSpan, field: &str, expected: &str) {
     );
 }
 
-fn checker_with_policy() -> PermissionChecker<Subject, Resource, Action, Ctx> {
+fn assert_event_value(event: &CapturedEvent, field: &str, expected: &str) {
+    assert_eq!(
+        event.values.get(field).map(String::as_str),
+        Some(expected),
+        "event {} field {field}; values: {:?}",
+        event.target,
+        event.values
+    );
+}
+
+fn checker_with_policy() -> PermissionChecker<Domain> {
     let mut checker = PermissionChecker::new().with_max_batch_size(NonZeroUsize::new(2).unwrap());
     checker.add_policy(TracePolicy);
     checker
@@ -246,17 +377,12 @@ fn tracing_fields_are_recorded_for_granted_decisions() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_in_session(
-                &session,
-                &Subject,
-                &Action,
-                &Resource { allowed: true },
-                &Ctx,
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
             .await
     });
 
-    let single = span(&spans, "evaluate_in_session");
+    let single = span(&spans, "evaluate_one");
     assert_fields(single, &["policy_count", "outcome", "policy.type"]);
     assert_value(single, "policy_count", "1");
     assert_value(single, "outcome", "granted");
@@ -266,17 +392,12 @@ fn tracing_fields_are_recorded_for_granted_decisions() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
-                &session,
-                &Subject,
-                &Action,
-                vec![(Resource { allowed: true }, Ctx)],
-                |item| (&item.0, &item.1),
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
             .await
     });
 
-    let batch = span(&spans, "evaluate_batch_in_session_by");
+    let batch = span(&spans, "evaluate_batch");
     assert_fields(
         batch,
         &[
@@ -319,17 +440,12 @@ fn tracing_records_one_batch_policy_span_per_chunk() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
-                &session,
-                &Subject,
-                &Action,
-                vec![
-                    (Resource { allowed: true }, Ctx),
-                    (Resource { allowed: false }, Ctx),
-                    (Resource { allowed: true }, Ctx),
-                ],
-                |item| (&item.0, &item.1),
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![
+                Resource { allowed: true },
+                Resource { allowed: false },
+                Resource { allowed: true },
+            ])
             .await
     });
 
@@ -358,17 +474,12 @@ fn tracing_fields_are_recorded_for_denied_decisions() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_in_session(
-                &session,
-                &Subject,
-                &Action,
-                &Resource { allowed: false },
-                &Ctx,
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: false })
             .await
     });
 
-    let single = span(&spans, "evaluate_in_session");
+    let single = span(&spans, "evaluate_one");
     assert_fields(single, &["policy_count", "outcome", "policy.type"]);
     assert_value(single, "policy_count", "1");
     assert_value(single, "outcome", "denied");
@@ -377,17 +488,12 @@ fn tracing_fields_are_recorded_for_denied_decisions() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
-                &session,
-                &Subject,
-                &Action,
-                vec![(Resource { allowed: false }, Ctx)],
-                |item| (&item.0, &item.1),
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: false }])
             .await
     });
 
-    let batch = span(&spans, "evaluate_batch_in_session_by");
+    let batch = span(&spans, "evaluate_batch");
     assert_fields(
         batch,
         &[
@@ -407,41 +513,31 @@ fn tracing_fields_are_recorded_for_denied_decisions() {
 
 #[test]
 fn tracing_fields_are_recorded_for_empty_policy_decisions() {
-    let checker = PermissionChecker::<Subject, Resource, Action, Ctx>::new();
+    let checker = PermissionChecker::<Domain>::new();
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_in_session(
-                &session,
-                &Subject,
-                &Action,
-                &Resource { allowed: true },
-                &Ctx,
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
             .await
     });
 
-    let single = span(&spans, "evaluate_in_session");
+    let single = span(&spans, "evaluate_one");
     assert_fields(single, &["policy_count", "outcome", "policy.type"]);
     assert_value(single, "policy_count", "0");
     assert_value(single, "outcome", "denied");
 
-    let checker = PermissionChecker::<Subject, Resource, Action, Ctx>::new()
-        .with_max_batch_size(NonZeroUsize::new(2).unwrap());
+    let checker =
+        PermissionChecker::<Domain>::new().with_max_batch_size(NonZeroUsize::new(2).unwrap());
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
-                &session,
-                &Subject,
-                &Action,
-                vec![(Resource { allowed: true }, Ctx)],
-                |item| (&item.0, &item.1),
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
             .await
     });
 
-    let batch = span(&spans, "evaluate_batch_in_session_by");
+    let batch = span(&spans, "evaluate_batch");
     assert_fields(
         batch,
         &[
@@ -461,23 +557,17 @@ fn tracing_fields_are_recorded_for_empty_policy_decisions() {
 
 #[test]
 fn named_checker_records_name_on_evaluate_span() {
-    let mut checker =
-        PermissionChecker::<Subject, Resource, Action, Ctx>::named("InvoiceItemChecker");
+    let mut checker = PermissionChecker::<Domain>::named("InvoiceItemChecker");
     checker.add_policy(TracePolicy);
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_in_session(
-                &session,
-                &Subject,
-                &Action,
-                &Resource { allowed: true },
-                &Ctx,
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
             .await
     });
 
-    let single = span(&spans, "evaluate_in_session");
+    let single = span(&spans, "evaluate_one");
     assert_value(single, "checker.name", "InvoiceItemChecker");
 }
 
@@ -487,17 +577,12 @@ fn unnamed_checker_omits_checker_name_field() {
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_in_session(
-                &session,
-                &Subject,
-                &Action,
-                &Resource { allowed: true },
-                &Ctx,
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
             .await
     });
 
-    let single = span(&spans, "evaluate_in_session");
+    let single = span(&spans, "evaluate_one");
     // Span declares the field but does not record a value when the checker
     // has no name.
     assert!(
@@ -509,73 +594,216 @@ fn unnamed_checker_omits_checker_name_field() {
 
 #[test]
 fn named_checker_records_name_on_batch_span() {
-    let mut checker =
-        PermissionChecker::<Subject, Resource, Action, Ctx>::named("InvoiceItemChecker");
+    let mut checker = PermissionChecker::<Domain>::named("InvoiceItemChecker");
     checker.add_policy(TracePolicy);
     let session = EvaluationSession::empty();
     let (_result, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
-                &session,
-                &Subject,
-                &Action,
-                vec![(Resource { allowed: true }, Ctx)],
-                |item| (&item.0, &item.1),
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
             .await
     });
 
-    let batch = span(&spans, "evaluate_batch_in_session_by");
+    let batch = span(&spans, "evaluate_batch");
     assert_value(batch, "checker.name", "InvoiceItemChecker");
 }
 
 #[test]
 fn tracing_fields_are_recorded_for_forbidden_decisions() {
-    // An allow policy that would grant, vetoed by a deny-effect policy.
+    // An allow policy that would grant, vetoed by a forbid-effect policy.
     let mut checker = PermissionChecker::new();
     checker.add_policy(TracePolicy);
     checker.add_policy(
-        PolicyBuilder::<Subject, Resource, Action, Ctx>::new("GlobalFreeze")
-            .effect(Effect::Deny)
+        PolicyBuilder::<Domain>::new("GlobalFreeze")
+            .forbid()
             .build(),
     );
 
     let session = EvaluationSession::empty();
     let (result, spans) = capture_async(|| async {
         checker
-            .evaluate_in_session(
-                &session,
-                &Subject,
-                &Action,
-                &Resource { allowed: true },
-                &Ctx,
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
             .await
     });
     assert!(!result.is_granted());
 
     // The single-evaluation span attributes the denial to the forbid.
-    let single = span(&spans, "evaluate_in_session");
+    let single = span(&spans, "evaluate_one");
     assert_value(single, "outcome", "denied");
     assert_value(single, "policy.type", "GlobalFreeze");
 
     // The batch policy span carries the declared effect and the forbid count.
     let (_results, spans) = capture_async(|| async {
         checker
-            .evaluate_batch_in_session_by(
-                &session,
-                &Subject,
-                &Action,
-                vec![(Resource { allowed: true }, Ctx)],
-                |item| (&item.0, &item.1),
-            )
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
             .await
     });
 
-    // Deny-first scheduling: the first batch_policy span is the deny policy.
+    // Forbid-first scheduling: the first batch_policy span is the forbid policy.
     let policy = span(&spans, "gatehouse.batch_policy");
     assert_value(policy, "policy.type", "GlobalFreeze");
     assert_value(policy, "policy.effect", "deny");
     assert_value(policy, "policy.forbidden_count", "1");
     assert_value(policy, "policy.granted_count", "0");
+}
+
+#[test]
+fn tracing_records_wrong_length_batch_policy_denials() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(WrongLengthTracePolicy);
+    let session = EvaluationSession::empty();
+    let (_results, spans) = capture_async(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![
+                Resource { allowed: true },
+                Resource { allowed: false },
+            ])
+            .await
+    });
+
+    let policy = span(&spans, "gatehouse.batch_policy");
+    assert_value(policy, "policy.type", "WrongLengthTracePolicy");
+    assert_value(policy, "policy.denied_count", "2");
+    assert_value(policy, "policy.granted_count", "0");
+    assert_value(policy, "policy.forbidden_count", "0");
+}
+
+#[test]
+fn tracing_records_forbid_effect_contract_violation_warning() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(GrantingForbidPolicy);
+    let session = EvaluationSession::empty();
+    let (_results, spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
+            .await
+    });
+
+    let policy = span(&spans, "gatehouse.batch_policy");
+    assert_value(policy, "policy.type", "GrantingForbidPolicy");
+    assert_value(policy, "policy.denied_count", "1");
+    assert_value(policy, "policy.granted_count", "0");
+
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.level == "WARN"
+                && event.values.get("message").is_some_and(|message| {
+                    message.contains("Forbid-effect policy returned a grant")
+                })
+        })
+        .unwrap_or_else(|| panic!("missing contract-violation warning; events: {events:#?}"));
+    assert_event_value(warning, "policy.type", "GrantingForbidPolicy");
+    assert_event_value(warning, "item_count", "1");
+
+    let mut clean_checker = PermissionChecker::new();
+    clean_checker.add_policy(PolicyBuilder::<Domain>::new("CleanForbid").forbid().build());
+    let (_results, _spans, clean_events) = capture_async_with_events(|| async {
+        clean_checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
+            .await
+    });
+    assert!(
+        clean_events.iter().all(|event| {
+            !event
+                .values
+                .get("message")
+                .is_some_and(|message| message.contains("Forbid-effect policy returned a grant"))
+        }),
+        "well-behaved forbid policies must not emit contract-violation warnings: {clean_events:#?}"
+    );
+}
+
+#[test]
+fn tracing_records_allow_effect_contract_violation_warning() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(ForbiddingAllowPolicy);
+    let session = EvaluationSession::empty();
+
+    // Batch path: the veto is still honored (fail-safe, not silently dropped)
+    // and a single warning records the contract violation with its count.
+    let (results, _spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
+            .await
+    });
+    assert!(!results[0].1.is_granted());
+
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.level == "WARN"
+                && event.values.get("message").is_some_and(|message| {
+                    message.contains("Allow-effect policy returned a forbid")
+                })
+        })
+        .unwrap_or_else(|| panic!("missing contract-violation warning; events: {events:#?}"));
+    assert_event_value(warning, "policy.type", "ForbiddingAllowPolicy");
+    assert_event_value(warning, "item_count", "1");
+
+    // Single path: the same warning fires, and access is still denied.
+    let (single, _spans, single_events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(!single.is_granted());
+    assert!(
+        single_events.iter().any(|event| {
+            event.level == "WARN"
+                && event.values.get("message").is_some_and(|message| {
+                    message.contains("Allow-effect policy returned a forbid")
+                })
+        }),
+        "single-path evaluation must emit the contract-violation warning: {single_events:#?}"
+    );
+
+    // A policy that declares its forbid effect is well-behaved: no warning.
+    let mut clean_checker = PermissionChecker::new();
+    clean_checker.add_policy(PolicyBuilder::<Domain>::new("CleanForbid").forbid().build());
+    let (_results, _spans, clean_events) = capture_async_with_events(|| async {
+        clean_checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![Resource { allowed: true }])
+            .await
+    });
+    assert!(
+        clean_events.iter().all(|event| {
+            !event
+                .values
+                .get("message")
+                .is_some_and(|message| message.contains("Allow-effect policy returned a forbid"))
+        }),
+        "policies declaring their forbid effect must not emit contract-violation warnings: {clean_events:#?}"
+    );
+
+    // Single path, well-behaved: a plain `Effect::Allow` policy that does not
+    // forbid must emit no contract-violation warning. This pins that *both*
+    // operands matter — an `Allow` declaration alone (without a forbid result)
+    // is not enough to warn — so the guard cannot weaken from `&&` to `||`.
+    let mut allow_checker = PermissionChecker::new();
+    allow_checker.add_policy(TracePolicy);
+    let (granted, _spans, allow_events) = capture_async_with_events(|| async {
+        allow_checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(granted.is_granted());
+    assert!(
+        allow_events.iter().all(|event| {
+            !event
+                .values
+                .get("message")
+                .is_some_and(|message| message.contains("Allow-effect policy returned a forbid"))
+        }),
+        "an allow policy that does not forbid must not emit the contract-violation warning: {allow_events:#?}"
+    );
 }

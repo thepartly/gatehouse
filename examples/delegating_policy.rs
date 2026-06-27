@@ -18,7 +18,8 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    DelegatingPolicy, EvalCtx, PermissionChecker, Policy, PolicyBuilder, PolicyEvalResult,
+    DelegatingPolicy, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
+    PolicyDomain, PolicyEvalResult,
 };
 use std::borrow::Cow;
 use uuid::Uuid;
@@ -39,14 +40,23 @@ struct Document {
 #[derive(Debug, Clone)]
 struct EditDoc;
 
+struct DocumentDomain;
+
+impl PolicyDomain for DocumentDomain {
+    type Subject = DocUser;
+    type Action = EditDoc;
+    type Resource = Document;
+    type Context = ();
+}
+
 /// The document domain owns its own access rules — the owner can edit, and so
 /// can an admin. This checker is the single source of truth for "can edit this
 /// document"; the comment domain borrows it rather than reimplementing it.
-fn document_checker() -> PermissionChecker<DocUser, Document, EditDoc, ()> {
-    let owner = PolicyBuilder::<DocUser, Document, EditDoc, ()>::new("DocumentOwner")
+fn document_checker() -> PermissionChecker<DocumentDomain> {
+    let owner = PolicyBuilder::<DocumentDomain>::new("DocumentOwner")
         .when(|user, _action, document, _ctx| user.id == document.owner_id)
         .build();
-    let admin = PolicyBuilder::<DocUser, Document, EditDoc, ()>::new("DocumentAdmin")
+    let admin = PolicyBuilder::<DocumentDomain>::new("DocumentAdmin")
         .subjects(|user| user.is_admin)
         .build();
 
@@ -75,19 +85,25 @@ struct Comment {
 #[derive(Debug, Clone)]
 struct EditComment;
 
+struct CommentDomain;
+
+impl PolicyDomain for CommentDomain {
+    type Subject = Principal;
+    type Action = EditComment;
+    type Resource = Comment;
+    type Context = ();
+}
+
 /// Direct comment rule: you can always edit your own comment.
 struct AuthorCanEditComment;
 
 #[async_trait]
-impl Policy<Principal, Comment, EditComment, ()> for AuthorCanEditComment {
-    async fn evaluate(
-        &self,
-        ctx: &EvalCtx<'_, Principal, Comment, EditComment, ()>,
-    ) -> PolicyEvalResult {
+impl Policy<CommentDomain> for AuthorCanEditComment {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, CommentDomain>) -> PolicyEvalResult {
         if ctx.subject.user_id == ctx.resource.author_id {
             ctx.grant("subject is the comment author")
         } else {
-            ctx.deny("subject is not the comment author")
+            ctx.not_applicable("subject is not the comment author")
         }
     }
     fn policy_type(&self) -> Cow<'static, str> {
@@ -97,10 +113,10 @@ impl Policy<Principal, Comment, EditComment, ()> for AuthorCanEditComment {
 
 /// The comment checker: edit your own comment OR inherit edit rights from the
 /// parent document via delegation.
-fn comment_checker() -> PermissionChecker<Principal, Comment, EditComment, ()> {
+fn comment_checker() -> PermissionChecker<CommentDomain> {
     // The four mappers are the entire bridge between the comment domain and the
-    // document domain. Subject and action map once per batch; resource and
-    // context map once per item.
+    // document domain. Subject, action, and context map once per batch; resource
+    // maps once per item.
     let inherit_from_document = DelegatingPolicy::new(
         "InheritDocumentEdit",
         document_checker(),
@@ -109,10 +125,10 @@ fn comment_checker() -> PermissionChecker<Principal, Comment, EditComment, ()> {
             is_admin: principal.is_admin,
         },
         |_action: &EditComment| EditDoc,
-        |_subject: &Principal, comment: &Comment, _action: &EditComment, _ctx: &()| {
+        |_subject: &Principal, _action: &EditComment, comment: &Comment, _ctx: &()| {
             comment.document.clone()
         },
-        |_subject, _comment, _action, _ctx| (),
+        |_subject, _action, _ctx| (),
     );
 
     let mut checker = PermissionChecker::named("CommentChecker");
@@ -151,6 +167,9 @@ async fn main() {
     };
 
     let checker = comment_checker();
+    let session = EvaluationSession::empty();
+    let action = EditComment;
+    let context = ();
 
     let cases = [
         ("author", &author),
@@ -160,7 +179,8 @@ async fn main() {
     ];
     for (who, principal) in cases {
         let granted = checker
-            .check(principal, &EditComment, &comment, &())
+            .bind(&session, principal, &action, &context)
+            .check(&comment)
             .await
             .is_granted();
         println!(
@@ -174,24 +194,29 @@ async fn main() {
     // trace shows the decision crossing the domain boundary.
     println!("\nTrace — document owner (not the author) editing the comment:");
     let decision = checker
-        .check(&document_owner, &EditComment, &comment, &())
+        .bind(&session, &document_owner, &action, &context)
+        .check(&comment)
         .await;
     println!("{}", decision.display_trace());
 
     assert!(checker
-        .check(&author, &EditComment, &comment, &())
+        .bind(&session, &author, &action, &context)
+        .check(&comment)
         .await
         .is_granted());
     assert!(checker
-        .check(&document_owner, &EditComment, &comment, &())
+        .bind(&session, &document_owner, &action, &context)
+        .check(&comment)
         .await
         .is_granted());
     assert!(checker
-        .check(&admin, &EditComment, &comment, &())
+        .bind(&session, &admin, &action, &context)
+        .check(&comment)
         .await
         .is_granted());
     assert!(!checker
-        .check(&stranger, &EditComment, &comment, &())
+        .bind(&session, &stranger, &action, &context)
+        .check(&comment)
         .await
         .is_granted());
 }

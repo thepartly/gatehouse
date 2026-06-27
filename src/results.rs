@@ -3,6 +3,9 @@ use std::fmt;
 
 /// The type of boolean combining operation a policy might represent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum CombineOp {
     /// All inner policies must grant access.
     And,
@@ -37,6 +40,9 @@ impl fmt::Display for CombineOp {
 /// check) is reflected by the grant/deny outcome and the node's reason, not by
 /// this enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum FactOutcome {
     /// The fact existed.
     Found,
@@ -71,7 +77,7 @@ impl fmt::Display for FactOutcome {
 ///
 /// Fact-backed policies (such as [`crate::RebacPolicy`]) attach one of these per
 /// fact lookup to their [`PolicyEvalResult::Granted`] or
-/// [`PolicyEvalResult::Denied`] node, so a decision's *inputs* are explained
+/// [`PolicyEvalResult::NotApplicable`] node, so a decision's *inputs* are explained
 /// alongside its outcome. Provenance is intentionally type-erased — a fact
 /// name, a rendered key, an outcome, and optional detail — rather than the
 /// typed [`crate::FactKey`], so it lives on the non-generic result tree and is
@@ -81,6 +87,7 @@ impl fmt::Display for FactOutcome {
 /// separate concern surfaced through `tracing` spans (`gatehouse.fact_load`);
 /// this type is for per-decision explanation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct FactProvenance {
     /// The [`crate::FactKey::NAME`] of the consulted fact (e.g. `"relationship"`).
     pub fact_name: &'static str,
@@ -130,16 +137,19 @@ impl fmt::Display for FactProvenance {
 /// outcome of access evaluation.
 ///
 /// - [`PolicyEvalResult::Granted`]: Indicates that access is granted, with an optional reason.
-/// - [`PolicyEvalResult::Denied`]: Indicates the policy did not grant access — either its
+/// - [`PolicyEvalResult::NotApplicable`]: Indicates the policy did not grant access — either its
 ///   predicate did not match (the policy is not applicable to this request) or it simply
-///   has nothing positive to say. A `Denied` from one policy never overrides a sibling's grant.
+///   has nothing positive to say. `NotApplicable` from one policy never overrides a sibling's grant.
 /// - [`PolicyEvalResult::Forbidden`]: Indicates the policy **actively forbids** this request.
 ///   Inside a [`crate::PermissionChecker`] a forbid overrides every grant (deny-overrides
 ///   semantics). Produced by [`crate::PolicyBuilder`] policies with
-///   [`crate::Effect::Deny`] whose predicate matches, or by custom policies via
+///   [`crate::Effect::Forbid`] whose predicate matches, or by custom policies via
 ///   [`crate::EvalCtx::forbid`].
 /// - [`PolicyEvalResult::Combined`]: Represents the aggregate result of combining multiple policies.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum PolicyEvalResult {
     /// Access granted. Contains the policy type and an optional reason.
     Granted {
@@ -152,28 +162,25 @@ pub enum PolicyEvalResult {
         /// An optional human-readable reason for the grant.
         reason: Option<String>,
         /// Facts the policy consulted to reach this decision. Empty for
-        /// policies that are not fact-backed (RBAC, ABAC, combinators).
+        /// policies that are not fact-backed.
         provenance: Vec<FactProvenance>,
     },
-    /// Access denied. Contains the policy type and a reason.
-    Denied {
-        /// The name of the policy that denied access.
+    /// Policy did not apply. Contains the policy type and a reason.
+    NotApplicable {
+        /// The name of the policy that did not apply.
         policy_type: Cow<'static, str>,
-        /// A human-readable reason for the denial.
+        /// A human-readable reason why this policy did not grant.
         reason: String,
         /// Facts the policy consulted to reach this decision. Empty for
-        /// policies that are not fact-backed (RBAC, ABAC, combinators).
+        /// policies that are not fact-backed.
         provenance: Vec<FactProvenance>,
     },
     /// Access actively forbidden: the policy matched and vetoes this request.
     ///
-    /// Unlike [`PolicyEvalResult::Denied`] ("this policy does not grant"),
+    /// Unlike [`PolicyEvalResult::NotApplicable`] ("this policy does not grant"),
     /// `Forbidden` means "this policy forbids". [`crate::PermissionChecker`]
-    /// honors a forbid over any grant from sibling policies. Combinators
-    /// ([`crate::AndPolicy`], [`crate::OrPolicy`], [`crate::NotPolicy`]) treat
-    /// a `Forbidden` child exactly like `Denied` — the veto is honored at the
-    /// checker level, not propagated through combinator trees. Register
-    /// forbidding policies directly on the checker.
+    /// honors a forbid over any grant from sibling policies, including forbids
+    /// nested inside combinator results.
     Forbidden {
         /// The name of the policy that forbids access.
         policy_type: Cow<'static, str>,
@@ -219,11 +226,18 @@ pub enum PolicyEvalResult {
 /// # struct EmptyContext;
 /// #
 /// # async fn example() -> AccessEvaluation {
-/// #     let mut checker = PermissionChecker::<User, Document, ReadAction, EmptyContext>::new();
+/// #     struct Documents;
+/// #     impl PolicyDomain for Documents {
+/// #         type Subject = User;
+/// #         type Action = ReadAction;
+/// #         type Resource = Document;
+/// #         type Context = EmptyContext;
+/// #     }
+/// #     let checker = PermissionChecker::<Documents>::new();
 /// #     let user = User { id: Uuid::new_v4() };
 /// #     let document = Document { id: Uuid::new_v4() };
 /// #     let session = EvaluationSession::empty();
-/// #     checker.evaluate_in_session(&session, &user, &ReadAction, &document, &EmptyContext).await
+/// #     checker.bind(&session, &user, &ReadAction, &EmptyContext).check(&document).await
 /// # }
 /// #
 /// # tokio_test::block_on(async {
@@ -238,10 +252,16 @@ pub enum PolicyEvalResult {
 ///         println!("Access denied: {}", reason);
 ///         println!("Full evaluation trace:\n{}", trace.format());
 ///     }
+///     _ => {
+///         println!("Access denied: unknown decision variant");
+///     }
 /// }
 /// # });
 /// ```
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum AccessEvaluation {
     /// Access was granted.
     Granted {
@@ -263,17 +283,16 @@ pub enum AccessEvaluation {
     },
 }
 
-/// Walks a [`PolicyEvalResult`] tree looking for a `Denied` or `Forbidden`
+/// Walks a [`PolicyEvalResult`] tree looking for a `NotApplicable`
 /// leaf whose `policy_type` equals `expected`. Used by
-/// [`AccessEvaluation::assert_denied_by`].
-fn leaf_denial_matches(node: &PolicyEvalResult, expected: &str) -> bool {
+/// [`AccessEvaluation::assert_not_applicable_by`].
+fn leaf_not_applicable_matches(node: &PolicyEvalResult, expected: &str) -> bool {
     match node {
-        PolicyEvalResult::Denied { policy_type, .. }
-        | PolicyEvalResult::Forbidden { policy_type, .. } => policy_type.as_ref() == expected,
-        PolicyEvalResult::Granted { .. } => false,
+        PolicyEvalResult::NotApplicable { policy_type, .. } => policy_type.as_ref() == expected,
+        PolicyEvalResult::Granted { .. } | PolicyEvalResult::Forbidden { .. } => false,
         PolicyEvalResult::Combined { children, .. } => children
             .iter()
-            .any(|child| leaf_denial_matches(child, expected)),
+            .any(|child| leaf_not_applicable_matches(child, expected)),
     }
 }
 
@@ -335,14 +354,9 @@ impl AccessEvaluation {
         else {
             return None;
         };
-        // The checker honors forbids only from directly-registered
-        // policies, so only direct children of the deny-overrides root
-        // are considered — a Forbidden buried in a combinator subtree
-        // did not veto and must not be reported as if it had.
-        children.iter().find_map(|child| match child {
-            PolicyEvalResult::Forbidden { policy_type, .. } => Some(policy_type.as_ref()),
-            _ => None,
-        })
+        children
+            .iter()
+            .find_map(|child| child.forbidden_leaf().map(|(policy_type, _)| policy_type))
     }
 
     /// Test helper: panic unless the evaluation is `Granted` and the
@@ -355,9 +369,17 @@ impl AccessEvaluation {
     /// ```rust
     /// # use gatehouse::*;
     /// # tokio_test::block_on(async {
-    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
-    /// # checker.add_policy(PolicyBuilder::<(), (), (), ()>::new("AllowAll").build());
-    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// # struct Domain;
+    /// # impl PolicyDomain for Domain {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// # let mut checker = PermissionChecker::<Domain>::new();
+    /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").build());
+    /// # let session = EvaluationSession::empty();
+    /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
     /// evaluation.assert_granted_by("AllowAll");
     /// # });
     /// ```
@@ -407,7 +429,7 @@ impl AccessEvaluation {
     /// `"All policies denied access"`, not the per-policy reasons
     /// inside the trace tree. For a multi-policy checker, asserting
     /// on a specific policy's reason needs [`Self::assert_trace_contains`]
-    /// or [`Self::assert_denied_by`].
+    /// or [`Self::assert_not_applicable_by`].
     ///
     /// Substring match keeps tests resilient to minor reason-string
     /// rewording. For exact-match assertions, inspect
@@ -430,43 +452,51 @@ impl AccessEvaluation {
     }
 
     /// Test helper: panic unless the evaluation is `Denied` and some
-    /// `Denied` leaf in the trace tree was produced by a policy whose
+    /// `NotApplicable` leaf in the trace tree was produced by a policy whose
     /// name matches `expected`.
     ///
     /// Symmetric with [`Self::assert_granted_by`] but walks the trace
-    /// rather than checking the top-level decision, because a denial
-    /// has no single denying policy: every policy in the checker has
-    /// to deny for the overall result to be `Denied`. Use this to
-    /// assert that policy `expected` actually fired and denied.
+    /// rather than checking the top-level decision, because an ordinary final
+    /// denial has no single denying policy: every policy in the checker declined
+    /// to grant. Use this to assert that policy `expected` actually fired and
+    /// was not applicable. Use [`Self::assert_forbidden_by`] for active vetoes.
     ///
     /// ```rust
     /// # use gatehouse::*;
     /// # tokio_test::block_on(async {
-    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
+    /// # struct Domain;
+    /// # impl PolicyDomain for Domain {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// # let mut checker = PermissionChecker::<Domain>::new();
     /// # checker.add_policy(
-    /// #     PolicyBuilder::<(), (), (), ()>::new("StaffOnly")
-    /// #         .effect(Effect::Deny)
+    /// #     PolicyBuilder::<Domain>::new("StaffOnly")
+    /// #         .subjects(|_: &()| false)
     /// #         .build(),
     /// # );
-    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
-    /// evaluation.assert_denied_by("StaffOnly");
+    /// # let session = EvaluationSession::empty();
+    /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
+    /// evaluation.assert_not_applicable_by("StaffOnly");
     /// # });
     /// ```
     #[track_caller]
-    pub fn assert_denied_by(&self, expected: &str) {
+    pub fn assert_not_applicable_by(&self, expected: &str) {
         match self {
             Self::Granted { policy_type, .. } => {
                 panic!(
-                    "expected denial by policy `{expected}`, but access was granted by `{policy_type}`"
+                    "expected not-applicable by policy `{expected}`, but access was granted by `{policy_type}`"
                 );
             }
             Self::Denied { trace, .. } => {
                 let Some(root) = trace.root() else {
-                    panic!("expected denial by `{expected}`, but the trace is empty");
+                    panic!("expected not-applicable by `{expected}`, but the trace is empty");
                 };
-                if !leaf_denial_matches(root, expected) {
+                if !leaf_not_applicable_matches(root, expected) {
                     panic!(
-                        "expected a denying leaf for policy `{expected}` in the trace; \
+                        "expected a not-applicable leaf for policy `{expected}` in the trace; \
                          got:\n{}",
                         trace.format()
                     );
@@ -478,22 +508,30 @@ impl AccessEvaluation {
     /// Test helper: panic unless the evaluation is `Denied` *because of a
     /// forbid* by the policy named `expected`.
     ///
-    /// Stronger than [`Self::assert_denied_by`]: this asserts the denial
+    /// Stronger than [`Self::assert_not_applicable_by`]: this asserts the denial
     /// was a deny-overrides veto attributed to `expected` (via
     /// [`Self::forbidden_by`]), not merely that `expected` appears as a
-    /// denying leaf somewhere in the trace.
+    /// not-applicable leaf somewhere in the trace.
     ///
     /// ```rust
     /// # use gatehouse::*;
     /// # tokio_test::block_on(async {
-    /// # let mut checker = PermissionChecker::<(), (), (), ()>::new();
-    /// # checker.add_policy(PolicyBuilder::<(), (), (), ()>::new("AllowAll").build());
+    /// # struct Domain;
+    /// # impl PolicyDomain for Domain {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// # let mut checker = PermissionChecker::<Domain>::new();
+    /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").build());
     /// # checker.add_policy(
-    /// #     PolicyBuilder::<(), (), (), ()>::new("GlobalFreeze")
-    /// #         .effect(Effect::Deny)
+    /// #     PolicyBuilder::<Domain>::new("GlobalFreeze")
+    /// #         .forbid()
     /// #         .build(),
     /// # );
-    /// # let evaluation = checker.check(&(), &(), &(), &()).await;
+    /// # let session = EvaluationSession::empty();
+    /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
     /// evaluation.assert_forbidden_by("GlobalFreeze");
     /// # });
     /// ```
@@ -557,10 +595,17 @@ impl AccessEvaluation {
     /// # struct Action;
     /// # #[derive(Debug, Clone)]
     /// # struct Ctx;
+    /// # struct Domain;
+    /// # impl PolicyDomain for Domain {
+    /// #     type Subject = User;
+    /// #     type Action = Action;
+    /// #     type Resource = Resource;
+    /// #     type Context = Ctx;
+    /// # }
     /// # tokio_test::block_on(async {
-    /// let checker = PermissionChecker::<User, Resource, Action, Ctx>::new();
+    /// let checker = PermissionChecker::<Domain>::new();
     /// let session = EvaluationSession::empty();
-    /// let result = checker.evaluate_in_session(&session, &User, &Action, &Resource, &Ctx).await;
+    /// let result = checker.bind(&session, &User, &Action, &Ctx).check(&Resource).await;
     ///
     /// // Map a denial into a standard error:
     /// let outcome: Result<(), String> = result.to_result(|reason| reason.to_string());
@@ -642,6 +687,7 @@ impl fmt::Display for AccessEvaluation {
 /// assert!(trace.format().contains("AdminPolicy GRANTED"));
 /// ```
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct EvalTrace {
     root: Option<PolicyEvalResult>,
 }
@@ -695,12 +741,15 @@ impl PolicyEvalResult {
         }
     }
 
-    /// Builds a denied leaf result with no fact provenance.
+    /// Builds a not-applicable leaf result with no fact provenance.
     ///
-    /// Prefer this over constructing [`PolicyEvalResult::Denied`] directly; use
-    /// [`Self::denied_with_facts`] when the decision was informed by facts.
-    pub fn denied(policy_type: impl Into<Cow<'static, str>>, reason: impl Into<String>) -> Self {
-        Self::Denied {
+    /// Prefer this over constructing [`PolicyEvalResult::NotApplicable`] directly; use
+    /// [`Self::not_applicable_with_facts`] when the decision was informed by facts.
+    pub fn not_applicable(
+        policy_type: impl Into<Cow<'static, str>>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::NotApplicable {
             policy_type: policy_type.into(),
             reason: reason.into(),
             provenance: Vec::new(),
@@ -712,8 +761,9 @@ impl PolicyEvalResult {
     /// A forbid is an **active veto**: inside a [`crate::PermissionChecker`]
     /// it overrides grants from sibling policies. Custom policies returning
     /// this from [`crate::Policy::evaluate`] should also override
-    /// [`crate::Policy::effect`] to return [`crate::Effect::Deny`] so the
-    /// checker schedules them ahead of the grant short-circuit. Prefer
+    /// [`crate::Policy::effect`] to return [`crate::Effect::Forbid`] if they
+    /// can only veto, or [`crate::Effect::AllowOrForbid`] if they can grant or
+    /// veto, so the checker schedules them ahead of allow-only policies. Prefer
     /// [`crate::EvalCtx::forbid`] inside policy bodies.
     pub fn forbidden(policy_type: impl Into<Cow<'static, str>>, reason: impl Into<String>) -> Self {
         Self::Forbidden {
@@ -736,13 +786,13 @@ impl PolicyEvalResult {
         }
     }
 
-    /// Builds a denied leaf result carrying the facts that informed it.
-    pub fn denied_with_facts(
+    /// Builds a not-applicable leaf result carrying the facts that informed it.
+    pub fn not_applicable_with_facts(
         policy_type: impl Into<Cow<'static, str>>,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
     ) -> Self {
-        Self::Denied {
+        Self::NotApplicable {
             policy_type: policy_type.into(),
             reason: reason.into(),
             provenance,
@@ -766,20 +816,27 @@ impl PolicyEvalResult {
     pub fn is_granted(&self) -> bool {
         match self {
             Self::Granted { .. } => true,
-            Self::Denied { .. } | Self::Forbidden { .. } => false,
+            Self::NotApplicable { .. } | Self::Forbidden { .. } => false,
             Self::Combined { outcome, .. } => *outcome,
         }
     }
 
-    /// Returns whether this result is an active forbid
+    /// Returns whether this result contains an active forbid
     /// ([`PolicyEvalResult::Forbidden`]).
-    ///
-    /// This is a **leaf check**, deliberately: a `Forbidden` nested inside a
-    /// [`PolicyEvalResult::Combined`] subtree does not make the combined
-    /// result forbidding. [`crate::PermissionChecker`] honors forbids only
-    /// from the policies registered directly on it.
     pub fn is_forbidden(&self) -> bool {
-        matches!(self, Self::Forbidden { .. })
+        self.forbidden_leaf().is_some()
+    }
+
+    pub(crate) fn forbidden_leaf(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            Self::Forbidden {
+                policy_type,
+                reason,
+                ..
+            } => Some((policy_type.as_ref(), Some(reason.as_str()))),
+            Self::Combined { children, .. } => children.iter().find_map(Self::forbidden_leaf),
+            Self::Granted { .. } | Self::NotApplicable { .. } => None,
+        }
     }
 
     /// Returns the reason string if available
@@ -794,7 +851,7 @@ impl PolicyEvalResult {
     pub fn reason_str(&self) -> Option<&str> {
         match self {
             Self::Granted { reason, .. } => reason.as_deref(),
-            Self::Denied { reason, .. } | Self::Forbidden { reason, .. } => Some(reason),
+            Self::NotApplicable { reason, .. } | Self::Forbidden { reason, .. } => Some(reason),
             Self::Combined { .. } => None,
         }
     }
@@ -805,7 +862,7 @@ impl PolicyEvalResult {
     pub fn provenance(&self) -> &[FactProvenance] {
         match self {
             Self::Granted { provenance, .. }
-            | Self::Denied { provenance, .. }
+            | Self::NotApplicable { provenance, .. }
             | Self::Forbidden { provenance, .. } => provenance,
             Self::Combined { .. } => &[],
         }
@@ -827,12 +884,13 @@ impl PolicyEvalResult {
                 let headline = format!("{}✔ {} GRANTED{}", indent_str, policy_type, reason_text);
                 Self::append_provenance(headline, &indent_str, provenance)
             }
-            Self::Denied {
+            Self::NotApplicable {
                 policy_type,
                 reason,
                 provenance,
             } => {
-                let headline = format!("{}✘ {} DENIED: {}", indent_str, policy_type, reason);
+                let headline =
+                    format!("{}✘ {} NOT_APPLICABLE: {}", indent_str, policy_type, reason);
                 Self::append_provenance(headline, &indent_str, provenance)
             }
             Self::Forbidden {
