@@ -3385,6 +3385,18 @@ mod policy_builder_tests {
         }
     }
 
+    #[test]
+    fn new_owned_accepts_non_static_str() {
+        let from_config: &str = "tenant-override";
+        let policy = PolicyBuilder::<TestDomain>::new_owned(from_config).build();
+        match policy.policy_type() {
+            std::borrow::Cow::Owned(name) => assert_eq!(name, "tenant-override"),
+            std::borrow::Cow::Borrowed(name) => {
+                panic!("new_owned should yield Cow::Owned, got Borrowed({name})")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn new_with_static_literal_grants_and_tags_trace_with_borrowed_name() {
         let policy = PolicyBuilder::<TestDomain>::new("StaticAdmin")

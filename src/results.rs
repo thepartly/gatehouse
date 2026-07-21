@@ -317,6 +317,22 @@ fn collect_fact_load_errors<'a>(node: &'a PolicyEvalResult, out: &mut Vec<&'a Fa
     }
 }
 
+/// Returns `true` on the first [`FactOutcome::Error`] in the tree — no
+/// allocation, early exit. Used by
+/// [`AccessEvaluation::denied_due_to_fact_load_error`].
+fn trace_has_fact_load_error(node: &PolicyEvalResult) -> bool {
+    match node {
+        PolicyEvalResult::Granted { provenance, .. }
+        | PolicyEvalResult::NotApplicable { provenance, .. }
+        | PolicyEvalResult::Forbidden { provenance, .. } => provenance
+            .iter()
+            .any(|fact| fact.outcome == FactOutcome::Error),
+        PolicyEvalResult::Combined { children, .. } => {
+            children.iter().any(trace_has_fact_load_error)
+        }
+    }
+}
+
 impl AccessEvaluation {
     /// Whether access was granted
     pub fn is_granted(&self) -> bool {
@@ -439,7 +455,10 @@ impl AccessEvaluation {
     /// (a load error never grants). This helper only exposes *why* so
     /// application layers can choose a response class.
     pub fn denied_due_to_fact_load_error(&self) -> bool {
-        matches!(self, Self::Denied { .. }) && !self.fact_load_errors().is_empty()
+        match self {
+            Self::Denied { trace, .. } => trace.root().is_some_and(trace_has_fact_load_error),
+            Self::Granted { .. } => false,
+        }
     }
 
     /// Test helper: panic unless the evaluation is `Granted` and the

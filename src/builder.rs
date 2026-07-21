@@ -130,9 +130,14 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 /// `'static` string literal (`new("Owner")`) is stored as
 /// [`Cow::Borrowed`] and is zero-allocation end-to-end on the trace /
 /// `ctx.grant` helper path — the same accounting as a hand-written
-/// `Policy` that returns `Cow::Borrowed("MyPolicy")`. Runtime-constructed
-/// names (`new(format!("p-{id}"))`, `new(owned_string)`) store
-/// [`Cow::Owned`] and pay one allocation per `policy_type()` call.
+/// `Policy` that returns `Cow::Borrowed("MyPolicy")`.
+///
+/// Runtime-constructed names (`new(format!("p-{id}"))`,
+/// [`Self::new_owned`], `new(owned_string)`) store [`Cow::Owned`]. Each
+/// evaluation clones that owned name into the `PolicyEvalResult` leaf
+/// (and again if the checker captures `policy_type` into an
+/// [`EvalCtx`](crate::EvalCtx)), so the cost is paid when building the
+/// trace, not only when calling `policy_type()` in isolation.
 pub struct PolicyBuilder<D: PolicyDomain> {
     name: Cow<'static, str>,
     effect: Effect,
@@ -153,6 +158,10 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
     ///   [`Cow::Borrowed`] — zero-allocation on the trace path.
     /// - owned [`String`] values (including `format!(...)`) become
     ///   [`Cow::Owned`].
+    ///
+    /// Non-`'static` borrowed strings (e.g. `&str` from config) are **not**
+    /// accepted directly — use [`Self::new_owned`] so the allocation is
+    /// explicit at the call site.
     ///
     /// ```rust
     /// # use gatehouse::*;
@@ -183,6 +192,31 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
             when_pred: None,
             _domain: PhantomData,
         }
+    }
+
+    /// Creates a policy builder with a runtime-owned name.
+    ///
+    /// Use this for names that are not `'static` — config keys, env values,
+    /// formatted strings already held as `&str`:
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # struct Documents;
+    /// # impl PolicyDomain for Documents {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// let from_config: &str = "tenant-override";
+    /// let policy = PolicyBuilder::<Documents>::new_owned(from_config).build();
+    /// assert!(matches!(policy.policy_type(), std::borrow::Cow::Owned(_)));
+    /// ```
+    ///
+    /// Equivalent to `Self::new(Cow::Owned(name.into()))`. Prefer
+    /// [`Self::new`] with a string literal when the name is fixed.
+    pub fn new_owned(name: impl Into<String>) -> Self {
+        Self::new(Cow::Owned(name.into()))
     }
 
     /// Alias for [`Self::new`] with an explicit `'static` name.

@@ -13,8 +13,10 @@
   `impl Into<String>`, so `'static` literals (`new("AdminOnly")`) are stored as
   `Cow::Borrowed` and are zero-allocation end-to-end on the trace / `ctx.grant`
   path. Runtime names (`new(format!(...))`, `new(owned_string)`) still store
-  `Cow::Owned`. `PolicyBuilder::new_static` is a thin alias for call sites that
-  want the static intent in the method name.
+  `Cow::Owned`. Non-`'static` `&str` inputs (config/env) use the new
+  `PolicyBuilder::new_owned` so the allocation is explicit.
+  `PolicyBuilder::new_static` remains a thin alias for call sites that want the
+  static intent in the method name.
 
 ## [0.5.0] - 2026-06-27
 
