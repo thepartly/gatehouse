@@ -296,6 +296,27 @@ fn leaf_not_applicable_matches(node: &PolicyEvalResult, expected: &str) -> bool 
     }
 }
 
+/// Collects every [`FactProvenance`] with [`FactOutcome::Error`] from a
+/// result tree (leaves and combinator children).
+fn collect_fact_load_errors<'a>(node: &'a PolicyEvalResult, out: &mut Vec<&'a FactProvenance>) {
+    match node {
+        PolicyEvalResult::Granted { provenance, .. }
+        | PolicyEvalResult::NotApplicable { provenance, .. }
+        | PolicyEvalResult::Forbidden { provenance, .. } => {
+            for fact in provenance {
+                if fact.outcome == FactOutcome::Error {
+                    out.push(fact);
+                }
+            }
+        }
+        PolicyEvalResult::Combined { children, .. } => {
+            for child in children {
+                collect_fact_load_errors(child, out);
+            }
+        }
+    }
+}
+
 impl AccessEvaluation {
     /// Whether access was granted
     pub fn is_granted(&self) -> bool {
@@ -357,6 +378,59 @@ impl AccessEvaluation {
         children
             .iter()
             .find_map(|child| child.forbidden_leaf().map(|(policy_type, _)| policy_type))
+    }
+
+    /// Returns every fact provenance entry with [`FactOutcome::Error`]
+    /// found anywhere in the evaluation trace.
+    ///
+    /// Empty for grants that never hit a load failure, and for denials
+    /// whose consulted facts were only [`FactOutcome::Found`] or
+    /// [`FactOutcome::Missing`]. Fact-backed policies (for example
+    /// [`crate::RebacPolicy`]) attach load failures as provenance on their
+    /// not-applicable leaves; this helper walks the whole tree so callers
+    /// do not need to destructure combinators by hand.
+    ///
+    /// Use this when you need the backend error detail (via
+    /// [`FactProvenance::detail`]) rather than a simple boolean — see
+    /// [`Self::denied_due_to_fact_load_error`] for the yes/no form.
+    pub fn fact_load_errors(&self) -> Vec<&FactProvenance> {
+        let mut errors = Vec::new();
+        if let Some(root) = self.trace().root() {
+            collect_fact_load_errors(root, &mut errors);
+        }
+        errors
+    }
+
+    /// Returns `true` when this evaluation is a **denial** and at least one
+    /// policy leaf in the trace consulted a fact that failed to load
+    /// ([`FactOutcome::Error`]).
+    ///
+    /// Grants always return `false`, even if some earlier policy recorded a
+    /// load error before a sibling granted (unusual; fact-backed policies
+    /// fail closed themselves). Ordinary denials with only Found/Missing
+    /// facts also return `false`.
+    ///
+    /// Typical use: map infrastructure failure to a distinct HTTP status
+    /// without hand-walking the trace:
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # fn handle(evaluation: AccessEvaluation) -> u16 {
+    /// if evaluation.is_granted() {
+    ///     200
+    /// } else if evaluation.denied_due_to_fact_load_error() {
+    ///     503 // backend unavailable — not "you may not"
+    /// } else {
+    ///     403
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// Gatehouse still fails closed on the authorization decision itself
+    /// (a load error never grants). This helper only exposes *why* so
+    /// application layers can choose a response class.
+    pub fn denied_due_to_fact_load_error(&self) -> bool {
+        matches!(self, Self::Denied { .. }) && !self.fact_load_errors().is_empty()
     }
 
     /// Test helper: panic unless the evaluation is `Granted` and the

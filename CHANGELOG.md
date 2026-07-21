@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- `AccessEvaluation::fact_load_errors()` / `denied_due_to_fact_load_error()` —
+  walk the evaluation trace for `FactOutcome::Error` provenance so callers can
+  map infrastructure failure (e.g. HTTP 503) without hand-destructuring
+  combinators. Authorization itself remains fail-closed; these helpers only
+  expose *why*.
+- `PolicyBuilder::new_static(&'static str)` — stores the policy name as
+  `Cow::Borrowed` so builder-built policies with fixed names are zero-allocation
+  end-to-end on the trace / `ctx.grant` path. `PolicyBuilder::new` remains the
+  dynamic-name path (`impl Into<String>` → `Cow::Owned`).
+
 ## [0.5.0] - 2026-06-27
 
 This is a semver-major API cleanup. Gatehouse now centers public authorization

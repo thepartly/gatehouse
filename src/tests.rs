@@ -3201,6 +3201,89 @@ mod core_tests {
             .await;
         evaluation.assert_trace_contains("this string is not in the trace");
     }
+
+    // --- Fact-load error helpers on AccessEvaluation --------------------
+
+    #[tokio::test]
+    async fn denied_due_to_fact_load_error_detects_rebac_backend_failure() {
+        let mut checker = PermissionChecker::<TestDomain>::new();
+        checker.add_policy(RebacPolicy::new(
+            |subject: &TestSubject| subject.id,
+            |resource: &TestResource| resource.id,
+            "manager".to_string(),
+        ));
+
+        let subject = test_subject();
+        let resource = test_resource();
+        let session = FactRegistry::builder()
+            .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(ErrorRelationshipSource)
+            .build()
+            .session();
+
+        let evaluation = checker
+            .bind(&session, &subject, &TestAction, &TestContext)
+            .check(&resource)
+            .await;
+
+        assert!(!evaluation.is_granted());
+        assert!(
+            evaluation.denied_due_to_fact_load_error(),
+            "backend failure should surface as denied_due_to_fact_load_error"
+        );
+        let errors = evaluation.fact_load_errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].fact_name, "relationship");
+        assert_eq!(errors[0].outcome, FactOutcome::Error);
+        assert!(errors[0].detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn denied_due_to_fact_load_error_is_false_for_ordinary_denial() {
+        let evaluation = deny_checker()
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        assert!(!evaluation.is_granted());
+        assert!(!evaluation.denied_due_to_fact_load_error());
+        assert!(evaluation.fact_load_errors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_due_to_fact_load_error_is_false_for_grant() {
+        let evaluation = allow_checker()
+            .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
+            .await;
+        assert!(evaluation.is_granted());
+        assert!(!evaluation.denied_due_to_fact_load_error());
+        assert!(evaluation.fact_load_errors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_due_to_fact_load_error_is_false_for_missing_fact() {
+        let mut checker = PermissionChecker::<TestDomain>::new();
+        checker.add_policy(RebacPolicy::new(
+            |subject: &TestSubject| subject.id,
+            |resource: &TestResource| resource.id,
+            "manager".to_string(),
+        ));
+
+        let subject = test_subject();
+        let resource = test_resource();
+        let session = FactRegistry::builder()
+            .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(MissingRelationshipSource)
+            .build()
+            .session();
+
+        let evaluation = checker
+            .bind(&session, &subject, &TestAction, &TestContext)
+            .check(&resource)
+            .await;
+
+        assert!(!evaluation.is_granted());
+        // Missing is a domain "no relationship" outcome, not infrastructure
+        // failure — must not trip the 503-style helper.
+        assert!(!evaluation.denied_due_to_fact_load_error());
+        assert!(evaluation.fact_load_errors().is_empty());
+    }
 }
 
 mod policy_builder_tests {
@@ -3268,6 +3351,60 @@ mod policy_builder_tests {
         type Action = TestAction;
         type Resource = TestResource;
         type Context = TestContext;
+    }
+
+    #[test]
+    fn new_static_stores_borrowed_policy_type() {
+        let policy = PolicyBuilder::<TestDomain>::new_static("StaticName").build();
+        match policy.policy_type() {
+            std::borrow::Cow::Borrowed(name) => assert_eq!(name, "StaticName"),
+            std::borrow::Cow::Owned(name) => {
+                panic!("new_static should yield Cow::Borrowed, got Owned({name})")
+            }
+        }
+    }
+
+    #[test]
+    fn new_stores_owned_policy_type() {
+        let dynamic = format!("Dynamic{}", 42);
+        let policy = PolicyBuilder::<TestDomain>::new(dynamic.clone()).build();
+        match policy.policy_type() {
+            std::borrow::Cow::Owned(name) => assert_eq!(name, dynamic),
+            std::borrow::Cow::Borrowed(name) => {
+                panic!("new(String) should yield Cow::Owned, got Borrowed({name})")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn new_static_policy_grants_and_tags_trace_with_static_name() {
+        let policy = PolicyBuilder::<TestDomain>::new_static("StaticAdmin")
+            .subjects(|s: &TestSubject| s.name == "Alice")
+            .build();
+
+        let mut checker = PermissionChecker::<TestDomain>::new();
+        checker.add_policy(policy);
+
+        let subject = TestSubject {
+            name: "Alice".into(),
+        };
+        let session = EvaluationSession::empty();
+        let evaluation = checker
+            .bind(&session, &subject, &TestAction, &TestContext)
+            .check(&TestResource)
+            .await;
+        evaluation.assert_granted_by("StaticAdmin");
+        match evaluation {
+            AccessEvaluation::Granted { policy_type, .. } => {
+                assert!(
+                    matches!(policy_type, std::borrow::Cow::Borrowed("StaticAdmin")),
+                    "granted policy_type should stay Borrowed, got {policy_type:?}"
+                );
+            }
+            AccessEvaluation::Denied { reason, .. } => {
+                panic!("expected grant, got denial: {reason}");
+            }
+        }
     }
 
     // Test that with no predicates the builder returns a policy that always "matches"

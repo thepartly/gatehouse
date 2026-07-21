@@ -568,10 +568,11 @@ impl gatehouse::Policy<SubjectOnlyDomain> for ManualSubjectOnlyDynamic {
     }
 }
 
-/// Same logic but with a static name. Lets the bench show the
-/// gap between PolicyBuilder (which has to use dynamic names because
-/// its builder API takes `impl Into<String>`) and a hand-written
-/// static-name policy.
+/// Same logic but with a static name. Lets the bench show the gap
+/// between `PolicyBuilder::new` (dynamic / owned name) and a
+/// hand-written static-name policy. Prefer `PolicyBuilder::new_static`
+/// in application code when the name is a `'static` literal — that
+/// path matches this static cost profile.
 struct ManualSubjectOnlyStatic;
 
 #[async_trait]

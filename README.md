@@ -42,11 +42,11 @@ impl PolicyDomain for Documents {
     type Context = ();
 }
 
-let admin_policy = PolicyBuilder::<Documents>::new("AdminOnly")
+let admin_policy = PolicyBuilder::<Documents>::new_static("AdminOnly")
     .subjects(|user: &User| user.roles.contains(&"admin"))
     .build();
 
-let owner_policy = PolicyBuilder::<Documents>::new("OwnerOnly")
+let owner_policy = PolicyBuilder::<Documents>::new_static("OwnerOnly")
     .when(|user: &User, _action: &ReadAction, doc: &Document, _ctx: &()| {
         user.id == doc.owner_id
     })
@@ -114,7 +114,7 @@ flowchart LR
 - `Forbidden` propagates through `AndPolicy`, `OrPolicy`, `NotPolicy`, and `DelegatingPolicy`.
 - `not()` does not neutralize a veto: `admin.or(blocked.not())` still denies if `blocked` returns `Forbidden`. For "grant unless blocked", make `blocked` an allow-only predicate and wrap that in `not()`, or register a direct forbid policy when the block should be global.
 
-Denials from `AccessEvaluation` are summary-level. Use `AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect individual policy reasons and fact provenance.
+Denials from `AccessEvaluation` are summary-level. Use `AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect individual policy reasons and fact provenance. Use `AccessEvaluation::denied_due_to_fact_load_error()` / `fact_load_errors()` when you need to distinguish infrastructure failure (fact load `Error`) from an ordinary denial — authorization remains fail-closed either way.
 
 ## Policy Domains
 
@@ -152,7 +152,9 @@ let checker = PermissionChecker::<Documents>::new();
 Use `PolicyBuilder` for synchronous predicate logic:
 
 ```rust,ignore
-let suspended_account = PolicyBuilder::<Documents>::new("SuspendedAccount")
+// Prefer new_static for fixed names (zero-allocation on the trace path).
+// Use new(name) when the name is runtime-constructed.
+let suspended_account = PolicyBuilder::<Documents>::new_static("SuspendedAccount")
     .when(|user, _action, _doc, _ctx| user.is_suspended)
     .forbid()
     .build();

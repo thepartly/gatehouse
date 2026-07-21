@@ -62,7 +62,8 @@ impl PolicyDomain for AdminDomain {
 /// organization*. The predicate reads three axes (subject, action, resource),
 /// which is exactly the cross-axis case `.when()` exists for.
 fn scoped_permission_policy() -> Box<dyn Policy<AdminDomain>> {
-    PolicyBuilder::<AdminDomain>::new("ScopedPermission")
+    // new_static: fixed name → zero-allocation on the trace path.
+    PolicyBuilder::<AdminDomain>::new_static("ScopedPermission")
         .when(
             |user: &StaffUser, action: &AdminAction, org: &Organization, _ctx: &()| {
                 user.permissions
@@ -76,7 +77,7 @@ fn scoped_permission_policy() -> Box<dyn Policy<AdminDomain>> {
 /// Grants on a single axis — the subject — so it uses `.subjects()` rather
 /// than `.when()`: single-axis predicates batch better and read clearer.
 fn global_admin_policy() -> Box<dyn Policy<AdminDomain>> {
-    PolicyBuilder::<AdminDomain>::new("GlobalAdmin")
+    PolicyBuilder::<AdminDomain>::new_static("GlobalAdmin")
         .subjects(|user: &StaffUser| user.permissions.iter().any(|p| p.scope == "global_admin"))
         .build()
 }

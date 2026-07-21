@@ -1,5 +1,6 @@
 use crate::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyDomain, PolicyEvalResult};
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 type SubjectPredicate<D> = Box<dyn Fn(&<D as PolicyDomain>::Subject) -> bool + Send + Sync>;
@@ -19,7 +20,7 @@ type WhenPredicate<D> = Box<
 
 /// An internal policy type constructed by [`PolicyBuilder`].
 struct InternalPolicy<D: PolicyDomain> {
-    name: String,
+    name: Cow<'static, str>,
     effect: Effect,
     subject_pred: Option<SubjectPredicate<D>>,
     action_pred: Option<ActionPredicate<D>>,
@@ -91,8 +92,8 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
             .collect()
     }
 
-    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Owned(self.name.clone())
+    fn policy_type(&self) -> Cow<'static, str> {
+        self.name.clone()
     }
 
     fn effect(&self) -> Effect {
@@ -118,12 +119,25 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 /// #     type Resource = Doc;
 /// #     type Context = Ctx;
 /// # }
-/// let owner = PolicyBuilder::<Documents>::new("Owner")
+/// // Prefer new_static for fixed names (zero-allocation on the trace path).
+/// let owner = PolicyBuilder::<Documents>::new_static("Owner")
 ///     .when(|user, _action, doc, _ctx| user.id == doc.owner_id)
 ///     .build();
 /// ```
+///
+/// # Allocation cost
+///
+/// Prefer [`PolicyBuilder::new_static`] when the policy name is a `'static`
+/// string literal. That path stores [`Cow::Borrowed`] and is zero-allocation
+/// end-to-end on the trace / `ctx.grant` helper path — the same accounting
+/// as a hand-written `Policy` that returns `Cow::Borrowed("MyPolicy")`.
+///
+/// [`PolicyBuilder::new`] takes `impl Into<String>` and stores the name
+/// owned. Every policy built that way is a *dynamic-name* policy and pays
+/// one allocation per `policy_type()` call. Use `new` when the name is
+/// runtime-constructed; use `new_static` for the common fixed-name case.
 pub struct PolicyBuilder<D: PolicyDomain> {
-    name: String,
+    name: Cow<'static, str>,
     effect: Effect,
     subject_pred: Option<SubjectPredicate<D>>,
     action_pred: Option<ActionPredicate<D>>,
@@ -134,10 +148,52 @@ pub struct PolicyBuilder<D: PolicyDomain> {
 }
 
 impl<D: PolicyDomain> PolicyBuilder<D> {
-    /// Creates a new policy builder with the given policy name.
+    /// Creates a new policy builder with a runtime-owned name.
+    ///
+    /// The name is stored as [`Cow::Owned`], so the built policy is a
+    /// *dynamic-name* policy under the trace-path allocation accounting.
+    /// Prefer [`Self::new_static`] when the name is a `'static` string literal.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
+            name: Cow::Owned(name.into()),
+            effect: Effect::Allow,
+            subject_pred: None,
+            action_pred: None,
+            resource_pred: None,
+            context_pred: None,
+            when_pred: None,
+            _domain: PhantomData,
+        }
+    }
+
+    /// Creates a new policy builder with a `'static` name.
+    ///
+    /// The name is stored as [`Cow::Borrowed`], so the built policy is
+    /// zero-allocation end-to-end on the trace / `EvalCtx::grant` helper
+    /// path — the same cost profile as a hand-written `Policy` that
+    /// returns `Cow::Borrowed("MyPolicy")` from [`Policy::policy_type`].
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # #[derive(Clone)] struct User { is_admin: bool }
+    /// # struct Documents;
+    /// # impl PolicyDomain for Documents {
+    /// #     type Subject = User;
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// let policy = PolicyBuilder::<Documents>::new_static("AdminOnly")
+    ///     .subjects(|user| user.is_admin)
+    ///     .build();
+    /// assert!(matches!(
+    ///     policy.policy_type(),
+    ///     std::borrow::Cow::Borrowed("AdminOnly")
+    /// ));
+    /// ```
+    pub fn new_static(name: &'static str) -> Self {
+        Self {
+            name: Cow::Borrowed(name),
             effect: Effect::Allow,
             subject_pred: None,
             action_pred: None,
