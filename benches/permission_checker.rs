@@ -569,10 +569,9 @@ impl gatehouse::Policy<SubjectOnlyDomain> for ManualSubjectOnlyDynamic {
 }
 
 /// Same logic but with a static name. Lets the bench show the gap
-/// between `PolicyBuilder::new` (dynamic / owned name) and a
-/// hand-written static-name policy. Prefer `PolicyBuilder::new_static`
-/// in application code when the name is a `'static` literal — that
-/// path matches this static cost profile.
+/// between a hand-written static-name policy and the serial default.
+/// Application code using `PolicyBuilder::new("Name")` with a `'static`
+/// literal already gets `Cow::Borrowed` (same cost profile as this type).
 struct ManualSubjectOnlyStatic;
 
 #[async_trait]

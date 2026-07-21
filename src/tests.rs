@@ -3354,18 +3354,27 @@ mod policy_builder_tests {
     }
 
     #[test]
-    fn new_static_stores_borrowed_policy_type() {
-        let policy = PolicyBuilder::<TestDomain>::new_static("StaticName").build();
+    fn new_with_static_literal_stores_borrowed_policy_type() {
+        let policy = PolicyBuilder::<TestDomain>::new("StaticName").build();
         match policy.policy_type() {
             std::borrow::Cow::Borrowed(name) => assert_eq!(name, "StaticName"),
             std::borrow::Cow::Owned(name) => {
-                panic!("new_static should yield Cow::Borrowed, got Owned({name})")
+                panic!("new(\"lit\") should yield Cow::Borrowed, got Owned({name})")
             }
         }
     }
 
     #[test]
-    fn new_stores_owned_policy_type() {
+    fn new_static_is_alias_for_borrowed_name() {
+        let policy = PolicyBuilder::<TestDomain>::new_static("AliasName").build();
+        assert!(matches!(
+            policy.policy_type(),
+            std::borrow::Cow::Borrowed("AliasName")
+        ));
+    }
+
+    #[test]
+    fn new_with_owned_string_stores_owned_policy_type() {
         let dynamic = format!("Dynamic{}", 42);
         let policy = PolicyBuilder::<TestDomain>::new(dynamic.clone()).build();
         match policy.policy_type() {
@@ -3377,8 +3386,8 @@ mod policy_builder_tests {
     }
 
     #[tokio::test]
-    async fn new_static_policy_grants_and_tags_trace_with_static_name() {
-        let policy = PolicyBuilder::<TestDomain>::new_static("StaticAdmin")
+    async fn new_with_static_literal_grants_and_tags_trace_with_borrowed_name() {
+        let policy = PolicyBuilder::<TestDomain>::new("StaticAdmin")
             .subjects(|s: &TestSubject| s.name == "Alice")
             .build();
 

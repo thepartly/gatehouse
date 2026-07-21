@@ -119,23 +119,20 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 /// #     type Resource = Doc;
 /// #     type Context = Ctx;
 /// # }
-/// // Prefer new_static for fixed names (zero-allocation on the trace path).
-/// let owner = PolicyBuilder::<Documents>::new_static("Owner")
+/// let owner = PolicyBuilder::<Documents>::new("Owner")
 ///     .when(|user, _action, doc, _ctx| user.id == doc.owner_id)
 ///     .build();
 /// ```
 ///
 /// # Allocation cost
 ///
-/// Prefer [`PolicyBuilder::new_static`] when the policy name is a `'static`
-/// string literal. That path stores [`Cow::Borrowed`] and is zero-allocation
-/// end-to-end on the trace / `ctx.grant` helper path — the same accounting
-/// as a hand-written `Policy` that returns `Cow::Borrowed("MyPolicy")`.
-///
-/// [`PolicyBuilder::new`] takes `impl Into<String>` and stores the name
-/// owned. Every policy built that way is a *dynamic-name* policy and pays
-/// one allocation per `policy_type()` call. Use `new` when the name is
-/// runtime-constructed; use `new_static` for the common fixed-name case.
+/// [`PolicyBuilder::new`] takes `impl Into<Cow<'static, str>>`, so a
+/// `'static` string literal (`new("Owner")`) is stored as
+/// [`Cow::Borrowed`] and is zero-allocation end-to-end on the trace /
+/// `ctx.grant` helper path — the same accounting as a hand-written
+/// `Policy` that returns `Cow::Borrowed("MyPolicy")`. Runtime-constructed
+/// names (`new(format!("p-{id}"))`, `new(owned_string)`) store
+/// [`Cow::Owned`] and pay one allocation per `policy_type()` call.
 pub struct PolicyBuilder<D: PolicyDomain> {
     name: Cow<'static, str>,
     effect: Effect,
@@ -148,30 +145,14 @@ pub struct PolicyBuilder<D: PolicyDomain> {
 }
 
 impl<D: PolicyDomain> PolicyBuilder<D> {
-    /// Creates a new policy builder with a runtime-owned name.
+    /// Creates a new policy builder with the given policy name.
     ///
-    /// The name is stored as [`Cow::Owned`], so the built policy is a
-    /// *dynamic-name* policy under the trace-path allocation accounting.
-    /// Prefer [`Self::new_static`] when the name is a `'static` string literal.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: Cow::Owned(name.into()),
-            effect: Effect::Allow,
-            subject_pred: None,
-            action_pred: None,
-            resource_pred: None,
-            context_pred: None,
-            when_pred: None,
-            _domain: PhantomData,
-        }
-    }
-
-    /// Creates a new policy builder with a `'static` name.
+    /// Accepts anything convertible to [`Cow<'static, str>`]:
     ///
-    /// The name is stored as [`Cow::Borrowed`], so the built policy is
-    /// zero-allocation end-to-end on the trace / `EvalCtx::grant` helper
-    /// path — the same cost profile as a hand-written `Policy` that
-    /// returns `Cow::Borrowed("MyPolicy")` from [`Policy::policy_type`].
+    /// - `'static` string literals (`"AdminOnly"`) become
+    ///   [`Cow::Borrowed`] — zero-allocation on the trace path.
+    /// - owned [`String`] values (including `format!(...)`) become
+    ///   [`Cow::Owned`].
     ///
     /// ```rust
     /// # use gatehouse::*;
@@ -183,7 +164,7 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
     /// #     type Resource = ();
     /// #     type Context = ();
     /// # }
-    /// let policy = PolicyBuilder::<Documents>::new_static("AdminOnly")
+    /// let policy = PolicyBuilder::<Documents>::new("AdminOnly")
     ///     .subjects(|user| user.is_admin)
     ///     .build();
     /// assert!(matches!(
@@ -191,9 +172,9 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
     ///     std::borrow::Cow::Borrowed("AdminOnly")
     /// ));
     /// ```
-    pub fn new_static(name: &'static str) -> Self {
+    pub fn new(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            name: Cow::Borrowed(name),
+            name: name.into(),
             effect: Effect::Allow,
             subject_pred: None,
             action_pred: None,
@@ -202,6 +183,16 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
             when_pred: None,
             _domain: PhantomData,
         }
+    }
+
+    /// Alias for [`Self::new`] with an explicit `'static` name.
+    ///
+    /// Prefer [`Self::new`] — `new("AdminOnly")` already stores
+    /// [`Cow::Borrowed`] via `impl Into<Cow<'static, str>>`. This method
+    /// exists for call sites that want the static intent spelled out in
+    /// the method name.
+    pub fn new_static(name: &'static str) -> Self {
+        Self::new(name)
     }
 
     /// Makes this policy forbid when its combined predicate matches.

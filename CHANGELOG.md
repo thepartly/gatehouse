@@ -9,10 +9,12 @@
   map infrastructure failure (e.g. HTTP 503) without hand-destructuring
   combinators. Authorization itself remains fail-closed; these helpers only
   expose *why*.
-- `PolicyBuilder::new_static(&'static str)` — stores the policy name as
-  `Cow::Borrowed` so builder-built policies with fixed names are zero-allocation
-  end-to-end on the trace / `ctx.grant` path. `PolicyBuilder::new` remains the
-  dynamic-name path (`impl Into<String>` → `Cow::Owned`).
+- `PolicyBuilder::new` now takes `impl Into<Cow<'static, str>>` instead of
+  `impl Into<String>`, so `'static` literals (`new("AdminOnly")`) are stored as
+  `Cow::Borrowed` and are zero-allocation end-to-end on the trace / `ctx.grant`
+  path. Runtime names (`new(format!(...))`, `new(owned_string)`) still store
+  `Cow::Owned`. `PolicyBuilder::new_static` is a thin alias for call sites that
+  want the static intent in the method name.
 
 ## [0.5.0] - 2026-06-27
 

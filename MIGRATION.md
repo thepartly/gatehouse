@@ -165,14 +165,14 @@ let owner = PolicyBuilder::<User, ReadAction, Document, RequestContext>::new("Ow
     .build();
 
 // After
-let owner = PolicyBuilder::<Documents>::new_static("Owner")
+let owner = PolicyBuilder::<Documents>::new("Owner")
     .when(|user, _action, doc, _ctx| user.id == doc.owner_id)
     .build();
 ```
 
 Use `.subjects`, `.actions`, `.resources`, and `.context` for single-axis predicates. Use `.when` when the predicate compares multiple inputs. The generated batch path evaluates subject, action, and context predicates once per batch and resource / cross-axis predicates per item.
 
-Prefer `PolicyBuilder::new_static("Name")` when the policy name is a `'static` string literal — that path stores `Cow::Borrowed` and is zero-allocation end-to-end on the trace / `ctx.grant` helper path. `PolicyBuilder::new(name)` takes `impl Into<String>` for runtime-constructed names and remains a dynamic-name policy under the allocation accounting.
+`PolicyBuilder::new` accepts `impl Into<Cow<'static, str>>`: a `'static` literal (`new("Owner")`) is zero-allocation on the trace path; runtime names (`new(format!(...))`) remain owned. Existing `new("literal")` call sites pick up the zero-alloc path with no source change.
 
 ## Checker calls
 

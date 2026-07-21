@@ -405,21 +405,30 @@ impl AccessEvaluation {
     /// policy leaf in the trace consulted a fact that failed to load
     /// ([`FactOutcome::Error`]).
     ///
-    /// Grants always return `false`, even if some earlier policy recorded a
-    /// load error before a sibling granted (unusual; fact-backed policies
-    /// fail closed themselves). Ordinary denials with only Found/Missing
-    /// facts also return `false`.
+    /// This is an **any-error-in-trace** check, not a causal one: it does
+    /// not prove the load failure was the sole reason for the denial, and
+    /// it treats every [`FactLoadError`](crate::FactLoadError) the same
+    /// (backend failure, missing source registration, contract violation,
+    /// loader cancel). Inspect [`Self::fact_load_errors`] and
+    /// [`Self::forbidden_by`] when you need a finer split (e.g. prefer a
+    /// forbid's 403 over a sibling's load-error signal).
     ///
-    /// Typical use: map infrastructure failure to a distinct HTTP status
-    /// without hand-walking the trace:
+    /// Grants always return `false`, even if some earlier policy recorded a
+    /// load error before a sibling granted. Ordinary denials with only
+    /// Found/Missing facts also return `false`.
+    ///
+    /// Typical use: a coarse signal for "something infrastructure-shaped
+    /// appeared during this denial" without hand-walking the trace:
     ///
     /// ```rust
     /// # use gatehouse::*;
     /// # fn handle(evaluation: AccessEvaluation) -> u16 {
     /// if evaluation.is_granted() {
     ///     200
+    /// } else if evaluation.forbidden_by().is_some() {
+    ///     403 // active veto — check before load-error
     /// } else if evaluation.denied_due_to_fact_load_error() {
-    ///     503 // backend unavailable — not "you may not"
+    ///     503 // at least one fact load failed in the trace
     /// } else {
     ///     403
     /// }

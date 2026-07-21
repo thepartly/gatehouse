@@ -42,11 +42,11 @@ impl PolicyDomain for Documents {
     type Context = ();
 }
 
-let admin_policy = PolicyBuilder::<Documents>::new_static("AdminOnly")
+let admin_policy = PolicyBuilder::<Documents>::new("AdminOnly")
     .subjects(|user: &User| user.roles.contains(&"admin"))
     .build();
 
-let owner_policy = PolicyBuilder::<Documents>::new_static("OwnerOnly")
+let owner_policy = PolicyBuilder::<Documents>::new("OwnerOnly")
     .when(|user: &User, _action: &ReadAction, doc: &Document, _ctx: &()| {
         user.id == doc.owner_id
     })
@@ -152,9 +152,9 @@ let checker = PermissionChecker::<Documents>::new();
 Use `PolicyBuilder` for synchronous predicate logic:
 
 ```rust,ignore
-// Prefer new_static for fixed names (zero-allocation on the trace path).
-// Use new(name) when the name is runtime-constructed.
-let suspended_account = PolicyBuilder::<Documents>::new_static("SuspendedAccount")
+// String literals are zero-allocation on the trace path
+// (new takes impl Into<Cow<'static, str>>).
+let suspended_account = PolicyBuilder::<Documents>::new("SuspendedAccount")
     .when(|user, _action, _doc, _ctx| user.is_suspended)
     .forbid()
     .build();
