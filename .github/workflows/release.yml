@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-check:
+    name: Verify tag and crate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require tag to match Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          with open("Cargo.toml", "rb") as file:
+              crate_version = tomllib.load(file)["package"]["version"]
+
+          tag = os.environ["TAG"]
+          expected_tag = f"v{crate_version}"
+          if tag != expected_tag:
+              print(
+                  f"::error file=Cargo.toml::tag {tag!r} does not match "
+                  f"crate version {crate_version!r}; expected {expected_tag!r}"
+              )
+              sys.exit(1)
+
+          print(f"Verified {tag} matches gatehouse {crate_version}")
+          PY
+
+  candidate-ci:
+    name: Verify exact-candidate CI
+    needs: version-check
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful main CI on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          count=$(gh api -X GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f head_sha="${EXPECTED_SHA}" \
+            -f event=push \
+            -f status=success \
+            -f per_page=100 \
+            --jq '.total_count')
+
+          if [ "$count" -lt 1 ]; then
+            echo "::error::No successful main push CI run exists for ${EXPECTED_SHA}."
+            echo "Merge the release preparation, wait for main CI, then tag that exact commit."
+            exit 1
+          fi
+
+          echo "Found ${count} successful main CI run(s) for ${EXPECTED_SHA}."
+
+  verify-package:
+    name: Audit and verify package
+    needs: candidate-ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "release-v1"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit dependencies
+        run: cargo audit
+      - name: Verify publishable crate
+        run: cargo publish --dry-run --locked
+
+  publish-crate:
+    name: Publish to crates.io
+    needs: verify-package
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate to crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish crate
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  github-release:
+    name: Publish GitHub Release
+    needs: publish-crate
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create release from changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::GitHub Release ${TAG} already exists. Release by pushing the tag only."
+            exit 1
+          fi
+
+          awk -v section="## [${TAG#v}]" '
+            index($0, section) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+
+          args=(--verify-tag --title "$TAG" --generate-notes)
+          if [ -s release-notes.md ]; then
+            args+=(--notes-file release-notes.md)
+          fi
+          if [[ "$TAG" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "$TAG" "${args[@]}"
