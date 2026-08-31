@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Cache cargo & target directories
         uses: Swatinem/rust-cache@v2
         with:
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Cache cargo & target directories
         uses: Swatinem/rust-cache@v2
         with:
@@ -62,7 +62,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Cache cargo & target directories
@@ -107,7 +107,7 @@ jobs:
     if: github.event.release && github.event.action == 'published'
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Cache cargo & target directories
         uses: Swatinem/rust-cache@v2
         with:
