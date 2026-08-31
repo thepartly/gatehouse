@@ -172,6 +172,8 @@ let owner = PolicyBuilder::<Documents>::new("Owner")
 
 Use `.subjects`, `.actions`, `.resources`, and `.context` for single-axis predicates. Use `.when` when the predicate compares multiple inputs. The generated batch path evaluates subject, action, and context predicates once per batch and resource / cross-axis predicates per item.
 
+`PolicyBuilder::new` accepts `impl Into<Cow<'static, str>>`: a `'static` literal (`new("Owner")`) is zero-allocation on the trace path; runtime names (`new(format!(...))`) remain owned. Existing `new("literal")` call sites pick up the zero-alloc path with no source change.
+
 ## Checker calls
 
 The old API had several entry points:

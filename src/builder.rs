@@ -1,5 +1,6 @@
 use crate::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyDomain, PolicyEvalResult};
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 type SubjectPredicate<D> = Box<dyn Fn(&<D as PolicyDomain>::Subject) -> bool + Send + Sync>;
@@ -19,7 +20,7 @@ type WhenPredicate<D> = Box<
 
 /// An internal policy type constructed by [`PolicyBuilder`].
 struct InternalPolicy<D: PolicyDomain> {
-    name: String,
+    name: Cow<'static, str>,
     effect: Effect,
     subject_pred: Option<SubjectPredicate<D>>,
     action_pred: Option<ActionPredicate<D>>,
@@ -91,8 +92,8 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
             .collect()
     }
 
-    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Owned(self.name.clone())
+    fn policy_type(&self) -> Cow<'static, str> {
+        self.name.clone()
     }
 
     fn effect(&self) -> Effect {
@@ -122,8 +123,23 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 ///     .when(|user, _action, doc, _ctx| user.id == doc.owner_id)
 ///     .build();
 /// ```
+///
+/// # Allocation cost
+///
+/// [`PolicyBuilder::new`] takes `impl Into<Cow<'static, str>>`, so a
+/// `'static` string literal (`new("Owner")`) is stored as
+/// [`Cow::Borrowed`] and is zero-allocation end-to-end on the trace /
+/// `ctx.grant` helper path — the same accounting as a hand-written
+/// `Policy` that returns `Cow::Borrowed("MyPolicy")`.
+///
+/// Runtime-constructed names (`new(format!("p-{id}"))`,
+/// [`Self::new_owned`], `new(owned_string)`) store [`Cow::Owned`]. Each
+/// evaluation clones that owned name into the `PolicyEvalResult` leaf
+/// (and again if the checker captures `policy_type` into an
+/// [`EvalCtx`](crate::EvalCtx)), so the cost is paid when building the
+/// trace, not only when calling `policy_type()` in isolation.
 pub struct PolicyBuilder<D: PolicyDomain> {
-    name: String,
+    name: Cow<'static, str>,
     effect: Effect,
     subject_pred: Option<SubjectPredicate<D>>,
     action_pred: Option<ActionPredicate<D>>,
@@ -135,7 +151,37 @@ pub struct PolicyBuilder<D: PolicyDomain> {
 
 impl<D: PolicyDomain> PolicyBuilder<D> {
     /// Creates a new policy builder with the given policy name.
-    pub fn new(name: impl Into<String>) -> Self {
+    ///
+    /// Accepts anything convertible to [`Cow<'static, str>`]:
+    ///
+    /// - `'static` string literals (`"AdminOnly"`) become
+    ///   [`Cow::Borrowed`] — zero-allocation on the trace path.
+    /// - owned [`String`] values (including `format!(...)`) become
+    ///   [`Cow::Owned`].
+    ///
+    /// Non-`'static` borrowed strings (e.g. `&str` from config) are **not**
+    /// accepted directly — use [`Self::new_owned`] so the allocation is
+    /// explicit at the call site.
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # #[derive(Clone)] struct User { is_admin: bool }
+    /// # struct Documents;
+    /// # impl PolicyDomain for Documents {
+    /// #     type Subject = User;
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// let policy = PolicyBuilder::<Documents>::new("AdminOnly")
+    ///     .subjects(|user| user.is_admin)
+    ///     .build();
+    /// assert!(matches!(
+    ///     policy.policy_type(),
+    ///     std::borrow::Cow::Borrowed("AdminOnly")
+    /// ));
+    /// ```
+    pub fn new(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),
             effect: Effect::Allow,
@@ -146,6 +192,41 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
             when_pred: None,
             _domain: PhantomData,
         }
+    }
+
+    /// Creates a policy builder with a runtime-owned name.
+    ///
+    /// Use this for names that are not `'static` — config keys, env values,
+    /// formatted strings already held as `&str`:
+    ///
+    /// ```rust
+    /// # use gatehouse::*;
+    /// # struct Documents;
+    /// # impl PolicyDomain for Documents {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// let from_config: &str = "tenant-override";
+    /// let policy = PolicyBuilder::<Documents>::new_owned(from_config).build();
+    /// assert!(matches!(policy.policy_type(), std::borrow::Cow::Owned(_)));
+    /// ```
+    ///
+    /// Equivalent to `Self::new(Cow::Owned(name.into()))`. Prefer
+    /// [`Self::new`] with a string literal when the name is fixed.
+    pub fn new_owned(name: impl Into<String>) -> Self {
+        Self::new(Cow::Owned(name.into()))
+    }
+
+    /// Alias for [`Self::new`] with an explicit `'static` name.
+    ///
+    /// Prefer [`Self::new`] — `new("AdminOnly")` already stores
+    /// [`Cow::Borrowed`] via `impl Into<Cow<'static, str>>`. This method
+    /// exists for call sites that want the static intent spelled out in
+    /// the method name.
+    pub fn new_static(name: &'static str) -> Self {
+        Self::new(name)
     }
 
     /// Makes this policy forbid when its combined predicate matches.

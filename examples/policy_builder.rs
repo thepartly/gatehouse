@@ -62,6 +62,7 @@ impl PolicyDomain for AdminDomain {
 /// organization*. The predicate reads three axes (subject, action, resource),
 /// which is exactly the cross-axis case `.when()` exists for.
 fn scoped_permission_policy() -> Box<dyn Policy<AdminDomain>> {
+    // String literals stay Cow::Borrowed on the trace path.
     PolicyBuilder::<AdminDomain>::new("ScopedPermission")
         .when(
             |user: &StaffUser, action: &AdminAction, org: &Organization, _ctx: &()| {
