@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-01
+
 ### Added
 
 - `AccessEvaluation::fact_load_errors()` / `denied_due_to_fact_load_error()` —
@@ -17,6 +19,13 @@
   `PolicyBuilder::new_owned` so the allocation is explicit.
   `PolicyBuilder::new_static` remains a thin alias for call sites that want the
   static intent in the method name.
+
+### Security
+
+- Remove the vulnerable `h2 0.3` path (`RUSTSEC-2026-0258`) from the Actix
+  example dependency by disabling all unused Actix Web default features and
+  retaining only the `macros` feature.
+- Refresh the locked dependency graph to current compatible releases.
 
 ## [0.5.0] - 2026-06-27
 

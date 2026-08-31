@@ -1,6 +1,6 @@
 [package]
 name = "gatehouse"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 # 1.82 is required for `Option::is_none_or` (stabilized 2024-10-17), used
 # in the builder's per-axis predicate evaluation. Other dependencies on
@@ -33,7 +33,7 @@ tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 axum = "0.8"
 tower = "0.5"
 hyper = "1"
-actix-web = "4"
+actix-web = { version = "4", default-features = false, features = ["macros"] }
 criterion = { version = "0.8" }
 dashmap = "6"
 proptest = "1"
