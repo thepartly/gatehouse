@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct the `permission_checker_bound_check` fixtures so `trailing_allow/N`
+  and `all_deny/N` genuinely evaluate all `N` policies. The previous forbid
+  fixtures short-circuited after the first policy, so their historical numbers
+  are not comparable with the corrected benchmark.
+
 ## [0.5.1] - 2026-09-01
 
 ### Added

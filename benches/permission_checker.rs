@@ -31,7 +31,7 @@ fn build_all_deny_checker(policy_count: usize) -> PermissionChecker<UnitDomain> 
 
     for index in 0..policy_count {
         let policy = PolicyBuilder::<UnitDomain>::new(format!("deny_policy_{index}"))
-            .forbid()
+            .when(|_subject, _action, _resource, _context| false)
             .build();
         checker.add_policy(policy);
     }
@@ -46,7 +46,7 @@ fn build_trailing_allow_checker(policy_count: usize) -> PermissionChecker<UnitDo
 
     for index in 0..(policy_count - 1) {
         let policy = PolicyBuilder::<UnitDomain>::new(format!("deny_policy_{index}"))
-            .forbid()
+            .when(|_subject, _action, _resource, _context| false)
             .build();
         checker.add_policy(policy);
     }
