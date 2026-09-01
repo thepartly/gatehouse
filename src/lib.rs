@@ -243,7 +243,9 @@ mod session;
 pub use builder::PolicyBuilder;
 pub use checker::{BoundEvaluator, PermissionChecker};
 pub use combinators::{AndPolicy, EmptyPoliciesError, NotPolicy, OrPolicy, PolicyExt};
-pub use facts::{FactKey, FactLoadError, FactLoadResult, FactSource, RelationshipQuery};
+pub use facts::{
+    FactKey, FactLoadError, FactLoadErrorKind, FactLoadResult, FactSource, RelationshipQuery,
+};
 pub use lookup::{Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupPage, LookupSource};
 pub use metadata::SecurityRuleMetadata;
 pub(crate) use metadata::{DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE};

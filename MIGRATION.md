@@ -1,3 +1,23 @@
+# Migrating from 0.5 to 0.6
+
+Gatehouse 0.6 adds a public `error_kind` field to `FactProvenance`. Code using
+`FactProvenance::new(...)` needs no change, but direct struct literals must
+initialize the new field:
+
+```rust,ignore
+FactProvenance {
+    fact_name: "membership",
+    key: "Member(42)".to_string(),
+    outcome: FactOutcome::Found,
+    detail: None,
+    error_kind: None,
+}
+```
+
+When provenance comes from a fact load, prefer
+`FactProvenance::from_load_result(...)`; it records the outcome, diagnostic
+detail, and structured `FactLoadErrorKind` together.
+
 # Migrating from 0.4 to 0.5
 
 Gatehouse 0.5 intentionally breaks the public API to make the authorization surface smaller and harder to misuse. The main changes are:

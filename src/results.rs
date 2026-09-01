@@ -1,3 +1,4 @@
+use crate::{FactLoadErrorKind, FactLoadResult};
 use std::borrow::Cow;
 use std::fmt;
 
@@ -98,10 +99,19 @@ pub struct FactProvenance {
     /// Optional extra detail, such as the backend error message when
     /// `outcome` is [`FactOutcome::Error`].
     pub detail: Option<String>,
+    /// Machine-readable classification when this provenance records a fact
+    /// load error.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub error_kind: Option<FactLoadErrorKind>,
 }
 
 impl FactProvenance {
-    /// Records a consulted fact.
+    /// Records a consulted fact from manually supplied parts.
+    ///
+    /// Prefer [`Self::from_load_result`] when a [`FactLoadResult`] is
+    /// available. Manually constructing [`FactOutcome::Error`] through this
+    /// method produces unclassified error provenance, so
+    /// [`Self::error_kind`] is `None`.
     pub fn new(
         fact_name: &'static str,
         key: impl Into<String>,
@@ -113,6 +123,32 @@ impl FactProvenance {
             key: key.into(),
             outcome,
             detail,
+            error_kind: None,
+        }
+    }
+
+    /// Records a consulted fact directly from its load result.
+    ///
+    /// This is the canonical constructor for fact-backed policies. It records
+    /// the value-erased [`FactOutcome`], preserves a structured
+    /// [`FactLoadErrorKind`], and renders the error message into [`Self::detail`]
+    /// without requiring every policy to repeat that mapping by hand.
+    pub fn from_load_result<V>(
+        fact_name: &'static str,
+        key: impl Into<String>,
+        result: &FactLoadResult<V>,
+    ) -> Self {
+        let (detail, error_kind) = match result {
+            FactLoadResult::Error(error) => (Some(error.to_string()), Some(error.kind())),
+            FactLoadResult::Found(_) | FactLoadResult::Missing => (None, None),
+        };
+
+        Self {
+            fact_name,
+            key: key.into(),
+            outcome: FactOutcome::from_load_result(result),
+            detail,
+            error_kind,
         }
     }
 }

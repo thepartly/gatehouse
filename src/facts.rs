@@ -80,6 +80,28 @@ pub enum FactLoadError {
     Backend(Arc<dyn std::error::Error + Send + Sync>),
 }
 
+/// Stable, value-erased classification of a [`FactLoadError`].
+///
+/// Use this when a machine needs to choose an operational response without
+/// parsing [`FactLoadError`]'s human-readable [`fmt::Display`] output. The
+/// classification deliberately does not promise that every backend error is
+/// transient: callers can distinguish backend failures from Gatehouse source
+/// wiring and contract failures, then apply their own retry policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
+pub enum FactLoadErrorKind {
+    /// No source is registered for the requested fact key type.
+    SourceNotRegistered,
+    /// A source returned the wrong number of results.
+    SourceContractViolation,
+    /// The future driving the load was cancelled.
+    LoaderCancelled,
+    /// The registered source reported a backend error.
+    Backend,
+}
+
 impl FactLoadError {
     /// Wraps a backend error.
     pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
@@ -89,6 +111,16 @@ impl FactLoadError {
     /// Wraps a human-readable backend error message.
     pub fn backend_message(message: impl Into<String>) -> Self {
         Self::backend(MessageError(message.into()))
+    }
+
+    /// Returns the stable machine-readable classification of this error.
+    pub fn kind(&self) -> FactLoadErrorKind {
+        match self {
+            Self::SourceNotRegistered { .. } => FactLoadErrorKind::SourceNotRegistered,
+            Self::SourceContractViolation { .. } => FactLoadErrorKind::SourceContractViolation,
+            Self::LoaderCancelled { .. } => FactLoadErrorKind::LoaderCancelled,
+            Self::Backend(_) => FactLoadErrorKind::Backend,
+        }
     }
 }
 
@@ -204,14 +236,31 @@ pub enum FactLoadResult<V> {
 ///     &self,
 ///     ctx: &EvalCtx<'_, InvoiceAccess>,
 /// ) -> PolicyEvalResult {
-///     match ctx.session.get(CustomerForOrg(ctx.subject.org_id)).await {
+///     let key = CustomerForOrg(ctx.subject.org_id);
+///     let result = ctx.session.get(key.clone()).await;
+///     let provenance = vec![FactProvenance::from_load_result(
+///         CustomerForOrg::NAME,
+///         format!("{key:?}"),
+///         &result,
+///     )];
+///
+///     match result {
 ///         FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
-///             ctx.grant("subject's org bills under the invoice's customer")
+///             ctx.grant_with_facts(
+///                 "subject's org bills under the invoice's customer",
+///                 provenance,
+///             )
 ///         }
-///         _ => ctx.not_applicable("not the billing customer"),
+///         _ => ctx.not_applicable_with_facts("not the billing customer", provenance),
 ///     }
 /// }
 /// ```
+///
+/// Recording provenance is operationally significant: it lets
+/// [`crate::AccessEvaluation::denied_due_to_fact_load_error`] distinguish a
+/// failed load from an ordinary authorization denial. Policies should use
+/// [`FactProvenance::from_load_result`](crate::FactProvenance::from_load_result)
+/// whenever a load result contributes to a decision.
 ///
 /// The built-in [`RebacPolicy`](crate::RebacPolicy) generalises this idiom
 /// for relationship-shaped facts; the same plumbing handles arbitrary

@@ -39,7 +39,7 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    EvalCtx, EvaluationSession, FactKey, FactLoadResult, FactRegistry, FactSource,
+    EvalCtx, EvaluationSession, FactKey, FactLoadResult, FactProvenance, FactRegistry, FactSource,
     PermissionChecker, Policy, PolicyDomain, PolicyEvalResult,
 };
 use std::borrow::Cow;
@@ -199,12 +199,24 @@ impl Policy<SupplierInvoiceDomain> for RightSupplierPolicy {
         // first call inside this request triggers `load_many`; every
         // subsequent call with the same key (e.g. another invoice in
         // the same batch) hits the request-scoped cache.
-        match ctx.session.get(CustomerForOrg(ctx.subject.org_id)).await {
+        let key = CustomerForOrg(ctx.subject.org_id);
+        let result = ctx.session.get(key.clone()).await;
+        let provenance = vec![FactProvenance::from_load_result(
+            CustomerForOrg::NAME,
+            format!("{key:?}"),
+            &result,
+        )];
+
+        match result {
             FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
-                ctx.grant("subject's supplier org bills under the invoice's customer")
+                ctx.grant_with_facts(
+                    "subject's supplier org bills under the invoice's customer",
+                    provenance,
+                )
             }
-            _ => ctx.not_applicable(
+            _ => ctx.not_applicable_with_facts(
                 "subject's supplier org does not bill under the invoice's customer",
+                provenance,
             ),
         }
     }
