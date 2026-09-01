@@ -41,7 +41,9 @@ not use a long-lived repository secret.
 The release workflow refuses to publish unless the tag matches the crate
 version and a successful `main` push CI run exists for the exact tagged commit.
 It then audits and packages the crate, publishes through crates.io Trusted
-Publishing, and creates the GitHub Release as the final step.
+Publishing, and creates the GitHub Release as the final step. The release body
+comes exclusively from the matching `CHANGELOG.md` section; GitHub-generated
+release notes are intentionally disabled.
 
 If a release fails, inspect the workflow before retrying. Do not move or reuse a
 published version tag, and do not manually create the GitHub Release to bypass a
