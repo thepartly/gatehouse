@@ -116,6 +116,8 @@ flowchart LR
 
 Denials from `AccessEvaluation` are summary-level. Use `AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect individual policy reasons and fact provenance. Use `AccessEvaluation::denied_due_to_fact_load_error()` / `fact_load_errors()` when you need to distinguish infrastructure failure (fact load `Error`) from an ordinary denial — authorization remains fail-closed either way.
 
+Fact-backed policies should construct provenance with `FactProvenance::from_load_result(...)` and attach it through the context's `*_with_facts` result helpers. The constructor maps `Found`/`Missing`/`Error`, includes diagnostic error detail, and preserves a machine-readable `FactLoadErrorKind` in `FactProvenance::error_kind`. `FactProvenance::new(...)` remains available for manually constructed or legacy provenance; an error created that way has no structured error kind.
+
 ## Policy Domains
 
 A `PolicyDomain` names the four types involved in one authorization domain:

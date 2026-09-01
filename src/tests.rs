@@ -1575,6 +1575,12 @@ mod core_tests {
         let result = policy.evaluate(&ctx).await;
 
         assert!(!result.is_granted());
+        let provenance = result.provenance();
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(
+            provenance[0].error_kind,
+            Some(FactLoadErrorKind::SourceNotRegistered)
+        );
         assert!(result
             .reason()
             .as_deref()
@@ -3088,7 +3094,110 @@ mod core_tests {
         assert_serialize::<PolicyEvalResult>();
         assert_serialize::<FactProvenance>();
         assert_serialize::<FactOutcome>();
+        assert_serialize::<FactLoadErrorKind>();
         assert_serialize::<CombineOp>();
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn fact_provenance_serializes_classified_error_kind_only_when_present() {
+        let classified = FactProvenance::from_load_result(
+            "membership",
+            "IsMember(42)",
+            &FactLoadResult::<bool>::Error(FactLoadError::SourceNotRegistered {
+                fact_name: "membership",
+            }),
+        );
+        let unclassified = FactProvenance::new(
+            "membership",
+            "IsMember(42)",
+            FactOutcome::Error,
+            Some("legacy detail".to_string()),
+        );
+        let found = FactProvenance::from_load_result(
+            "membership",
+            "IsMember(42)",
+            &FactLoadResult::Found(true),
+        );
+
+        let classified = serde_json::to_value(classified).expect("provenance should serialize");
+        let unclassified = serde_json::to_value(unclassified).expect("provenance should serialize");
+        let found = serde_json::to_value(found).expect("provenance should serialize");
+
+        assert_eq!(classified["error_kind"], "source_not_registered");
+        assert!(unclassified.get("error_kind").is_none());
+        assert!(found.get("error_kind").is_none());
+    }
+
+    #[test]
+    fn fact_load_error_kind_preserves_machine_readable_classification() {
+        let errors = [
+            (
+                FactLoadError::SourceNotRegistered {
+                    fact_name: "membership",
+                },
+                FactLoadErrorKind::SourceNotRegistered,
+            ),
+            (
+                FactLoadError::SourceContractViolation {
+                    fact_name: "membership",
+                    expected: 2,
+                    actual: 1,
+                },
+                FactLoadErrorKind::SourceContractViolation,
+            ),
+            (
+                FactLoadError::LoaderCancelled {
+                    fact_name: "membership",
+                },
+                FactLoadErrorKind::LoaderCancelled,
+            ),
+            (
+                FactLoadError::backend_message("database unavailable"),
+                FactLoadErrorKind::Backend,
+            ),
+        ];
+
+        for (error, expected_kind) in errors {
+            assert_eq!(error.kind(), expected_kind);
+        }
+    }
+
+    #[test]
+    fn provenance_from_load_result_records_error_kind_and_detail() {
+        let result = FactLoadResult::<bool>::Error(FactLoadError::SourceNotRegistered {
+            fact_name: "membership",
+        });
+
+        let provenance = FactProvenance::from_load_result("membership", "IsMember(42)", &result);
+
+        assert_eq!(provenance.fact_name, "membership");
+        assert_eq!(provenance.key, "IsMember(42)");
+        assert_eq!(provenance.outcome, FactOutcome::Error);
+        assert_eq!(
+            provenance.error_kind,
+            Some(FactLoadErrorKind::SourceNotRegistered)
+        );
+        assert_eq!(
+            provenance.detail.as_deref(),
+            Some("No fact source registered for 'membership'")
+        );
+    }
+
+    #[test]
+    fn provenance_from_load_result_leaves_non_errors_unclassified() {
+        let found = FactLoadResult::Found(true);
+        let missing = FactLoadResult::<bool>::Missing;
+
+        let found = FactProvenance::from_load_result("membership", "found", &found);
+        let missing = FactProvenance::from_load_result("membership", "missing", &missing);
+
+        assert_eq!(found.outcome, FactOutcome::Found);
+        assert_eq!(found.error_kind, None);
+        assert_eq!(found.detail, None);
+        assert_eq!(missing.outcome, FactOutcome::Missing);
+        assert_eq!(missing.error_kind, None);
+        assert_eq!(missing.detail, None);
     }
 
     #[tokio::test]
@@ -3234,7 +3343,34 @@ mod core_tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].fact_name, "relationship");
         assert_eq!(errors[0].outcome, FactOutcome::Error);
+        assert_eq!(errors[0].error_kind, Some(FactLoadErrorKind::Backend));
         assert!(errors[0].detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn fact_load_errors_distinguish_unregistered_source_from_backend_failure() {
+        let mut checker = PermissionChecker::<TestDomain>::new();
+        checker.add_policy(RebacPolicy::new(
+            |subject: &TestSubject| subject.id,
+            |resource: &TestResource| resource.id,
+            "manager".to_string(),
+        ));
+        let subject = test_subject();
+        let resource = test_resource();
+        let session = EvaluationSession::new();
+
+        let evaluation = checker
+            .bind(&session, &subject, &TestAction, &TestContext)
+            .check(&resource)
+            .await;
+
+        assert!(evaluation.denied_due_to_fact_load_error());
+        let errors = evaluation.fact_load_errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].error_kind,
+            Some(FactLoadErrorKind::SourceNotRegistered)
+        );
     }
 
     #[tokio::test]

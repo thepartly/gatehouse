@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- `FactLoadErrorKind` and `FactLoadError::kind()` provide stable,
+  machine-readable classifications for unregistered sources, source contract
+  violations, cancelled loaders, and backend failures.
+- `FactProvenance::from_load_result(...)` is the canonical way for fact-backed
+  policies to record a load result. It maps the outcome and diagnostic detail
+  and preserves the error classification in the public `error_kind` field.
+
+### Changed
+
+- **Breaking:** `FactProvenance` gains a public `error_kind` field. Downstream
+  struct literals must initialize it; constructors using `FactProvenance::new`
+  continue to produce unclassified provenance with `error_kind: None`.
+
 ### Fixed
 
 - Correct the `permission_checker_bound_check` fixtures so `trailing_allow/N`

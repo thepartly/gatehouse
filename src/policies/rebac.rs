@@ -1,6 +1,6 @@
 use crate::{
-    BatchEvalCtx, EvalCtx, FactKey, FactLoadResult, FactOutcome, FactProvenance, Policy,
-    PolicyDomain, PolicyEvalResult, RelationshipQuery,
+    BatchEvalCtx, EvalCtx, FactKey, FactLoadResult, FactProvenance, Policy, PolicyDomain,
+    PolicyEvalResult, RelationshipQuery,
 };
 use async_trait::async_trait;
 use std::fmt;
@@ -116,12 +116,7 @@ where
         key_repr: &str,
         fact: FactLoadResult<bool>,
     ) -> PolicyEvalResult {
-        let outcome = FactOutcome::from_load_result(&fact);
-        let detail = match &fact {
-            FactLoadResult::Error(error) => Some(error.to_string()),
-            _ => None,
-        };
-        let provenance = vec![FactProvenance::new(fact_name, key_repr, outcome, detail)];
+        let provenance = vec![FactProvenance::from_load_result(fact_name, key_repr, &fact)];
 
         match fact {
             FactLoadResult::Found(true) => PolicyEvalResult::granted_with_facts(
