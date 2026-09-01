@@ -140,7 +140,7 @@ jobs:
             inside { print }
           ' CHANGELOG.md > release-notes.md
 
-          args=(--verify-tag --title "$TAG" --generate-notes)
+          args=(--verify-tag --title "$TAG")
           if [ -s release-notes.md ]; then
             args+=(--notes-file release-notes.md)
           fi
