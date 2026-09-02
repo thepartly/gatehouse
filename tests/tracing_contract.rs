@@ -61,6 +61,19 @@ impl Policy<Domain> for TracePolicy {
     }
 }
 
+struct IndeterminateTracePolicy;
+
+#[async_trait]
+impl Policy<Domain> for IndeterminateTracePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.indeterminate("fact backend unreachable")
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("IndeterminateTracePolicy")
+    }
+}
+
 struct GrantingForbidPolicy;
 
 #[async_trait]
@@ -647,6 +660,45 @@ fn tracing_fields_are_recorded_for_forbidden_decisions() {
     assert_value(policy, "policy.effect", "deny");
     assert_value(policy, "policy.forbidden_count", "1");
     assert_value(policy, "policy.granted_count", "0");
+}
+
+#[test]
+fn tracing_records_indeterminate_outcomes_and_batch_counts() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(IndeterminateTracePolicy);
+    let session = EvaluationSession::empty();
+
+    // Single path: the evaluation span attributes the indeterminate
+    // outcome to the failing policy.
+    let (result, spans) = capture_async(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(result.is_indeterminate());
+    let single = span(&spans, "evaluate_one");
+    assert_value(single, "outcome", "indeterminate");
+    assert_value(single, "policy.type", "IndeterminateTracePolicy");
+
+    // Batch path: indeterminate results are counted separately from
+    // ordinary denials on the per-policy span. Two items pin the counter
+    // arithmetic (a broken increment would report 0 or 1, not 2).
+    let (_results, spans) = capture_async(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![
+                Resource { allowed: true },
+                Resource { allowed: false },
+            ])
+            .await
+    });
+    let policy = span(&spans, "gatehouse.batch_policy");
+    assert_value(policy, "policy.type", "IndeterminateTracePolicy");
+    assert_value(policy, "policy.indeterminate_count", "2");
+    assert_value(policy, "policy.denied_count", "0");
+    assert_value(policy, "policy.granted_count", "0");
+    assert_value(policy, "policy.forbidden_count", "0");
 }
 
 #[test]
