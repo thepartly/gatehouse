@@ -77,7 +77,7 @@ where
                 .items
                 .iter()
                 .map(|_| {
-                    PolicyEvalResult::not_applicable(
+                    PolicyEvalResult::indeterminate(
                         self.policy_type(),
                         "Relationship fact source returned the wrong number of results",
                     )
@@ -140,7 +140,12 @@ where
                 format!("Relationship '{}' fact is missing", self.relation),
                 provenance,
             ),
-            FactLoadResult::Error(error) => PolicyEvalResult::not_applicable_with_facts(
+            // Fail closed, but structurally: the relationship could not be
+            // loaded, so the policy could not decide. This surfaces as
+            // `AccessEvaluation::Indeterminate` rather than an ordinary
+            // denial, letting callers map an authorization-data outage to a
+            // 5xx instead of a 403.
+            FactLoadResult::Error(error) => PolicyEvalResult::indeterminate_with_facts(
                 "RebacPolicy",
                 format!("Relationship '{}' fact load failed: {error}", self.relation),
                 provenance,

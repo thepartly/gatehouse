@@ -666,7 +666,11 @@ fn tracing_records_wrong_length_batch_policy_denials() {
 
     let policy = span(&spans, "gatehouse.batch_policy");
     assert_value(policy, "policy.type", "WrongLengthTracePolicy");
-    assert_value(policy, "policy.denied_count", "2");
+    // A wrong-length batch is a broken policy contract: the items could
+    // not be evaluated, so they are counted (and surfaced) as
+    // indeterminate rather than denied.
+    assert_value(policy, "policy.indeterminate_count", "2");
+    assert_value(policy, "policy.denied_count", "0");
     assert_value(policy, "policy.granted_count", "0");
     assert_value(policy, "policy.forbidden_count", "0");
 }

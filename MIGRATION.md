@@ -18,6 +18,79 @@ When provenance comes from a fact load, prefer
 `FactProvenance::from_load_result(...)`; it records the outcome, diagnostic
 detail, and structured `FactLoadErrorKind` together.
 
+## First-class `Indeterminate` decisions
+
+0.6 makes "the policy could not be evaluated" a structural outcome instead of
+a convention over provenance:
+
+- `PolicyEvalResult` gains an `Indeterminate` leaf variant (constructors
+  `PolicyEvalResult::indeterminate` / `indeterminate_with_facts`, plus
+  `ctx.indeterminate(...)` inside policy bodies).
+- Every node now carries a four-valued `Decision`, exposed via
+  `PolicyEvalResult::decision()`.
+- `AccessEvaluation` gains an `Indeterminate` variant, with
+  `is_indeterminate()` and `indeterminate_reason()`.
+
+### `Combined.outcome` is now `Combined.decision`
+
+Code that constructed or matched `PolicyEvalResult::Combined` must switch
+from the boolean to the `Decision` enum:
+
+```rust,ignore
+// Before
+PolicyEvalResult::Combined { policy_type, operation, children, outcome: true }
+
+// After
+PolicyEvalResult::Combined { policy_type, operation, children, decision: Decision::Grant }
+```
+
+Custom combinators must keep `decision` consistent with their children — in
+particular, never report `Decision::Grant` while a `Forbidden` leaf survives
+in `children`. (`is_forbidden()` still runs a recursive leaf scan as a
+fail-closed backstop, so an inconsistent node is treated as forbidding, but
+do not rely on that.)
+
+### HTTP mapping
+
+The 403-vs-5xx split is now structural rather than provenance-scraping:
+
+```rust,ignore
+if evaluation.is_granted() {
+    // 200
+} else if evaluation.forbidden_by().is_some() {
+    // 403: active veto
+} else if evaluation.is_indeterminate() {
+    // 503: authorization inputs unavailable — inspect
+    // evaluation.fact_load_errors() / FactProvenance::error_kind
+} else {
+    // 403: ordinary denial
+}
+```
+
+`denied_due_to_fact_load_error()` remains as the coarser any-error-in-trace
+scan for policies that still record failed loads on `NotApplicable` results.
+
+### Behavior changes to audit
+
+- `RebacPolicy` now returns `Indeterminate` when a relationship fact **load
+  fails** (backend error, unregistered source, source contract violation).
+  A checker that previously answered `Denied` for those cases now answers
+  `AccessEvaluation::Indeterminate`. `Found(false)` and `Missing` are still
+  ordinary non-grants. If your HTTP layer treated every non-grant as 403,
+  add an `Indeterminate` branch (or keep treating it as a denial — it is
+  still fail-closed and `to_result` still maps it to an error).
+- A policy whose `evaluate_batch` returns the wrong number of results now
+  fails closed as `Indeterminate` instead of a plain denial.
+- An indeterminate veto-capable policy blocks sibling grants; an
+  indeterminate allow-only policy does not, but with no grant the checker
+  returns `Indeterminate` instead of `"All policies denied access"`.
+- With the `serde` feature, `Combined` nodes serialize a `decision` field
+  instead of `outcome`, and the new variants appear in serialized traces —
+  update audit-log consumers.
+- Matches on `AccessEvaluation` / `PolicyEvalResult` with wildcard arms keep
+  compiling (`#[non_exhaustive]`), but review them: treating `Indeterminate`
+  as an ordinary denial is safe (fail-closed), just less informative.
+
 # Migrating from 0.4 to 0.5
 
 Gatehouse 0.5 intentionally breaks the public API to make the authorization surface smaller and harder to misuse. The main changes are:

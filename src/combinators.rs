@@ -1,5 +1,5 @@
 use crate::{
-    BatchEvalCtx, CombineOp, Effect, EvalCtx, Policy, PolicyBatchItem, PolicyDomain,
+    BatchEvalCtx, CombineOp, Decision, Effect, EvalCtx, Policy, PolicyBatchItem, PolicyDomain,
     PolicyEvalResult,
 };
 use async_trait::async_trait;
@@ -137,6 +137,8 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
     async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
         let mut veto_prefix_failed = false;
+        let mut veto_prefix_indeterminate = false;
+        let mut allow_indeterminate = false;
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             let inner_ctx = EvalCtx {
@@ -150,6 +152,7 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
             let result = policy.evaluate(&inner_ctx).await;
             let is_granted = result.is_granted();
             let is_forbidden = result.is_forbidden();
+            let is_indeterminate = result.decision() == Decision::Indeterminate;
             children_results.push(result);
 
             if is_forbidden {
@@ -157,26 +160,46 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
                     policy_type: self.policy_type(),
                     operation: CombineOp::And,
                     children: children_results,
-                    outcome: false,
+                    decision: Decision::Forbid,
                 };
             }
 
             if policy_index < self.veto_capable_count {
-                veto_prefix_failed |= !is_granted;
-                if policy_index + 1 == self.veto_capable_count && veto_prefix_failed {
-                    return PolicyEvalResult::Combined {
-                        policy_type: self.policy_type(),
-                        operation: CombineOp::And,
-                        children: children_results,
-                        outcome: false,
-                    };
+                // An indeterminate veto-capable child might have forbidden;
+                // that possibility outranks a definite non-grant because at
+                // the checker level Forbid and NotApplicable behave
+                // differently for sibling grants.
+                veto_prefix_indeterminate |= is_indeterminate;
+                veto_prefix_failed |= !is_granted && !is_indeterminate;
+                if policy_index + 1 == self.veto_capable_count {
+                    if veto_prefix_indeterminate {
+                        return PolicyEvalResult::Combined {
+                            policy_type: self.policy_type(),
+                            operation: CombineOp::And,
+                            children: children_results,
+                            decision: Decision::Indeterminate,
+                        };
+                    }
+                    if veto_prefix_failed {
+                        return PolicyEvalResult::Combined {
+                            policy_type: self.policy_type(),
+                            operation: CombineOp::And,
+                            children: children_results,
+                            decision: Decision::NotApplicable,
+                        };
+                    }
                 }
+            } else if is_indeterminate {
+                // The conjunction cannot be granted, but a later definite
+                // non-grant can still resolve it to NotApplicable, so keep
+                // evaluating.
+                allow_indeterminate = true;
             } else if !is_granted {
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
                     operation: CombineOp::And,
                     children: children_results,
-                    outcome: false,
+                    decision: Decision::NotApplicable,
                 };
             }
         }
@@ -185,7 +208,11 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
             policy_type: self.policy_type(),
             operation: CombineOp::And,
             children: children_results,
-            outcome: true,
+            decision: if allow_indeterminate {
+                Decision::Indeterminate
+            } else {
+                Decision::Grant
+            },
         }
     }
 
@@ -194,6 +221,8 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
         let mut results = vec![None; ctx.items.len()];
         let mut pending = (0..ctx.items.len()).collect::<Vec<_>>();
         let mut veto_prefix_failed = vec![false; ctx.items.len()];
+        let mut veto_prefix_indeterminate = vec![false; ctx.items.len()];
+        let mut allow_indeterminate = vec![false; ctx.items.len()];
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             if pending.is_empty() {
@@ -218,7 +247,7 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
 
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
-                    children_by_item[index].push(PolicyEvalResult::not_applicable(
+                    children_by_item[index].push(PolicyEvalResult::indeterminate(
                         policy.policy_type(),
                         "Policy batch result count did not match input count",
                     ));
@@ -226,7 +255,7 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
                         policy_type: self.policy_type(),
                         operation: CombineOp::And,
                         children: std::mem::take(&mut children_by_item[index]),
-                        outcome: false,
+                        decision: Decision::Indeterminate,
                     });
                 }
                 break;
@@ -236,6 +265,7 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
             for (index, child_result) in pending.into_iter().zip(child_results) {
                 let is_granted = child_result.is_granted();
                 let is_forbidden = child_result.is_forbidden();
+                let is_indeterminate = child_result.decision() == Decision::Indeterminate;
                 children_by_item[index].push(child_result);
 
                 if is_forbidden {
@@ -243,20 +273,30 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
                         policy_type: self.policy_type(),
                         operation: CombineOp::And,
                         children: std::mem::take(&mut children_by_item[index]),
-                        outcome: false,
+                        decision: Decision::Forbid,
                     });
                 } else if policy_index < self.veto_capable_count {
-                    veto_prefix_failed[index] |= !is_granted;
-                    if policy_index + 1 == self.veto_capable_count && veto_prefix_failed[index] {
+                    veto_prefix_indeterminate[index] |= is_indeterminate;
+                    veto_prefix_failed[index] |= !is_granted && !is_indeterminate;
+                    if policy_index + 1 == self.veto_capable_count
+                        && (veto_prefix_indeterminate[index] || veto_prefix_failed[index])
+                    {
                         results[index] = Some(PolicyEvalResult::Combined {
                             policy_type: self.policy_type(),
                             operation: CombineOp::And,
                             children: std::mem::take(&mut children_by_item[index]),
-                            outcome: false,
+                            decision: if veto_prefix_indeterminate[index] {
+                                Decision::Indeterminate
+                            } else {
+                                Decision::NotApplicable
+                            },
                         });
                     } else {
                         still_pending.push(index);
                     }
+                } else if is_indeterminate {
+                    allow_indeterminate[index] = true;
+                    still_pending.push(index);
                 } else if is_granted {
                     still_pending.push(index);
                 } else {
@@ -264,7 +304,7 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
                         policy_type: self.policy_type(),
                         operation: CombineOp::And,
                         children: std::mem::take(&mut children_by_item[index]),
-                        outcome: false,
+                        decision: Decision::NotApplicable,
                     });
                 }
             }
@@ -276,7 +316,11 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
                 policy_type: self.policy_type(),
                 operation: CombineOp::And,
                 children: std::mem::take(&mut children_by_item[index]),
-                outcome: true,
+                decision: if allow_indeterminate[index] {
+                    Decision::Indeterminate
+                } else {
+                    Decision::Grant
+                },
             });
         }
 
@@ -336,6 +380,8 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
     async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
         let mut children_results = Vec::with_capacity(self.policies.len());
         let mut veto_prefix_granted = false;
+        let mut veto_prefix_indeterminate = false;
+        let mut allow_indeterminate = false;
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             let inner_ctx = EvalCtx {
@@ -349,6 +395,7 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
             let result = policy.evaluate(&inner_ctx).await;
             let is_granted = result.is_granted();
             let is_forbidden = result.is_forbidden();
+            let is_indeterminate = result.decision() == Decision::Indeterminate;
             children_results.push(result);
 
             if is_forbidden {
@@ -356,27 +403,47 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
                     policy_type: self.policy_type(),
                     operation: CombineOp::Or,
                     children: children_results,
-                    outcome: false,
+                    decision: Decision::Forbid,
                 };
             }
 
             if policy_index < self.veto_capable_count {
+                // An indeterminate veto-capable child might have forbidden,
+                // which would override every grant — so it blocks a sibling
+                // grant inside this OR, exactly like the checker's veto
+                // prefix. A definite forbid from a later prefix child still
+                // wins over the indeterminate.
+                veto_prefix_indeterminate |= is_indeterminate;
                 veto_prefix_granted |= is_granted;
-                if policy_index + 1 == self.veto_capable_count && veto_prefix_granted {
-                    return PolicyEvalResult::Combined {
-                        policy_type: self.policy_type(),
-                        operation: CombineOp::Or,
-                        children: children_results,
-                        outcome: true,
-                    };
+                if policy_index + 1 == self.veto_capable_count {
+                    if veto_prefix_indeterminate {
+                        return PolicyEvalResult::Combined {
+                            policy_type: self.policy_type(),
+                            operation: CombineOp::Or,
+                            children: children_results,
+                            decision: Decision::Indeterminate,
+                        };
+                    }
+                    if veto_prefix_granted {
+                        return PolicyEvalResult::Combined {
+                            policy_type: self.policy_type(),
+                            operation: CombineOp::Or,
+                            children: children_results,
+                            decision: Decision::Grant,
+                        };
+                    }
                 }
             } else if is_granted {
+                // An allow-only indeterminate sibling cannot forbid, so a
+                // definite grant resolves the OR regardless of it.
                 return PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
                     operation: CombineOp::Or,
                     children: children_results,
-                    outcome: true,
+                    decision: Decision::Grant,
                 };
+            } else if is_indeterminate {
+                allow_indeterminate = true;
             }
         }
 
@@ -384,7 +451,11 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
             policy_type: self.policy_type(),
             operation: CombineOp::Or,
             children: children_results,
-            outcome: false,
+            decision: if allow_indeterminate {
+                Decision::Indeterminate
+            } else {
+                Decision::NotApplicable
+            },
         }
     }
 
@@ -393,6 +464,8 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
         let mut results = vec![None; ctx.items.len()];
         let mut pending = (0..ctx.items.len()).collect::<Vec<_>>();
         let mut veto_prefix_granted = vec![false; ctx.items.len()];
+        let mut veto_prefix_indeterminate = vec![false; ctx.items.len()];
+        let mut allow_indeterminate = vec![false; ctx.items.len()];
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             if pending.is_empty() {
@@ -417,7 +490,7 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
 
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
-                    children_by_item[index].push(PolicyEvalResult::not_applicable(
+                    children_by_item[index].push(PolicyEvalResult::indeterminate(
                         policy.policy_type(),
                         "Policy batch result count did not match input count",
                     ));
@@ -425,7 +498,7 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
                         policy_type: self.policy_type(),
                         operation: CombineOp::Or,
                         children: std::mem::take(&mut children_by_item[index]),
-                        outcome: false,
+                        decision: Decision::Indeterminate,
                     });
                 }
                 break;
@@ -435,6 +508,7 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
             for (index, child_result) in pending.into_iter().zip(child_results) {
                 let is_granted = child_result.is_granted();
                 let is_forbidden = child_result.is_forbidden();
+                let is_indeterminate = child_result.decision() == Decision::Indeterminate;
                 children_by_item[index].push(child_result);
 
                 if is_forbidden {
@@ -442,16 +516,23 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
                         policy_type: self.policy_type(),
                         operation: CombineOp::Or,
                         children: std::mem::take(&mut children_by_item[index]),
-                        outcome: false,
+                        decision: Decision::Forbid,
                     });
                 } else if policy_index < self.veto_capable_count {
+                    veto_prefix_indeterminate[index] |= is_indeterminate;
                     veto_prefix_granted[index] |= is_granted;
-                    if policy_index + 1 == self.veto_capable_count && veto_prefix_granted[index] {
+                    if policy_index + 1 == self.veto_capable_count
+                        && (veto_prefix_indeterminate[index] || veto_prefix_granted[index])
+                    {
                         results[index] = Some(PolicyEvalResult::Combined {
                             policy_type: self.policy_type(),
                             operation: CombineOp::Or,
                             children: std::mem::take(&mut children_by_item[index]),
-                            outcome: true,
+                            decision: if veto_prefix_indeterminate[index] {
+                                Decision::Indeterminate
+                            } else {
+                                Decision::Grant
+                            },
                         });
                     } else {
                         still_pending.push(index);
@@ -461,9 +542,12 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
                         policy_type: self.policy_type(),
                         operation: CombineOp::Or,
                         children: std::mem::take(&mut children_by_item[index]),
-                        outcome: true,
+                        decision: Decision::Grant,
                     });
                 } else {
+                    if is_indeterminate {
+                        allow_indeterminate[index] = true;
+                    }
                     still_pending.push(index);
                 }
             }
@@ -475,7 +559,11 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
                 policy_type: self.policy_type(),
                 operation: CombineOp::Or,
                 children: std::mem::take(&mut children_by_item[index]),
-                outcome: false,
+                decision: if allow_indeterminate[index] {
+                    Decision::Indeterminate
+                } else {
+                    Decision::NotApplicable
+                },
             });
         }
 
@@ -527,14 +615,13 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
             policy_type: self.policy.policy_type(),
         };
         let inner_result = self.policy.evaluate(&inner_ctx).await;
-        let is_forbidden = inner_result.is_forbidden();
-        let is_granted = inner_result.is_granted();
+        let decision = not_decision(&inner_result);
 
         PolicyEvalResult::Combined {
             policy_type: Policy::<D>::policy_type(self),
             operation: CombineOp::Not,
             children: vec![inner_result],
-            outcome: !is_forbidden && !is_granted,
+            decision,
         }
     }
 
@@ -554,7 +641,7 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
                 .items
                 .iter()
                 .map(|_| {
-                    PolicyEvalResult::not_applicable(
+                    PolicyEvalResult::indeterminate(
                         self.policy_type(),
                         "Policy batch result count did not match input count",
                     )
@@ -565,15 +652,37 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
         inner_results
             .into_iter()
             .map(|inner_result| {
-                let is_forbidden = inner_result.is_forbidden();
-                let is_granted = inner_result.is_granted();
+                let decision = not_decision(&inner_result);
                 PolicyEvalResult::Combined {
                     policy_type: self.policy_type(),
                     operation: CombineOp::Not,
                     children: vec![inner_result],
-                    outcome: !is_forbidden && !is_granted,
+                    decision,
                 }
             })
             .collect()
+    }
+}
+
+/// Decision mapping for [`NotPolicy`].
+///
+/// `NOT` inverts grant/non-grant only; it never neutralizes a veto and never
+/// manufactures certainty out of an indeterminate child:
+///
+/// * `Forbid` stays `Forbid` (the veto propagates; `is_forbidden` also
+///   covers a forbidden leaf hidden inside a mislabeled child tree).
+/// * `Grant` becomes `NotApplicable`.
+/// * `NotApplicable` becomes `Grant`.
+/// * `Indeterminate` stays `Indeterminate` — the inner policy might have
+///   granted or not, so the inversion is equally unknown.
+fn not_decision(inner_result: &PolicyEvalResult) -> Decision {
+    if inner_result.is_forbidden() {
+        return Decision::Forbid;
+    }
+    match inner_result.decision() {
+        Decision::Forbid => Decision::Forbid,
+        Decision::Grant => Decision::NotApplicable,
+        Decision::NotApplicable => Decision::Grant,
+        Decision::Indeterminate => Decision::Indeterminate,
     }
 }

@@ -1,7 +1,8 @@
 use crate::{
-    AccessEvaluation, BatchEvalCtx, CombineOp, Effect, EvalCtx, EvalTrace, EvaluationSession,
-    Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupSource, Policy, PolicyBatchItem,
-    PolicyDomain, PolicyEvalResult, DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE,
+    AccessEvaluation, BatchEvalCtx, CombineOp, Decision, Effect, EvalCtx, EvalTrace,
+    EvaluationSession, Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupSource, Policy,
+    PolicyBatchItem, PolicyDomain, PolicyEvalResult, DEFAULT_SECURITY_RULE_CATEGORY,
+    PERMISSION_CHECKER_POLICY_TYPE,
 };
 use std::borrow::{Borrow, Cow};
 use std::num::NonZeroUsize;
@@ -15,18 +16,32 @@ fn forbid_summary(policy_type: &str, reason: Option<&str>) -> String {
     }
 }
 
+fn indeterminate_summary(policy_type: &str, reason: &str) -> String {
+    format!("Could not evaluate {policy_type}: {reason}")
+}
+
+/// Extracts `(policy_type, reason)` attribution for an indeterminate policy
+/// result, falling back to the policy's own name when the tree has no
+/// indeterminate leaf (e.g. a custom node without one).
+fn indeterminate_attribution(result: &PolicyEvalResult, policy_type: &str) -> (String, String) {
+    result
+        .indeterminate_leaf()
+        .map(|(leaf_type, reason)| (leaf_type.to_string(), reason.to_string()))
+        .unwrap_or_else(|| (policy_type.to_string(), result.reason().unwrap_or_default()))
+}
+
 const FORBID_EFFECT_GRANT_REASON: &str =
     "Forbid-effect policy returned a grant; treated as not applicable";
 
 const ALLOW_EFFECT_FORBID_REASON: &str =
     "Allow-effect policy returned a forbid; the veto is honored but only where observed, so declare Effect::Forbid or Effect::AllowOrForbid to schedule it ahead of grants";
 
-fn checker_root(children: Vec<PolicyEvalResult>, outcome: bool) -> PolicyEvalResult {
+fn checker_root(children: Vec<PolicyEvalResult>, decision: Decision) -> PolicyEvalResult {
     PolicyEvalResult::Combined {
         policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
         operation: CombineOp::DenyOverrides,
         children,
-        outcome,
+        decision,
     }
 }
 
@@ -180,6 +195,13 @@ impl<D: PolicyDomain> PermissionChecker<D> {
 
         let mut policy_results = Vec::with_capacity(self.policies.len());
         let mut first_grant: Option<(Cow<'static, str>, Option<String>)> = None;
+        // First indeterminate result from the veto prefix. Blocks grants:
+        // the failed policy might have forbidden this request.
+        let mut veto_indeterminate: Option<(String, String)> = None;
+        // First indeterminate result from an allow-only policy. Harmless to
+        // grants (the failed policy could only have granted), but if nothing
+        // grants the evaluation is indeterminate rather than denied.
+        let mut allow_indeterminate: Option<(String, String)> = None;
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             let declared_effect = self.declared_effect(policy_index);
@@ -205,6 +227,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
 
             let result_passes = result.is_granted();
             let result_forbids = result.is_forbidden();
+            let result_indeterminate = result.decision() == Decision::Indeterminate;
             if declared_effect == Effect::Allow && result_forbids {
                 tracing::warn!(
                     policy.type = ctx.policy_type.as_ref(),
@@ -222,7 +245,13 @@ impl<D: PolicyDomain> PermissionChecker<D> {
             let ruleset_name = metadata
                 .ruleset_name()
                 .unwrap_or(PERMISSION_CHECKER_POLICY_TYPE);
-            let event_outcome = if result_passes { "success" } else { "failure" };
+            let event_outcome = if result_passes {
+                "success"
+            } else if result_indeterminate {
+                "unknown"
+            } else {
+                "failure"
+            };
             let policy_effect = declared_effect.telemetry_label();
 
             tracing::trace!(
@@ -253,12 +282,21 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     .unwrap_or_else(|| (policy_type_str.to_string(), reason.clone()))
             });
 
+            if result_indeterminate {
+                let attribution = indeterminate_attribution(&result, ctx.policy_type.as_ref());
+                if policy_index < self.veto_capable_count {
+                    veto_indeterminate.get_or_insert(attribution);
+                } else {
+                    allow_indeterminate.get_or_insert(attribution);
+                }
+            }
+
             policy_results.push(result);
 
             if let Some((forbid_policy_type, forbid_reason)) = forbidden {
                 tracing::Span::current().record("outcome", "denied");
                 tracing::Span::current().record("policy.type", forbid_policy_type.as_str());
-                let combined = checker_root(policy_results, false);
+                let combined = checker_root(policy_results, Decision::Forbid);
                 return AccessEvaluation::Denied {
                     trace: EvalTrace::with_root(combined),
                     reason: forbid_summary(&forbid_policy_type, forbid_reason.as_deref()),
@@ -270,10 +308,23 @@ impl<D: PolicyDomain> PermissionChecker<D> {
             }
 
             if policy_index + 1 >= self.veto_capable_count {
+                // Every veto-capable policy has now been evaluated and none
+                // forbade. If one of them was indeterminate its potential
+                // veto is unresolved, so no grant may be released; the
+                // remaining allow-only policies cannot change that.
+                if let Some((policy_type, reason)) = veto_indeterminate.take() {
+                    tracing::Span::current().record("outcome", "indeterminate");
+                    tracing::Span::current().record("policy.type", policy_type.as_str());
+                    let combined = checker_root(policy_results, Decision::Indeterminate);
+                    return AccessEvaluation::Indeterminate {
+                        trace: EvalTrace::with_root(combined),
+                        reason: indeterminate_summary(&policy_type, &reason),
+                    };
+                }
                 if let Some((policy_type, reason)) = first_grant.take() {
                     tracing::Span::current().record("outcome", "granted");
                     tracing::Span::current().record("policy.type", policy_type.as_ref());
-                    let combined = checker_root(policy_results, true);
+                    let combined = checker_root(policy_results, Decision::Grant);
                     return AccessEvaluation::Granted {
                         policy_type,
                         reason,
@@ -283,8 +334,21 @@ impl<D: PolicyDomain> PermissionChecker<D> {
             }
         }
 
+        // Nothing granted and no veto fired. If an allow-only policy was
+        // indeterminate it might have granted, so the evaluation cannot
+        // claim the policies denied the request.
+        if let Some((policy_type, reason)) = allow_indeterminate.take() {
+            tracing::Span::current().record("outcome", "indeterminate");
+            tracing::Span::current().record("policy.type", policy_type.as_str());
+            let combined = checker_root(policy_results, Decision::Indeterminate);
+            return AccessEvaluation::Indeterminate {
+                trace: EvalTrace::with_root(combined),
+                reason: indeterminate_summary(&policy_type, &reason),
+            };
+        }
+
         tracing::Span::current().record("outcome", "denied");
-        let combined = checker_root(policy_results, false);
+        let combined = checker_root(policy_results, Decision::NotApplicable);
         AccessEvaluation::Denied {
             trace: EvalTrace::with_root(combined),
             reason: "All policies denied access".to_string(),
@@ -350,6 +414,11 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         let mut pending: Vec<usize> = (0..item_count).collect();
         let mut first_grants: Vec<Option<(Cow<'static, str>, Option<String>)>> =
             vec![None; item_count];
+        // Per-item attribution for the first indeterminate policy result
+        // (any position), and whether an indeterminate was observed in the
+        // veto prefix (which blocks grants for that item).
+        let mut indeterminate_notes: Vec<Option<(String, String)>> = vec![None; item_count];
+        let mut veto_indeterminate = vec![false; item_count];
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             if pending.is_empty() {
@@ -377,10 +446,12 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     policy.granted_count = tracing::field::Empty,
                     policy.denied_count = tracing::field::Empty,
                     policy.forbidden_count = tracing::field::Empty,
+                    policy.indeterminate_count = tracing::field::Empty,
                 );
                 let mut policy_granted_count = 0usize;
                 let mut policy_denied_count = 0usize;
                 let mut policy_forbidden_count = 0usize;
+                let mut policy_indeterminate_count = 0usize;
                 let mut contract_violation_count = 0usize;
                 let mut allow_forbid_violation_count = 0usize;
                 let batch_items = pending_chunk
@@ -404,23 +475,34 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     .await;
 
                 if policy_results.len() != pending_chunk.len() {
+                    // The policy broke the one-result-per-item contract, so
+                    // these items could not be evaluated. Fail closed as
+                    // indeterminate: never a grant, and surfaced as an
+                    // infrastructure-shaped failure rather than a policy
+                    // decision.
                     for &index in pending_chunk {
-                        policy_denied_count += 1;
-                        let policy_result = PolicyEvalResult::not_applicable(
+                        policy_indeterminate_count += 1;
+                        let policy_result = PolicyEvalResult::indeterminate(
                             policy_type.clone(),
                             "Policy batch result count did not match input count",
                         );
                         traces[index].push(policy_result);
-                        let combined = checker_root(std::mem::take(&mut traces[index]), false);
-                        evaluations[index] = Some(AccessEvaluation::Denied {
+                        let combined = checker_root(
+                            std::mem::take(&mut traces[index]),
+                            Decision::Indeterminate,
+                        );
+                        evaluations[index] = Some(AccessEvaluation::Indeterminate {
                             trace: EvalTrace::with_root(combined),
-                            reason: "Policy batch result count did not match input count"
-                                .to_string(),
+                            reason: indeterminate_summary(
+                                policy_type_str,
+                                "Policy batch result count did not match input count",
+                            ),
                         });
                     }
                     policy_span.record("policy.granted_count", policy_granted_count);
                     policy_span.record("policy.denied_count", policy_denied_count);
                     policy_span.record("policy.forbidden_count", policy_forbidden_count);
+                    policy_span.record("policy.indeterminate_count", policy_indeterminate_count);
                     continue;
                 }
 
@@ -435,6 +517,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     }
                     let result_passes = result.is_granted();
                     let result_forbids = result.is_forbidden();
+                    let result_indeterminate = result.decision() == Decision::Indeterminate;
                     if declared_effect == Effect::Allow && result_forbids {
                         allow_forbid_violation_count += 1;
                     }
@@ -448,11 +531,20 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                             .unwrap_or_else(|| (policy_type_str.to_string(), reason.clone()))
                     });
 
+                    if result_indeterminate {
+                        let attribution = indeterminate_attribution(&result, policy_type_str);
+                        indeterminate_notes[index].get_or_insert(attribution);
+                        if policy_index < self.veto_capable_count {
+                            veto_indeterminate[index] = true;
+                        }
+                    }
+
                     traces[index].push(result);
 
                     if let Some((forbid_policy_type, forbid_reason)) = forbidden {
                         policy_forbidden_count += 1;
-                        let combined = checker_root(std::mem::take(&mut traces[index]), false);
+                        let combined =
+                            checker_root(std::mem::take(&mut traces[index]), Decision::Forbid);
                         evaluations[index] = Some(AccessEvaluation::Denied {
                             trace: EvalTrace::with_root(combined),
                             reason: forbid_summary(&forbid_policy_type, forbid_reason.as_deref()),
@@ -462,16 +554,36 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                             policy_granted_count += 1;
                             first_grants[index]
                                 .get_or_insert_with(|| (policy_type.clone(), reason));
+                        } else if result_indeterminate {
+                            policy_indeterminate_count += 1;
                         } else {
                             policy_denied_count += 1;
                         }
 
                         if policy_index + 1 >= self.veto_capable_count {
-                            if let Some((grant_policy_type, grant_reason)) =
+                            // Mirrors `evaluate_one`: after the full veto
+                            // prefix, an unresolved potential veto blocks
+                            // any grant for this item.
+                            if veto_indeterminate[index] {
+                                let (note_policy_type, note_reason) =
+                                    indeterminate_notes[index].take().unwrap_or_else(|| {
+                                        (policy_type_str.to_string(), String::new())
+                                    });
+                                let combined = checker_root(
+                                    std::mem::take(&mut traces[index]),
+                                    Decision::Indeterminate,
+                                );
+                                evaluations[index] = Some(AccessEvaluation::Indeterminate {
+                                    trace: EvalTrace::with_root(combined),
+                                    reason: indeterminate_summary(&note_policy_type, &note_reason),
+                                });
+                            } else if let Some((grant_policy_type, grant_reason)) =
                                 first_grants[index].take()
                             {
-                                let combined =
-                                    checker_root(std::mem::take(&mut traces[index]), true);
+                                let combined = checker_root(
+                                    std::mem::take(&mut traces[index]),
+                                    Decision::Grant,
+                                );
                                 evaluations[index] = Some(AccessEvaluation::Granted {
                                     policy_type: grant_policy_type,
                                     reason: grant_reason,
@@ -502,16 +614,30 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                 policy_span.record("policy.granted_count", policy_granted_count);
                 policy_span.record("policy.denied_count", policy_denied_count);
                 policy_span.record("policy.forbidden_count", policy_forbidden_count);
+                policy_span.record("policy.indeterminate_count", policy_indeterminate_count);
             }
             pending = still_pending;
         }
 
         for index in pending {
-            let combined = checker_root(std::mem::take(&mut traces[index]), false);
-            evaluations[index] = Some(AccessEvaluation::Denied {
-                trace: EvalTrace::with_root(combined),
-                reason: "All policies denied access".to_string(),
-            });
+            // Mirrors `evaluate_one`: nothing granted and no veto fired.
+            // An allow-only indeterminate policy might have granted, so the
+            // item is indeterminate rather than denied.
+            if let Some((note_policy_type, note_reason)) = indeterminate_notes[index].take() {
+                let combined =
+                    checker_root(std::mem::take(&mut traces[index]), Decision::Indeterminate);
+                evaluations[index] = Some(AccessEvaluation::Indeterminate {
+                    trace: EvalTrace::with_root(combined),
+                    reason: indeterminate_summary(&note_policy_type, &note_reason),
+                });
+            } else {
+                let combined =
+                    checker_root(std::mem::take(&mut traces[index]), Decision::NotApplicable);
+                evaluations[index] = Some(AccessEvaluation::Denied {
+                    trace: EvalTrace::with_root(combined),
+                    reason: "All policies denied access".to_string(),
+                });
+            }
         }
 
         drop(item_parts);

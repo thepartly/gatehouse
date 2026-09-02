@@ -1,6 +1,6 @@
 use crate::{
-    AccessEvaluation, BatchEvalCtx, CombineOp, Effect, EvalCtx, PermissionChecker, Policy,
-    PolicyDomain, PolicyEvalResult, SecurityRuleMetadata, PERMISSION_CHECKER_POLICY_TYPE,
+    AccessEvaluation, BatchEvalCtx, CombineOp, Decision, Effect, EvalCtx, PermissionChecker,
+    Policy, PolicyDomain, PolicyEvalResult, SecurityRuleMetadata, PERMISSION_CHECKER_POLICY_TYPE,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -9,32 +9,53 @@ fn delegated_evaluation_to_result(
     policy_type: std::borrow::Cow<'static, str>,
     evaluation: AccessEvaluation,
 ) -> PolicyEvalResult {
-    match evaluation {
+    let (decision, child) = match evaluation {
         AccessEvaluation::Granted {
             policy_type: child_policy_type,
             reason,
             trace,
-        } => PolicyEvalResult::Combined {
-            policy_type,
-            operation: CombineOp::Delegate,
-            children: vec![trace
+        } => (
+            Decision::Grant,
+            trace
                 .root()
                 .cloned()
-                .unwrap_or(PolicyEvalResult::granted(child_policy_type, reason))],
-            outcome: true,
-        },
-        AccessEvaluation::Denied { reason, trace } => PolicyEvalResult::Combined {
-            policy_type,
-            operation: CombineOp::Delegate,
-            children: vec![trace
+                .unwrap_or(PolicyEvalResult::granted(child_policy_type, reason)),
+        ),
+        AccessEvaluation::Denied { reason, trace } => {
+            let child = trace
                 .root()
                 .cloned()
                 .unwrap_or(PolicyEvalResult::not_applicable(
                     PERMISSION_CHECKER_POLICY_TYPE,
                     reason,
-                ))],
-            outcome: false,
-        },
+                ));
+            // A child-checker denial is either a veto (which must propagate
+            // so the parent checker honors it over sibling grants) or an
+            // ordinary "nothing granted".
+            let decision = if child.is_forbidden() {
+                Decision::Forbid
+            } else {
+                Decision::NotApplicable
+            };
+            (decision, child)
+        }
+        AccessEvaluation::Indeterminate { reason, trace } => (
+            Decision::Indeterminate,
+            trace
+                .root()
+                .cloned()
+                .unwrap_or(PolicyEvalResult::indeterminate(
+                    PERMISSION_CHECKER_POLICY_TYPE,
+                    reason,
+                )),
+        ),
+    };
+
+    PolicyEvalResult::Combined {
+        policy_type,
+        operation: CombineOp::Delegate,
+        children: vec![child],
+        decision,
     }
 }
 

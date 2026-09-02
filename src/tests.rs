@@ -789,15 +789,16 @@ mod core_tests {
         for (_item, evaluation) in results {
             assert!(!evaluation.is_granted());
             match evaluation {
-                AccessEvaluation::Denied { reason, trace } => {
-                    assert_eq!(
-                        reason,
-                        "Policy batch result count did not match input count"
+                AccessEvaluation::Indeterminate { reason, trace } => {
+                    assert!(
+                        reason.contains("Policy batch result count did not match input count"),
+                        "unexpected reason: {reason}"
                     );
+                    assert!(reason.contains("MismatchedBatchPolicy"));
                     assert!(trace.format().contains("MismatchedBatchPolicy"));
                 }
-                AccessEvaluation::Granted { .. } => {
-                    panic!("mismatched batch result should fail closed");
+                other => {
+                    panic!("mismatched batch result should fail closed as indeterminate, got {other:?}");
                 }
             }
         }
@@ -1546,6 +1547,7 @@ mod core_tests {
         let result = policy.evaluate(&ctx).await;
 
         assert!(!result.is_granted());
+        assert_eq!(result.decision(), Decision::Indeterminate);
         let provenance = result.provenance();
         assert_eq!(provenance.len(), 1);
         assert_eq!(provenance[0].outcome, FactOutcome::Error);
@@ -1701,7 +1703,7 @@ mod core_tests {
         };
         let policy = relationship_policy("viewer".to_string());
 
-        for (session, expected_reason) in [
+        for (session, expected_reason, expected_decision) in [
             {
                 let session = FactRegistry::builder()
                     .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
@@ -1709,7 +1711,8 @@ mod core_tests {
                     )
                     .build()
                     .session();
-                (session, "fact is missing")
+                // An authoritative "no such fact" is an ordinary non-grant.
+                (session, "fact is missing", Decision::NotApplicable)
             },
             {
                 let session = FactRegistry::builder()
@@ -1718,7 +1721,8 @@ mod core_tests {
                     )
                     .build()
                     .session();
-                (session, "database unavailable")
+                // A failed load means the policy could not decide.
+                (session, "database unavailable", Decision::Indeterminate)
             },
             {
                 let session = FactRegistry::builder()
@@ -1727,7 +1731,7 @@ mod core_tests {
                     )
                     .build()
                     .session();
-                (session, "returned")
+                (session, "returned", Decision::Indeterminate)
             },
         ] {
             let ctx = EvalCtx {
@@ -1740,6 +1744,7 @@ mod core_tests {
             };
             let result = policy.evaluate(&ctx).await;
             assert!(!result.is_granted());
+            assert_eq!(result.decision(), expected_decision);
             assert!(result
                 .reason()
                 .as_deref()
@@ -1879,10 +1884,10 @@ mod core_tests {
                 policy_type,
                 operation,
                 children,
-                outcome,
+                decision,
             } => {
                 assert_eq!(operation, CombineOp::And);
-                assert!(!outcome);
+                assert_eq!(decision, Decision::NotApplicable);
                 assert_eq!(children.len(), 2);
                 assert!(children[1].format(0).contains("DenyInAnd"));
                 assert_eq!(policy_type, "AndPolicy");
@@ -1932,10 +1937,10 @@ mod core_tests {
                 policy_type,
                 operation,
                 children,
-                outcome,
+                decision,
             } => {
                 assert_eq!(operation, CombineOp::Or);
-                assert!(!outcome);
+                assert_eq!(decision, Decision::NotApplicable);
                 assert_eq!(children.len(), 2);
                 assert!(children[0].format(0).contains("Deny1"));
                 assert!(children[1].format(0).contains("Deny2"));
@@ -1978,10 +1983,10 @@ mod core_tests {
                 policy_type,
                 operation,
                 children,
-                outcome,
+                decision,
             } => {
                 assert_eq!(operation, CombineOp::Not);
-                assert!(!outcome);
+                assert_eq!(decision, Decision::NotApplicable);
                 assert_eq!(children.len(), 1);
                 assert!(children[0].format(0).contains("AlwaysAllowPolicy"));
                 assert_eq!(policy_type, "NotPolicy");
@@ -2835,7 +2840,7 @@ mod core_tests {
             policy_type: std::borrow::Cow::Borrowed("CombinedPolicy"),
             operation: CombineOp::And,
             children: vec![],
-            outcome: true,
+            decision: Decision::Grant,
         };
         assert_eq!(
             result.reason(),
@@ -3079,7 +3084,7 @@ mod core_tests {
             policy_type: "C".into(),
             operation: CombineOp::Or,
             children: vec![],
-            outcome: false,
+            decision: Decision::NotApplicable,
         };
         assert_eq!(combined.reason_str(), None);
     }
@@ -3096,6 +3101,7 @@ mod core_tests {
         assert_serialize::<FactOutcome>();
         assert_serialize::<FactLoadErrorKind>();
         assert_serialize::<CombineOp>();
+        assert_serialize::<Decision>();
     }
 
     #[cfg(feature = "serde")]
@@ -3336,6 +3342,13 @@ mod core_tests {
 
         assert!(!evaluation.is_granted());
         assert!(
+            evaluation.is_indeterminate(),
+            "a backend failure means the policy could not be evaluated: {evaluation}"
+        );
+        assert!(evaluation
+            .indeterminate_reason()
+            .is_some_and(|reason| reason.contains("RebacPolicy")));
+        assert!(
             evaluation.denied_due_to_fact_load_error(),
             "backend failure should surface as denied_due_to_fact_load_error"
         );
@@ -3364,6 +3377,7 @@ mod core_tests {
             .check(&resource)
             .await;
 
+        assert!(evaluation.is_indeterminate());
         assert!(evaluation.denied_due_to_fact_load_error());
         let errors = evaluation.fact_load_errors();
         assert_eq!(errors.len(), 1);
@@ -3558,8 +3572,9 @@ mod policy_builder_tests {
                     "granted policy_type should stay Borrowed, got {policy_type:?}"
                 );
             }
-            AccessEvaluation::Denied { reason, .. } => {
-                panic!("expected grant, got denial: {reason}");
+            AccessEvaluation::Denied { reason, .. }
+            | AccessEvaluation::Indeterminate { reason, .. } => {
+                panic!("expected grant, got non-grant: {reason}");
             }
         }
     }

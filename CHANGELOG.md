@@ -10,12 +10,52 @@
 - `FactProvenance::from_load_result(...)` is the canonical way for fact-backed
   policies to record a load result. It maps the outcome and diagnostic detail
   and preserves the error classification in the public `error_kind` field.
+- First-class `Indeterminate` outcome (#61). `Decision` is a new
+  four-valued enum (`Grant` / `NotApplicable` / `Forbid` / `Indeterminate`)
+  carried by **every** `PolicyEvalResult` node via the new
+  `PolicyEvalResult::decision()` accessor. New leaf variant
+  `PolicyEvalResult::Indeterminate` (constructors `indeterminate` /
+  `indeterminate_with_facts`) means "this policy consulted an input that was
+  unavailable and could not decide" — fail-closed, never a grant. New
+  top-level variant `AccessEvaluation::Indeterminate` (plus
+  `is_indeterminate()`, `indeterminate_reason()`, `assert_indeterminate()`)
+  is the structural, causal signal for mapping authorization-data outages to
+  a 5xx instead of a 403.
+- Deny-overrides combination rules for `Indeterminate`: a definite
+  `Forbidden` still overrides everything; an indeterminate **veto-capable**
+  policy blocks sibling grants (its unresolved potential veto is never
+  short-circuited); an indeterminate **allow-only** policy never blocks a
+  grant, but if nothing grants the evaluation is `Indeterminate` rather than
+  `"All policies denied access"`. `AndPolicy` / `OrPolicy` apply the same
+  veto-prefix rules; `NotPolicy` maps `Indeterminate` to `Indeterminate`
+  (never a grant); `DelegatingPolicy` propagates a child checker's
+  indeterminate outcome.
+- `gatehouse.batch_policy` spans record `policy.indeterminate_count`, the
+  `evaluate_one` span can record `outcome = "indeterminate"`, and the
+  `gatehouse::security` event outcome is `"unknown"` for indeterminate
+  policy results.
 
 ### Changed
 
 - **Breaking:** `FactProvenance` gains a public `error_kind` field. Downstream
   struct literals must initialize it; constructors using `FactProvenance::new`
   continue to produce unclassified provenance with `error_kind: None`.
+- **Breaking:** `PolicyEvalResult::Combined` replaces `outcome: bool` with
+  `decision: Decision`. `is_forbidden()` now reads the node decision first
+  and keeps the recursive `Forbidden`-leaf scan as a fail-closed backstop
+  for inconsistent custom combinator nodes.
+- **Breaking:** `RebacPolicy` returns `Indeterminate` (previously
+  `NotApplicable`) when a relationship fact load *fails* — backend errors,
+  unregistered sources, contract violations. A checker whose decisive path
+  hits such a failure now yields `AccessEvaluation::Indeterminate` instead of
+  `Denied`. Authoritative `Found(false)` / `Missing` answers remain ordinary
+  non-grants.
+- **Breaking:** a policy whose `evaluate_batch` returns the wrong number of
+  results now fails closed as `Indeterminate` (previously an ordinary
+  denial): the affected items genuinely could not be evaluated.
+- `AccessEvaluation::denied_due_to_fact_load_error()` also returns `true`
+  for `Indeterminate` evaluations whose trace carries a fact-load error;
+  prefer the structural `is_indeterminate()` for the 403-vs-5xx split.
 
 ### Fixed
 
