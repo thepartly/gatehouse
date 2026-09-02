@@ -1191,8 +1191,12 @@ impl PolicyEvalResult {
     /// non-forbid decision while keeping a `Forbidden` leaf in its children
     /// is still treated as forbidding — and a `WARN` names the inconsistent
     /// node so the broken combinator is visible in logs rather than being
-    /// silently corrected forever. The scan short-circuits as soon as a
-    /// forbid is found.
+    /// silently corrected forever. The warning fires on every call that
+    /// takes the backstop path (the checker and combinators consult
+    /// `is_forbidden` several times per evaluation), so one inconsistent
+    /// node can log more than once per request; that is accepted noise for
+    /// a condition that indicates a broken combinator. The scan
+    /// short-circuits as soon as a forbid is found.
     pub fn is_forbidden(&self) -> bool {
         if self.decision() == Decision::Forbid {
             return true;

@@ -122,6 +122,12 @@ Mechanical changes:
   the pre-0.6 `subject -[relation]-> resource` form unchanged.
   `RebacPolicy` consequently requires `Relation: fmt::Debug` in addition to
   `fmt::Display`.
+- The `FactKey` impl for `RelationshipQuery` itself now requires
+  `Relation: fmt::Display` (its `render` override uses it) and `fmt::Debug`
+  on all three id types. Policies that build `RelationshipQuery` keys and
+  load them directly — without `RebacPolicy`, which always required
+  `Display` — need a `Display` impl on relation types that only derived
+  `Debug`.
 - Loading a fact through some other loader? Record it explicitly:
   `ctx.record(FactProvenance::from_load_result(NAME, key_repr, &result))`.
 - The `*_with_facts` helpers remain for provenance computed from something

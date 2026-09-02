@@ -727,6 +727,79 @@ fn tracing_records_wrong_length_batch_policy_denials() {
     assert_value(policy, "policy.forbidden_count", "0");
 }
 
+/// A combinator node whose decision disagrees with a surviving `Forbidden`
+/// leaf is treated as forbidding, and the backstop names the inconsistent
+/// node in a `WARN` so the broken combinator is visible in logs.
+struct LyingGrantNodePolicy;
+
+#[async_trait]
+impl Policy<Domain> for LyingGrantNodePolicy {
+    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("LyingGrantNodePolicy"),
+            operation: gatehouse::CombineOp::And,
+            children: vec![PolicyEvalResult::forbidden("HiddenVeto", "buried veto")],
+            decision: gatehouse::Decision::Grant,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("LyingGrantNodePolicy")
+    }
+
+    fn effect(&self) -> gatehouse::Effect {
+        gatehouse::Effect::AllowOrForbid
+    }
+}
+
+#[test]
+fn tracing_records_inconsistent_combined_node_warning() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(LyingGrantNodePolicy);
+    let session = EvaluationSession::empty();
+
+    let (result, _spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(!result.is_granted(), "the buried veto must fail closed");
+
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.level == "WARN"
+                && event
+                    .values
+                    .get("message")
+                    .is_some_and(|message| message.contains("non-forbid decision"))
+        })
+        .unwrap_or_else(|| panic!("missing inconsistent-node warning; events: {events:#?}"));
+    assert_event_value(warning, "node.policy_type", "LyingGrantNodePolicy");
+    assert_event_value(warning, "node.decision", "GRANT");
+    assert_event_value(warning, "forbidden_leaf.policy_type", "HiddenVeto");
+
+    // Consistent trees never trigger the backstop warning.
+    let mut clean_checker = PermissionChecker::new();
+    clean_checker.add_policy(PolicyBuilder::<Domain>::new("CleanForbid").forbid().build());
+    let (_result, _spans, clean_events) = capture_async_with_events(|| async {
+        clean_checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(
+        clean_events.iter().all(|event| {
+            !event
+                .values
+                .get("message")
+                .is_some_and(|message| message.contains("non-forbid decision"))
+        }),
+        "consistent nodes must not emit the backstop warning: {clean_events:#?}"
+    );
+}
+
 #[test]
 fn tracing_records_forbid_effect_contract_violation_warning() {
     let mut checker = PermissionChecker::new();

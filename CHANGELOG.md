@@ -84,6 +84,12 @@
   `render` to keep its established `subject -[relation]-> resource` audit
   form, so recorded key strings are unchanged from 0.5; `RebacPolicy` now
   requires `Relation: fmt::Debug` in addition to `fmt::Display`.
+- **Breaking:** the `FactKey` impl for `RelationshipQuery` now requires
+  `Relation: fmt::Display` (used by its `render` override) in addition to
+  the `fmt::Debug` required on all three id types by the new supertrait.
+  Code that builds `RelationshipQuery` keys and loads them directly —
+  without going through `RebacPolicy`, which always required `Display` —
+  breaks if its relation type only derives `Debug`.
 - A `Combined` node whose decision disagrees with a surviving `Forbidden`
   leaf is still treated as forbidding (fail closed) and now emits a `WARN`
   naming the inconsistent node, so a broken custom combinator is visible in
