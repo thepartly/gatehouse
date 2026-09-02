@@ -34,6 +34,23 @@
   `evaluate_one` span can record `outcome = "indeterminate"`, and the
   `gatehouse::security` event outcome is `"unknown"` for indeterminate
   policy results.
+- Recording evaluation contexts (#62). `EvalCtx::fact(key)` /
+  `EvalCtx::facts(keys)` and `BatchEvalCtx::facts_by(key_of)` /
+  `BatchEvalCtx::fact(key)` load through the session **and** record each
+  consulted fact as `FactProvenance`; the context result helpers
+  (`ctx.grant`, `ctx.not_applicable`, `ctx.forbid`, the new
+  `ctx.indeterminate`, and the `*_with_facts` variants) attach everything
+  recorded, so provenance is correct by construction instead of opt-in.
+  The checker and combinators merge facts a policy recorded but did not
+  attach (`EvalCtx::finish` / `BatchEvalCtx::finish`, public for callers
+  that drive `Policy::evaluate` directly). `ctx.record(...)` covers facts
+  loaded outside the context; `ctx.session()` is the documented
+  non-recording escape hatch.
+- `ctx.not_applicable(...)` after a **recorded** failed load is upgraded to
+  `PolicyEvalResult::Indeterminate`, closing the silent case where a policy
+  that forgot `*_with_facts` disabled the infrastructure-failure signal
+  (#58 case 3). Explicit provenance passed to `not_applicable_with_facts`
+  never changes the author's variant choice.
 
 ### Changed
 
@@ -56,6 +73,16 @@
 - `AccessEvaluation::denied_due_to_fact_load_error()` also returns `true`
   for `Indeterminate` evaluations whose trace carries a fact-load error;
   prefer the structural `is_indeterminate()` for the 403-vs-5xx split.
+- **Breaking:** `EvalCtx` and `BatchEvalCtx` are no longer constructible by
+  struct literal: `session` is private (use the new `session()` accessor)
+  and both gain a private provenance recorder. Use `EvalCtx::new(...)` /
+  `BatchEvalCtx::new(...)`, and pass results through `finish` when invoking
+  policies directly.
+- **Breaking:** `RebacPolicy` now requires `Relation: fmt::Debug` (its
+  `RelationshipQuery` keys are recorded through the context, which renders
+  keys with `Debug`). `RelationshipQuery`'s `Debug` output is the audit
+  form `subject -[relation]-> resource` and is the provenance key string;
+  the relation is now rendered with `Debug` instead of `Display`.
 
 ### Fixed
 

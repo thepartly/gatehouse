@@ -141,15 +141,16 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
         let mut allow_indeterminate = false;
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
-            let inner_ctx = EvalCtx {
-                session: ctx.session,
-                subject: ctx.subject,
-                action: ctx.action,
-                resource: ctx.resource,
-                context: ctx.context,
-                policy_type: policy.policy_type(),
-            };
+            let inner_ctx = EvalCtx::new(
+                ctx.session(),
+                ctx.subject,
+                ctx.action,
+                ctx.resource,
+                ctx.context,
+                policy.policy_type(),
+            );
             let result = policy.evaluate(&inner_ctx).await;
+            let result = inner_ctx.finish(result);
             let is_granted = result.is_granted();
             let is_forbidden = result.is_forbidden();
             let is_indeterminate = result.decision() == Decision::Indeterminate;
@@ -235,15 +236,16 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
                     resource: ctx.items[index].resource,
                 })
                 .collect::<Vec<_>>();
-            let batch_ctx = BatchEvalCtx {
-                session: ctx.session,
-                subject: ctx.subject,
-                action: ctx.action,
-                context: ctx.context,
-                items: &batch_items,
-                policy_type: policy.policy_type(),
-            };
+            let batch_ctx = BatchEvalCtx::new(
+                ctx.session(),
+                ctx.subject,
+                ctx.action,
+                ctx.context,
+                &batch_items,
+                policy.policy_type(),
+            );
             let child_results = policy.evaluate_batch(&batch_ctx).await;
+            let child_results = batch_ctx.finish(child_results);
 
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
@@ -384,15 +386,16 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
         let mut allow_indeterminate = false;
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
-            let inner_ctx = EvalCtx {
-                session: ctx.session,
-                subject: ctx.subject,
-                action: ctx.action,
-                resource: ctx.resource,
-                context: ctx.context,
-                policy_type: policy.policy_type(),
-            };
+            let inner_ctx = EvalCtx::new(
+                ctx.session(),
+                ctx.subject,
+                ctx.action,
+                ctx.resource,
+                ctx.context,
+                policy.policy_type(),
+            );
             let result = policy.evaluate(&inner_ctx).await;
+            let result = inner_ctx.finish(result);
             let is_granted = result.is_granted();
             let is_forbidden = result.is_forbidden();
             let is_indeterminate = result.decision() == Decision::Indeterminate;
@@ -478,15 +481,16 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
                     resource: ctx.items[index].resource,
                 })
                 .collect::<Vec<_>>();
-            let batch_ctx = BatchEvalCtx {
-                session: ctx.session,
-                subject: ctx.subject,
-                action: ctx.action,
-                context: ctx.context,
-                items: &batch_items,
-                policy_type: policy.policy_type(),
-            };
+            let batch_ctx = BatchEvalCtx::new(
+                ctx.session(),
+                ctx.subject,
+                ctx.action,
+                ctx.context,
+                &batch_items,
+                policy.policy_type(),
+            );
             let child_results = policy.evaluate_batch(&batch_ctx).await;
+            let child_results = batch_ctx.finish(child_results);
 
             if child_results.len() != pending.len() {
                 for index in pending.drain(..) {
@@ -606,15 +610,16 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
     }
 
     async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
-        let inner_ctx = EvalCtx {
-            session: ctx.session,
-            subject: ctx.subject,
-            action: ctx.action,
-            resource: ctx.resource,
-            context: ctx.context,
-            policy_type: self.policy.policy_type(),
-        };
+        let inner_ctx = EvalCtx::new(
+            ctx.session(),
+            ctx.subject,
+            ctx.action,
+            ctx.resource,
+            ctx.context,
+            self.policy.policy_type(),
+        );
         let inner_result = self.policy.evaluate(&inner_ctx).await;
+        let inner_result = inner_ctx.finish(inner_result);
         let decision = not_decision(&inner_result);
 
         PolicyEvalResult::Combined {
@@ -626,15 +631,16 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
     }
 
     async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
-        let inner_ctx = BatchEvalCtx {
-            session: ctx.session,
-            subject: ctx.subject,
-            action: ctx.action,
-            context: ctx.context,
-            items: ctx.items,
-            policy_type: self.policy.policy_type(),
-        };
+        let inner_ctx = BatchEvalCtx::new(
+            ctx.session(),
+            ctx.subject,
+            ctx.action,
+            ctx.context,
+            ctx.items,
+            self.policy.policy_type(),
+        );
         let inner_results = self.policy.evaluate_batch(&inner_ctx).await;
+        let inner_results = inner_ctx.finish(inner_results);
 
         if inner_results.len() != ctx.items.len() {
             return ctx

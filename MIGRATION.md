@@ -70,6 +70,64 @@ if evaluation.is_granted() {
 `denied_due_to_fact_load_error()` remains as the coarser any-error-in-trace
 scan for policies that still record failed loads on `NotApplicable` results.
 
+## Recording evaluation contexts
+
+Fact provenance is no longer opt-in. `EvalCtx` owns a recorder, and fact
+access goes through the context:
+
+```rust,ignore
+// Before: six lines of ceremony per fact, silently wrong if skipped.
+let key = IsMember(ctx.subject.id);
+let result = ctx.session.get(key.clone()).await;
+let provenance = vec![FactProvenance::from_load_result(
+    IsMember::NAME,
+    format!("{key:?}"),
+    &result,
+)];
+match result {
+    FactLoadResult::Found(true) => ctx.grant_with_facts("is a member", provenance),
+    _ => ctx.not_applicable_with_facts("not a member", provenance),
+}
+
+// After: recording is a side effect of the load; the helpers attach it.
+match ctx.fact(IsMember(ctx.subject.id)).await {
+    FactLoadResult::Found(true) => ctx.grant("is a member"),
+    _ => ctx.not_applicable("not a member"),
+}
+```
+
+Batch policies use `ctx.facts_by(|resource| Key(...))` for one key per item
+(one deduplicated `get_many`, provenance recorded against the originating
+item) and `ctx.fact(key)` for a per-subject fact shared by every item.
+
+Mechanical changes:
+
+- `EvalCtx` / `BatchEvalCtx` can no longer be built with struct literals.
+  Use `EvalCtx::new(session, subject, action, resource, context,
+  policy_type)` and `BatchEvalCtx::new(session, subject, action, context,
+  items, policy_type)` — typically only in policy unit tests and custom
+  combinators.
+- `ctx.session` is now a method: `ctx.session()`. Loads made directly on
+  the session are invisible to recording; treat it as an escape hatch.
+- Callers that invoke `Policy::evaluate` / `Policy::evaluate_batch`
+  directly (tests, custom combinators) should pass the results through
+  `ctx.finish(result)` / `batch_ctx.finish(results)` so facts a policy
+  recorded but did not attach still reach the trace. The checker and the
+  built-in combinators do this for you.
+- `ctx.fact` requires the key type to implement `fmt::Debug` (the rendered
+  key becomes the provenance key string). `RebacPolicy` consequently
+  requires `Relation: fmt::Debug` in addition to `fmt::Display`.
+- Loading a fact through some other loader? Record it explicitly:
+  `ctx.record(FactProvenance::from_load_result(NAME, key_repr, &result))`.
+- The `*_with_facts` helpers remain for provenance computed from something
+  other than a context load, and now *append* to whatever was recorded.
+
+Because the context witnesses every recorded load,
+`ctx.not_applicable(...)` after a failed load now returns an
+`Indeterminate` result instead of silently looking like an ordinary
+non-match — the 403-vs-503 signal no longer depends on the policy author
+remembering `*_with_facts`.
+
 ### Behavior changes to audit
 
 - `RebacPolicy` now returns `Indeterminate` when a relationship fact **load

@@ -236,31 +236,25 @@ pub enum FactLoadResult<V> {
 ///     &self,
 ///     ctx: &EvalCtx<'_, InvoiceAccess>,
 /// ) -> PolicyEvalResult {
-///     let key = CustomerForOrg(ctx.subject.org_id);
-///     let result = ctx.session.get(key.clone()).await;
-///     let provenance = vec![FactProvenance::from_load_result(
-///         CustomerForOrg::NAME,
-///         format!("{key:?}"),
-///         &result,
-///     )];
-///
-///     match result {
+///     match ctx.fact(CustomerForOrg(ctx.subject.org_id)).await {
 ///         FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
-///             ctx.grant_with_facts(
-///                 "subject's org bills under the invoice's customer",
-///                 provenance,
-///             )
+///             ctx.grant("subject's org bills under the invoice's customer")
 ///         }
-///         _ => ctx.not_applicable_with_facts("not the billing customer", provenance),
+///         _ => ctx.not_applicable("not the billing customer"),
 ///     }
 /// }
 /// ```
 ///
-/// Recording provenance is operationally significant: it lets
-/// [`crate::AccessEvaluation::denied_due_to_fact_load_error`] distinguish a
-/// failed load from an ordinary authorization denial. Policies should use
+/// [`crate::EvalCtx::fact`] records the consulted fact as
+/// [`crate::FactProvenance`] and the context's result helpers attach it, so
+/// provenance is correct by construction — and a failed load reported
+/// through `ctx.not_applicable` is upgraded to an indeterminate result,
+/// which lets [`crate::AccessEvaluation::is_indeterminate`] distinguish a
+/// failed load from an ordinary authorization denial. Policies that load
+/// outside the context (via [`crate::EvalCtx::session`]) can still record
+/// provenance manually with
 /// [`FactProvenance::from_load_result`](crate::FactProvenance::from_load_result)
-/// whenever a load result contributes to a decision.
+/// and [`crate::EvalCtx::record`].
 ///
 /// The built-in [`RebacPolicy`](crate::RebacPolicy) generalises this idiom
 /// for relationship-shaped facts; the same plumbing handles arbitrary
@@ -371,7 +365,7 @@ impl std::error::Error for FactSourceRegistrationError {}
 /// };
 /// assert_eq!(query.relation, Relation::Owner);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RelationshipQuery<SubjectId, ResourceId, Relation> {
     /// Subject identifier.
     pub subject_id: SubjectId,
@@ -379,6 +373,26 @@ pub struct RelationshipQuery<SubjectId, ResourceId, Relation> {
     pub resource_id: ResourceId,
     /// Relationship being checked.
     pub relation: Relation,
+}
+
+/// Renders the relationship in its established audit form,
+/// `subject -[relation]-> resource`, which is also the key string recorded
+/// in [`crate::FactProvenance`] when the query is loaded through
+/// [`crate::EvalCtx::fact`].
+impl<SubjectId, ResourceId, Relation> fmt::Debug
+    for RelationshipQuery<SubjectId, ResourceId, Relation>
+where
+    SubjectId: fmt::Debug,
+    ResourceId: fmt::Debug,
+    Relation: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?} -[{:?}]-> {:?}",
+            self.subject_id, self.relation, self.resource_id
+        )
+    }
 }
 
 impl<SubjectId, ResourceId, Relation> FactKey for RelationshipQuery<SubjectId, ResourceId, Relation>

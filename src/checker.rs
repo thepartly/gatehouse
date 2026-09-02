@@ -205,22 +205,27 @@ impl<D: PolicyDomain> PermissionChecker<D> {
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             let declared_effect = self.declared_effect(policy_index);
-            let ctx = EvalCtx {
+            let policy_type = policy.policy_type();
+            let ctx = EvalCtx::new(
                 session,
                 subject,
                 action,
                 resource,
                 context,
-                policy_type: policy.policy_type(),
-            };
-            let mut result = policy.evaluate(&ctx).await;
+                policy_type.clone(),
+            );
+            let result = policy.evaluate(&ctx).await;
+            // Merge facts the policy recorded on the context but did not
+            // attach itself (hand-built results); may upgrade a
+            // NotApplicable with a recorded load failure to Indeterminate.
+            let mut result = ctx.finish(result);
             if declared_effect == Effect::Forbid && result.is_granted() {
                 tracing::warn!(
-                    policy.type = ctx.policy_type.as_ref(),
+                    policy.type = policy_type.as_ref(),
                     "{FORBID_EFFECT_GRANT_REASON}"
                 );
                 result = PolicyEvalResult::not_applicable(
-                    ctx.policy_type.clone(),
+                    policy_type.clone(),
                     FORBID_EFFECT_GRANT_REASON,
                 );
             }
@@ -230,11 +235,11 @@ impl<D: PolicyDomain> PermissionChecker<D> {
             let result_indeterminate = result.decision() == Decision::Indeterminate;
             if declared_effect == Effect::Allow && result_forbids {
                 tracing::warn!(
-                    policy.type = ctx.policy_type.as_ref(),
+                    policy.type = policy_type.as_ref(),
                     "{ALLOW_EFFECT_FORBID_REASON}"
                 );
             }
-            let policy_type_str: &str = ctx.policy_type.as_ref();
+            let policy_type_str: &str = policy_type.as_ref();
             let metadata = policy.security_rule();
             let reason = result.reason();
             let reason_str = reason.as_deref();
@@ -283,7 +288,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
             });
 
             if result_indeterminate {
-                let attribution = indeterminate_attribution(&result, ctx.policy_type.as_ref());
+                let attribution = indeterminate_attribution(&result, policy_type.as_ref());
                 if policy_index < self.veto_capable_count {
                     veto_indeterminate.get_or_insert(attribution);
                 } else {
@@ -304,7 +309,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
             }
 
             if result_passes {
-                first_grant.get_or_insert_with(|| (ctx.policy_type.clone(), reason));
+                first_grant.get_or_insert_with(|| (policy_type.clone(), reason));
             }
 
             if policy_index + 1 >= self.veto_capable_count {
@@ -461,18 +466,21 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     })
                     .collect::<Vec<_>>();
 
-                let batch_ctx = BatchEvalCtx {
+                let batch_ctx = BatchEvalCtx::new(
                     session,
                     subject,
                     action,
                     context,
-                    items: &batch_items,
-                    policy_type: policy_type.clone(),
-                };
+                    &batch_items,
+                    policy_type.clone(),
+                );
                 let policy_results = policy
                     .evaluate_batch(&batch_ctx)
                     .instrument(policy_span.clone())
                     .await;
+                // Merge per-item recorded facts into the per-item results
+                // (no-op for wrong-length results; handled below).
+                let policy_results = batch_ctx.finish(policy_results);
 
                 if policy_results.len() != pending_chunk.len() {
                     // The policy broke the one-result-per-item contract, so

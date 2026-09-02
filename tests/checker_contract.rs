@@ -653,14 +653,14 @@ async fn boxed_dyn_policy_dispatches_evaluate_batch_override() {
         .collect::<Vec<_>>();
 
     let results = boxed
-        .evaluate_batch(&BatchEvalCtx {
-            session: &session,
-            subject: &Subject,
-            action: &Action,
-            context: &Ctx,
-            items: &batch_items,
-            policy_type: boxed.policy_type(),
-        })
+        .evaluate_batch(&BatchEvalCtx::new(
+            &session,
+            &Subject,
+            &Action,
+            &Ctx,
+            &batch_items,
+            boxed.policy_type(),
+        ))
         .await;
 
     assert_eq!(results.len(), 2);
@@ -872,24 +872,24 @@ proptest! {
 
         let session = EvaluationSession::empty();
         let resource = Resource { id: resource_id };
-        let single = tokio_test::block_on(policy.evaluate(&EvalCtx {
-            session: &session,
-            subject: &Subject,
-            action: &Action,
-            resource: &resource,
-            context: &Ctx,
-            policy_type: policy.policy_type(),
-        }));
+        let single = tokio_test::block_on(policy.evaluate(&EvalCtx::new(
+            &session,
+            &Subject,
+            &Action,
+            &resource,
+            &Ctx,
+            policy.policy_type(),
+        )));
 
         let items = [PolicyBatchItem { resource: &resource }];
-        let batch = tokio_test::block_on(policy.evaluate_batch(&BatchEvalCtx {
-            session: &session,
-            subject: &Subject,
-            action: &Action,
-            context: &Ctx,
-            items: &items,
-            policy_type: policy.policy_type(),
-        }));
+        let batch = tokio_test::block_on(policy.evaluate_batch(&BatchEvalCtx::new(
+            &session,
+            &Subject,
+            &Action,
+            &Ctx,
+            &items,
+            policy.policy_type(),
+        )));
 
         prop_assert_eq!(batch.len(), 1);
         prop_assert_eq!(policy_decision(&single), policy_decision(&batch[0]));
@@ -1963,6 +1963,281 @@ async fn delegated_child_indeterminate_propagates_to_parent_checker() {
         .contains("ChildBroken"));
 }
 
+// ---- recording contexts (EvalCtx::fact / BatchEvalCtx::facts_by) ----
+
+/// Per-resource yes/no fact used to exercise provenance recording.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct OddFlag(u8);
+
+impl gatehouse::FactKey for OddFlag {
+    const NAME: &'static str = "odd_flag";
+    type Value = bool;
+}
+
+/// Answers `Found(id is odd)` and fails to load configured ids.
+struct OddFlagSource {
+    fail_ids: HashSet<u8>,
+}
+
+#[async_trait]
+impl FactSource<OddFlag> for OddFlagSource {
+    async fn load_many(&self, keys: &[OddFlag]) -> Vec<FactLoadResult<bool>> {
+        keys.iter()
+            .map(|OddFlag(id)| {
+                if self.fail_ids.contains(id) {
+                    FactLoadResult::Error(gatehouse::FactLoadError::backend_message(
+                        "flag store unreachable",
+                    ))
+                } else {
+                    FactLoadResult::Found(id % 2 == 1)
+                }
+            })
+            .collect()
+    }
+}
+
+fn odd_flag_session(fail_ids: impl IntoIterator<Item = u8>) -> EvaluationSession {
+    gatehouse::FactRegistry::builder()
+        .with::<OddFlag, _>(OddFlagSource {
+            fail_ids: fail_ids.into_iter().collect(),
+        })
+        .build()
+        .session()
+}
+
+/// A fact-backed policy that loads through the recording context but builds
+/// its results **by hand** with the plain constructors — the #58 case 3
+/// "forgetful" shape. Provenance (and the NotApplicable → Indeterminate
+/// upgrade after a failed load) must therefore come from the caller-side
+/// `EvalCtx::finish` / `BatchEvalCtx::finish` merge in the checker and
+/// combinators; removing any of those calls breaks these tests.
+struct HandBuiltOddPolicy;
+
+impl HandBuiltOddPolicy {
+    fn result_for(fact: FactLoadResult<bool>) -> PolicyEvalResult {
+        match fact {
+            FactLoadResult::Found(true) => {
+                PolicyEvalResult::granted("HandBuiltOddPolicy", Some("odd resource".into()))
+            }
+            _ => PolicyEvalResult::not_applicable("HandBuiltOddPolicy", "not odd"),
+        }
+    }
+}
+
+#[async_trait]
+impl Policy<Domain> for HandBuiltOddPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        Self::result_for(ctx.fact(OddFlag(ctx.resource.id)).await)
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        ctx.facts_by(|resource| OddFlag(resource.id))
+            .await
+            .into_iter()
+            .map(Self::result_for)
+            .collect()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("HandBuiltOddPolicy")
+    }
+}
+
+/// Facts recorded on the context reach the trace even when the policy
+/// builds results by hand: the checker merges them after evaluation, on
+/// both the single and the batch path.
+#[tokio::test]
+async fn recorded_facts_reach_the_trace_for_hand_built_results() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(HandBuiltOddPolicy);
+    let session = odd_flag_session([]);
+
+    let granted = check_resource(&checker, &session, &Resource { id: 1 }).await;
+    granted.assert_granted_by("HandBuiltOddPolicy");
+    assert!(
+        granted.trace().format().contains("fact odd_flag [found]"),
+        "single-path grant must carry recorded provenance:\n{}",
+        granted.trace().format()
+    );
+
+    let denied = check_resource(&checker, &session, &Resource { id: 2 }).await;
+    denied.assert_denied();
+    assert!(denied.trace().format().contains("fact odd_flag [found]"));
+
+    let batch = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 1 }, Resource { id: 2 }],
+    )
+    .await;
+    for (resource, evaluation) in &batch {
+        assert!(
+            evaluation
+                .trace()
+                .format()
+                .contains("fact odd_flag [found]"),
+            "batch item {} must carry recorded provenance:\n{}",
+            resource.id,
+            evaluation.trace().format()
+        );
+    }
+    assert!(batch[0].1.is_granted());
+    assert!(!batch[1].1.is_granted());
+}
+
+/// A recorded load failure upgrades a hand-built `NotApplicable` to
+/// `Indeterminate` when the checker merges the recorded facts — closing the
+/// silent #58-case-3 gap on both evaluation paths.
+#[tokio::test]
+async fn recorded_load_failure_upgrades_hand_built_not_applicable() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(HandBuiltOddPolicy);
+    let session = odd_flag_session([3]);
+
+    let single = check_resource(&checker, &session, &Resource { id: 3 }).await;
+    single.assert_indeterminate();
+    let errors = single.fact_load_errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].fact_name, "odd_flag");
+    assert_eq!(
+        errors[0].error_kind,
+        Some(gatehouse::FactLoadErrorKind::Backend)
+    );
+
+    let batch = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 3 }, Resource { id: 1 }],
+    )
+    .await;
+    batch[0].1.assert_indeterminate();
+    assert_eq!(batch[0].1.fact_load_errors().len(), 1);
+    batch[1].1.assert_granted_by("HandBuiltOddPolicy");
+    assert!(batch[1].1.fact_load_errors().is_empty());
+}
+
+/// The combinators perform the same recorded-fact merge for their children.
+/// If `AndPolicy` / `OrPolicy` / `NotPolicy` dropped their `finish` calls,
+/// the failing child would stay `NotApplicable` — turning the AND/OR result
+/// into an ordinary denial and, worse, letting `NOT` invert it into a grant.
+#[tokio::test]
+async fn combinators_merge_recorded_facts_for_hand_built_children() {
+    let failing = Resource { id: 3 };
+
+    // AND: the upgraded Indeterminate child taints the conjunction.
+    let mut and_checker = PermissionChecker::new();
+    and_checker.add_policy(
+        AndPolicy::try_new(vec![
+            Arc::new(HandBuiltOddPolicy),
+            Arc::new(allow_everything("AllowAll")) as Arc<dyn Policy<Domain>>,
+        ])
+        .unwrap(),
+    );
+    let session = odd_flag_session([3]);
+    let single = check_resource(&and_checker, &session, &failing).await;
+    single.assert_indeterminate();
+    assert!(single.trace().format().contains("fact odd_flag [error]"));
+    let batch = evaluate_resources(&and_checker, &session, vec![failing.clone()]).await;
+    batch[0].1.assert_indeterminate();
+
+    // OR: with no grant available, the disjunction is indeterminate.
+    let mut or_checker = PermissionChecker::new();
+    or_checker.add_policy(
+        OrPolicy::try_new(vec![
+            Arc::new(HandBuiltOddPolicy),
+            Arc::new(NamedNoopPolicy { name: "NoOpinion" }) as Arc<dyn Policy<Domain>>,
+        ])
+        .unwrap(),
+    );
+    let session = odd_flag_session([3]);
+    let single = check_resource(&or_checker, &session, &failing).await;
+    single.assert_indeterminate();
+    let batch = evaluate_resources(&or_checker, &session, vec![failing.clone()]).await;
+    batch[0].1.assert_indeterminate();
+
+    // NOT: without the merge the failed child would look like an ordinary
+    // non-grant and NOT would invert it into a grant.
+    let mut not_checker = PermissionChecker::new();
+    not_checker.add_policy(NotPolicy::new(HandBuiltOddPolicy));
+    let session = odd_flag_session([3]);
+    let single = check_resource(&not_checker, &session, &failing).await;
+    single.assert_indeterminate();
+    assert!(!single.is_granted());
+    let batch = evaluate_resources(&not_checker, &session, vec![failing]).await;
+    batch[0].1.assert_indeterminate();
+}
+
+/// A batch-shared fact loaded through `BatchEvalCtx::fact` records
+/// provenance against every item in the batch.
+struct SharedFactPolicy;
+
+#[async_trait]
+impl Policy<Domain> for SharedFactPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        match ctx.fact(OddFlag(0)).await {
+            FactLoadResult::Found(true) => ctx.grant("shared flag set"),
+            _ => ctx.not_applicable("shared flag not set"),
+        }
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        let fact = ctx.fact(OddFlag(0)).await;
+        ctx.items
+            .iter()
+            .map(|_| match &fact {
+                FactLoadResult::Found(true) => {
+                    PolicyEvalResult::granted("SharedFactPolicy", Some("shared flag set".into()))
+                }
+                _ => PolicyEvalResult::not_applicable("SharedFactPolicy", "shared flag not set"),
+            })
+            .collect()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("SharedFactPolicy")
+    }
+}
+
+#[tokio::test]
+async fn batch_shared_fact_records_against_every_item() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(SharedFactPolicy);
+
+    let session = odd_flag_session([]);
+    let batch = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 10 }, Resource { id: 11 }],
+    )
+    .await;
+    for (_, evaluation) in &batch {
+        assert!(evaluation
+            .trace()
+            .format()
+            .contains("fact odd_flag [found]"));
+    }
+
+    // A failing shared fact makes every hand-built NotApplicable item
+    // indeterminate through the same merge.
+    let session = odd_flag_session([0]);
+    let batch = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 10 }, Resource { id: 11 }],
+    )
+    .await;
+    for (_, evaluation) in &batch {
+        evaluation.assert_indeterminate();
+        assert_eq!(evaluation.fact_load_errors().len(), 1);
+    }
+}
+
 /// Combinator decision tables for indeterminate children. Distinguishes
 /// the veto-prefix rules (indeterminate outranks a definite non-grant when
 /// the child might have forbidden) from the allow-only rules (a definite
@@ -1978,25 +2253,25 @@ async fn combinator_indeterminate_decision_tables() {
         resource: &Resource,
     ) -> Decision {
         let single = policy
-            .evaluate(&EvalCtx {
+            .evaluate(&EvalCtx::new(
                 session,
-                subject: &Subject,
-                action: &Action,
+                &Subject,
+                &Action,
                 resource,
-                context: &Ctx,
-                policy_type: policy.policy_type(),
-            })
+                &Ctx,
+                policy.policy_type(),
+            ))
             .await;
         let items = [PolicyBatchItem { resource }];
         let batch = policy
-            .evaluate_batch(&BatchEvalCtx {
+            .evaluate_batch(&BatchEvalCtx::new(
                 session,
-                subject: &Subject,
-                action: &Action,
-                context: &Ctx,
-                items: &items,
-                policy_type: policy.policy_type(),
-            })
+                &Subject,
+                &Action,
+                &Ctx,
+                &items,
+                policy.policy_type(),
+            ))
             .await;
         assert_eq!(batch.len(), 1);
         assert_eq!(

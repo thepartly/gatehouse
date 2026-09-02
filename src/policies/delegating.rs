@@ -142,7 +142,7 @@ where
         let child_context = (self.context)(ctx.subject, ctx.action, ctx.context);
         let evaluation = self
             .checker
-            .bind(ctx.session, &child_subject, &child_action, &child_context)
+            .bind(ctx.session(), &child_subject, &child_action, &child_context)
             .check(&child_resource)
             .await;
 
@@ -167,7 +167,7 @@ where
             .collect::<Vec<_>>();
 
         self.checker
-            .bind(ctx.session, &child_subject, &child_action, &child_context)
+            .bind(ctx.session(), &child_subject, &child_action, &child_context)
             .evaluate(child_resources)
             .await
             .into_iter()

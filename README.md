@@ -71,7 +71,7 @@ assert!(!checker.bind(&session, &guest, &action, &()).check(&document).await.is_
 # });
 ```
 
-Use `EvaluationSession::empty()` for fact-free checkers. When any policy reads facts through `ctx.session.get(...)`, build a `FactRegistry` at application setup and create a fresh `registry.session()` for each request.
+Use `EvaluationSession::empty()` for fact-free checkers. When any policy reads facts through `ctx.fact(...)`, build a `FactRegistry` at application setup and create a fresh `registry.session()` for each request.
 
 ## Core Flow
 
@@ -117,7 +117,7 @@ flowchart LR
 
 Denials from `AccessEvaluation` are summary-level. Use `AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect individual policy reasons and fact provenance. Use `AccessEvaluation::is_indeterminate()` to distinguish infrastructure failure from an ordinary denial (the natural 403-vs-503 split — authorization remains fail-closed either way), `fact_load_errors()` to classify the failed loads via `FactProvenance::error_kind`, and `denied_due_to_fact_load_error()` as the coarser any-error-in-trace scan.
 
-Fact-backed policies should construct provenance with `FactProvenance::from_load_result(...)` and attach it through the context's `*_with_facts` result helpers. The constructor maps `Found`/`Missing`/`Error`, includes diagnostic error detail, and preserves a machine-readable `FactLoadErrorKind` in `FactProvenance::error_kind`. `FactProvenance::new(...)` remains available for manually constructed or legacy provenance; an error created that way has no structured error kind.
+Fact-backed policies load through the evaluation context — `ctx.fact(key)` (single) and `ctx.facts_by(key_of)` (batch) — which records each consulted fact as `FactProvenance` and attaches it to the policy's result automatically, so provenance is correct by construction. A failed load reported through `ctx.not_applicable(...)` is upgraded to an indeterminate result rather than silently looking like an ordinary non-match. `ctx.session()` remains as an escape hatch for loads that must bypass recording, and `FactProvenance::from_load_result(...)` + `ctx.record(...)` cover facts loaded outside the context. The provenance constructor maps `Found`/`Missing`/`Error`, includes diagnostic error detail, and preserves a machine-readable `FactLoadErrorKind` in `FactProvenance::error_kind`.
 
 ## Policy Domains
 

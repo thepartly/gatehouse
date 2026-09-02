@@ -95,8 +95,9 @@
 //! ```
 //!
 //! Use [`EvaluationSession::empty`] for fact-free decisions. Use a session from
-//! [`FactRegistry::session`] when any policy calls `ctx.session.get(...)`, such
-//! as [`RebacPolicy`] or a custom fact-backed policy.
+//! [`FactRegistry::session`] when any policy loads facts — via `ctx.fact(...)`
+//! (which also records provenance) or the raw session — such as [`RebacPolicy`]
+//! or a custom fact-backed policy.
 //!
 //! [`BoundEvaluator::evaluate`] preserves input order and returns one
 //! [`AccessEvaluation`] per input resource. [`BoundEvaluator::filter`] keeps
