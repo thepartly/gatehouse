@@ -36,6 +36,20 @@ const FORBID_EFFECT_GRANT_REASON: &str =
 const ALLOW_EFFECT_FORBID_REASON: &str =
     "Allow-effect policy returned a forbid; the veto is honored but only where observed, so declare Effect::Forbid or Effect::AllowOrForbid to schedule it ahead of grants";
 
+/// Normalizes the contract-violating grant of a `Forbid`-effect policy to
+/// `NotApplicable`, preserving the facts the policy consulted so they stay
+/// in the trace.
+fn forbid_effect_grant_to_not_applicable(
+    policy_type: Cow<'static, str>,
+    result: &PolicyEvalResult,
+) -> PolicyEvalResult {
+    PolicyEvalResult::not_applicable_with_facts(
+        policy_type,
+        FORBID_EFFECT_GRANT_REASON,
+        result.provenance().to_vec(),
+    )
+}
+
 fn checker_root(children: Vec<PolicyEvalResult>, decision: Decision) -> PolicyEvalResult {
     PolicyEvalResult::Combined {
         policy_type: std::borrow::Cow::Borrowed(PERMISSION_CHECKER_POLICY_TYPE),
@@ -224,10 +238,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     policy.type = policy_type.as_ref(),
                     "{FORBID_EFFECT_GRANT_REASON}"
                 );
-                result = PolicyEvalResult::not_applicable(
-                    policy_type.clone(),
-                    FORBID_EFFECT_GRANT_REASON,
-                );
+                result = forbid_effect_grant_to_not_applicable(policy_type.clone(), &result);
             }
 
             let result_passes = result.is_granted();
@@ -419,11 +430,17 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         let mut pending: Vec<usize> = (0..item_count).collect();
         let mut first_grants: Vec<Option<(Cow<'static, str>, Option<String>)>> =
             vec![None; item_count];
-        // Per-item attribution for the first indeterminate policy result
-        // (any position), and whether an indeterminate was observed in the
-        // veto prefix (which blocks grants for that item).
-        let mut indeterminate_notes: Vec<Option<(String, String)>> = vec![None; item_count];
-        let mut veto_indeterminate = vec![false; item_count];
+        // Per-item indeterminate bookkeeping, allocated only when an
+        // indeterminate result is actually observed so the common
+        // all-definite path pays nothing. `notes` holds the attribution for
+        // the first indeterminate policy result (any position); `veto`
+        // marks items whose veto prefix contained one (which blocks their
+        // grants).
+        struct IndeterminateState {
+            notes: Vec<Option<(String, String)>>,
+            veto: Vec<bool>,
+        }
+        let mut indeterminate: Option<IndeterminateState> = None;
 
         for (policy_index, policy) in self.policies.iter().enumerate() {
             if pending.is_empty() {
@@ -518,10 +535,8 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     let mut result = result;
                     if declared_effect == Effect::Forbid && result.is_granted() {
                         contract_violation_count += 1;
-                        result = PolicyEvalResult::not_applicable(
-                            policy_type.clone(),
-                            FORBID_EFFECT_GRANT_REASON,
-                        );
+                        result =
+                            forbid_effect_grant_to_not_applicable(policy_type.clone(), &result);
                     }
                     let result_passes = result.is_granted();
                     let result_forbids = result.is_forbidden();
@@ -541,9 +556,13 @@ impl<D: PolicyDomain> PermissionChecker<D> {
 
                     if result_indeterminate {
                         let attribution = indeterminate_attribution(&result, policy_type_str);
-                        indeterminate_notes[index].get_or_insert(attribution);
+                        let state = indeterminate.get_or_insert_with(|| IndeterminateState {
+                            notes: vec![None; item_count],
+                            veto: vec![false; item_count],
+                        });
+                        state.notes[index].get_or_insert(attribution);
                         if policy_index < self.veto_capable_count {
-                            veto_indeterminate[index] = true;
+                            state.veto[index] = true;
                         }
                     }
 
@@ -572,9 +591,14 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                             // Mirrors `evaluate_one`: after the full veto
                             // prefix, an unresolved potential veto blocks
                             // any grant for this item.
-                            if veto_indeterminate[index] {
-                                let (note_policy_type, note_reason) =
-                                    indeterminate_notes[index].take().unwrap_or_else(|| {
+                            if indeterminate
+                                .as_ref()
+                                .is_some_and(|state| state.veto[index])
+                            {
+                                let (note_policy_type, note_reason) = indeterminate
+                                    .as_mut()
+                                    .and_then(|state| state.notes[index].take())
+                                    .unwrap_or_else(|| {
                                         (policy_type_str.to_string(), String::new())
                                     });
                                 let combined = checker_root(
@@ -631,7 +655,10 @@ impl<D: PolicyDomain> PermissionChecker<D> {
             // Mirrors `evaluate_one`: nothing granted and no veto fired.
             // An allow-only indeterminate policy might have granted, so the
             // item is indeterminate rather than denied.
-            if let Some((note_policy_type, note_reason)) = indeterminate_notes[index].take() {
+            if let Some((note_policy_type, note_reason)) = indeterminate
+                .as_mut()
+                .and_then(|state| state.notes[index].take())
+            {
                 let combined =
                     checker_root(std::mem::take(&mut traces[index]), Decision::Indeterminate);
                 evaluations[index] = Some(AccessEvaluation::Indeterminate {

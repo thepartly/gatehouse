@@ -114,9 +114,14 @@ Mechanical changes:
   `ctx.finish(result)` / `batch_ctx.finish(results)` so facts a policy
   recorded but did not attach still reach the trace. The checker and the
   built-in combinators do this for you.
-- `ctx.fact` requires the key type to implement `fmt::Debug` (the rendered
-  key becomes the provenance key string). `RebacPolicy` consequently
-  requires `Relation: fmt::Debug` in addition to `fmt::Display`.
+- `FactKey` gains a `fmt::Debug` supertrait and a defaulted
+  `render(&self) -> String` (the provenance key string, defaulting to the
+  `Debug` representation). Every practical key already derives `Debug`;
+  override `render` when the key has an established audit form.
+  `RelationshipQuery` does exactly that, so its recorded key string keeps
+  the pre-0.6 `subject -[relation]-> resource` form unchanged.
+  `RebacPolicy` consequently requires `Relation: fmt::Debug` in addition to
+  `fmt::Display`.
 - Loading a fact through some other loader? Record it explicitly:
   `ctx.record(FactProvenance::from_load_result(NAME, key_repr, &result))`.
 - The `*_with_facts` helpers remain for provenance computed from something
@@ -148,6 +153,14 @@ remembering `*_with_facts`.
 - Matches on `AccessEvaluation` / `PolicyEvalResult` with wildcard arms keep
   compiling (`#[non_exhaustive]`), but review them: treating `Indeterminate`
   as an ordinary denial is safe (fail-closed), just less informative.
+- **Test suites:** `AccessEvaluation::assert_denied` (and the other
+  `assert_*` helpers) now panic on an `Indeterminate` evaluation instead of
+  accepting it as a denial. Downstream tests that asserted a denial on a
+  `RebacPolicy` (or other fact-backed) load failure will start failing in
+  CI — switch them to the new `assert_indeterminate()`.
+- `denied_due_to_fact_load_error()` is deprecated. Use `is_indeterminate()`
+  for the structural 403-vs-5xx split and `fact_load_errors()` to inspect
+  the failed loads; the any-error-in-trace scan will be removed in 0.7.
 
 # Migrating from 0.4 to 0.5
 

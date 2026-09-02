@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// dropped when the session is dropped, so permission revocations or backend
 /// changes are observed by the next session rather than being held in a
 /// process-global cache.
-pub trait FactKey: Eq + Hash + Clone + Send + Sync + 'static {
+pub trait FactKey: Eq + Hash + Clone + fmt::Debug + Send + Sync + 'static {
     /// The value returned by a [`FactSource`] for this key.
     type Value: Clone + Send + Sync + 'static;
 
@@ -25,6 +25,18 @@ pub trait FactKey: Eq + Hash + Clone + Send + Sync + 'static {
     /// The session registry is keyed by [`std::any::TypeId`], not by this name, so two
     /// unrelated key types with the same name do not share a source or cache.
     const NAME: &'static str;
+
+    /// Renders the key for diagnostics: the [`crate::FactProvenance::key`]
+    /// string recorded when this key is loaded through
+    /// [`crate::EvalCtx::fact`] and friends.
+    ///
+    /// Defaults to the `Debug` representation. Override it when the key has
+    /// an established audit form (as [`RelationshipQuery`] does) — the
+    /// rendered string reaches evaluation traces, `tracing` subscribers, and
+    /// serialized audit logs, so treat it as audit surface.
+    fn render(&self) -> String {
+        format!("{self:?}")
+    }
 }
 
 /// Private error type backing [`FactLoadError::backend_message`], so callers
@@ -365,7 +377,7 @@ impl std::error::Error for FactSourceRegistrationError {}
 /// };
 /// assert_eq!(query.relation, Relation::Owner);
 /// ```
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RelationshipQuery<SubjectId, ResourceId, Relation> {
     /// Subject identifier.
     pub subject_id: SubjectId,
@@ -375,33 +387,23 @@ pub struct RelationshipQuery<SubjectId, ResourceId, Relation> {
     pub relation: Relation,
 }
 
-/// Renders the relationship in its established audit form,
-/// `subject -[relation]-> resource`, which is also the key string recorded
-/// in [`crate::FactProvenance`] when the query is loaded through
-/// [`crate::EvalCtx::fact`].
-impl<SubjectId, ResourceId, Relation> fmt::Debug
-    for RelationshipQuery<SubjectId, ResourceId, Relation>
-where
-    SubjectId: fmt::Debug,
-    ResourceId: fmt::Debug,
-    Relation: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:?} -[{:?}]-> {:?}",
-            self.subject_id, self.relation, self.resource_id
-        )
-    }
-}
-
 impl<SubjectId, ResourceId, Relation> FactKey for RelationshipQuery<SubjectId, ResourceId, Relation>
 where
-    SubjectId: Eq + Hash + Clone + Send + Sync + 'static,
-    ResourceId: Eq + Hash + Clone + Send + Sync + 'static,
-    Relation: Eq + Hash + Clone + Send + Sync + 'static,
+    SubjectId: Eq + Hash + Clone + fmt::Debug + Send + Sync + 'static,
+    ResourceId: Eq + Hash + Clone + fmt::Debug + Send + Sync + 'static,
+    Relation: Eq + Hash + Clone + fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     type Value = bool;
 
     const NAME: &'static str = "relationship";
+
+    /// Renders the relationship in its established audit form,
+    /// `subject -[relation]-> resource`, preserving the key string recorded
+    /// on provenance by pre-0.6 `RebacPolicy` versions.
+    fn render(&self) -> String {
+        format!(
+            "{:?} -[{}]-> {:?}",
+            self.subject_id, self.relation, self.resource_id
+        )
+    }
 }

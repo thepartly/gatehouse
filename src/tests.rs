@@ -1507,6 +1507,13 @@ mod core_tests {
         assert_eq!(provenance[0].fact_name, "relationship");
         assert_eq!(provenance[0].outcome, FactOutcome::Found);
         assert!(provenance[0].detail.is_none());
+        // `RelationshipQuery::render` keeps the established audit form for
+        // the recorded key (relation via `Display`, no quotes).
+        assert!(
+            provenance[0].key.contains("-[manager]->"),
+            "unexpected key rendering: {}",
+            provenance[0].key
+        );
         // The rendered trace surfaces the fact inline.
         assert!(result.format(0).contains("↳ fact relationship [found]"));
     }
@@ -3309,6 +3316,7 @@ mod core_tests {
     // --- Fact-load error helpers on AccessEvaluation --------------------
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn denied_due_to_fact_load_error_detects_rebac_backend_failure() {
         let mut checker = PermissionChecker::<TestDomain>::new();
         checker.add_policy(RebacPolicy::new(
@@ -3350,6 +3358,7 @@ mod core_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn fact_load_errors_distinguish_unregistered_source_from_backend_failure() {
         let mut checker = PermissionChecker::<TestDomain>::new();
         checker.add_policy(RebacPolicy::new(
@@ -3377,6 +3386,7 @@ mod core_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn denied_due_to_fact_load_error_is_false_for_ordinary_denial() {
         let evaluation = deny_checker()
             .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
@@ -3387,6 +3397,7 @@ mod core_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn denied_due_to_fact_load_error_is_false_for_grant() {
         let evaluation = allow_checker()
             .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
@@ -3397,6 +3408,7 @@ mod core_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn denied_due_to_fact_load_error_is_false_for_missing_fact() {
         let mut checker = PermissionChecker::<TestDomain>::new();
         checker.add_policy(RebacPolicy::new(

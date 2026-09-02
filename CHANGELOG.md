@@ -78,11 +78,26 @@
   and both gain a private provenance recorder. Use `EvalCtx::new(...)` /
   `BatchEvalCtx::new(...)`, and pass results through `finish` when invoking
   policies directly.
-- **Breaking:** `RebacPolicy` now requires `Relation: fmt::Debug` (its
-  `RelationshipQuery` keys are recorded through the context, which renders
-  keys with `Debug`). `RelationshipQuery`'s `Debug` output is the audit
-  form `subject -[relation]-> resource` and is the provenance key string;
-  the relation is now rendered with `Debug` instead of `Display`.
+- **Breaking:** `FactKey` gains a `fmt::Debug` supertrait and a defaulted
+  `render(&self) -> String` hook that produces the provenance key string
+  (defaulting to the `Debug` representation). `RelationshipQuery` overrides
+  `render` to keep its established `subject -[relation]-> resource` audit
+  form, so recorded key strings are unchanged from 0.5; `RebacPolicy` now
+  requires `Relation: fmt::Debug` in addition to `fmt::Display`.
+- A `Combined` node whose decision disagrees with a surviving `Forbidden`
+  leaf is still treated as forbidding (fail closed) and now emits a `WARN`
+  naming the inconsistent node, so a broken custom combinator is visible in
+  logs instead of being silently corrected.
+- A `Forbid`-effect policy's contract-violating grant is still normalized
+  to `NotApplicable`, now preserving the facts the policy consulted so
+  they stay in the trace.
+
+### Deprecated
+
+- `AccessEvaluation::denied_due_to_fact_load_error()`: use the structural
+  `is_indeterminate()` for the 403-vs-5xx split and `fact_load_errors()`
+  to inspect failed loads. The any-error-in-trace scan will be removed in
+  0.7.
 
 ### Fixed
 

@@ -576,23 +576,9 @@ impl AccessEvaluation {
     /// one policy leaf in the trace consulted a fact that failed to load
     /// ([`FactOutcome::Error`]).
     ///
-    /// Prefer [`Self::is_indeterminate`]: since the decision model gained a
-    /// structural [`AccessEvaluation::Indeterminate`] variant, "could not
-    /// evaluate" is a first-class, causal outcome. This helper remains an
-    /// **any-error-in-trace** check, not a causal one: it does not prove
-    /// the load failure was the reason for the denial (a policy may record
-    /// a load error yet deny for ordinary reasons), and it treats every
-    /// [`FactLoadError`](crate::FactLoadError) the same. It still catches
-    /// errors recorded by policies that reported a failed load as plain
-    /// `NotApplicable` provenance instead of returning
-    /// [`PolicyEvalResult::Indeterminate`].
-    ///
-    /// Grants always return `false`, even if some earlier policy recorded a
-    /// load error before a sibling granted. Ordinary denials with only
-    /// Found/Missing facts also return `false`.
-    ///
-    /// Typical use: a coarse signal for "something infrastructure-shaped
-    /// appeared during this denial" without hand-walking the trace:
+    /// Deprecated: use [`Self::is_indeterminate`]. Since the decision model
+    /// gained a structural [`AccessEvaluation::Indeterminate`] variant,
+    /// "could not evaluate" is a first-class, causal outcome:
     ///
     /// ```rust
     /// # use gatehouse::*;
@@ -600,20 +586,28 @@ impl AccessEvaluation {
     /// if evaluation.is_granted() {
     ///     200
     /// } else if evaluation.forbidden_by().is_some() {
-    ///     403 // active veto — check before the infrastructure signals
+    ///     403 // active veto — check before the infrastructure signal
     /// } else if evaluation.is_indeterminate() {
     ///     503 // authorization inputs unavailable — structural signal
-    /// } else if evaluation.denied_due_to_fact_load_error() {
-    ///     503 // legacy: a load error appeared somewhere in the trace
     /// } else {
     ///     403
     /// }
     /// # }
     /// ```
     ///
-    /// Gatehouse still fails closed on the authorization decision itself
-    /// (a load error never grants). This helper only exposes *why* so
-    /// application layers can choose a response class.
+    /// This helper remains an **any-error-in-trace** scan, not a causal
+    /// check: it does not prove the load failure was the reason for the
+    /// denial (a policy may record a load error yet deny for ordinary
+    /// reasons). Its only remaining use is catching errors attached as
+    /// explicit `NotApplicable` provenance by policies that bypass the
+    /// recording context; with [`crate::EvalCtx::fact`] such failures are
+    /// upgraded to [`PolicyEvalResult::Indeterminate`] automatically. Use
+    /// [`Self::fact_load_errors`] when you need the failed loads
+    /// themselves.
+    #[deprecated(
+        since = "0.6.0",
+        note = "use is_indeterminate() for the structural signal, or fact_load_errors() to inspect failed loads; this any-error-in-trace scan will be removed in 0.7"
+    )]
     pub fn denied_due_to_fact_load_error(&self) -> bool {
         match self {
             Self::Denied { trace, .. } | Self::Indeterminate { trace, .. } => {
@@ -1195,10 +1189,35 @@ impl PolicyEvalResult {
     /// combinators always keep a `Combined` node's decision consistent with
     /// its children, but a custom combinator that (incorrectly) reports a
     /// non-forbid decision while keeping a `Forbidden` leaf in its children
-    /// is still treated as forbidding. The scan short-circuits as soon as a
+    /// is still treated as forbidding — and a `WARN` names the inconsistent
+    /// node so the broken combinator is visible in logs rather than being
+    /// silently corrected forever. The scan short-circuits as soon as a
     /// forbid is found.
     pub fn is_forbidden(&self) -> bool {
-        self.decision() == Decision::Forbid || self.forbidden_leaf().is_some()
+        if self.decision() == Decision::Forbid {
+            return true;
+        }
+        match self.forbidden_leaf() {
+            Some((leaf_policy_type, _)) => {
+                if let Self::Combined {
+                    policy_type,
+                    decision,
+                    ..
+                } = self
+                {
+                    tracing::warn!(
+                        node.policy_type = policy_type.as_ref(),
+                        node.decision = %decision,
+                        forbidden_leaf.policy_type = leaf_policy_type,
+                        "Combined node reports a non-forbid decision but keeps a Forbidden \
+                         leaf in its children; treating it as forbidding (fail closed). \
+                         Fix the combinator that built this node."
+                    );
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn forbidden_leaf(&self) -> Option<(&str, Option<&str>)> {

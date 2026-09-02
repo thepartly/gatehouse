@@ -2170,6 +2170,60 @@ async fn combinators_merge_recorded_facts_for_hand_built_children() {
     batch[0].1.assert_indeterminate();
 }
 
+/// A `Forbid`-effect policy that (in violation of its contract) grants,
+/// after consulting a fact through the recording context.
+struct MisbehavingFactBackedForbidPolicy;
+
+#[async_trait]
+impl Policy<Domain> for MisbehavingFactBackedForbidPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        let _ = ctx.fact(OddFlag(ctx.resource.id)).await;
+        ctx.grant("grants despite declaring Effect::Forbid")
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("MisbehavingFactBackedForbidPolicy")
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::Forbid
+    }
+}
+
+/// Normalizing a forbid-effect policy's contract-violating grant to
+/// `NotApplicable` keeps the facts the policy consulted in the trace, on
+/// both evaluation paths.
+#[tokio::test]
+async fn forbid_effect_grant_normalization_preserves_provenance() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(MisbehavingFactBackedForbidPolicy);
+    let session = odd_flag_session([]);
+
+    let single = check_resource(&checker, &session, &Resource { id: 1 }).await;
+    single.assert_denied();
+    let rendered = single.trace().format();
+    assert!(
+        rendered.contains("treated as not applicable"),
+        "trace should show the normalized contract violation:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("fact odd_flag [found]"),
+        "normalization must not drop the consulted facts:\n{rendered}"
+    );
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 1 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_denied();
+    let rendered = batch.trace().format();
+    assert!(rendered.contains("treated as not applicable"));
+    assert!(
+        rendered.contains("fact odd_flag [found]"),
+        "batch normalization must not drop the consulted facts:\n{rendered}"
+    );
+}
+
 /// A batch-shared fact loaded through `BatchEvalCtx::fact` records
 /// provenance against every item in the batch.
 struct SharedFactPolicy;

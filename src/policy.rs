@@ -4,7 +4,6 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
-use std::fmt;
 use std::sync::{Arc, Mutex};
 
 /// Names the four Rust types that make up one authorization domain.
@@ -158,15 +157,19 @@ fn attach_recorded(
                 provenance: recorded,
             }
         }
-        PolicyEvalResult::Combined { .. } => result,
+        PolicyEvalResult::Combined { .. } => {
+            tracing::debug!(
+                recorded_count = recorded.len(),
+                "facts recorded on an evaluation context were dropped: the policy \
+                 returned a Combined result, which has no provenance to merge into"
+            );
+            result
+        }
     }
 }
 
-fn provenance_for<K: FactKey + fmt::Debug>(
-    key: &K,
-    result: &FactLoadResult<K::Value>,
-) -> FactProvenance {
-    FactProvenance::from_load_result(K::NAME, format!("{key:?}"), result)
+fn provenance_for<K: FactKey>(key: &K, result: &FactLoadResult<K::Value>) -> FactProvenance {
+    FactProvenance::from_load_result(K::NAME, key.render(), result)
 }
 
 /// Per-item policy evaluation context.
@@ -214,6 +217,7 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// caller that invokes [`Policy::evaluate`] directly should pass the
     /// returned result through [`Self::finish`] afterwards so facts recorded
     /// by the policy but not attached by a result helper are not lost.
+    #[inline]
     pub fn new(
         session: &'a EvaluationSession,
         subject: &'a D::Subject,
@@ -251,22 +255,11 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// its result by hand).
     pub async fn fact<K>(&self, key: K) -> FactLoadResult<K::Value>
     where
-        K: FactKey + fmt::Debug,
+        K: FactKey,
     {
-        let result = self
-            .session
-            .get_many(std::slice::from_ref(&key))
-            .await
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| {
-                FactLoadResult::Error(crate::FactLoadError::SourceContractViolation {
-                    fact_name: K::NAME,
-                    expected: 1,
-                    actual: 0,
-                })
-            });
-        self.record(provenance_for(&key, &result));
+        let rendered = key.render();
+        let result = self.session.get(key).await;
+        self.record(FactProvenance::from_load_result(K::NAME, rendered, &result));
         result
     }
 
@@ -274,7 +267,7 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// per key, in input order.
     pub async fn facts<K>(&self, keys: &[K]) -> Vec<FactLoadResult<K::Value>>
     where
-        K: FactKey + fmt::Debug,
+        K: FactKey,
     {
         let results = self.session.get_many(keys).await;
         if results.len() == keys.len() {
@@ -313,8 +306,12 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// [`Self::not_applicable`]). Call it yourself when driving
     /// [`Policy::evaluate`] directly. Recorded facts cannot be merged into a
     /// `Combined` result and are dropped in that case.
+    #[inline]
     pub fn finish(self, result: PolicyEvalResult) -> PolicyEvalResult {
         let recorded = self.recorded.into_inner().expect("recorded facts poisoned");
+        if recorded.is_empty() {
+            return result;
+        }
         attach_recorded(result, recorded)
     }
 
@@ -481,6 +478,7 @@ impl<'a, D: PolicyDomain> BatchEvalCtx<'a, D> {
     /// caller that invokes [`Policy::evaluate_batch`] directly should pass
     /// the returned results through [`Self::finish`] afterwards so recorded
     /// facts reach the per-item results.
+    #[inline]
     pub fn new(
         session: &'a EvaluationSession,
         subject: &'a D::Subject,
@@ -513,7 +511,7 @@ impl<'a, D: PolicyDomain> BatchEvalCtx<'a, D> {
     /// item, and returns results aligned with [`Self::items`].
     pub async fn facts_by<K, F>(&self, key_of: F) -> Vec<FactLoadResult<K::Value>>
     where
-        K: FactKey + fmt::Debug,
+        K: FactKey,
         F: Fn(&D::Resource) -> K,
     {
         let keys = self
@@ -535,22 +533,11 @@ impl<'a, D: PolicyDomain> BatchEvalCtx<'a, D> {
     /// per-subject lookup) and records its provenance against each item.
     pub async fn fact<K>(&self, key: K) -> FactLoadResult<K::Value>
     where
-        K: FactKey + fmt::Debug,
+        K: FactKey,
     {
-        let result = self
-            .session
-            .get_many(std::slice::from_ref(&key))
-            .await
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| {
-                FactLoadResult::Error(crate::FactLoadError::SourceContractViolation {
-                    fact_name: K::NAME,
-                    expected: 1,
-                    actual: 0,
-                })
-            });
-        let provenance = provenance_for(&key, &result);
+        let rendered = key.render();
+        let result = self.session.get(key).await;
+        let provenance = FactProvenance::from_load_result(K::NAME, rendered, &result);
         let mut recorded = self.recorded_slots();
         for slot in recorded.iter_mut() {
             slot.push(provenance.clone());
@@ -573,6 +560,7 @@ impl<'a, D: PolicyDomain> BatchEvalCtx<'a, D> {
     /// `NotApplicable` → `Indeterminate` upgrade on recorded load failures.
     /// A `results` vector whose length does not match [`Self::items`] is
     /// returned unchanged (the caller's wrong-length handling applies).
+    #[inline]
     pub fn finish(self, results: Vec<PolicyEvalResult>) -> Vec<PolicyEvalResult> {
         let recorded = self.recorded.into_inner().expect("recorded facts poisoned");
         if recorded.is_empty() || results.len() != recorded.len() {
