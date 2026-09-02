@@ -2428,3 +2428,211 @@ async fn combinator_indeterminate_decision_tables() {
         Decision::NotApplicable
     );
 }
+
+// ---- wrong-length batches feed the normal combination rules ----------
+
+/// A policy whose batch override breaks the one-result-per-item contract,
+/// with a configurable declared effect. Its single-item path is an
+/// ordinary non-grant, so only batch evaluation observes the violation.
+struct WrongLengthBatchPolicy {
+    name: &'static str,
+    effect: Effect,
+}
+
+#[async_trait]
+impl Policy<Domain> for WrongLengthBatchPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.not_applicable("not applicable")
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        _ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        Vec::new()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(self.name)
+    }
+
+    fn effect(&self) -> Effect {
+        self.effect
+    }
+}
+
+fn wrong_length_allow() -> WrongLengthBatchPolicy {
+    WrongLengthBatchPolicy {
+        name: "BrokenAllowBatch",
+        effect: Effect::Allow,
+    }
+}
+
+fn wrong_length_veto() -> WrongLengthBatchPolicy {
+    WrongLengthBatchPolicy {
+        name: "BrokenVetoBatch",
+        effect: Effect::AllowOrForbid,
+    }
+}
+
+/// A malformed allow-only batch is an indeterminate that cannot block a
+/// later grant: the checker keeps evaluating instead of sealing the item.
+/// With nothing granting, it is what makes the item indeterminate.
+#[tokio::test]
+async fn wrong_length_allow_only_batch_does_not_suppress_later_grant() {
+    let session = EvaluationSession::empty();
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(wrong_length_allow());
+    checker.add_policy(allow_everything("AllowAll"));
+    let results = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 0 }, Resource { id: 1 }],
+    )
+    .await;
+    assert_eq!(results.len(), 2);
+    for (_item, evaluation) in &results {
+        evaluation.assert_granted_by("AllowAll");
+        evaluation.assert_trace_contains("BrokenAllowBatch INDETERMINATE");
+    }
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(wrong_length_allow());
+    checker.add_policy(NamedNoopPolicy { name: "NoOpinion" });
+    let results = evaluate_resources(&checker, &session, vec![Resource { id: 0 }]).await;
+    results[0].1.assert_indeterminate();
+    assert!(
+        results[0]
+            .1
+            .indeterminate_reason()
+            .is_some_and(|reason| reason.contains("BrokenAllowBatch")),
+        "unexpected reason: {:?}",
+        results[0].1.indeterminate_reason()
+    );
+}
+
+/// A malformed veto-capable batch is an unresolved veto: it blocks a later
+/// grant, but a later definite forbid in the prefix still wins and stays
+/// attributable through `forbidden_by`.
+#[tokio::test]
+async fn wrong_length_veto_batch_yields_to_later_forbid_but_blocks_grant() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(wrong_length_veto());
+    checker.add_policy(forbid_odd_resources("OddBlock"));
+    checker.add_policy(allow_everything("AllowAll"));
+    let session = EvaluationSession::empty();
+
+    let results = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 1 }, Resource { id: 2 }],
+    )
+    .await;
+    assert_eq!(results.len(), 2);
+    // Odd: the definite forbid later in the veto prefix overrides the
+    // indeterminate from the malformed batch.
+    results[0].1.assert_forbidden_by("OddBlock");
+    // Even: no forbid observed, so the unresolved veto blocks the grant.
+    results[1].1.assert_indeterminate();
+    assert!(
+        results[1]
+            .1
+            .indeterminate_reason()
+            .is_some_and(|reason| reason.contains("BrokenVetoBatch")),
+        "unexpected reason: {:?}",
+        results[1].1.indeterminate_reason()
+    );
+}
+
+/// Malformed child batches inside combinators are indeterminate children,
+/// not terminal: the remaining children still apply the combination rules.
+#[tokio::test]
+async fn wrong_length_child_batches_keep_combinator_items_pending() {
+    let session = EvaluationSession::empty();
+    let resource = Resource { id: 1 };
+
+    async fn decide_batch(
+        policy: &dyn Policy<Domain>,
+        session: &EvaluationSession,
+        resource: &Resource,
+    ) -> Decision {
+        let items = [PolicyBatchItem { resource }];
+        let results = policy
+            .evaluate_batch(&BatchEvalCtx::new(
+                session,
+                &Subject,
+                &Action,
+                &Ctx,
+                &items,
+                policy.policy_type(),
+            ))
+            .await;
+        assert_eq!(results.len(), 1);
+        results[0].decision()
+    }
+
+    // AND: allow-only malformed child, then a definite non-grant settles
+    // the conjunction as NotApplicable...
+    let and = AndPolicy::try_new(vec![
+        Arc::new(wrong_length_allow()),
+        Arc::new(NamedNoopPolicy { name: "NoOpinion" }),
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&and, &session, &resource).await,
+        Decision::NotApplicable
+    );
+    // ...while a later grant leaves it tainted.
+    let and = AndPolicy::try_new(vec![
+        Arc::new(wrong_length_allow()),
+        Arc::new(allow_everything("AllowAll")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&and, &session, &resource).await,
+        Decision::Indeterminate
+    );
+    // AND: veto-capable malformed child, then a definite forbid in the
+    // prefix still wins.
+    let and = AndPolicy::try_new(vec![
+        Arc::new(wrong_length_veto()),
+        Arc::new(forbid_odd_resources("OddBlock")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&and, &session, &resource).await,
+        Decision::Forbid
+    );
+
+    // OR: allow-only malformed child, then a grant resolves the disjunction.
+    let or = OrPolicy::try_new(vec![
+        Arc::new(wrong_length_allow()),
+        Arc::new(allow_everything("AllowAll")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&or, &session, &resource).await,
+        Decision::Grant
+    );
+    // OR: allow-only malformed child with nothing granting is indeterminate.
+    let or = OrPolicy::try_new(vec![
+        Arc::new(wrong_length_allow()),
+        Arc::new(NamedNoopPolicy { name: "NoOpinion" }),
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&or, &session, &resource).await,
+        Decision::Indeterminate
+    );
+    // OR: veto-capable malformed child, then a definite forbid still wins.
+    let or = OrPolicy::try_new(vec![
+        Arc::new(wrong_length_veto()),
+        Arc::new(forbid_odd_resources("OddBlock")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&or, &session, &resource).await,
+        Decision::Forbid
+    );
+}

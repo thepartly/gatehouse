@@ -496,40 +496,30 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                     .instrument(policy_span.clone())
                     .await;
                 // Merge per-item recorded facts into the per-item results
-                // (no-op for wrong-length results; handled below).
+                // (no-op for wrong-length results, which are replaced below).
                 let policy_results = batch_ctx.finish(policy_results);
 
-                if policy_results.len() != pending_chunk.len() {
-                    // The policy broke the one-result-per-item contract, so
-                    // these items could not be evaluated. Fail closed as
-                    // indeterminate: never a grant, and surfaced as an
-                    // infrastructure-shaped failure rather than a policy
-                    // decision.
-                    for &index in pending_chunk {
-                        policy_indeterminate_count += 1;
-                        let policy_result = PolicyEvalResult::indeterminate(
-                            policy_type.clone(),
-                            "Policy batch result count did not match input count",
-                        );
-                        traces[index].push(policy_result);
-                        let combined = checker_root(
-                            std::mem::take(&mut traces[index]),
-                            Decision::Indeterminate,
-                        );
-                        evaluations[index] = Some(AccessEvaluation::Indeterminate {
-                            trace: EvalTrace::with_root(combined),
-                            reason: indeterminate_summary(
-                                policy_type_str,
+                // A wrong-length result breaks the one-result-per-item
+                // contract, so this policy evaluated none of these items.
+                // Synthesize an indeterminate result per item and feed it
+                // through the ordinary effect-aware bookkeeping below rather
+                // than sealing the items here: a veto-capable policy's
+                // indeterminate still yields to a later definite forbid in
+                // the prefix, and an allow-only policy's indeterminate never
+                // suppresses a later grant.
+                let policy_results = if policy_results.len() == pending_chunk.len() {
+                    policy_results
+                } else {
+                    pending_chunk
+                        .iter()
+                        .map(|_| {
+                            PolicyEvalResult::indeterminate(
+                                policy_type.clone(),
                                 "Policy batch result count did not match input count",
-                            ),
-                        });
-                    }
-                    policy_span.record("policy.granted_count", policy_granted_count);
-                    policy_span.record("policy.denied_count", policy_denied_count);
-                    policy_span.record("policy.forbidden_count", policy_forbidden_count);
-                    policy_span.record("policy.indeterminate_count", policy_indeterminate_count);
-                    continue;
-                }
+                            )
+                        })
+                        .collect()
+                };
 
                 for (&index, result) in pending_chunk.iter().zip(policy_results) {
                     let mut result = result;

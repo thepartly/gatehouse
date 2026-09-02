@@ -69,7 +69,10 @@
   non-grants.
 - **Breaking:** a policy whose `evaluate_batch` returns the wrong number of
   results now fails closed as `Indeterminate` (previously an ordinary
-  denial): the affected items genuinely could not be evaluated.
+  denial): the affected items genuinely could not be evaluated. The
+  synthesized indeterminate is combined under the normal rules rather than
+  ending evaluation: a later definite forbid in the veto prefix still wins,
+  and a malformed allow-only policy never suppresses a later grant.
 - `AccessEvaluation::denied_due_to_fact_load_error()` also returns `true`
   for `Indeterminate` evaluations whose trace carries a fact-load error;
   prefer the structural `is_indeterminate()` for the 403-vs-5xx split.

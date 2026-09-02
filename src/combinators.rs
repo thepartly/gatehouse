@@ -247,21 +247,25 @@ impl<D: PolicyDomain> Policy<D> for AndPolicy<D> {
             let child_results = policy.evaluate_batch(&batch_ctx).await;
             let child_results = batch_ctx.finish(child_results);
 
-            if child_results.len() != pending.len() {
-                for index in pending.drain(..) {
-                    children_by_item[index].push(PolicyEvalResult::indeterminate(
-                        policy.policy_type(),
-                        "Policy batch result count did not match input count",
-                    ));
-                    results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: self.policy_type(),
-                        operation: CombineOp::And,
-                        children: std::mem::take(&mut children_by_item[index]),
-                        decision: Decision::Indeterminate,
-                    });
-                }
-                break;
-            }
+            // A wrong-length child batch means this child evaluated none of
+            // the pending items. Treat each as an indeterminate child result
+            // and keep the items pending, so the remaining children still
+            // apply the normal combination rules (a later definite forbid in
+            // the prefix wins; a definite answer from an allow-only child can
+            // still settle the aggregate).
+            let child_results = if child_results.len() == pending.len() {
+                child_results
+            } else {
+                pending
+                    .iter()
+                    .map(|_| {
+                        PolicyEvalResult::indeterminate(
+                            policy.policy_type(),
+                            "Policy batch result count did not match input count",
+                        )
+                    })
+                    .collect()
+            };
 
             let mut still_pending = Vec::new();
             for (index, child_result) in pending.into_iter().zip(child_results) {
@@ -492,21 +496,25 @@ impl<D: PolicyDomain> Policy<D> for OrPolicy<D> {
             let child_results = policy.evaluate_batch(&batch_ctx).await;
             let child_results = batch_ctx.finish(child_results);
 
-            if child_results.len() != pending.len() {
-                for index in pending.drain(..) {
-                    children_by_item[index].push(PolicyEvalResult::indeterminate(
-                        policy.policy_type(),
-                        "Policy batch result count did not match input count",
-                    ));
-                    results[index] = Some(PolicyEvalResult::Combined {
-                        policy_type: self.policy_type(),
-                        operation: CombineOp::Or,
-                        children: std::mem::take(&mut children_by_item[index]),
-                        decision: Decision::Indeterminate,
-                    });
-                }
-                break;
-            }
+            // A wrong-length child batch means this child evaluated none of
+            // the pending items. Treat each as an indeterminate child result
+            // and keep the items pending, so the remaining children still
+            // apply the normal combination rules (a later definite forbid in
+            // the prefix wins; a definite answer from an allow-only child can
+            // still settle the aggregate).
+            let child_results = if child_results.len() == pending.len() {
+                child_results
+            } else {
+                pending
+                    .iter()
+                    .map(|_| {
+                        PolicyEvalResult::indeterminate(
+                            policy.policy_type(),
+                            "Policy batch result count did not match input count",
+                        )
+                    })
+                    .collect()
+            };
 
             let mut still_pending = Vec::new();
             for (index, child_result) in pending.into_iter().zip(child_results) {

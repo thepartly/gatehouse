@@ -149,7 +149,10 @@ remembering `*_with_facts`.
   add an `Indeterminate` branch (or keep treating it as a denial — it is
   still fail-closed and `to_result` still maps it to an error).
 - A policy whose `evaluate_batch` returns the wrong number of results now
-  fails closed as `Indeterminate` instead of a plain denial.
+  fails closed as `Indeterminate` instead of a plain denial. Evaluation
+  continues under the normal `Indeterminate` rules, so a later definite
+  forbid still wins and a later grant is not suppressed by a malformed
+  allow-only policy.
 - An indeterminate veto-capable policy blocks sibling grants; an
   indeterminate allow-only policy does not, but with no grant the checker
   returns `Indeterminate` instead of `"All policies denied access"`.

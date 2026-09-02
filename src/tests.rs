@@ -766,9 +766,35 @@ mod core_tests {
             })
             .collect::<Vec<_>>();
 
+        // The malformed policy's own (wrong-length) grants are discarded:
+        // each item gets a synthesized indeterminate for it, and evaluation
+        // continues, so a healthy allow-only sibling still grants on its own
+        // merits and the trace keeps the contract violation visible.
         let mut checker = PermissionChecker::new();
         checker.add_policy(MismatchedBatchPolicy);
         checker.add_policy(AlwaysAllowPolicy);
+
+        let results = checker
+            .evaluate_batch_by(&subject, &TestAction, resources.clone(), |item| {
+                (&item.0, &item.1)
+            })
+            .await;
+
+        assert_eq!(results.len(), 3);
+        for (_item, evaluation) in results {
+            assert_eq!(evaluation.granted_policy_type(), Some("AlwaysAllowPolicy"));
+            let rendered = evaluation.trace().format();
+            assert!(
+                rendered.contains("MismatchedBatchPolicy INDETERMINATE"),
+                "unexpected trace: {rendered}"
+            );
+            assert!(rendered.contains("Policy batch result count did not match input count"));
+        }
+
+        // With no healthy sibling, the malformed policy alone fails closed as
+        // indeterminate: its wrong-length grants never reach the decision.
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(MismatchedBatchPolicy);
 
         let results = checker
             .evaluate_batch_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
