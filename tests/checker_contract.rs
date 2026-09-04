@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use gatehouse::{
     AccessEvaluation, AndPolicy, BatchEvalCtx, Decision, DelegatingPolicy, Effect, EvalCtx,
-    EvaluationSession, FactLoadResult, FactSource, Hydrator, LookupAuthorizedError, LookupPage,
-    LookupSource, NotPolicy, OrPolicy, PermissionChecker, Policy, PolicyBatchItem, PolicyBuilder,
-    PolicyDomain, PolicyEvalResult, RebacPolicy, RelationshipQuery,
+    EvaluationSession, FactLoadResult, FactOutcome, FactProvenance, FactSource, Hydrator,
+    LookupAuthorizedError, LookupPage, LookupSource, NotPolicy, OrPolicy, PermissionChecker,
+    Policy, PolicyBatchItem, PolicyBuilder, PolicyDomain, PolicyEvalResult, RebacPolicy,
+    RelationshipQuery,
 };
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -1691,6 +1692,52 @@ struct IndeterminatePolicy {
     effect: Effect,
 }
 
+/// Models the explicit-provenance escape hatch: the leaf remains
+/// `NotApplicable`, but its provenance says a required fact load failed.
+struct ErrorBearingNotApplicablePolicy;
+
+#[async_trait]
+impl Policy<Domain> for ErrorBearingNotApplicablePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.not_applicable_with_facts(
+            "fact was unavailable",
+            vec![FactProvenance::new(
+                "membership",
+                "Membership(7)",
+                FactOutcome::Error,
+                Some("membership backend unavailable".to_string()),
+            )],
+        )
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ErrorBearingNotApplicablePolicy")
+    }
+}
+
+/// Negation must never manufacture a grant from a leaf that reports a failed
+/// fact load, even when the policy deliberately used the explicit-provenance
+/// escape hatch to keep the leaf itself `NotApplicable`.
+#[tokio::test]
+async fn not_policy_fail_closes_error_bearing_not_applicable() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(NotPolicy::new(ErrorBearingNotApplicablePolicy));
+    let session = EvaluationSession::empty();
+
+    let single = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    single.assert_indeterminate();
+    assert!(!single.is_granted());
+    assert_eq!(single.fact_load_errors().len(), 1);
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_indeterminate();
+    assert!(!batch.is_granted());
+    assert_eq!(batch.fact_load_errors().len(), 1);
+}
+
 #[async_trait]
 impl Policy<Domain> for IndeterminatePolicy {
     async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
@@ -1898,6 +1945,47 @@ impl Policy<Domain> for DecisionOnlyForbidPolicy {
     }
 }
 
+struct DecisionOnlyIndeterminatePolicy;
+
+#[async_trait]
+impl Policy<Domain> for DecisionOnlyIndeterminatePolicy {
+    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("DecisionOnlyIndeterminate"),
+            operation: gatehouse::CombineOp::And,
+            children: Vec::new(),
+            decision: Decision::Indeterminate,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("DecisionOnlyIndeterminate")
+    }
+}
+
+#[tokio::test]
+async fn decision_only_indeterminate_has_a_nonempty_fallback_reason() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(DecisionOnlyIndeterminatePolicy);
+    let session = EvaluationSession::empty();
+
+    let single = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    single.assert_indeterminate();
+    assert_eq!(
+        single.indeterminate_reason(),
+        Some(
+            "Could not evaluate DecisionOnlyIndeterminate: indeterminate result did not contain an indeterminate leaf"
+        )
+    );
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_indeterminate();
+    assert_eq!(batch.indeterminate_reason(), single.indeterminate_reason());
+}
+
 #[tokio::test]
 async fn inconsistent_custom_combinator_nodes_still_fail_closed() {
     let session = EvaluationSession::empty();
@@ -2044,6 +2132,48 @@ impl Policy<Domain> for HandBuiltOddPolicy {
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("HandBuiltOddPolicy")
     }
+}
+
+/// A custom combinator-shaped policy that records a fact on its outer
+/// context. `finish` must preserve a failed load even though `Combined` has no
+/// provenance field of its own.
+struct HandBuiltCombinedOddPolicy;
+
+#[async_trait]
+impl Policy<Domain> for HandBuiltCombinedOddPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        let _ = ctx.fact(OddFlag(ctx.resource.id)).await;
+        PolicyEvalResult::Combined {
+            policy_type: self.policy_type(),
+            operation: gatehouse::CombineOp::And,
+            children: Vec::new(),
+            decision: Decision::NotApplicable,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("HandBuiltCombinedOddPolicy")
+    }
+}
+
+#[tokio::test]
+async fn combined_policy_preserves_recorded_load_failures() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(HandBuiltCombinedOddPolicy);
+    let session = odd_flag_session([3]);
+
+    let single = check_resource(&checker, &session, &Resource { id: 3 }).await;
+    single.assert_indeterminate();
+    assert_eq!(single.fact_load_errors().len(), 1);
+    assert!(single.trace().format().contains("fact odd_flag [error]"));
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 3 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_indeterminate();
+    assert_eq!(batch.fact_load_errors().len(), 1);
+    assert!(batch.trace().format().contains("fact odd_flag [error]"));
 }
 
 /// Facts recorded on the context reach the trace even when the policy
@@ -2344,6 +2474,14 @@ async fn combinator_indeterminate_decision_tables() {
         name: "BrokenAllow",
         effect: Effect::Allow,
     };
+
+    // A veto-capable child that definitely grants must not be mistaken for a
+    // failed veto-prefix child on the batch path. This distinguishes the
+    // `!is_granted && !is_indeterminate` conjunction from `||`.
+    let and = AndPolicy::try_new(vec![Arc::new(MixedGrantPolicy)]).unwrap();
+    assert_eq!(decide(&and, &session, &resource).await, Decision::Grant);
+    let or = OrPolicy::try_new(vec![Arc::new(MixedGrantPolicy)]).unwrap();
+    assert_eq!(decide(&or, &session, &resource).await, Decision::Grant);
 
     // AND: a veto-prefix indeterminate outranks both grants and definite
     // non-grants from the prefix.

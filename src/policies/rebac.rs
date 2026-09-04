@@ -1,6 +1,6 @@
 use crate::{
-    BatchEvalCtx, EvalCtx, FactLoadError, FactLoadResult, Policy, PolicyDomain, PolicyEvalResult,
-    RelationshipQuery,
+    BatchEvalCtx, EvalCtx, FactLoadError, FactLoadErrorKind, FactLoadResult, Policy, PolicyDomain,
+    PolicyEvalResult, RelationshipQuery,
 };
 use async_trait::async_trait;
 use std::fmt;
@@ -119,7 +119,13 @@ where
     }
 
     fn error_reason(&self, error: &FactLoadError) -> String {
-        format!("Relationship '{}' fact load failed: {error}", self.relation)
+        let kind = match error.kind() {
+            FactLoadErrorKind::SourceNotRegistered => "source_not_registered",
+            FactLoadErrorKind::SourceContractViolation => "source_contract_violation",
+            FactLoadErrorKind::LoaderCancelled => "loader_cancelled",
+            FactLoadErrorKind::Backend => "backend_error",
+        };
+        format!("Relationship '{}' fact load failed ({kind})", self.relation)
     }
 
     fn result_from_fact(

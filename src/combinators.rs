@@ -1,6 +1,6 @@
 use crate::{
-    BatchEvalCtx, CombineOp, Decision, Effect, EvalCtx, Policy, PolicyBatchItem, PolicyDomain,
-    PolicyEvalResult,
+    BatchEvalCtx, CombineOp, Decision, Effect, EvalCtx, FactOutcome, Policy, PolicyBatchItem,
+    PolicyDomain, PolicyEvalResult,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -686,7 +686,9 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
 /// * `Forbid` stays `Forbid` (the veto propagates; `is_forbidden` also
 ///   covers a forbidden leaf hidden inside a mislabeled child tree).
 /// * `Grant` becomes `NotApplicable`.
-/// * `NotApplicable` becomes `Grant`.
+/// * `NotApplicable` becomes `Grant`, unless its leaf provenance reports a
+///   failed fact load; that inconsistent escape-hatch shape is treated as
+///   `Indeterminate` rather than manufacturing a grant.
 /// * `Indeterminate` stays `Indeterminate` — the inner policy might have
 ///   granted or not, so the inversion is equally unknown.
 fn not_decision(inner_result: &PolicyEvalResult) -> Decision {
@@ -696,6 +698,14 @@ fn not_decision(inner_result: &PolicyEvalResult) -> Decision {
     match inner_result.decision() {
         Decision::Forbid => Decision::Forbid,
         Decision::Grant => Decision::NotApplicable,
+        Decision::NotApplicable
+            if inner_result
+                .provenance()
+                .iter()
+                .any(|fact| fact.outcome == FactOutcome::Error) =>
+        {
+            Decision::Indeterminate
+        }
         Decision::NotApplicable => Decision::Grant,
         Decision::Indeterminate => Decision::Indeterminate,
     }

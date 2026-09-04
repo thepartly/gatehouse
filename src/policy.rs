@@ -1,6 +1,6 @@
 use crate::{
-    EvaluationSession, FactKey, FactLoadResult, FactOutcome, FactProvenance, PolicyEvalResult,
-    SecurityRuleMetadata,
+    EvaluationSession, FactKey, FactLoadError, FactLoadResult, FactOutcome, FactProvenance,
+    PolicyEvalResult, SecurityRuleMetadata,
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -88,8 +88,10 @@ pub struct PolicyBatchItem<'a, D: PolicyDomain> {
 /// was unavailable, so "did not grant" cannot be distinguished from "could
 /// not decide" — the context witnessed the failure and reports it
 /// structurally. Grants and forbids are decisive and are never rewritten.
-/// `Combined` nodes have no provenance to merge into; recorded entries are
-/// dropped for them.
+/// `Combined` nodes have no provenance field. When a recorded load failed,
+/// the entry is preserved on a synthetic `Indeterminate` child and every
+/// non-forbid aggregate decision is downgraded to `Indeterminate`. Benign
+/// recorded entries are dropped with a debug event.
 fn attach_recorded(
     result: PolicyEvalResult,
     mut recorded: Vec<FactProvenance>,
@@ -157,19 +159,82 @@ fn attach_recorded(
                 provenance: recorded,
             }
         }
-        PolicyEvalResult::Combined { .. } => {
-            tracing::debug!(
-                recorded_count = recorded.len(),
-                "facts recorded on an evaluation context were dropped: the policy \
-                 returned a Combined result, which has no provenance to merge into"
-            );
-            result
+        PolicyEvalResult::Combined {
+            policy_type,
+            operation,
+            mut children,
+            decision,
+        } => {
+            if recorded_error {
+                let recorded_count = recorded.len();
+                let error_count = recorded
+                    .iter()
+                    .filter(|fact| fact.outcome == FactOutcome::Error)
+                    .count();
+                tracing::warn!(
+                    policy.type = %policy_type,
+                    recorded_count,
+                    error_count,
+                    "a policy returned a Combined result after recorded fact loads failed; \
+                     preserving the failures on an Indeterminate child and failing closed"
+                );
+                children.push(PolicyEvalResult::indeterminate_with_facts(
+                    policy_type.clone(),
+                    "Fact load recorded by combined policy failed",
+                    recorded,
+                ));
+                PolicyEvalResult::Combined {
+                    policy_type,
+                    operation,
+                    children,
+                    decision: if decision == crate::Decision::Forbid {
+                        crate::Decision::Forbid
+                    } else {
+                        crate::Decision::Indeterminate
+                    },
+                }
+            } else {
+                tracing::debug!(
+                    policy.type = %policy_type,
+                    recorded_count = recorded.len(),
+                    "facts recorded on an evaluation context were dropped: the policy \
+                     returned a Combined result, which has no provenance to merge into"
+                );
+                PolicyEvalResult::Combined {
+                    policy_type,
+                    operation,
+                    children,
+                    decision,
+                }
+            }
         }
     }
 }
 
 fn provenance_for<K: FactKey>(key: &K, result: &FactLoadResult<K::Value>) -> FactProvenance {
     FactProvenance::from_load_result(K::NAME, key.render(), result)
+}
+
+/// Keeps the context's fail-closed recording contract even if a future or
+/// custom session implementation violates `get_many`'s length guarantee.
+fn normalize_fact_result_count<K: FactKey>(
+    results: Vec<FactLoadResult<K::Value>>,
+    expected: usize,
+) -> Vec<FactLoadResult<K::Value>> {
+    if results.len() == expected {
+        return results;
+    }
+
+    let actual = results.len();
+    (0..expected)
+        .map(|_| {
+            FactLoadResult::Error(FactLoadError::SourceContractViolation {
+                fact_name: K::NAME,
+                expected,
+                actual,
+            })
+        })
+        .collect()
 }
 
 /// Per-item policy evaluation context.
@@ -205,7 +270,9 @@ pub struct EvalCtx<'a, D: PolicyDomain> {
     pub policy_type: Cow<'static, str>,
     /// Facts consulted through this context and not yet attached to a
     /// result. A `std::sync::Mutex` (never held across an `await`) keeps the
-    /// context `Sync` for `&self` use inside async policy bodies.
+    /// context `Sync` for `&self` use inside async policy bodies. Result
+    /// helpers take this uncontended lock even on the fact-free path, while
+    /// the empty `Vec` itself performs no heap allocation.
     recorded: Mutex<Vec<FactProvenance>>,
 }
 
@@ -243,7 +310,9 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// provenance recording — they will not appear in the evaluation trace,
     /// and a failed load reported through [`Self::not_applicable`] will not
     /// be upgraded to an indeterminate result. Prefer [`Self::fact`] /
-    /// [`Self::facts`].
+    /// [`Self::facts`]. In particular, returning `NotApplicable` after an
+    /// invisible failed load can be inverted to a grant by [`crate::NotPolicy`]
+    /// because neither the result nor its provenance reports the failure.
     pub fn session(&self) -> &'a EvaluationSession {
         self.session
     }
@@ -269,12 +338,11 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     where
         K: FactKey,
     {
-        let results = self.session.get_many(keys).await;
-        if results.len() == keys.len() {
-            let mut recorded = self.recorded.lock().expect("recorded facts poisoned");
-            for (key, result) in keys.iter().zip(&results) {
-                recorded.push(provenance_for(key, result));
-            }
+        let results =
+            normalize_fact_result_count::<K>(self.session.get_many(keys).await, keys.len());
+        let mut recorded = self.recorded.lock().expect("recorded facts poisoned");
+        for (key, result) in keys.iter().zip(&results) {
+            recorded.push(provenance_for(key, result));
         }
         results
     }
@@ -304,8 +372,10 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// produces full provenance — and a hand-built `NotApplicable` after a
     /// recorded load failure is upgraded to `Indeterminate` (see
     /// [`Self::not_applicable`]). Call it yourself when driving
-    /// [`Policy::evaluate`] directly. Recorded facts cannot be merged into a
-    /// `Combined` result and are dropped in that case.
+    /// [`Policy::evaluate`] directly. A `Combined` result has no provenance
+    /// field: recorded failures are preserved on a synthetic `Indeterminate`
+    /// child and make every non-forbid aggregate indeterminate; benign entries
+    /// are dropped with a debug event.
     #[inline]
     pub fn finish(self, result: PolicyEvalResult) -> PolicyEvalResult {
         let recorded = self.recorded.into_inner().expect("recorded facts poisoned");
@@ -395,7 +465,9 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// failures (witnessed by the context); explicit provenance passed here
     /// is attached verbatim without changing the result variant, so policies
     /// that deliberately report a failed load as not-applicable can still do
-    /// so by constructing provenance themselves.
+    /// so by constructing provenance themselves. [`crate::NotPolicy`] still
+    /// treats an error-bearing not-applicable leaf as indeterminate instead of
+    /// inverting it to a grant.
     pub fn not_applicable_with_facts(
         &self,
         reason: impl Into<String>,
@@ -466,7 +538,7 @@ pub struct BatchEvalCtx<'a, D: PolicyDomain> {
     /// The current policy's [`Policy::policy_type`].
     pub policy_type: Cow<'static, str>,
     /// Per-item recorded provenance, lazily sized to `items.len()` on first
-    /// use so the fact-free path allocates nothing.
+    /// use so the fact-free path performs no per-item heap allocation.
     recorded: Mutex<Vec<Vec<FactProvenance>>>,
 }
 
@@ -501,7 +573,10 @@ impl<'a, D: PolicyDomain> BatchEvalCtx<'a, D> {
     /// Returns the raw request-scoped fact session.
     ///
     /// **Escape hatch**: loads made directly on the session are invisible to
-    /// provenance recording. Prefer [`Self::facts_by`] / [`Self::fact`].
+    /// provenance recording. Prefer [`Self::facts_by`] / [`Self::fact`]. In
+    /// particular, an invisible failed load followed by `NotApplicable` can
+    /// be inverted to a grant by [`crate::NotPolicy`] because no failure is
+    /// present in the result or provenance.
     pub fn session(&self) -> &'a EvaluationSession {
         self.session
     }
@@ -519,12 +594,11 @@ impl<'a, D: PolicyDomain> BatchEvalCtx<'a, D> {
             .iter()
             .map(|item| key_of(item.resource))
             .collect::<Vec<_>>();
-        let results = self.session.get_many(&keys).await;
-        if results.len() == keys.len() {
-            let mut recorded = self.recorded_slots();
-            for (index, (key, result)) in keys.iter().zip(&results).enumerate() {
-                recorded[index].push(provenance_for(key, result));
-            }
+        let results =
+            normalize_fact_result_count::<K>(self.session.get_many(&keys).await, keys.len());
+        let mut recorded = self.recorded_slots();
+        for (index, (key, result)) in keys.iter().zip(&results).enumerate() {
+            recorded[index].push(provenance_for(key, result));
         }
         results
     }

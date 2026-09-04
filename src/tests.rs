@@ -1574,7 +1574,16 @@ mod core_tests {
         assert_eq!(provenance.len(), 1);
         assert_eq!(provenance[0].outcome, FactOutcome::Error);
         // The backend error message is carried as provenance detail.
-        assert!(provenance[0].detail.is_some());
+        assert_eq!(
+            provenance[0].detail.as_deref(),
+            Some("database unavailable")
+        );
+        let reason = result.reason().expect("indeterminate reason");
+        assert!(reason.contains("backend_error"));
+        assert!(
+            !reason.contains("database unavailable"),
+            "raw backend details belong in provenance, not the policy reason: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -1605,10 +1614,12 @@ mod core_tests {
             provenance[0].error_kind,
             Some(FactLoadErrorKind::SourceNotRegistered)
         );
-        assert!(result
-            .reason()
-            .as_deref()
-            .is_some_and(|reason| reason.contains("No fact source registered")));
+        let reason = result.reason().expect("indeterminate reason");
+        assert!(reason.contains("source_not_registered"));
+        assert!(
+            !reason.contains("No fact source registered"),
+            "raw load errors belong in provenance, not the policy reason: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -1744,7 +1755,7 @@ mod core_tests {
                     .build()
                     .session();
                 // A failed load means the policy could not decide.
-                (session, "database unavailable", Decision::Indeterminate)
+                (session, "backend_error", Decision::Indeterminate)
             },
             {
                 let session = FactRegistry::builder()
@@ -1753,7 +1764,11 @@ mod core_tests {
                     )
                     .build()
                     .session();
-                (session, "returned", Decision::Indeterminate)
+                (
+                    session,
+                    "source_contract_violation",
+                    Decision::Indeterminate,
+                )
             },
         ] {
             let ctx = EvalCtx::new(
@@ -3372,6 +3387,13 @@ mod core_tests {
             .indeterminate_reason()
             .is_some_and(|reason| reason.contains("RebacPolicy")));
         assert!(
+            !evaluation
+                .indeterminate_reason()
+                .expect("indeterminate summary")
+                .contains("database unavailable"),
+            "top-level summaries must not expose raw backend errors"
+        );
+        assert!(
             evaluation.denied_due_to_fact_load_error(),
             "backend failure should surface as denied_due_to_fact_load_error"
         );
@@ -4578,7 +4600,8 @@ mod recording_ctx_tests {
         assert!(result.is_granted());
         assert_eq!(result.provenance().len(), 1);
 
-        // Recorded facts cannot merge into a Combined node and are dropped.
+        // A recorded failure cannot merge directly into a Combined node, so
+        // finish preserves it on a synthetic child and fails closed.
         let c = ctx(&session, &subject, &resource);
         c.fact(Flag(2)).await;
         let combined = c.finish(PolicyEvalResult::Combined {
@@ -4587,7 +4610,19 @@ mod recording_ctx_tests {
             children: vec![],
             decision: Decision::Grant,
         });
-        assert!(combined.provenance().is_empty());
+        assert_eq!(combined.decision(), Decision::Indeterminate);
+        assert!(combined.format(0).contains("fact flag [error]"));
+
+        // A definite forbid still wins over the failed load.
+        let c = ctx(&session, &subject, &resource);
+        c.fact(Flag(2)).await;
+        let combined = c.finish(PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("C"),
+            operation: CombineOp::And,
+            children: vec![],
+            decision: Decision::Forbid,
+        });
+        assert_eq!(combined.decision(), Decision::Forbid);
     }
 
     #[tokio::test]

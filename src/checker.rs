@@ -20,6 +20,9 @@ fn indeterminate_summary(policy_type: &str, reason: &str) -> String {
     format!("Could not evaluate {policy_type}: {reason}")
 }
 
+const MISSING_INDETERMINATE_LEAF_REASON: &str =
+    "indeterminate result did not contain an indeterminate leaf";
+
 /// Extracts `(policy_type, reason)` attribution for an indeterminate policy
 /// result, falling back to the policy's own name when the tree has no
 /// indeterminate leaf (e.g. a custom node without one).
@@ -27,7 +30,14 @@ fn indeterminate_attribution(result: &PolicyEvalResult, policy_type: &str) -> (S
     result
         .indeterminate_leaf()
         .map(|(leaf_type, reason)| (leaf_type.to_string(), reason.to_string()))
-        .unwrap_or_else(|| (policy_type.to_string(), result.reason().unwrap_or_default()))
+        .unwrap_or_else(|| {
+            (
+                policy_type.to_string(),
+                result
+                    .reason()
+                    .unwrap_or_else(|| MISSING_INDETERMINATE_LEAF_REASON.to_string()),
+            )
+        })
 }
 
 const FORBID_EFFECT_GRANT_REASON: &str =
@@ -371,7 +381,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         }
     }
 
-    #[tracing::instrument(name = "evaluate_batch", skip_all, fields(checker.name = tracing::field::Empty, item_count, granted_count, denied_count, max_batch_size, policy_count = self.policies.len()))]
+    #[tracing::instrument(name = "evaluate_batch", skip_all, fields(checker.name = tracing::field::Empty, item_count, granted_count, denied_count, indeterminate_count, max_batch_size, policy_count = self.policies.len()))]
     async fn evaluate_batch_by<I, F>(
         &self,
         session: &EvaluationSession,
@@ -417,6 +427,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                 .collect();
             tracing::Span::current().record("granted_count", 0usize);
             tracing::Span::current().record("denied_count", item_count);
+            tracing::Span::current().record("indeterminate_count", 0usize);
             return results;
         }
 
@@ -668,6 +679,7 @@ impl<D: PolicyDomain> PermissionChecker<D> {
         drop(item_parts);
 
         let mut granted_count = 0usize;
+        let mut indeterminate_count = 0usize;
         let results = items
             .into_iter()
             .zip(evaluations.into_iter())
@@ -684,13 +696,16 @@ impl<D: PolicyDomain> PermissionChecker<D> {
                 });
                 if evaluation.is_granted() {
                     granted_count += 1;
+                } else if evaluation.is_indeterminate() {
+                    indeterminate_count += 1;
                 }
                 (item, evaluation)
             })
             .collect::<Vec<_>>();
-        let denied_count = item_count - granted_count;
+        let denied_count = item_count - granted_count - indeterminate_count;
         tracing::Span::current().record("granted_count", granted_count);
         tracing::Span::current().record("denied_count", denied_count);
+        tracing::Span::current().record("indeterminate_count", indeterminate_count);
         results
     }
 
@@ -785,6 +800,10 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     }
 
     /// Returns only the resources granted by [`Self::evaluate`].
+    ///
+    /// Denied and indeterminate resources are both excluded. Use
+    /// [`Self::evaluate`] and inspect each [`AccessEvaluation`] when callers
+    /// must distinguish an authorization-data outage from an ordinary denial.
     pub async fn filter<I>(&self, resources: I) -> Vec<I::Item>
     where
         I: IntoIterator,
@@ -800,7 +819,8 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     /// Returns only the caller-owned items granted by [`Self::evaluate_by`].
     ///
     /// The returned values are the original input items, not cloned projected
-    /// resources.
+    /// resources. Denied and indeterminate items are both excluded; use
+    /// [`Self::evaluate_by`] when callers must distinguish them.
     pub async fn filter_by<I, F>(&self, items: I, resource_of: F) -> Vec<I::Item>
     where
         I: IntoIterator,
@@ -815,6 +835,12 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
 
     /// Looks up one candidate page, hydrates it, and returns authorized
     /// resources from that page.
+    ///
+    /// Indeterminate resources are excluded exactly like denials, so this
+    /// method can return `Ok` with a shorter or empty page during an
+    /// authorization-data outage. Drive the lookup and hydration steps
+    /// directly, then use [`Self::evaluate`] if the caller must surface that
+    /// distinction.
     pub async fn lookup_page<L, H>(
         &self,
         lookup: &L,

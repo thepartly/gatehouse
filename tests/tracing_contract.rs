@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use gatehouse::{
-    BatchEvalCtx, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
-    PolicyDomain, PolicyEvalResult,
+    BatchEvalCtx, CombineOp, Decision, EvalCtx, EvaluationSession, FactOutcome, FactProvenance,
+    PermissionChecker, Policy, PolicyBuilder, PolicyDomain, PolicyEvalResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -153,6 +153,30 @@ impl Policy<Domain> for WrongLengthTracePolicy {
 
     fn effect(&self) -> gatehouse::Effect {
         gatehouse::Effect::Forbid
+    }
+}
+
+struct RecordedErrorCombinedPolicy;
+
+#[async_trait]
+impl Policy<Domain> for RecordedErrorCombinedPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.record(FactProvenance::new(
+            "membership",
+            "Membership(7)",
+            FactOutcome::Error,
+            Some("membership backend unavailable".to_string()),
+        ));
+        PolicyEvalResult::Combined {
+            policy_type: self.policy_type(),
+            operation: CombineOp::And,
+            children: Vec::new(),
+            decision: Decision::NotApplicable,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("RecordedErrorCombinedPolicy")
     }
 }
 
@@ -670,7 +694,7 @@ fn tracing_records_indeterminate_outcomes_and_batch_counts() {
 
     // Single path: the evaluation span attributes the indeterminate
     // outcome to the failing policy.
-    let (result, spans) = capture_async(|| async {
+    let (result, spans, events) = capture_async_with_events(|| async {
         checker
             .bind(&session, &Subject, &Action, &Ctx)
             .check(&Resource { allowed: true })
@@ -680,6 +704,11 @@ fn tracing_records_indeterminate_outcomes_and_batch_counts() {
     let single = span(&spans, "evaluate_one");
     assert_value(single, "outcome", "indeterminate");
     assert_value(single, "policy.type", "IndeterminateTracePolicy");
+    let security_event = events
+        .iter()
+        .find(|event| event.target == "gatehouse::security")
+        .unwrap_or_else(|| panic!("missing security event; events: {events:#?}"));
+    assert_event_value(security_event, "event.outcome", "unknown");
 
     // Batch path: indeterminate results are counted separately from
     // ordinary denials on the per-policy span. Two items pin the counter
@@ -699,6 +728,42 @@ fn tracing_records_indeterminate_outcomes_and_batch_counts() {
     assert_value(policy, "policy.denied_count", "0");
     assert_value(policy, "policy.granted_count", "0");
     assert_value(policy, "policy.forbidden_count", "0");
+
+    let batch = span(&spans, "evaluate_batch");
+    assert_value(batch, "item_count", "2");
+    assert_value(batch, "granted_count", "0");
+    assert_value(batch, "denied_count", "0");
+    assert_value(batch, "indeterminate_count", "2");
+}
+
+#[test]
+fn tracing_warns_when_combined_result_preserves_recorded_errors() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(RecordedErrorCombinedPolicy);
+    let session = EvaluationSession::empty();
+
+    let (result, _spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: false })
+            .await
+    });
+
+    result.assert_indeterminate();
+    assert_eq!(result.fact_load_errors().len(), 1);
+
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.level == "WARN"
+                && event.values.get("message").is_some_and(|message| {
+                    message.contains("preserving the failures on an Indeterminate child")
+                })
+        })
+        .unwrap_or_else(|| panic!("missing combined-error warning; events: {events:#?}"));
+    assert_event_value(warning, "policy.type", "RecordedErrorCombinedPolicy");
+    assert_event_value(warning, "recorded_count", "1");
+    assert_event_value(warning, "error_count", "1");
 }
 
 #[test]

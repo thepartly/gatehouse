@@ -31,9 +31,10 @@
   (never a grant); `DelegatingPolicy` propagates a child checker's
   indeterminate outcome.
 - `gatehouse.batch_policy` spans record `policy.indeterminate_count`, the
-  `evaluate_one` span can record `outcome = "indeterminate"`, and the
-  `gatehouse::security` event outcome is `"unknown"` for indeterminate
-  policy results.
+  top-level `evaluate_batch` span records `indeterminate_count` separately
+  from `denied_count`, the `evaluate_one` span can record
+  `outcome = "indeterminate"`, and the `gatehouse::security` event outcome is
+  `"unknown"` for indeterminate policy results.
 - Recording evaluation contexts (#62). `EvalCtx::fact(key)` /
   `EvalCtx::facts(keys)` and `BatchEvalCtx::facts_by(key_of)` /
   `BatchEvalCtx::fact(key)` load through the session **and** record each
@@ -97,6 +98,22 @@
   leaf is still treated as forbidding (fail closed) and now emits a `WARN`
   naming the inconsistent node, so a broken custom combinator is visible in
   logs instead of being silently corrected.
+- When a custom policy returns `Combined` after recording a failed fact load,
+  `EvalCtx::finish` preserves the provenance on a synthetic `Indeterminate`
+  child and downgrades every non-forbid aggregate decision to
+  `Indeterminate`. The outage can no longer disappear because `Combined` has
+  no provenance field.
+- `RebacPolicy` reasons classify load failures without interpolating raw
+  backend error text. Diagnostic detail remains available only through the
+  attached `FactProvenance::detail` in the trace.
+- `NotPolicy` treats an error-bearing `NotApplicable` leaf as
+  `Indeterminate`, preventing explicit failed-load provenance from being
+  inverted into a grant. Loads made through the raw `ctx.session()` escape
+  hatch remain invisible and must not be reported as ordinary non-matches.
+- `filter`, `filter_by`, and `lookup_page` continue to exclude indeterminate
+  items like denials; their docs now make that list-endpoint behavior explicit
+  and direct callers to `evaluate` / `evaluate_by` when they need to surface
+  authorization-data outages.
 - A `Forbid`-effect policy's contract-violating grant is still normalized
   to `NotApplicable`, now preserving the facts the policy consulted so
   they stay in the trace.

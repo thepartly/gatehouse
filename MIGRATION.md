@@ -141,6 +141,11 @@ remembering `*_with_facts`.
 
 ### Behavior changes to audit
 
+- `filter`, `filter_by`, and `lookup_page` exclude indeterminate items exactly
+  like denials and return a shorter (possibly empty) list inside `Ok`. List
+  endpoints that must distinguish an authorization-data outage from "no rows
+  are authorized" should use `evaluate` / `evaluate_by` and inspect
+  `is_indeterminate()` for each item instead.
 - `RebacPolicy` now returns `Indeterminate` when a relationship fact **load
   fails** (backend error, unregistered source, source contract violation).
   A checker that previously answered `Denied` for those cases now answers
@@ -156,6 +161,19 @@ remembering `*_with_facts`.
 - An indeterminate veto-capable policy blocks sibling grants; an
   indeterminate allow-only policy does not, but with no grant the checker
   returns `Indeterminate` instead of `"All policies denied access"`.
+- `NotPolicy` fail-closes a `NotApplicable` leaf that carries explicit
+  `FactOutcome::Error` provenance as `Indeterminate` instead of inverting it
+  to a grant. A raw `ctx.session()` load remains invisible; do not return
+  `NotApplicable` after an unrecorded failure inside a negated policy.
+- A custom policy that records facts and returns `Combined` now preserves any
+  failed-load provenance on a synthetic `Indeterminate` child. Unless the
+  aggregate already forbids, its decision becomes `Indeterminate`; previously
+  the recorded failures were dropped because `Combined` has no provenance
+  field.
+- `RebacPolicy` no longer copies raw `FactLoadError` display text into its
+  policy reason (and therefore the top-level indeterminate summary). The
+  reason contains a stable failure classification; inspect
+  `FactProvenance::detail` in the trace when backend diagnostics are needed.
 - With the `serde` feature, `Combined` nodes serialize a `decision` field
   instead of `outcome`, and the new variants appear in serialized traces —
   update audit-log consumers.
