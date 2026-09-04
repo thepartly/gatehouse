@@ -237,7 +237,7 @@ impl RandomPolicySpec {
     }
 }
 
-/// Deny-overrides oracle with three-valued leaves:
+/// Deny-overrides oracle with four-valued leaves:
 ///
 /// 1. Any observed `Forbid` denies — a definite veto beats everything,
 ///    including indeterminate results.

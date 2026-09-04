@@ -176,7 +176,8 @@ pub enum FactLoadResult<V> {
     Found(V),
     /// The fact source was reached, but no value exists for the key.
     Missing,
-    /// Loading failed. Policies should map this to a denied decision.
+    /// Loading failed. Policies that require the fact should map this to an
+    /// indeterminate decision.
     Error(FactLoadError),
 }
 

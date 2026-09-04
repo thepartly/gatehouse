@@ -9,7 +9,8 @@
 //! deduplicates and caches by the typed `RelationshipQuery` key, the compiler
 //! checks relation names, and any backend-specific serialization stays inside
 //! the `FactSource`. Relationship store failures are returned as
-//! `FactLoadResult::Error` and fail closed to denial — asserted at the end.
+//! `FactLoadResult::Error` and fail closed to an indeterminate non-grant —
+//! asserted at the end.
 //!
 //! To run this example:
 //! ```
@@ -211,7 +212,7 @@ async fn main() {
     println!("=== Error During Relationship Loading ===\n");
 
     // A failing store must never grant: the load error is carried into the
-    // trace and the decision fails closed to denial — even for the owner.
+    // trace and the decision is indeterminate — even for the owner.
     let error_registry = FactRegistry::builder()
         .with::<ProjectRelationship, _>(ProjectRelationshipSource::new(relationships).with_error())
         .build();
@@ -221,6 +222,6 @@ async fn main() {
         .check(&project)
         .await;
     println!("{}", decision.display_trace());
-    decision.assert_denied();
+    decision.assert_indeterminate();
     decision.assert_trace_contains("simulated relationship store error");
 }
