@@ -207,10 +207,12 @@ impl fmt::Display for FactProvenance {
     }
 }
 
-/// The result of evaluating a single policy (or a combination).
+/// The inspectable audit representation of a policy decision or aggregate.
 ///
-/// This enum is used both by individual policies and by combinators to represent the
-/// outcome of access evaluation.
+/// Policies return [`crate::GrantResult`] or [`crate::VetoResult`], whose
+/// constructors preserve capability boundaries. This public enum supports
+/// inspection, formatting, and serialization; constructing a raw tree does not
+/// grant authority and it cannot be converted into a typed policy result.
 ///
 /// - [`PolicyEvalResult::Granted`]: Indicates that access is granted, with an optional reason.
 /// - [`PolicyEvalResult::NotApplicable`]: Indicates the policy did not grant access — either its
@@ -218,9 +220,8 @@ impl fmt::Display for FactProvenance {
 ///   has nothing positive to say. `NotApplicable` from one policy never overrides a sibling's grant.
 /// - [`PolicyEvalResult::Forbidden`]: Indicates the policy **actively forbids** this request.
 ///   Inside a [`crate::PermissionChecker`] a forbid overrides every grant (deny-overrides
-///   semantics). Produced by [`crate::PolicyBuilder`] policies with
-///   [`crate::Effect::Forbid`] whose predicate matches, or by custom policies via
-///   [`crate::EvalCtx::forbid`].
+///   semantics). Produced by [`crate::PolicyBuilder::build_veto`] policies
+///   whose predicates match, or custom [`crate::VetoPolicy`] implementations.
 /// - [`PolicyEvalResult::Combined`]: Represents the aggregate result of combining multiple policies.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -298,6 +299,8 @@ pub enum PolicyEvalResult {
         children: Vec<PolicyEvalResult>,
         /// The aggregate decision after applying the combining operation.
         decision: Decision,
+        /// Facts consulted directly by this aggregate policy.
+        provenance: Vec<FactProvenance>,
     },
 }
 
@@ -405,6 +408,98 @@ pub enum AccessEvaluation {
     },
 }
 
+/// A non-grant decision with its full audit evidence.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
+pub enum AccessError {
+    /// Authorization completed and denied access.
+    Denied {
+        /// Summary reason for the denial.
+        reason: String,
+        /// Complete evaluation evidence.
+        trace: EvalTrace,
+    },
+    /// Authorization could not be decided.
+    Indeterminate {
+        /// Summary reason for the unresolved decision.
+        reason: String,
+        /// Complete evaluation evidence, including fact errors.
+        trace: EvalTrace,
+    },
+}
+
+impl AccessError {
+    /// Returns the complete audit trace.
+    pub fn trace(&self) -> &EvalTrace {
+        match self {
+            Self::Denied { trace, .. } | Self::Indeterminate { trace, .. } => trace,
+        }
+    }
+
+    /// Returns all recorded fact failures, including failures in child policies.
+    pub fn fact_load_errors(&self) -> Vec<&FactProvenance> {
+        let mut errors = Vec::new();
+        if let Some(root) = self.trace().root() {
+            collect_fact_load_errors(root, &mut errors);
+        }
+        errors
+    }
+}
+
+impl fmt::Display for AccessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Denied { reason, .. } => write!(f, "access denied: {reason}"),
+            Self::Indeterminate { reason, .. } => {
+                write!(f, "authorization indeterminate: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AccessError {}
+
+/// An authorization batch containing at least one indeterminate decision.
+///
+/// No partial authorized list is returned. The original items and every
+/// decision remain available in input order for inspection or recovery.
+pub struct FilterError<T> {
+    /// All input items paired with their completed evaluations.
+    pub evaluations: Vec<(T, AccessEvaluation)>,
+}
+
+impl<T> fmt::Debug for FilterError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(
+                self.evaluations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, evaluation))| (index, evaluation)),
+            )
+            .finish()
+    }
+}
+
+impl<T> FilterError<T> {
+    /// Iterates over the original items whose authorization could not be decided.
+    pub fn indeterminate(&self) -> impl Iterator<Item = (&T, &AccessEvaluation)> {
+        self.evaluations
+            .iter()
+            .filter(|(_, evaluation)| evaluation.is_indeterminate())
+            .map(|(item, evaluation)| (item, evaluation))
+    }
+}
+
+impl<T> fmt::Display for FilterError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("could not determine authorization for every item")
+    }
+}
+
+impl<T> std::error::Error for FilterError<T> {}
+
 /// Walks a [`PolicyEvalResult`] tree looking for a `NotApplicable`
 /// leaf whose `policy_type` equals `expected`. Used by
 /// [`AccessEvaluation::assert_not_applicable_by`].
@@ -423,40 +518,23 @@ fn leaf_not_applicable_matches(node: &PolicyEvalResult, expected: &str) -> bool 
 /// Collects every [`FactProvenance`] with [`FactOutcome::Error`] from a
 /// result tree (leaves and combinator children).
 fn collect_fact_load_errors<'a>(node: &'a PolicyEvalResult, out: &mut Vec<&'a FactProvenance>) {
-    match node {
-        PolicyEvalResult::Granted { provenance, .. }
-        | PolicyEvalResult::NotApplicable { provenance, .. }
-        | PolicyEvalResult::Forbidden { provenance, .. }
-        | PolicyEvalResult::Indeterminate { provenance, .. } => {
-            for fact in provenance {
-                if fact.outcome == FactOutcome::Error {
-                    out.push(fact);
-                }
-            }
-        }
-        PolicyEvalResult::Combined { children, .. } => {
-            for child in children {
-                collect_fact_load_errors(child, out);
-            }
+    out.extend(
+        node.provenance()
+            .iter()
+            .filter(|fact| fact.outcome == FactOutcome::Error),
+    );
+    if let PolicyEvalResult::Combined { children, .. } = node {
+        for child in children {
+            collect_fact_load_errors(child, out);
         }
     }
 }
 
-/// Returns `true` on the first [`FactOutcome::Error`] in the tree — no
-/// allocation, early exit. Used by
-/// [`AccessEvaluation::denied_due_to_fact_load_error`].
 fn trace_has_fact_load_error(node: &PolicyEvalResult) -> bool {
-    match node {
-        PolicyEvalResult::Granted { provenance, .. }
-        | PolicyEvalResult::NotApplicable { provenance, .. }
-        | PolicyEvalResult::Forbidden { provenance, .. }
-        | PolicyEvalResult::Indeterminate { provenance, .. } => provenance
-            .iter()
-            .any(|fact| fact.outcome == FactOutcome::Error),
-        PolicyEvalResult::Combined { children, .. } => {
-            children.iter().any(trace_has_fact_load_error)
-        }
-    }
+    node.provenance()
+        .iter()
+        .any(|fact| fact.outcome == FactOutcome::Error)
+        || matches!(node, PolicyEvalResult::Combined { children, .. } if children.iter().any(trace_has_fact_load_error))
 }
 
 impl AccessEvaluation {
@@ -828,10 +906,9 @@ impl AccessEvaluation {
     /// # }
     /// # let mut checker = PermissionChecker::<Domain>::new();
     /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").build());
-    /// # checker.add_policy(
+    /// # checker.add_veto(
     /// #     PolicyBuilder::<Domain>::new("GlobalFreeze")
-    /// #         .forbid()
-    /// #         .build(),
+    /// #         .build_veto(),
     /// # );
     /// # let session = EvaluationSession::empty();
     /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
@@ -885,7 +962,9 @@ impl AccessEvaluation {
         );
     }
 
-    /// Converts the evaluation into a `Result`, mapping a denial into an error.
+    /// Converts the evaluation into a `Result`, mapping denial and indeterminate
+    /// into the same reason-only error callback. Prefer [`Self::into_result`]
+    /// when callers need to distinguish those outcomes.
     ///
     /// `error_fn` receives the denial reason string and should return your
     /// application's error type.
@@ -929,6 +1008,36 @@ impl AccessEvaluation {
             // as a 5xx) should branch on `is_indeterminate()` first.
             Self::Denied { reason, .. } | Self::Indeterminate { reason, .. } => {
                 Err(error_fn(reason))
+            }
+        }
+    }
+
+    /// Converts a decision to a typed error, retaining the reason and complete audit trace.
+    ///
+    /// Unlike [`Self::to_result`], this distinguishes a definite denial from an
+    /// inability to evaluate authorization. Map [`AccessError::Denied`] to a
+    /// forbidden response and [`AccessError::Indeterminate`] to an appropriate
+    /// service error in application code.
+    ///
+    /// ```
+    /// use gatehouse::{AccessError, AccessEvaluation, EvalTrace};
+    /// let evaluation = AccessEvaluation::Indeterminate {
+    ///     reason: "relationship backend unavailable".into(),
+    ///     trace: EvalTrace::new(),
+    /// };
+    /// let status = match evaluation.into_result() {
+    ///     Ok(()) => 200,
+    ///     Err(AccessError::Denied { .. }) => 403,
+    ///     Err(_) => 503,
+    /// };
+    /// assert_eq!(status, 503);
+    /// ```
+    pub fn into_result(self) -> Result<(), AccessError> {
+        match self {
+            Self::Granted { .. } => Ok(()),
+            Self::Denied { reason, trace } => Err(AccessError::Denied { reason, trace }),
+            Self::Indeterminate { reason, trace } => {
+                Err(AccessError::Indeterminate { reason, trace })
             }
         }
     }
@@ -1073,15 +1182,11 @@ impl PolicyEvalResult {
         }
     }
 
-    /// Builds a forbidden leaf result with no fact provenance.
+    /// Builds a forbidden audit leaf with no fact provenance.
     ///
-    /// A forbid is an **active veto**: inside a [`crate::PermissionChecker`]
-    /// it overrides grants from sibling policies. Custom policies returning
-    /// this from [`crate::Policy::evaluate`] should also override
-    /// [`crate::Policy::effect`] to return [`crate::Effect::Forbid`] if they
-    /// can only veto, or [`crate::Effect::AllowOrForbid`] if they can grant or
-    /// veto, so the checker schedules them ahead of allow-only policies. Prefer
-    /// [`crate::EvalCtx::forbid`] inside policy bodies.
+    /// This is an audit representation, not a veto result accepted by the
+    /// checker. Custom veto policies return [`crate::VetoResult`] through
+    /// [`crate::EvalCtx::forbid`] or [`crate::VetoResult::forbid`].
     pub fn forbidden(policy_type: impl Into<Cow<'static, str>>, reason: impl Into<String>) -> Self {
         Self::Forbidden {
             policy_type: policy_type.into(),
@@ -1165,6 +1270,17 @@ impl PolicyEvalResult {
     /// Returns the decision carried by this node.
     ///
     /// Leaves map 1:1 onto their variant; [`PolicyEvalResult::Combined`]
+    /// Returns the name of this audit-tree node.
+    pub fn policy_type(&self) -> &str {
+        match self {
+            Self::Granted { policy_type, .. }
+            | Self::NotApplicable { policy_type, .. }
+            | Self::Forbidden { policy_type, .. }
+            | Self::Indeterminate { policy_type, .. }
+            | Self::Combined { policy_type, .. } => policy_type,
+        }
+    }
+
     /// returns its stored aggregate decision without walking children.
     pub fn decision(&self) -> Decision {
         match self {
@@ -1181,47 +1297,13 @@ impl PolicyEvalResult {
         self.decision() == Decision::Grant
     }
 
-    /// Returns whether this result contains an active forbid.
+    /// Whether this node's aggregate decision is a veto.
     ///
-    /// True when this node's [`Self::decision`] is [`Decision::Forbid`]
-    /// **or** a [`PolicyEvalResult::Forbidden`] leaf survives anywhere in
-    /// the tree. The whole-tree scan is a fail-closed backstop: the crate's
-    /// combinators always keep a `Combined` node's decision consistent with
-    /// its children, but a custom combinator that (incorrectly) reports a
-    /// non-forbid decision while keeping a `Forbidden` leaf in its children
-    /// is still treated as forbidding — and a `WARN` names the inconsistent
-    /// node so the broken combinator is visible in logs rather than being
-    /// silently corrected forever. The warning fires on every call that
-    /// takes the backstop path (the checker and combinators consult
-    /// `is_forbidden` several times per evaluation), so one inconsistent
-    /// node can log more than once per request; that is accepted noise for
-    /// a condition that indicates a broken combinator. The scan
-    /// short-circuits as soon as a forbid is found.
+    /// Audit descendants can contain inactive vetoes (for example one child
+    /// of an all-of veto whose other child passed). Only the node's decision
+    /// carries authority.
     pub fn is_forbidden(&self) -> bool {
-        if self.decision() == Decision::Forbid {
-            return true;
-        }
-        match self.forbidden_leaf() {
-            Some((leaf_policy_type, _)) => {
-                if let Self::Combined {
-                    policy_type,
-                    decision,
-                    ..
-                } = self
-                {
-                    tracing::warn!(
-                        node.policy_type = policy_type.as_ref(),
-                        node.decision = %decision,
-                        forbidden_leaf.policy_type = leaf_policy_type,
-                        "Combined node reports a non-forbid decision but keeps a Forbidden \
-                         leaf in its children; treating it as forbidding (fail closed). \
-                         Fix the combinator that built this node."
-                    );
-                }
-                true
-            }
-            None => false,
-        }
+        self.decision() == Decision::Forbid
     }
 
     pub(crate) fn forbidden_leaf(&self) -> Option<(&str, Option<&str>)> {
@@ -1231,18 +1313,24 @@ impl PolicyEvalResult {
                 reason,
                 ..
             } => Some((policy_type.as_ref(), Some(reason.as_str()))),
-            Self::Combined { children, .. } => children.iter().find_map(Self::forbidden_leaf),
+            Self::Combined {
+                children,
+                decision: Decision::Forbid,
+                ..
+            } => children.iter().find_map(Self::forbidden_leaf),
+            Self::Combined { .. } => None,
             Self::Granted { .. } | Self::NotApplicable { .. } | Self::Indeterminate { .. } => None,
         }
     }
 
-    /// Returns the first indeterminate leaf along the indeterminate spine of
-    /// the tree, as `(policy_type, reason)`. Used to attribute an
-    /// [`AccessEvaluation::Indeterminate`] summary to the policy whose input
-    /// was unavailable. Combined nodes are only entered when they are
-    /// themselves indeterminate, so an incidental indeterminate leaf inside
-    /// a resolved subtree is not misattributed as the cause.
+    /// Attributes uncertainty along the active indeterminate spine.
+    ///
+    /// Resolved subtrees are skipped. An aggregate's own recorded failures
+    /// are attributed to that aggregate. Indeterminate NOT also admits
+    /// explicit error evidence on an abstaining child, since that evidence
+    /// prevents inversion even when the child has no indeterminate leaf.
     pub(crate) fn indeterminate_leaf(&self) -> Option<(&str, &str)> {
+        const FACT_FAILURE_REASON: &str = "A consulted fact could not be loaded";
         match self {
             Self::Indeterminate {
                 policy_type,
@@ -1250,14 +1338,47 @@ impl PolicyEvalResult {
                 ..
             } => Some((policy_type.as_ref(), reason.as_str())),
             Self::Combined {
+                policy_type,
                 children,
+                operation,
+                provenance,
                 decision: Decision::Indeterminate,
-                ..
-            } => children.iter().find_map(Self::indeterminate_leaf),
+            } => children
+                .iter()
+                .find_map(Self::indeterminate_leaf)
+                .or_else(|| {
+                    if provenance
+                        .iter()
+                        .any(|fact| fact.outcome == FactOutcome::Error)
+                    {
+                        Some((policy_type.as_ref(), FACT_FAILURE_REASON))
+                    } else if *operation == CombineOp::Not {
+                        children
+                            .iter()
+                            .find_map(Self::fact_error_policy)
+                            .map(|policy_type| (policy_type, FACT_FAILURE_REASON))
+                    } else {
+                        None
+                    }
+                }),
             Self::Combined { .. }
             | Self::Granted { .. }
             | Self::NotApplicable { .. }
             | Self::Forbidden { .. } => None,
+        }
+    }
+
+    fn fact_error_policy(&self) -> Option<&str> {
+        if self
+            .provenance()
+            .iter()
+            .any(|fact| fact.outcome == FactOutcome::Error)
+        {
+            return Some(self.policy_type());
+        }
+        match self {
+            Self::Combined { children, .. } => children.iter().find_map(Self::fact_error_policy),
+            _ => None,
         }
     }
 
@@ -1282,14 +1403,14 @@ impl PolicyEvalResult {
 
     /// Returns the facts the policy consulted to reach this decision.
     ///
-    /// Empty for combinators and for policies that are not fact-backed.
+    /// Aggregate nodes contain their own facts; child facts remain on their children.
     pub fn provenance(&self) -> &[FactProvenance] {
         match self {
             Self::Granted { provenance, .. }
             | Self::NotApplicable { provenance, .. }
             | Self::Forbidden { provenance, .. }
-            | Self::Indeterminate { provenance, .. } => provenance,
-            Self::Combined { .. } => &[],
+            | Self::Indeterminate { provenance, .. }
+            | Self::Combined { provenance, .. } => provenance,
         }
     }
 
@@ -1339,6 +1460,7 @@ impl PolicyEvalResult {
                 operation,
                 children,
                 decision,
+                provenance,
             } => {
                 let decision_char = match decision {
                     Decision::Grant => "✔",
@@ -1351,6 +1473,7 @@ impl PolicyEvalResult {
                     indent_str, decision_char, policy_type, operation
                 );
 
+                result = Self::append_provenance(result, &indent_str, provenance);
                 for child in children {
                     result.push_str(&format!("\n{}", child.format(indent + 2)));
                 }

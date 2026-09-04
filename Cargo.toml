@@ -1,6 +1,6 @@
 [package]
 name = "gatehouse"
-version = "0.6.0"
+version = "0.6.0-alpha.1"
 edition = "2021"
 # 1.82 is required for `Option::is_none_or` (stabilized 2024-10-17), used
 # in the builder's per-axis predicate evaluation. Other dependencies on
@@ -10,15 +10,17 @@ rust-version = "1.82"
 license = "MIT"
 repository = "https://github.com/thepartly/gatehouse"
 description = "An in-process authorization engine for Rust with composable policies and request-scoped fact loading."
+include = ["src/**", "tests/**", "examples/**", "benches/**", "Cargo.toml", "Cargo.lock", "README.md", "MIGRATION.md", "CHANGELOG.md", "LICENSE", ".github/logo.svg"]
 
 [dependencies]
-tracing = "0.1"
+tracing = { version = "0.1", optional = true }
 async-trait = "0.1"
 futures-channel = "0.3"
 serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
-default = []
+default = ["tracing"]
+tracing = ["dep:tracing"]
 serde = ["dep:serde"]
 
 # Regular dev-deps. Gated on `cfg(not(loom))` because several of them
@@ -50,6 +52,10 @@ loom = "0.7"
 
 [[bench]]
 name = "permission_checker"
+harness = false
+
+[[bench]]
+name = "recording"
 harness = false
 
 [[example]]

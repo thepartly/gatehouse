@@ -9,31 +9,33 @@ cargo run --example axum        # HTTP server on :8000
 cargo run --example actix_web   # HTTP server on :8080
 
 # Reproduce the PR mutation gate locally (see "CI gates" below)
-git diff origin/main...HEAD -- src/checker.rs src/combinators.rs > mutants.diff
+git diff origin/main...HEAD -- src/checker.rs src/combinators.rs src/capability.rs src/policies/delegating.rs > mutants.diff
 cargo mutants --in-place --in-diff=mutants.diff \
-  --file src/checker.rs --file src/combinators.rs \
+  --file src/checker.rs --file src/combinators.rs --file src/capability.rs \
+  --file src/policies/delegating.rs \
   --baseline=skip --timeout=60 --build-timeout=300 --all-features \
-  -- --test checker_contract --test tracing_contract
+  -- --test checker_contract --test tracing_contract --test outcome_contract
 ```
 
 ## CI gates that bite
 
 - Clippy runs with `-D warnings`; any warning fails CI. `fmt` + `clippy` before committing.
-- A **diff-scoped `cargo-mutants` gate** mutates the PR's changes to `src/checker.rs` and `src/combinators.rs` only. Every new/changed line there must be killed by a test or CI fails (~20 min run). When you touch veto/short-circuit logic, add a test that *distinguishes the mutation* (e.g. a case where `&&` vs `||` actually diverge), not just a happy-path assertion — a green test that survives the mutant is the usual failure mode here.
+- A **diff-scoped `cargo-mutants` gate** covers `src/checker.rs`, `src/combinators.rs`, `src/capability.rs`, and `src/policies/delegating.rs`. When changing decisions or short-circuit logic, add a test that distinguishes the mutation (for example, inputs where `&&` and `||` diverge).
 - `main` is governed by a require-approval ruleset: PRs need an approving review (you cannot self-approve); repo/org admins can bypass.
-- Publishing a GitHub Release for tag `vX.Y.Z` triggers `cargo publish` to crates.io — irreversible. Releases finalize `CHANGELOG.md` (`[Unreleased]` → `[X.Y.Z] - <date>`) in a small "Release vX.Y.Z" PR; `Cargo.toml`/`Cargo.lock` are bumped in the feature PR.
+- Pushing a `v*` tag triggers irreversible crates.io publication, followed by creation of the GitHub Release. The tag must match the Cargo version and point to a commit with successful main CI. Prepare and validate the exact candidate before requesting publication approval; see `.github/workflows/release.yml`.
 
 ## Architecture
 
 One library crate, split across `src/*.rs` and re-exported from `src/lib.rs`. Unit tests are in `src/tests.rs`; integration tests in `tests/` — and the examples are `include!`d into those tests, so a broken example breaks the test build.
 
-`Policy<D: PolicyDomain>` is the core trait: async `evaluate` → `PolicyEvalResult`, plus `evaluate_batch` (must return one result per input, in order). `PolicyDomain` names `Subject`/`Action`/`Resource`/`Context` once. `PermissionChecker<D>` is bound per request — `checker.bind(&session, &subject, &action, &context)` yields a `BoundEvaluator` with `check` / `evaluate` / `evaluate_by` / `filter` / `filter_by` / `lookup_page`.
+`Policy<D>` returns `GrantResult`; `VetoPolicy<D>` returns `VetoResult`. Both have single and batch evaluation; batches return one result per input in order. `PolicyDomain` names `Subject`/`Action`/`Resource`/`Context`. Bind request inputs once with `checker.bind(...)`. Use `try_filter`, `try_filter_by`, or `try_lookup_page` when an indeterminate item must fail the list operation; the non-fallible variants deliberately omit indeterminate items.
 
-Built-ins: `RbacPolicy`, `RebacPolicy`, `DelegatingPolicy`; `PolicyBuilder::when` for ABAC-style predicates; combinators `AndPolicy` / `OrPolicy` / `NotPolicy` plus fluent `PolicyExt`. Closures are `Send + Sync + 'static`. Decisions are never `Result`: `PolicyEvalResult::{Granted, NotApplicable, Forbidden, Indeterminate, Combined}` at the policy level, `AccessEvaluation::{Granted, Denied, Indeterminate}` at the top. Every node also exposes a `Decision` via `PolicyEvalResult::decision()` (`Combined` stores its aggregate decision). Public enums are `#[non_exhaustive]`. Telemetry is `tracing` (OpenTelemetry semantic conventions); reason strings and `FactProvenance.detail` reach subscribers — treat them as audit surface, no secrets.
+`PolicyEvalResult` is the inspectable audit tree, not a custom policy's return type. Controlled `GrantResult` and `VetoResult` constructors enforce authority boundaries. `AccessEvaluation::{Granted, Denied, Indeterminate}` is the top-level decision; `into_result` preserves denied versus indeterminate in `AccessError`. Context fact-loading helpers record provenance; aggregate nodes retain their own facts. Public enums are `#[non_exhaustive]`. The default-enabled `tracing` feature controls instrumentation independently of returned audit evidence. Reasons and fact details are audit surfaces; exclude secrets.
 
-## Load-bearing invariants (read before editing `checker.rs` / `combinators.rs`)
+## Load-bearing invariants (read before editing evaluator or capability code)
 
-- **Deny-overrides via veto-prefix ordering.** Veto-capable policies (`effect().can_forbid()`) are scheduled ahead of allow-only ones, and a grant is never returned until *every* veto-capable policy has been evaluated — so a `Forbidden` is always observed before a grant can short-circuit. `evaluate_one` (single) and `evaluate_batch_by` (batch) implement this independently and **must agree per item**; differential proptests against a deny-overrides oracle in `tests/checker_contract.rs` enforce it.
-- **Indeterminate is fail-closed and effect-aware.** A node whose decision is `Indeterminate` never grants. In the checker (and inside `AndPolicy`/`OrPolicy`), an `Indeterminate` from the **veto prefix** blocks grants — the failed policy might have forbidden — and resolves at the end of the prefix (a later definite `Forbidden` in the prefix still wins). An `Indeterminate` from an **allow-only** policy never blocks a grant, but with no grant on the table it makes the aggregate `Indeterminate` rather than a plain non-grant. `NotPolicy` maps `Indeterminate` to `Indeterminate` — never to a grant. The oracle in `tests/checker_contract.rs` encodes these rules; keep it in sync.
-- **Forbid detection reads the node decision plus a whole-tree backstop.** `is_forbidden()` is `decision() == Decision::Forbid || forbidden_leaf().is_some()`. The crate's combinators must keep a `Combined` node's `decision` consistent with its children (in particular: **never `Decision::Grant` while a `Forbidden` leaf survives in the children**); the recursive leaf scan is defense-in-depth so a downstream combinator that breaks that rule still fails closed.
-- **`effect()` is a security contract.** A policy that can return `Forbidden` must declare `Effect::Forbid` or `Effect::AllowOrForbid`, or its veto can be short-circuited by an earlier grant. The checker emits a `WARN` when an `Effect::Allow` policy returns `Forbidden` (it honors the veto where observed, but cannot reorder it). The same declaration decides whether a policy's `Indeterminate` blocks sibling grants (veto prefix) or not (allow-only).
+- **Vetoes precede grants.** Every applicable veto must pass before grants can authorize. A definite veto outranks uncertainty; unresolved vetoes block grants. An unresolved grant never defeats an independent grant. Single and batch results must agree per item, including nested delegation.
+- **Authority is typed.** Keep raw audit-tree construction separate from grant/veto return values. A public conversion from an arbitrary `PolicyEvalResult` into a capability result would defeat this boundary.
+- **Aggregate decisions govern audit descendants.** An `AllOfVeto` can pass while retaining a matched child veto in its trace. `is_forbidden()` reads the node decision; veto attribution follows only active veto branches. A recursive search for any forbidden leaf would change authorization semantics.
+- **Delegation is atomic.** `add_delegate` installs both child capabilities. Child grant uncertainty remains grant uncertainty in the parent. Both phases must use the same mapped inputs, and each child policy runs at most once per resource in its phase.
+- **Adversarial validation.** Preserve recursive oracle tests, capability compile-fail tests, malformed-batch tests, and mutation coverage when simplifying code. A shorter evaluator still needs these guarantees.

@@ -1,195 +1,233 @@
-# Migrating from 0.5 to 0.6
+# Migrating from 0.5.1 to the 0.6 prerelease
 
-Gatehouse 0.6 adds a public `error_kind` field to `FactProvenance`. Code using
-`FactProvenance::new(...)` needs no change, but direct struct literals must
-initialize the new field:
+This guide describes the unreleased 0.6 API, including typed grant and veto
+capabilities. The intended first prerelease is `0.6.0-alpha.1`; it is not yet
+published. Rust 1.82 remains the minimum supported compiler. The historical
+0.4 → 0.5 guide follows at the end and describes that older API only.
 
-```rust,ignore
-FactProvenance {
-    fact_name: "membership",
-    key: "Member(42)".to_string(),
-    outcome: FactOutcome::Found,
-    detail: None,
-    error_kind: None,
+## Separate grants from vetoes
+
+`Policy<D>::evaluate` now returns `GrantResult`, and `evaluate_batch` returns
+`Vec<GrantResult>`. These results can grant, abstain, or be indeterminate;
+they cannot veto. Existing grant policies generally need only to change their
+return type and replace `PolicyEvalResult` constructors with `GrantResult`
+constructors. Context helpers (`ctx.grant`, `ctx.not_applicable`, and
+`ctx.indeterminate`) already return the correct type.
+
+Veto rules implement `VetoPolicy<D>` and return `VetoResult`. Use
+`ctx.forbid`, `ctx.pass`, or `ctx.veto_indeterminate`. Register them with
+`checker.add_veto(...)`. A passing veto never grants access. `Effect`,
+`Policy::effect`, `add_forbid_policy`, and `PolicyBuilder::forbid` are removed.
+For predicates, replace `.forbid().build()` with `.build_veto()`:
+
+```rust
+use gatehouse::*;
+
+struct Account { suspended: bool }
+struct Accounts;
+impl PolicyDomain for Accounts {
+    type Subject = Account;
+    type Action = ();
+    type Resource = ();
+    type Context = ();
+}
+
+let mut checker = PermissionChecker::<Accounts>::new();
+checker.add_policy(PolicyBuilder::<Accounts>::new("Member").build());
+checker.add_veto(
+    PolicyBuilder::<Accounts>::new("Suspended")
+        .subjects(|account| account.suspended)
+        .build_veto(),
+);
+# tokio_test::block_on(async {
+let session = EvaluationSession::empty();
+let evaluation = checker
+    .bind(&session, &Account { suspended: true }, &(), &())
+    .check(&()).await;
+evaluation.assert_forbidden_by("Suspended");
+# });
+```
+
+For a custom rule that previously both granted and vetoed, split it into
+separate grant and veto policies and register both. Share backend inputs
+through a request-scoped fact session. The type checker now rejects a grant
+policy returning a veto, rather than relying on a correctly declared effect.
+
+## Composition and delegation
+
+`PolicyExt::and`, `or`, and `not` accept grant policies only. For a local
+exclusion, use `grant.and(blocked.not())`, where `blocked` is an ordinary
+predicate grant. A veto cannot be embedded in this expression.
+
+Use `AllOfVeto` / `VetoPolicyExt::all_of` when every child must veto to block,
+and `AnyOfVeto` / `VetoPolicyExt::any_of` when any child veto should block.
+A definite pass settles an all-of veto; a definite veto settles an any-of
+veto. Otherwise uncertainty remains indeterminate. There is no veto negation.
+Dynamic policy combinators reject empty collections.
+
+Custom grant result composition uses `GrantResult::all` / `any`. Empty
+result collections abstain. Their aggregate decisions are computed by the
+constructors; compose veto policies with `AllOfVeto` / `AnyOfVeto`. `PolicyEvalResult`
+remains the inspectable audit tree, including `Combined { decision,
+provenance, children, .. }`; policies cannot return it or convert an arbitrary
+raw tree into an authority-bearing result. Use `result.trace()` to inspect
+and `PolicyResult::into_trace()` to consume a typed result into its audit tree.
+
+Register a `DelegatingPolicy` with **`checker.add_delegate(delegate)`**, not
+`add_policy`. That one call installs both capabilities atomically. Child veto
+uncertainty blocks parent grants; a child grant failure does not block an
+independent parent grant after the child's vetoes pass. Each child capability
+phase runs at most once for each parent evaluation; delegation retains batch
+execution and nested evidence.
+
+## Preserve outages at application boundaries
+
+`AccessEvaluation` has three outcomes: `Granted`, `Denied`, and
+`Indeterminate`. A definite veto wins over uncertainty. An unresolved veto
+blocks grants. A failed grant policy can be superseded by an independent
+grant; without a grant, its failure makes the evaluation indeterminate.
+
+Replace reason-only `to_result(...)` conversion or blanket 403 responses with
+`into_result()` and classify `AccessError`:
+
+```rust
+use gatehouse::{AccessError, AccessEvaluation, EvalTrace};
+
+fn status(evaluation: AccessEvaluation) -> u16 {
+    match evaluation.into_result() {
+        Ok(()) => 200,
+        Err(AccessError::Denied { .. }) => 403,
+        Err(_) => 503,
+    }
+}
+assert_eq!(status(AccessEvaluation::Indeterminate {
+    reason: "authorization input unavailable".into(),
+    trace: EvalTrace::new(),
+}), 503);
+```
+
+`AccessError` retains the full trace and exposes `fact_load_errors()` for
+structured classification. Applications can implement `From<AccessError>`
+for their own error type and then use `check(...).await.into_result()?`.
+Inspect `FactProvenance::error_kind` to distinguish backend failures,
+unregistered sources, contract violations, and cancelled loaders. Keep
+trace details in internal diagnostics rather than HTTP response bodies.
+
+For complete lists, migrate:
+
+| Previous call | Strict replacement |
+| --- | --- |
+| `filter(resources).await` | `try_filter(resources).await?` |
+| `filter_by(rows, projection).await` | `try_filter_by(rows, projection).await?` |
+| `lookup_page(...).await?` | `try_lookup_page(...).await?` |
+
+Strict filtering excludes definite denials but returns `FilterError<Item>`
+if any final decision is indeterminate. The error owns **all** original items
+and evaluations in input order; `indeterminate()` selects unresolved items.
+A grant that supersedes an irrelevant failure succeeds normally. No partial
+list is returned as success.
+
+`try_lookup_page` returns `LookupAuthorizedError<LookupErr, HydrateErr,
+Resource>`. Its `Evaluation` variant retains hydrated resources and their
+decisions; source, hydration, and contract errors remain distinct variants.
+An authorization failure returns no next cursor: retry the same input cursor
+with a fresh session after recovery. Previously returned pages cannot be
+retracted, so an endpoint requiring an atomic multi-page response must collect
+all pages before sending it.
+
+The original `filter`, `filter_by`, and `lookup_page` remain deliberately
+lossy: they exclude both denials and indeterminate items. The old `to_result`
+also merges both outcomes into one reason-only error callback.
+`denied_due_to_fact_load_error()` is deprecated; it detects any error in the
+trace, which may be irrelevant to the final decision.
+
+## Record consulted facts
+
+Use `ctx.fact(key)` / `ctx.facts(keys)` instead of raw session loads. Batch
+policies use `ctx.facts_by(key_of)` or `ctx.fact(shared_key)`. These APIs load
+through the session and record successful, missing, and failed facts. The
+checker and built-in combinators attach the recorded evidence automatically.
+
+```rust
+use async_trait::async_trait;
+use gatehouse::*;
+use std::borrow::Cow;
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct Membership(u64);
+impl FactKey for Membership {
+    type Value = bool;
+    const NAME: &'static str = "membership";
+}
+struct Documents;
+impl PolicyDomain for Documents {
+    type Subject = u64;
+    type Action = ();
+    type Resource = ();
+    type Context = ();
+}
+struct Member;
+#[async_trait]
+impl Policy<Documents> for Member {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Documents>) -> GrantResult {
+        match ctx.fact(Membership(*ctx.subject)).await {
+            FactLoadResult::Found(true) => ctx.grant("member"),
+            _ => ctx.not_applicable("membership not established"),
+        }
+    }
+    fn policy_type(&self) -> Cow<'static, str> { "Member".into() }
 }
 ```
 
-When provenance comes from a fact load, prefer
-`FactProvenance::from_load_result(...)`; it records the outcome, diagnostic
-detail, and structured `FactLoadErrorKind` together.
+A recorded failure upgrades abstention or veto pass to `Indeterminate`.
+Decisive grants and vetoes retain their decisions even if an optional recorded
+load failed. This rule is the same for leaf and aggregate results. `Combined`
+now stores its own provenance; child evidence remains on child nodes. There
+are no synthetic failure children and no shape-dependent loss of evidence.
 
-## First-class `Indeterminate` decisions
+When invoking a policy directly, call `ctx.finish(result)` or
+`batch_ctx.finish(results)`. Construct contexts with `EvalCtx::new` /
+`BatchEvalCtx::new`; their recorders and session fields are private.
+`ctx.session()` remains an explicit non-recording escape hatch. Use
+`ctx.record(FactProvenance::from_load_result(...))` for externally loaded facts.
 
-0.6 makes "the policy could not be evaluated" a structural outcome instead of
-a convention over provenance:
+Other source and behavior changes:
 
-- `PolicyEvalResult` gains an `Indeterminate` leaf variant (constructors
-  `PolicyEvalResult::indeterminate` / `indeterminate_with_facts`, plus
-  `ctx.indeterminate(...)` inside policy bodies).
-- Every node now carries a four-valued `Decision`, exposed via
-  `PolicyEvalResult::decision()`.
-- `AccessEvaluation` gains an `Indeterminate` variant, with
-  `is_indeterminate()` and `indeterminate_reason()`.
+- `FactKey` requires `Debug` and has a default `render()` for audit keys.
+  `RelationshipQuery` requires `Debug` on IDs and relations, plus `Display`
+  on the relation. Override `render()` to control diagnostic key text.
+- `FactProvenance` gains `error_kind`. Add `error_kind: None` to old struct
+  literals, or prefer `from_load_result`. `new` produces unclassified evidence.
+- `RebacPolicy` returns indeterminate for failed loads. `Missing` and
+  `Found(false)` still abstain. Backend detail stays in provenance.
+- Wrong-length policy batches produce indeterminate results. Veto failures
+  block grants; grant failures can be superseded by a later grant.
+- `NotPolicy` preserves uncertainty, including explicit failed-load evidence
+  on an abstaining result. Never disguise an unrecorded failure as abstention.
+- `assert_denied()` no longer accepts indeterminate evaluations. Use
+  `assert_indeterminate()` for outage tests.
+- Serialized audit nodes gain `decision` and aggregate `provenance` fields;
+  update consumers that previously expected `Combined.outcome`.
 
-### `Combined.outcome` is now `Combined.decision`
+## Optional instrumentation
 
-Code that constructed or matched `PolicyEvalResult::Combined` must switch
-from the boolean to the `Decision` enum:
+`tracing` is a default-enabled Cargo feature. Set `default-features = false`
+to remove tracing instrumentation and its dependency. Decisions, returned
+`EvalTrace`, and fact provenance remain available and have the same semantics;
+telemetry spans, security events, and contract warnings are absent. `serde`
+is independent and can be enabled without tracing.
 
-```rust,ignore
-// Before
-PolicyEvalResult::Combined { policy_type, operation, children, outcome: true }
+Before adopting the prerelease, run custom policy and batch tests, inject fact
+backend failures into single and list endpoints, and check every wildcard
+match on `AccessEvaluation`. Create a fresh session for retries and each
+reauthorization pass so cached failures or stale permissions are not reused.
 
-// After
-PolicyEvalResult::Combined { policy_type, operation, children, decision: Decision::Grant }
-```
+---
 
-Custom combinators must keep `decision` consistent with their children — in
-particular, never report `Decision::Grant` while a `Forbidden` leaf survives
-in `children`. (`is_forbidden()` still runs a recursive leaf scan as a
-fail-closed backstop, so an inconsistent node is treated as forbidding, but
-do not rely on that.)
+# Historical: migrating from 0.4 to 0.5
 
-### HTTP mapping
-
-The 403-vs-5xx split is now structural rather than provenance-scraping:
-
-```rust,ignore
-if evaluation.is_granted() {
-    // 200
-} else if evaluation.forbidden_by().is_some() {
-    // 403: active veto
-} else if evaluation.is_indeterminate() {
-    // 503: authorization inputs unavailable — inspect
-    // evaluation.fact_load_errors() / FactProvenance::error_kind
-} else {
-    // 403: ordinary denial
-}
-```
-
-`denied_due_to_fact_load_error()` remains as the coarser any-error-in-trace
-scan for policies that still record failed loads on `NotApplicable` results.
-
-## Recording evaluation contexts
-
-Fact provenance is no longer opt-in. `EvalCtx` owns a recorder, and fact
-access goes through the context:
-
-```rust,ignore
-// Before: six lines of ceremony per fact, silently wrong if skipped.
-let key = IsMember(ctx.subject.id);
-let result = ctx.session.get(key.clone()).await;
-let provenance = vec![FactProvenance::from_load_result(
-    IsMember::NAME,
-    format!("{key:?}"),
-    &result,
-)];
-match result {
-    FactLoadResult::Found(true) => ctx.grant_with_facts("is a member", provenance),
-    _ => ctx.not_applicable_with_facts("not a member", provenance),
-}
-
-// After: recording is a side effect of the load; the helpers attach it.
-match ctx.fact(IsMember(ctx.subject.id)).await {
-    FactLoadResult::Found(true) => ctx.grant("is a member"),
-    _ => ctx.not_applicable("not a member"),
-}
-```
-
-Batch policies use `ctx.facts_by(|resource| Key(...))` for one key per item
-(one deduplicated `get_many`, provenance recorded against the originating
-item) and `ctx.fact(key)` for a per-subject fact shared by every item.
-
-Mechanical changes:
-
-- `EvalCtx` / `BatchEvalCtx` can no longer be built with struct literals.
-  Use `EvalCtx::new(session, subject, action, resource, context,
-  policy_type)` and `BatchEvalCtx::new(session, subject, action, context,
-  items, policy_type)` — typically only in policy unit tests and custom
-  combinators.
-- `ctx.session` is now a method: `ctx.session()`. Loads made directly on
-  the session are invisible to recording; treat it as an escape hatch.
-- Callers that invoke `Policy::evaluate` / `Policy::evaluate_batch`
-  directly (tests, custom combinators) should pass the results through
-  `ctx.finish(result)` / `batch_ctx.finish(results)` so facts a policy
-  recorded but did not attach still reach the trace. The checker and the
-  built-in combinators do this for you.
-- `FactKey` gains a `fmt::Debug` supertrait and a defaulted
-  `render(&self) -> String` (the provenance key string, defaulting to the
-  `Debug` representation). Every practical key already derives `Debug`;
-  override `render` when the key has an established audit form.
-  `RelationshipQuery` does exactly that, so its recorded key string keeps
-  the pre-0.6 `subject -[relation]-> resource` form unchanged.
-  `RebacPolicy` consequently requires `Relation: fmt::Debug` in addition to
-  `fmt::Display`.
-- The `FactKey` impl for `RelationshipQuery` itself now requires
-  `Relation: fmt::Display` (its `render` override uses it) and `fmt::Debug`
-  on all three id types. Policies that build `RelationshipQuery` keys and
-  load them directly — without `RebacPolicy`, which always required
-  `Display` — need a `Display` impl on relation types that only derived
-  `Debug`.
-- Loading a fact through some other loader? Record it explicitly:
-  `ctx.record(FactProvenance::from_load_result(NAME, key_repr, &result))`.
-- The `*_with_facts` helpers remain for provenance computed from something
-  other than a context load, and now *append* to whatever was recorded.
-
-Because the context witnesses every recorded load,
-`ctx.not_applicable(...)` after a failed load now returns an
-`Indeterminate` result instead of silently looking like an ordinary
-non-match — the 403-vs-503 signal no longer depends on the policy author
-remembering `*_with_facts`.
-
-### Behavior changes to audit
-
-- `filter`, `filter_by`, and `lookup_page` exclude indeterminate items exactly
-  like denials and return a shorter (possibly empty) list inside `Ok`. List
-  endpoints that must distinguish an authorization-data outage from "no rows
-  are authorized" should use `evaluate` / `evaluate_by` and inspect
-  `is_indeterminate()` for each item instead.
-- `RebacPolicy` now returns `Indeterminate` when a relationship fact **load
-  fails** (backend error, unregistered source, source contract violation).
-  A checker that previously answered `Denied` for those cases now answers
-  `AccessEvaluation::Indeterminate`. `Found(false)` and `Missing` are still
-  ordinary non-grants. If your HTTP layer treated every non-grant as 403,
-  add an `Indeterminate` branch (or keep treating it as a denial — it is
-  still fail-closed and `to_result` still maps it to an error).
-- A policy whose `evaluate_batch` returns the wrong number of results now
-  fails closed as `Indeterminate` instead of a plain denial. Evaluation
-  continues under the normal `Indeterminate` rules, so a later definite
-  forbid still wins and a later grant is not suppressed by a malformed
-  allow-only policy.
-- An indeterminate veto-capable policy blocks sibling grants; an
-  indeterminate allow-only policy does not, but with no grant the checker
-  returns `Indeterminate` instead of `"All policies denied access"`.
-- `NotPolicy` fail-closes a `NotApplicable` leaf that carries explicit
-  `FactOutcome::Error` provenance as `Indeterminate` instead of inverting it
-  to a grant. A raw `ctx.session()` load remains invisible; do not return
-  `NotApplicable` after an unrecorded failure inside a negated policy.
-- A custom policy that records facts and returns `Combined` now preserves any
-  failed-load provenance on a synthetic `Indeterminate` child. Unless the
-  aggregate already forbids, its decision becomes `Indeterminate`; previously
-  the recorded failures were dropped because `Combined` has no provenance
-  field.
-- `RebacPolicy` no longer copies raw `FactLoadError` display text into its
-  policy reason (and therefore the top-level indeterminate summary). The
-  reason contains a stable failure classification; inspect
-  `FactProvenance::detail` in the trace when backend diagnostics are needed.
-- With the `serde` feature, `Combined` nodes serialize a `decision` field
-  instead of `outcome`, and the new variants appear in serialized traces —
-  update audit-log consumers.
-- Matches on `AccessEvaluation` / `PolicyEvalResult` with wildcard arms keep
-  compiling (`#[non_exhaustive]`), but review them: treating `Indeterminate`
-  as an ordinary denial is safe (fail-closed), just less informative.
-- **Test suites:** `AccessEvaluation::assert_denied` (and the other
-  `assert_*` helpers) now panic on an `Indeterminate` evaluation instead of
-  accepting it as a denial. Downstream tests that asserted a denial on a
-  `RebacPolicy` (or other fact-backed) load failure will start failing in
-  CI — switch them to the new `assert_indeterminate()`.
-- `denied_due_to_fact_load_error()` is deprecated. Use `is_indeterminate()`
-  for the structural 403-vs-5xx split and `fact_load_errors()` to inspect
-  the failed loads; the any-error-in-trace scan will be removed in 0.7.
-
-# Migrating from 0.4 to 0.5
+This section describes the released 0.5 API. Its Effect declarations, raw policy
+results, and mixed combinators are superseded by the 0.6 guide above.
 
 Gatehouse 0.5 intentionally breaks the public API to make the authorization surface smaller and harder to misuse. The main changes are:
 

@@ -56,7 +56,7 @@ struct CountingPolicy {
 
 #[async_trait]
 impl Policy<DocumentDomain> for CountingPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, DocumentDomain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, DocumentDomain>) -> GrantResult {
         // Increment evaluation counter
         self.counter.fetch_add(1, Ordering::SeqCst);
         println!("Evaluating policy: {}", self.name);

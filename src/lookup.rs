@@ -1,6 +1,6 @@
 //! Lookup-style enumeration for "what can this subject see?" authorization.
 //!
-//! [`crate::BoundEvaluator::check`] and [`crate::BoundEvaluator::filter`] both
+//! [`crate::BoundEvaluator::check`] and [`crate::BoundEvaluator::try_filter`] both
 //! require the caller to already hold every candidate resource. That breaks
 //! down for list and scope endpoints where the candidate population may be
 //! millions of rows and the visible subset is tiny.
@@ -40,7 +40,7 @@ use std::num::NonZeroUsize;
 /// grants (deny-overrides over OR). If you compose policies whose grant
 /// axes are independent (for example, "I own it" OR "it is public" OR
 /// "the admin override applies"), the `LookupSource` must enumerate the
-/// union of every grant axis. Forbid-effect policies only *remove* results,
+/// union of every grant axis. Veto policies only *remove* results,
 /// so they never widen what the source must enumerate. Lookup is the
 /// scaling story for the narrow case where one axis dominates; it is
 /// **not** a way to express policy logic inside the data layer.
@@ -151,13 +151,20 @@ where
     }
 }
 
-/// Failure modes for [`crate::BoundEvaluator::lookup_page`].
+/// Failure modes for lookup, hydration, and authorization of one candidate page.
+///
+/// [`crate::BoundEvaluator::try_lookup_page`] uses the resource type in its
+/// third parameter and may return [`Self::Evaluation`]. The original
+/// [`crate::BoundEvaluator::lookup_page`] omits indeterminate resources instead.
 ///
 /// The generic parameters carry the source's and hydrator's own error
 /// types, so callers retain full backend context on the wrapped variants.
-#[derive(Debug)]
 #[non_exhaustive]
-pub enum LookupAuthorizedError<LookupErr, HydrateErr> {
+pub enum LookupAuthorizedError<LookupErr, HydrateErr, Resource = ()> {
+    /// At least one resource could not be authorized; no partial page is returned.
+    /// Inspect the contained evaluations for audit evidence. This variant has no
+    /// [`std::error::Error::source`], allowing it to retain borrowed resources.
+    Evaluation(crate::FilterError<Resource>),
     /// The [`LookupSource`] returned an error for the current page.
     Lookup(LookupErr),
     /// The [`Hydrator`] returned an error for the current page.
@@ -176,13 +183,30 @@ pub enum LookupAuthorizedError<LookupErr, HydrateErr> {
     LookupCursorStuck,
 }
 
-impl<L, H> fmt::Display for LookupAuthorizedError<L, H>
+impl<L: fmt::Debug, H: fmt::Debug, R> fmt::Debug for LookupAuthorizedError<L, H, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Evaluation(error) => f.debug_tuple("Evaluation").field(error).finish(),
+            Self::Lookup(error) => f.debug_tuple("Lookup").field(error).finish(),
+            Self::Hydrate(error) => f.debug_tuple("Hydrate").field(error).finish(),
+            Self::HydratorContractViolation { expected, actual } => f
+                .debug_struct("HydratorContractViolation")
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            Self::LookupCursorStuck => f.write_str("LookupCursorStuck"),
+        }
+    }
+}
+
+impl<L, H, R> fmt::Display for LookupAuthorizedError<L, H, R>
 where
     L: fmt::Display,
     H: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Evaluation(err) => fmt::Display::fmt(err, f),
             Self::Lookup(err) => write!(f, "lookup source error: {err}"),
             Self::Hydrate(err) => write!(f, "hydrator error: {err}"),
             Self::HydratorContractViolation { expected, actual } => write!(
@@ -198,13 +222,14 @@ where
     }
 }
 
-impl<L, H> std::error::Error for LookupAuthorizedError<L, H>
+impl<L, H, R> std::error::Error for LookupAuthorizedError<L, H, R>
 where
     L: std::error::Error + 'static,
     H: std::error::Error + 'static,
 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Evaluation(_) => None,
             Self::Lookup(err) => Some(err),
             Self::Hydrate(err) => Some(err),
             Self::HydratorContractViolation { .. } | Self::LookupCursorStuck => None,

@@ -4,133 +4,77 @@
 
 ### Added
 
-- `FactLoadErrorKind` and `FactLoadError::kind()` provide stable,
-  machine-readable classifications for unregistered sources, source contract
-  violations, cancelled loaders, and backend failures.
-- `FactProvenance::from_load_result(...)` is the canonical way for fact-backed
-  policies to record a load result. It maps the outcome and diagnostic detail
-  and preserves the error classification in the public `error_kind` field.
-- First-class `Indeterminate` outcome (#61). `Decision` is a new
-  four-valued enum (`Grant` / `NotApplicable` / `Forbid` / `Indeterminate`)
-  carried by **every** `PolicyEvalResult` node via the new
-  `PolicyEvalResult::decision()` accessor. New leaf variant
-  `PolicyEvalResult::Indeterminate` (constructors `indeterminate` /
-  `indeterminate_with_facts`) means "this policy consulted an input that was
-  unavailable and could not decide" — fail-closed, never a grant. New
-  top-level variant `AccessEvaluation::Indeterminate` (plus
-  `is_indeterminate()`, `indeterminate_reason()`, `assert_indeterminate()`)
-  is the structural, causal signal for mapping authorization-data outages to
-  a 5xx instead of a 403.
-- Deny-overrides combination rules for `Indeterminate`: a definite
-  `Forbidden` still overrides everything; an indeterminate **veto-capable**
-  policy blocks sibling grants (its unresolved potential veto is never
-  short-circuited); an indeterminate **allow-only** policy never blocks a
-  grant, but if nothing grants the evaluation is `Indeterminate` rather than
-  `"All policies denied access"`. `AndPolicy` / `OrPolicy` apply the same
-  veto-prefix rules; `NotPolicy` maps `Indeterminate` to `Indeterminate`
-  (never a grant); `DelegatingPolicy` propagates a child checker's
-  indeterminate outcome.
-- `gatehouse.batch_policy` spans record `policy.indeterminate_count`, the
-  top-level `evaluate_batch` span records `indeterminate_count` separately
-  from `denied_count`, the `evaluate_one` span can record
-  `outcome = "indeterminate"`, and the `gatehouse::security` event outcome is
-  `"unknown"` for indeterminate policy results.
-- Recording evaluation contexts (#62). `EvalCtx::fact(key)` /
-  `EvalCtx::facts(keys)` and `BatchEvalCtx::facts_by(key_of)` /
-  `BatchEvalCtx::fact(key)` load through the session **and** record each
-  consulted fact as `FactProvenance`; the context result helpers
-  (`ctx.grant`, `ctx.not_applicable`, `ctx.forbid`, the new
-  `ctx.indeterminate`, and the `*_with_facts` variants) attach everything
-  recorded, so provenance is correct by construction instead of opt-in.
-  The checker and combinators merge facts a policy recorded but did not
-  attach (`EvalCtx::finish` / `BatchEvalCtx::finish`, public for callers
-  that drive `Policy::evaluate` directly). `ctx.record(...)` covers facts
-  loaded outside the context; `ctx.session()` is the documented
-  non-recording escape hatch.
-- `ctx.not_applicable(...)` after a **recorded** failed load is upgraded to
-  `PolicyEvalResult::Indeterminate`, closing the silent case where a policy
-  that forgot `*_with_facts` disabled the infrastructure-failure signal
-  (#58 case 3). Explicit provenance passed to `not_applicable_with_facts`
-  never changes the author's variant choice.
+- Separate `GrantResult` and `VetoResult` capabilities, `VetoPolicy`,
+  `PermissionChecker::add_veto`, and `PolicyBuilder::build_veto`. Grant policies
+  cannot return veto authority; veto policies cannot grant.
+- `AllOfVeto`, `AnyOfVeto`, and `VetoPolicyExt` for typed veto composition;
+  `GrantResult::all` / `any` for controlled custom grant aggregates.
+- `PermissionChecker::add_delegate` registers both delegated capabilities
+  atomically, preserving the distinction between child grant and veto failures.
+- First-class `AccessEvaluation::Indeterminate` and four-valued audit
+  `Decision`. Definite vetoes win; unresolved vetoes block grants; independent
+  grants can supersede grant-policy failures.
+- `AccessEvaluation::into_result` and typed `AccessError` retain denial versus
+  indeterminate classification, reasons, complete traces, and fact errors.
+- `try_filter`, `try_filter_by`, and `try_lookup_page` exclude denials and fail
+  on indeterminate evaluations. Errors retain original items and decisions;
+  strict lookup distinguishes evaluation, source, hydration, and contract errors.
+- Recording contexts: `EvalCtx::fact` / `facts`, `BatchEvalCtx::facts_by` /
+  `fact`, and `record` automatically attach consulted facts. `finish` supports
+  callers evaluating policies directly.
+- `FactLoadErrorKind`, `FactLoadError::kind`, and
+  `FactProvenance::from_load_result` expose structured failure classifications.
+- Default-enabled `tracing` feature. Disabling default features removes
+  instrumentation and its dependency while retaining decisions and audit data.
+  The `serde` feature remains independent.
+- CI checks for formatting, MSRV, doctests, and feature combinations; recursive
+  composition properties and compile-fail capability checks.
 
 ### Changed
 
-- **Breaking:** `FactProvenance` gains a public `error_kind` field. Downstream
-  struct literals must initialize it; constructors using `FactProvenance::new`
-  continue to produce unclassified provenance with `error_kind: None`.
-- **Breaking:** `PolicyEvalResult::Combined` replaces `outcome: bool` with
-  `decision: Decision`. `is_forbidden()` now reads the node decision first
-  and keeps the recursive `Forbidden`-leaf scan as a fail-closed backstop
-  for inconsistent custom combinator nodes.
-- **Breaking:** `RebacPolicy` returns `Indeterminate` (previously
-  `NotApplicable`) when a relationship fact load *fails* — backend errors,
-  unregistered sources, contract violations. A checker whose decisive path
-  hits such a failure now yields `AccessEvaluation::Indeterminate` instead of
-  `Denied`. Authoritative `Found(false)` / `Missing` answers remain ordinary
-  non-grants.
-- **Breaking:** a policy whose `evaluate_batch` returns the wrong number of
-  results now fails closed as `Indeterminate` (previously an ordinary
-  denial): the affected items genuinely could not be evaluated. The
-  synthesized indeterminate is combined under the normal rules rather than
-  ending evaluation: a later definite forbid in the veto prefix still wins,
-  and a malformed allow-only policy never suppresses a later grant.
-- `AccessEvaluation::denied_due_to_fact_load_error()` also returns `true`
-  for `Indeterminate` evaluations whose trace carries a fact-load error;
-  prefer the structural `is_indeterminate()` for the 403-vs-5xx split.
-- **Breaking:** `EvalCtx` and `BatchEvalCtx` are no longer constructible by
-  struct literal: `session` is private (use the new `session()` accessor)
-  and both gain a private provenance recorder. Use `EvalCtx::new(...)` /
-  `BatchEvalCtx::new(...)`, and pass results through `finish` when invoking
-  policies directly.
-- **Breaking:** `FactKey` gains a `fmt::Debug` supertrait and a defaulted
-  `render(&self) -> String` hook that produces the provenance key string
-  (defaulting to the `Debug` representation). `RelationshipQuery` overrides
-  `render` to keep its established `subject -[relation]-> resource` audit
-  form, so recorded key strings are unchanged from 0.5; `RebacPolicy` now
-  requires `Relation: fmt::Debug` in addition to `fmt::Display`.
-- **Breaking:** the `FactKey` impl for `RelationshipQuery` now requires
-  `Relation: fmt::Display` (used by its `render` override) in addition to
-  the `fmt::Debug` required on all three id types by the new supertrait.
-  Code that builds `RelationshipQuery` keys and loads them directly —
-  without going through `RebacPolicy`, which always required `Display` —
-  breaks if its relation type only derives `Debug`.
-- A `Combined` node whose decision disagrees with a surviving `Forbidden`
-  leaf is still treated as forbidding (fail closed) and now emits a `WARN`
-  naming the inconsistent node, so a broken custom combinator is visible in
-  logs instead of being silently corrected.
-- When a custom policy returns `Combined` after recording a failed fact load,
-  `EvalCtx::finish` preserves the provenance on a synthetic `Indeterminate`
-  child and downgrades every non-forbid aggregate decision to
-  `Indeterminate`. The outage can no longer disappear because `Combined` has
-  no provenance field.
-- `RebacPolicy` reasons classify load failures without interpolating raw
-  backend error text. Diagnostic detail remains available only through the
-  attached `FactProvenance::detail` in the trace.
-- `NotPolicy` treats an error-bearing `NotApplicable` leaf as
-  `Indeterminate`, preventing explicit failed-load provenance from being
-  inverted into a grant. Loads made through the raw `ctx.session()` escape
-  hatch remain invisible and must not be reported as ordinary non-matches.
-- `filter`, `filter_by`, and `lookup_page` continue to exclude indeterminate
-  items like denials; their docs now make that list-endpoint behavior explicit
-  and direct callers to `evaluate` / `evaluate_by` when they need to surface
-  authorization-data outages.
-- A `Forbid`-effect policy's contract-violating grant is still normalized
-  to `NotApplicable`, now preserving the facts the policy consulted so
-  they stay in the trace.
+- **Breaking:** `Policy::evaluate` / `evaluate_batch` return `GrantResult` /
+  `Vec<GrantResult>`. `Effect`, `Policy::effect`, `add_forbid_policy`, and
+  `PolicyBuilder::forbid` are removed. Register typed vetoes with `add_veto`.
+- **Breaking:** grant combinators accept only grant policies. Veto composition
+  uses its own combinators. `DelegatingPolicy` is registered with `add_delegate`.
+- **Breaking:** `PolicyEvalResult` is an audit representation, not an
+  authority-bearing return type. `Combined` has `decision` instead of `outcome`
+  and a `provenance` field. Typed aggregate constructors determine decisions;
+  arbitrary raw trees cannot be converted into typed policy results.
+- **Breaking:** fact-load failures and malformed policy batches produce
+  indeterminate outcomes instead of ordinary denials. `RebacPolicy` still
+  abstains on `Found(false)` and `Missing`.
+- **Breaking:** `EvalCtx` / `BatchEvalCtx` require constructors; their recorder
+  and session fields are private. Raw access remains through `session()`.
+- **Breaking:** `FactKey` requires `Debug` and supplies `render()` for audit
+  keys. `RelationshipQuery` requires `Debug` on IDs/relations and `Display` on
+  relations. `FactProvenance` gains `error_kind`.
+- Recorded failures upgrade abstention and veto pass to indeterminate. Decisive
+  grants/vetoes retain their decisions. Aggregate provenance follows the same
+  rules as leaves, without synthetic children or lost successful/missing facts.
+- `NotPolicy` preserves uncertainty, including explicit failed-load evidence
+  on an abstaining result. It cannot invert a veto policy.
+- ReBAC reasons classify errors without interpolating backend text; detailed
+  diagnostics remain in fact provenance. HTTP examples distinguish 403 from
+  outages and use strict list APIs with failure-injection coverage.
+- Existing `filter`, `filter_by`, `lookup_page`, and `to_result` retain their
+  deliberately lossy behavior. Prefer their strict or typed alternatives when
+  outages must be surfaced.
+- Indeterminate evaluations have separate telemetry outcomes and counters.
+  Contract warnings are emitted only when the tracing feature is enabled.
 
 ### Deprecated
 
-- `AccessEvaluation::denied_due_to_fact_load_error()`: use the structural
-  `is_indeterminate()` for the 403-vs-5xx split and `fact_load_errors()`
-  to inspect failed loads. The any-error-in-trace scan will be removed in
-  0.7.
+- `AccessEvaluation::denied_due_to_fact_load_error`: classify the final outcome
+  using `is_indeterminate()` / `into_result()` and inspect `fact_load_errors()`
+  for diagnostics. Removal is planned for 0.7.
 
 ### Fixed
 
-- Correct the `permission_checker_bound_check` fixtures so `trailing_allow/N`
-  and `all_deny/N` genuinely evaluate all `N` policies. The previous forbid
-  fixtures short-circuited after the first policy, so their historical numbers
-  are not comparable with the corrected benchmark.
+- Lookup example now enumerates all documents for admins, satisfying the
+  candidate-superset contract across both admin and viewer grant paths.
+- Correct benchmark fixtures so trailing grants and all-abstaining stacks
+  evaluate every intended policy; previous measurements are not comparable.
 
 ## [0.5.1] - 2026-09-01
 

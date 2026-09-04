@@ -1,3 +1,4 @@
+#[cfg(feature = "tracing")]
 pub(crate) const DEFAULT_SECURITY_RULE_CATEGORY: &str = "Access Control";
 pub(crate) const PERMISSION_CHECKER_POLICY_TYPE: &str = "PermissionChecker";
 
