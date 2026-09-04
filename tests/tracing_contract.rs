@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use gatehouse::{
-    BatchEvalCtx, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
-    PolicyDomain, PolicyEvalResult,
+    BatchEvalCtx, CombineOp, Decision, EvalCtx, EvaluationSession, FactOutcome, FactProvenance,
+    PermissionChecker, Policy, PolicyBuilder, PolicyDomain, PolicyEvalResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -58,6 +58,19 @@ impl Policy<Domain> for TracePolicy {
 
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("TracePolicy")
+    }
+}
+
+struct IndeterminateTracePolicy;
+
+#[async_trait]
+impl Policy<Domain> for IndeterminateTracePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.indeterminate("fact backend unreachable")
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("IndeterminateTracePolicy")
     }
 }
 
@@ -140,6 +153,30 @@ impl Policy<Domain> for WrongLengthTracePolicy {
 
     fn effect(&self) -> gatehouse::Effect {
         gatehouse::Effect::Forbid
+    }
+}
+
+struct RecordedErrorCombinedPolicy;
+
+#[async_trait]
+impl Policy<Domain> for RecordedErrorCombinedPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.record(FactProvenance::new(
+            "membership",
+            "Membership(7)",
+            FactOutcome::Error,
+            Some("membership backend unavailable".to_string()),
+        ));
+        PolicyEvalResult::Combined {
+            policy_type: self.policy_type(),
+            operation: CombineOp::And,
+            children: Vec::new(),
+            decision: Decision::NotApplicable,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("RecordedErrorCombinedPolicy")
     }
 }
 
@@ -650,6 +687,86 @@ fn tracing_fields_are_recorded_for_forbidden_decisions() {
 }
 
 #[test]
+fn tracing_records_indeterminate_outcomes_and_batch_counts() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(IndeterminateTracePolicy);
+    let session = EvaluationSession::empty();
+
+    // Single path: the evaluation span attributes the indeterminate
+    // outcome to the failing policy.
+    let (result, spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(result.is_indeterminate());
+    let single = span(&spans, "evaluate_one");
+    assert_value(single, "outcome", "indeterminate");
+    assert_value(single, "policy.type", "IndeterminateTracePolicy");
+    let security_event = events
+        .iter()
+        .find(|event| event.target == "gatehouse::security")
+        .unwrap_or_else(|| panic!("missing security event; events: {events:#?}"));
+    assert_event_value(security_event, "event.outcome", "unknown");
+
+    // Batch path: indeterminate results are counted separately from
+    // ordinary denials on the per-policy span. Two items pin the counter
+    // arithmetic (a broken increment would report 0 or 1, not 2).
+    let (_results, spans) = capture_async(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![
+                Resource { allowed: true },
+                Resource { allowed: false },
+            ])
+            .await
+    });
+    let policy = span(&spans, "gatehouse.batch_policy");
+    assert_value(policy, "policy.type", "IndeterminateTracePolicy");
+    assert_value(policy, "policy.indeterminate_count", "2");
+    assert_value(policy, "policy.denied_count", "0");
+    assert_value(policy, "policy.granted_count", "0");
+    assert_value(policy, "policy.forbidden_count", "0");
+
+    let batch = span(&spans, "evaluate_batch");
+    assert_value(batch, "item_count", "2");
+    assert_value(batch, "granted_count", "0");
+    assert_value(batch, "denied_count", "0");
+    assert_value(batch, "indeterminate_count", "2");
+}
+
+#[test]
+fn tracing_warns_when_combined_result_preserves_recorded_errors() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(RecordedErrorCombinedPolicy);
+    let session = EvaluationSession::empty();
+
+    let (result, _spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: false })
+            .await
+    });
+
+    result.assert_indeterminate();
+    assert_eq!(result.fact_load_errors().len(), 1);
+
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.level == "WARN"
+                && event.values.get("message").is_some_and(|message| {
+                    message.contains("preserving the failures on an Indeterminate child")
+                })
+        })
+        .unwrap_or_else(|| panic!("missing combined-error warning; events: {events:#?}"));
+    assert_event_value(warning, "policy.type", "RecordedErrorCombinedPolicy");
+    assert_event_value(warning, "recorded_count", "1");
+    assert_event_value(warning, "error_count", "1");
+}
+
+#[test]
 fn tracing_records_wrong_length_batch_policy_denials() {
     let mut checker = PermissionChecker::new();
     checker.add_policy(WrongLengthTracePolicy);
@@ -666,9 +783,86 @@ fn tracing_records_wrong_length_batch_policy_denials() {
 
     let policy = span(&spans, "gatehouse.batch_policy");
     assert_value(policy, "policy.type", "WrongLengthTracePolicy");
-    assert_value(policy, "policy.denied_count", "2");
+    // A wrong-length batch is a broken policy contract: the items could
+    // not be evaluated, so they are counted (and surfaced) as
+    // indeterminate rather than denied.
+    assert_value(policy, "policy.indeterminate_count", "2");
+    assert_value(policy, "policy.denied_count", "0");
     assert_value(policy, "policy.granted_count", "0");
     assert_value(policy, "policy.forbidden_count", "0");
+}
+
+/// A combinator node whose decision disagrees with a surviving `Forbidden`
+/// leaf is treated as forbidding, and the backstop names the inconsistent
+/// node in a `WARN` so the broken combinator is visible in logs.
+struct LyingGrantNodePolicy;
+
+#[async_trait]
+impl Policy<Domain> for LyingGrantNodePolicy {
+    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("LyingGrantNodePolicy"),
+            operation: gatehouse::CombineOp::And,
+            children: vec![PolicyEvalResult::forbidden("HiddenVeto", "buried veto")],
+            decision: gatehouse::Decision::Grant,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("LyingGrantNodePolicy")
+    }
+
+    fn effect(&self) -> gatehouse::Effect {
+        gatehouse::Effect::AllowOrForbid
+    }
+}
+
+#[test]
+fn tracing_records_inconsistent_combined_node_warning() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(LyingGrantNodePolicy);
+    let session = EvaluationSession::empty();
+
+    let (result, _spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(!result.is_granted(), "the buried veto must fail closed");
+
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.level == "WARN"
+                && event
+                    .values
+                    .get("message")
+                    .is_some_and(|message| message.contains("non-forbid decision"))
+        })
+        .unwrap_or_else(|| panic!("missing inconsistent-node warning; events: {events:#?}"));
+    assert_event_value(warning, "node.policy_type", "LyingGrantNodePolicy");
+    assert_event_value(warning, "node.decision", "GRANT");
+    assert_event_value(warning, "forbidden_leaf.policy_type", "HiddenVeto");
+
+    // Consistent trees never trigger the backstop warning.
+    let mut clean_checker = PermissionChecker::new();
+    clean_checker.add_policy(PolicyBuilder::<Domain>::new("CleanForbid").forbid().build());
+    let (_result, _spans, clean_events) = capture_async_with_events(|| async {
+        clean_checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(
+        clean_events.iter().all(|event| {
+            !event
+                .values
+                .get("message")
+                .is_some_and(|message| message.contains("non-forbid decision"))
+        }),
+        "consistent nodes must not emit the backstop warning: {clean_events:#?}"
+    );
 }
 
 #[test]

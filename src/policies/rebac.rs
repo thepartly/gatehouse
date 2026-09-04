@@ -1,5 +1,5 @@
 use crate::{
-    BatchEvalCtx, EvalCtx, FactKey, FactLoadResult, FactProvenance, Policy, PolicyDomain,
+    BatchEvalCtx, EvalCtx, FactLoadError, FactLoadErrorKind, FactLoadResult, Policy, PolicyDomain,
     PolicyEvalResult, RelationshipQuery,
 };
 use async_trait::async_trait;
@@ -45,39 +45,41 @@ where
     D: PolicyDomain,
     SubjectId: Eq + Hash + Clone + Send + Sync + fmt::Debug + 'static,
     ResourceId: Eq + Hash + Clone + Send + Sync + fmt::Debug + 'static,
-    Relation: Eq + Hash + Clone + Send + Sync + fmt::Display + 'static,
+    Relation: Eq + Hash + Clone + Send + Sync + fmt::Display + fmt::Debug + 'static,
 {
     async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
-        let fact_name = <RelationshipQuery<SubjectId, ResourceId, Relation> as FactKey>::NAME;
         let key = RelationshipQuery {
             subject_id: (self.subject_id)(ctx.subject),
             resource_id: (self.resource_id)(ctx.resource),
             relation: self.relation.clone(),
         };
-        let key_repr = Self::render_key(&key);
-        self.result_from_fact(fact_name, &key_repr, ctx.session.get(key).await)
+        // `ctx.fact` records provenance; the ctx result helpers attach it.
+        match ctx.fact(key).await {
+            FactLoadResult::Found(true) => ctx.grant(self.granted_reason()),
+            FactLoadResult::Found(false) => ctx.not_applicable(self.no_relationship_reason()),
+            FactLoadResult::Missing => ctx.not_applicable(self.missing_reason()),
+            FactLoadResult::Error(error) => ctx.indeterminate(self.error_reason(&error)),
+        }
     }
 
     async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
-        let fact_name = <RelationshipQuery<SubjectId, ResourceId, Relation> as FactKey>::NAME;
         let subject_id = (self.subject_id)(ctx.subject);
-        let keys = ctx
-            .items
-            .iter()
-            .map(|item| RelationshipQuery {
+        // `facts_by` performs one deduplicated `get_many` and records
+        // provenance against each originating item; the caller's
+        // `BatchEvalCtx::finish` merges it into the per-item results below.
+        let facts = ctx
+            .facts_by(|resource| RelationshipQuery {
                 subject_id: subject_id.clone(),
-                resource_id: (self.resource_id)(item.resource),
+                resource_id: (self.resource_id)(resource),
                 relation: self.relation.clone(),
             })
-            .collect::<Vec<_>>();
-
-        let facts = ctx.session.get_many(&keys).await;
+            .await;
         if facts.len() != ctx.items.len() {
             return ctx
                 .items
                 .iter()
                 .map(|_| {
-                    PolicyEvalResult::not_applicable(
+                    PolicyEvalResult::indeterminate(
                         self.policy_type(),
                         "Relationship fact source returned the wrong number of results",
                     )
@@ -85,9 +87,9 @@ where
                 .collect();
         }
 
-        keys.iter()
-            .zip(facts)
-            .map(|(key, fact)| self.result_from_fact(fact_name, &Self::render_key(key), fact))
+        facts
+            .into_iter()
+            .map(|fact| self.result_from_fact(ctx.policy_type.clone(), fact))
             .collect()
     }
 
@@ -99,52 +101,56 @@ where
 impl<D, SubjectId, ResourceId, Relation> RebacPolicy<D, SubjectId, ResourceId, Relation>
 where
     D: PolicyDomain,
-    SubjectId: fmt::Debug,
-    ResourceId: fmt::Debug,
     Relation: fmt::Display,
 {
-    fn render_key(key: &RelationshipQuery<SubjectId, ResourceId, Relation>) -> String {
+    fn granted_reason(&self) -> String {
+        format!("Subject has '{}' relationship with resource", self.relation)
+    }
+
+    fn no_relationship_reason(&self) -> String {
         format!(
-            "{:?} -[{}]-> {:?}",
-            key.subject_id, key.relation, key.resource_id
+            "Subject does not have '{}' relationship with resource",
+            self.relation
         )
+    }
+
+    fn missing_reason(&self) -> String {
+        format!("Relationship '{}' fact is missing", self.relation)
+    }
+
+    fn error_reason(&self, error: &FactLoadError) -> String {
+        let kind = match error.kind() {
+            FactLoadErrorKind::SourceNotRegistered => "source_not_registered",
+            FactLoadErrorKind::SourceContractViolation => "source_contract_violation",
+            FactLoadErrorKind::LoaderCancelled => "loader_cancelled",
+            FactLoadErrorKind::Backend => "backend_error",
+        };
+        format!("Relationship '{}' fact load failed ({kind})", self.relation)
     }
 
     fn result_from_fact(
         &self,
-        fact_name: &'static str,
-        key_repr: &str,
+        policy_type: std::borrow::Cow<'static, str>,
         fact: FactLoadResult<bool>,
     ) -> PolicyEvalResult {
-        let provenance = vec![FactProvenance::from_load_result(fact_name, key_repr, &fact)];
-
         match fact {
-            FactLoadResult::Found(true) => PolicyEvalResult::granted_with_facts(
-                "RebacPolicy",
-                Some(format!(
-                    "Subject has '{}' relationship with resource",
-                    self.relation
-                )),
-                provenance,
-            ),
-            FactLoadResult::Found(false) => PolicyEvalResult::not_applicable_with_facts(
-                "RebacPolicy",
-                format!(
-                    "Subject does not have '{}' relationship with resource",
-                    self.relation
-                ),
-                provenance,
-            ),
-            FactLoadResult::Missing => PolicyEvalResult::not_applicable_with_facts(
-                "RebacPolicy",
-                format!("Relationship '{}' fact is missing", self.relation),
-                provenance,
-            ),
-            FactLoadResult::Error(error) => PolicyEvalResult::not_applicable_with_facts(
-                "RebacPolicy",
-                format!("Relationship '{}' fact load failed: {error}", self.relation),
-                provenance,
-            ),
+            FactLoadResult::Found(true) => {
+                PolicyEvalResult::granted(policy_type, Some(self.granted_reason()))
+            }
+            FactLoadResult::Found(false) => {
+                PolicyEvalResult::not_applicable(policy_type, self.no_relationship_reason())
+            }
+            FactLoadResult::Missing => {
+                PolicyEvalResult::not_applicable(policy_type, self.missing_reason())
+            }
+            // Fail closed, but structurally: the relationship could not be
+            // loaded, so the policy could not decide. This surfaces as
+            // `AccessEvaluation::Indeterminate` rather than an ordinary
+            // denial, letting callers map an authorization-data outage to a
+            // 5xx instead of a 403.
+            FactLoadResult::Error(error) => {
+                PolicyEvalResult::indeterminate(policy_type, self.error_reason(&error))
+            }
         }
     }
 }

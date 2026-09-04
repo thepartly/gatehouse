@@ -71,7 +71,7 @@ assert!(!checker.bind(&session, &guest, &action, &()).check(&document).await.is_
 # });
 ```
 
-Use `EvaluationSession::empty()` for fact-free checkers. When any policy reads facts through `ctx.session.get(...)`, build a `FactRegistry` at application setup and create a fresh `registry.session()` for each request.
+Use `EvaluationSession::empty()` for fact-free checkers. When any policy reads facts through `ctx.fact(...)`, build a `FactRegistry` at application setup and create a fresh `registry.session()` for each request.
 
 ## Core Flow
 
@@ -109,14 +109,16 @@ flowchart LR
 - If nothing grants, the checker denies with `"All policies denied access"`.
 - An empty checker denies with `"No policies configured"`.
 - `PolicyEvalResult::NotApplicable` means the policy did not grant. `PolicyEvalResult::Forbidden` means the policy actively vetoed.
+- `PolicyEvalResult::Indeterminate` means the policy could not be evaluated because an input it needed (typically a fact load) was unavailable. It never grants. An indeterminate **veto-capable** policy blocks sibling grants (its unresolved potential veto is never short-circuited) and the evaluation surfaces as `AccessEvaluation::Indeterminate`; an observed `Forbidden` still overrides it. An indeterminate **allow-only** policy never blocks a grant, but if nothing grants the evaluation is `Indeterminate` rather than an ordinary denial.
 - `PolicyBuilder` combines configured predicates with AND logic. `PolicyBuilder::forbid()` makes a matching policy forbid; a non-match remains not applicable and does not block.
-- `AndPolicy` and `OrPolicy` evaluate veto-capable children before allow-only children, then short-circuit normally. `NotPolicy` inverts grants and non-grants, but never turns `Forbidden` into a grant.
+- `AndPolicy` and `OrPolicy` evaluate veto-capable children before allow-only children, then short-circuit normally. `NotPolicy` inverts grants and non-grants, but never turns `Forbidden` or `Indeterminate` into a grant.
+- Inside `AndPolicy`, an indeterminate **allow-only** child is outranked by a definite non-grant: the conjunction is definitely unsatisfied, so the result is `NotApplicable` rather than `Indeterminate`. This is deliberate — it is the one place a definite answer settles the aggregate regardless of the unknown — and only holds for allow-only children; an indeterminate veto-capable child always taints the conjunction because it might have forbidden.
 - `Forbidden` propagates through `AndPolicy`, `OrPolicy`, `NotPolicy`, and `DelegatingPolicy`.
 - `not()` does not neutralize a veto: `admin.or(blocked.not())` still denies if `blocked` returns `Forbidden`. For "grant unless blocked", make `blocked` an allow-only predicate and wrap that in `not()`, or register a direct forbid policy when the block should be global.
 
-Denials from `AccessEvaluation` are summary-level. Use `AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect individual policy reasons and fact provenance. Use `AccessEvaluation::denied_due_to_fact_load_error()` / `fact_load_errors()` when you need to distinguish infrastructure failure (fact load `Error`) from an ordinary denial — authorization remains fail-closed either way.
+Denials from `AccessEvaluation` are summary-level. Use `AccessEvaluation::display_trace()` or the attached `EvalTrace` to inspect individual policy reasons and fact provenance. Use `AccessEvaluation::is_indeterminate()` to distinguish infrastructure failure from an ordinary denial (the natural 403-vs-503 split — authorization remains fail-closed either way) and `fact_load_errors()` to classify the failed loads via `FactProvenance::error_kind`. `RebacPolicy` keeps raw backend error text out of summary and policy reasons; diagnostics remain in `FactProvenance::detail` inside the trace. The older `denied_due_to_fact_load_error()` any-error-in-trace scan is deprecated in favor of the structural signal.
 
-Fact-backed policies should construct provenance with `FactProvenance::from_load_result(...)` and attach it through the context's `*_with_facts` result helpers. The constructor maps `Found`/`Missing`/`Error`, includes diagnostic error detail, and preserves a machine-readable `FactLoadErrorKind` in `FactProvenance::error_kind`. `FactProvenance::new(...)` remains available for manually constructed or legacy provenance; an error created that way has no structured error kind.
+Fact-backed policies load through the evaluation context — `ctx.fact(key)` (single) and `ctx.facts_by(key_of)` (batch) — which records each consulted fact as `FactProvenance` and attaches it to the policy's result automatically, so provenance is correct by construction. A failed load reported through `ctx.not_applicable(...)` is upgraded to an indeterminate result rather than silently looking like an ordinary non-match. `ctx.session()` remains as an escape hatch for loads that must bypass recording, and `FactProvenance::from_load_result(...)` + `ctx.record(...)` cover facts loaded outside the context. The provenance constructor maps `Found`/`Missing`/`Error`, includes diagnostic error detail, and preserves a machine-readable `FactLoadErrorKind` in `FactProvenance::error_kind`.
 
 ## Policy Domains
 

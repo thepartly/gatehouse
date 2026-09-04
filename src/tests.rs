@@ -53,15 +53,9 @@ mod core_tests {
             Box::pin(async move {
                 let session = EvaluationSession::new();
                 let policy_type = self.policy_type();
-                let ctx = EvalCtx {
-                    session: &session,
-                    subject,
-                    action,
-                    resource,
-                    context,
-                    policy_type,
-                };
-                self.evaluate(&ctx).await
+                let ctx = EvalCtx::new(&session, subject, action, resource, context, policy_type);
+                let result = self.evaluate(&ctx).await;
+                ctx.finish(result)
             })
         }
 
@@ -75,15 +69,9 @@ mod core_tests {
             Box::pin(async move {
                 let session = EvaluationSession::new();
                 let policy_type = self.policy_type();
-                let ctx = BatchEvalCtx {
-                    session: &session,
-                    subject,
-                    action,
-                    context,
-                    items,
-                    policy_type,
-                };
-                self.evaluate_batch(&ctx).await
+                let ctx = BatchEvalCtx::new(&session, subject, action, context, items, policy_type);
+                let results = self.evaluate_batch(&ctx).await;
+                ctx.finish(results)
             })
         }
     }
@@ -418,15 +406,16 @@ mod core_tests {
             self.batch_calls.fetch_add(1, Ordering::SeqCst);
             let mut results = Vec::with_capacity(ctx.items.len());
             for item in ctx.items {
-                let item_ctx = EvalCtx {
-                    session: ctx.session,
-                    subject: ctx.subject,
-                    action: ctx.action,
-                    resource: item.resource,
-                    context: ctx.context,
-                    policy_type: ctx.policy_type.clone(),
-                };
-                results.push(self.evaluate(&item_ctx).await);
+                let item_ctx = EvalCtx::new(
+                    ctx.session(),
+                    ctx.subject,
+                    ctx.action,
+                    item.resource,
+                    ctx.context,
+                    ctx.policy_type.clone(),
+                );
+                let result = self.evaluate(&item_ctx).await;
+                results.push(item_ctx.finish(result));
             }
             results
         }
@@ -777,9 +766,35 @@ mod core_tests {
             })
             .collect::<Vec<_>>();
 
+        // The malformed policy's own (wrong-length) grants are discarded:
+        // each item gets a synthesized indeterminate for it, and evaluation
+        // continues, so a healthy allow-only sibling still grants on its own
+        // merits and the trace keeps the contract violation visible.
         let mut checker = PermissionChecker::new();
         checker.add_policy(MismatchedBatchPolicy);
         checker.add_policy(AlwaysAllowPolicy);
+
+        let results = checker
+            .evaluate_batch_by(&subject, &TestAction, resources.clone(), |item| {
+                (&item.0, &item.1)
+            })
+            .await;
+
+        assert_eq!(results.len(), 3);
+        for (_item, evaluation) in results {
+            assert_eq!(evaluation.granted_policy_type(), Some("AlwaysAllowPolicy"));
+            let rendered = evaluation.trace().format();
+            assert!(
+                rendered.contains("MismatchedBatchPolicy INDETERMINATE"),
+                "unexpected trace: {rendered}"
+            );
+            assert!(rendered.contains("Policy batch result count did not match input count"));
+        }
+
+        // With no healthy sibling, the malformed policy alone fails closed as
+        // indeterminate: its wrong-length grants never reach the decision.
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(MismatchedBatchPolicy);
 
         let results = checker
             .evaluate_batch_by(&subject, &TestAction, resources, |item| (&item.0, &item.1))
@@ -789,15 +804,16 @@ mod core_tests {
         for (_item, evaluation) in results {
             assert!(!evaluation.is_granted());
             match evaluation {
-                AccessEvaluation::Denied { reason, trace } => {
-                    assert_eq!(
-                        reason,
-                        "Policy batch result count did not match input count"
+                AccessEvaluation::Indeterminate { reason, trace } => {
+                    assert!(
+                        reason.contains("Policy batch result count did not match input count"),
+                        "unexpected reason: {reason}"
                     );
+                    assert!(reason.contains("MismatchedBatchPolicy"));
                     assert!(trace.format().contains("MismatchedBatchPolicy"));
                 }
-                AccessEvaluation::Granted { .. } => {
-                    panic!("mismatched batch result should fail closed");
+                other => {
+                    panic!("mismatched batch result should fail closed as indeterminate, got {other:?}");
                 }
             }
         }
@@ -1500,14 +1516,14 @@ mod core_tests {
             .session();
         let policy = relationship_policy(relationship);
 
-        let ctx = EvalCtx {
-            session: &session,
-            subject: &subject,
-            action: &TestAction,
-            resource: &resource,
-            context: &TestContext,
-            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
-        };
+        let ctx = EvalCtx::new(
+            &session,
+            &subject,
+            &TestAction,
+            &resource,
+            &TestContext,
+            "TestPolicy",
+        );
         let result = policy.evaluate(&ctx).await;
 
         assert!(result.is_granted());
@@ -1517,6 +1533,13 @@ mod core_tests {
         assert_eq!(provenance[0].fact_name, "relationship");
         assert_eq!(provenance[0].outcome, FactOutcome::Found);
         assert!(provenance[0].detail.is_none());
+        // `RelationshipQuery::render` keeps the established audit form for
+        // the recorded key (relation via `Display`, no quotes).
+        assert!(
+            provenance[0].key.contains("-[manager]->"),
+            "unexpected key rendering: {}",
+            provenance[0].key
+        );
         // The rendered trace surfaces the fact inline.
         assert!(result.format(0).contains("↳ fact relationship [found]"));
     }
@@ -1534,23 +1557,33 @@ mod core_tests {
             .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(ErrorRelationshipSource)
             .build()
             .session();
-        let ctx = EvalCtx {
-            session: &session,
-            subject: &subject,
-            action: &TestAction,
-            resource: &resource,
-            context: &TestContext,
-            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
-        };
+        let ctx = EvalCtx::new(
+            &session,
+            &subject,
+            &TestAction,
+            &resource,
+            &TestContext,
+            "TestPolicy",
+        );
 
         let result = policy.evaluate(&ctx).await;
 
         assert!(!result.is_granted());
+        assert_eq!(result.decision(), Decision::Indeterminate);
         let provenance = result.provenance();
         assert_eq!(provenance.len(), 1);
         assert_eq!(provenance[0].outcome, FactOutcome::Error);
         // The backend error message is carried as provenance detail.
-        assert!(provenance[0].detail.is_some());
+        assert_eq!(
+            provenance[0].detail.as_deref(),
+            Some("database unavailable")
+        );
+        let reason = result.reason().expect("indeterminate reason");
+        assert!(reason.contains("backend_error"));
+        assert!(
+            !reason.contains("database unavailable"),
+            "raw backend details belong in provenance, not the policy reason: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -1563,14 +1596,14 @@ mod core_tests {
             id: uuid::Uuid::new_v4(),
         };
         let session = EvaluationSession::new();
-        let ctx = EvalCtx {
-            session: &session,
-            subject: &subject,
-            action: &TestAction,
-            resource: &resource,
-            context: &TestContext,
-            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
-        };
+        let ctx = EvalCtx::new(
+            &session,
+            &subject,
+            &TestAction,
+            &resource,
+            &TestContext,
+            "TestPolicy",
+        );
 
         let result = policy.evaluate(&ctx).await;
 
@@ -1581,10 +1614,12 @@ mod core_tests {
             provenance[0].error_kind,
             Some(FactLoadErrorKind::SourceNotRegistered)
         );
-        assert!(result
-            .reason()
-            .as_deref()
-            .is_some_and(|reason| reason.contains("No fact source registered")));
+        let reason = result.reason().expect("indeterminate reason");
+        assert!(reason.contains("source_not_registered"));
+        assert!(
+            !reason.contains("No fact source registered"),
+            "raw load errors belong in provenance, not the policy reason: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -1628,14 +1663,14 @@ mod core_tests {
             .map(|(resource, _context)| PolicyBatchItem { resource })
             .collect::<Vec<_>>();
         let policy = relationship_policy(relationship);
-        let ctx = BatchEvalCtx {
-            session: &session,
-            subject: &subject,
-            action: &TestAction,
-            context: &TestContext,
-            items: &batch_items,
-            policy_type: policy.policy_type(),
-        };
+        let ctx = BatchEvalCtx::new(
+            &session,
+            &subject,
+            &TestAction,
+            &TestContext,
+            &batch_items,
+            policy.policy_type(),
+        );
 
         let results = policy.evaluate_batch(&ctx).await;
 
@@ -1701,7 +1736,7 @@ mod core_tests {
         };
         let policy = relationship_policy("viewer".to_string());
 
-        for (session, expected_reason) in [
+        for (session, expected_reason, expected_decision) in [
             {
                 let session = FactRegistry::builder()
                     .with::<RelationshipQuery<uuid::Uuid, uuid::Uuid, String>, _>(
@@ -1709,7 +1744,8 @@ mod core_tests {
                     )
                     .build()
                     .session();
-                (session, "fact is missing")
+                // An authoritative "no such fact" is an ordinary non-grant.
+                (session, "fact is missing", Decision::NotApplicable)
             },
             {
                 let session = FactRegistry::builder()
@@ -1718,7 +1754,8 @@ mod core_tests {
                     )
                     .build()
                     .session();
-                (session, "database unavailable")
+                // A failed load means the policy could not decide.
+                (session, "backend_error", Decision::Indeterminate)
             },
             {
                 let session = FactRegistry::builder()
@@ -1727,19 +1764,24 @@ mod core_tests {
                     )
                     .build()
                     .session();
-                (session, "returned")
+                (
+                    session,
+                    "source_contract_violation",
+                    Decision::Indeterminate,
+                )
             },
         ] {
-            let ctx = EvalCtx {
-                session: &session,
-                subject: &subject,
-                action: &TestAction,
-                resource: &resource,
-                context: &TestContext,
-                policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
-            };
+            let ctx = EvalCtx::new(
+                &session,
+                &subject,
+                &TestAction,
+                &resource,
+                &TestContext,
+                "TestPolicy",
+            );
             let result = policy.evaluate(&ctx).await;
             assert!(!result.is_granted());
+            assert_eq!(result.decision(), expected_decision);
             assert!(result
                 .reason()
                 .as_deref()
@@ -1810,14 +1852,14 @@ mod core_tests {
         );
 
         // Manager relationship exists — should be granted.
-        let ctx = EvalCtx {
-            session: &session,
-            subject: &subject,
-            action: &TestAction,
-            resource: &resource,
-            context: &TestContext,
-            policy_type: std::borrow::Cow::Borrowed("TestPolicy"),
-        };
+        let ctx = EvalCtx::new(
+            &session,
+            &subject,
+            &TestAction,
+            &resource,
+            &TestContext,
+            "TestPolicy",
+        );
         let result = policy.evaluate(&ctx).await;
         assert!(
             result.is_granted(),
@@ -1879,10 +1921,10 @@ mod core_tests {
                 policy_type,
                 operation,
                 children,
-                outcome,
+                decision,
             } => {
                 assert_eq!(operation, CombineOp::And);
-                assert!(!outcome);
+                assert_eq!(decision, Decision::NotApplicable);
                 assert_eq!(children.len(), 2);
                 assert!(children[1].format(0).contains("DenyInAnd"));
                 assert_eq!(policy_type, "AndPolicy");
@@ -1932,10 +1974,10 @@ mod core_tests {
                 policy_type,
                 operation,
                 children,
-                outcome,
+                decision,
             } => {
                 assert_eq!(operation, CombineOp::Or);
-                assert!(!outcome);
+                assert_eq!(decision, Decision::NotApplicable);
                 assert_eq!(children.len(), 2);
                 assert!(children[0].format(0).contains("Deny1"));
                 assert!(children[1].format(0).contains("Deny2"));
@@ -1978,10 +2020,10 @@ mod core_tests {
                 policy_type,
                 operation,
                 children,
-                outcome,
+                decision,
             } => {
                 assert_eq!(operation, CombineOp::Not);
-                assert!(!outcome);
+                assert_eq!(decision, Decision::NotApplicable);
                 assert_eq!(children.len(), 1);
                 assert!(children[0].format(0).contains("AlwaysAllowPolicy"));
                 assert_eq!(policy_type, "NotPolicy");
@@ -2835,7 +2877,7 @@ mod core_tests {
             policy_type: std::borrow::Cow::Borrowed("CombinedPolicy"),
             operation: CombineOp::And,
             children: vec![],
-            outcome: true,
+            decision: Decision::Grant,
         };
         assert_eq!(
             result.reason(),
@@ -3079,7 +3121,7 @@ mod core_tests {
             policy_type: "C".into(),
             operation: CombineOp::Or,
             children: vec![],
-            outcome: false,
+            decision: Decision::NotApplicable,
         };
         assert_eq!(combined.reason_str(), None);
     }
@@ -3096,6 +3138,7 @@ mod core_tests {
         assert_serialize::<FactOutcome>();
         assert_serialize::<FactLoadErrorKind>();
         assert_serialize::<CombineOp>();
+        assert_serialize::<Decision>();
     }
 
     #[cfg(feature = "serde")]
@@ -3314,6 +3357,7 @@ mod core_tests {
     // --- Fact-load error helpers on AccessEvaluation --------------------
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn denied_due_to_fact_load_error_detects_rebac_backend_failure() {
         let mut checker = PermissionChecker::<TestDomain>::new();
         checker.add_policy(RebacPolicy::new(
@@ -3336,6 +3380,20 @@ mod core_tests {
 
         assert!(!evaluation.is_granted());
         assert!(
+            evaluation.is_indeterminate(),
+            "a backend failure means the policy could not be evaluated: {evaluation}"
+        );
+        assert!(evaluation
+            .indeterminate_reason()
+            .is_some_and(|reason| reason.contains("RebacPolicy")));
+        assert!(
+            !evaluation
+                .indeterminate_reason()
+                .expect("indeterminate summary")
+                .contains("database unavailable"),
+            "top-level summaries must not expose raw backend errors"
+        );
+        assert!(
             evaluation.denied_due_to_fact_load_error(),
             "backend failure should surface as denied_due_to_fact_load_error"
         );
@@ -3348,6 +3406,7 @@ mod core_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn fact_load_errors_distinguish_unregistered_source_from_backend_failure() {
         let mut checker = PermissionChecker::<TestDomain>::new();
         checker.add_policy(RebacPolicy::new(
@@ -3364,6 +3423,7 @@ mod core_tests {
             .check(&resource)
             .await;
 
+        assert!(evaluation.is_indeterminate());
         assert!(evaluation.denied_due_to_fact_load_error());
         let errors = evaluation.fact_load_errors();
         assert_eq!(errors.len(), 1);
@@ -3374,6 +3434,7 @@ mod core_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn denied_due_to_fact_load_error_is_false_for_ordinary_denial() {
         let evaluation = deny_checker()
             .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
@@ -3384,6 +3445,7 @@ mod core_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn denied_due_to_fact_load_error_is_false_for_grant() {
         let evaluation = allow_checker()
             .evaluate_access(&test_subject(), &TestAction, &test_resource(), &TestContext)
@@ -3394,6 +3456,7 @@ mod core_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercising the deprecated any-error-in-trace scan
     async fn denied_due_to_fact_load_error_is_false_for_missing_fact() {
         let mut checker = PermissionChecker::<TestDomain>::new();
         checker.add_policy(RebacPolicy::new(
@@ -3455,15 +3518,9 @@ mod policy_builder_tests {
             Box::pin(async move {
                 let session = EvaluationSession::new();
                 let policy_type = self.policy_type();
-                let ctx = EvalCtx {
-                    session: &session,
-                    subject,
-                    action,
-                    resource,
-                    context,
-                    policy_type,
-                };
-                self.evaluate(&ctx).await
+                let ctx = EvalCtx::new(&session, subject, action, resource, context, policy_type);
+                let result = self.evaluate(&ctx).await;
+                ctx.finish(result)
             })
         }
     }
@@ -3558,8 +3615,9 @@ mod policy_builder_tests {
                     "granted policy_type should stay Borrowed, got {policy_type:?}"
                 );
             }
-            AccessEvaluation::Denied { reason, .. } => {
-                panic!("expected grant, got denial: {reason}");
+            AccessEvaluation::Denied { reason, .. }
+            | AccessEvaluation::Indeterminate { reason, .. } => {
+                panic!("expected grant, got non-grant: {reason}");
             }
         }
     }
@@ -4195,14 +4253,7 @@ mod policy_builder_tests {
         context: &'a BatchContext,
         items: &'a [PolicyBatchItem<'a, BatchDomain>],
     ) -> BatchEvalCtx<'a, BatchDomain> {
-        BatchEvalCtx {
-            session,
-            subject,
-            action,
-            context,
-            items,
-            policy_type: std::borrow::Cow::Borrowed("test"),
-        }
+        BatchEvalCtx::new(session, subject, action, context, items, "test")
     }
 
     #[tokio::test]
@@ -4400,5 +4451,251 @@ mod policy_builder_tests {
         let results = policy.evaluate_batch(&bctx).await;
 
         assert!(results.is_empty());
+    }
+}
+
+mod recording_ctx_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone)]
+    struct Subject(#[allow(dead_code)] u8);
+    #[derive(Debug, Clone)]
+    struct Resource(u8);
+    #[derive(Debug, Clone)]
+    struct Action;
+    #[derive(Debug, Clone)]
+    struct Ctx;
+
+    struct Domain;
+
+    impl PolicyDomain for Domain {
+        type Subject = Subject;
+        type Action = Action;
+        type Resource = Resource;
+        type Context = Ctx;
+    }
+
+    #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+    struct Flag(u8);
+
+    impl FactKey for Flag {
+        const NAME: &'static str = "flag";
+        type Value = bool;
+    }
+
+    struct FlagSource {
+        fail_ids: HashSet<u8>,
+    }
+
+    #[async_trait]
+    impl FactSource<Flag> for FlagSource {
+        async fn load_many(&self, keys: &[Flag]) -> Vec<FactLoadResult<bool>> {
+            keys.iter()
+                .map(|Flag(id)| {
+                    if self.fail_ids.contains(id) {
+                        FactLoadResult::Error(FactLoadError::backend_message("flag store down"))
+                    } else {
+                        FactLoadResult::Found(id % 2 == 1)
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn flag_session(fail_ids: impl IntoIterator<Item = u8>) -> EvaluationSession {
+        FactRegistry::builder()
+            .with::<Flag, _>(FlagSource {
+                fail_ids: fail_ids.into_iter().collect(),
+            })
+            .build()
+            .session()
+    }
+
+    fn ctx<'a>(
+        session: &'a EvaluationSession,
+        subject: &'a Subject,
+        resource: &'a Resource,
+    ) -> EvalCtx<'a, Domain> {
+        EvalCtx::new(session, subject, &Action, resource, &Ctx, "TestPolicy")
+    }
+
+    #[tokio::test]
+    async fn ctx_fact_records_and_result_helpers_attach() {
+        let session = flag_session([]);
+        let subject = Subject(1);
+        let resource = Resource(1);
+        let c = ctx(&session, &subject, &resource);
+
+        assert!(matches!(c.fact(Flag(1)).await, FactLoadResult::Found(true)));
+        let result = c.grant("odd");
+
+        assert!(result.is_granted());
+        let provenance = result.provenance();
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].fact_name, "flag");
+        assert_eq!(provenance[0].key, "Flag(1)");
+        assert_eq!(provenance[0].outcome, FactOutcome::Found);
+
+        // The helper drained the recording: a second result is clean.
+        assert!(c.not_applicable("again").provenance().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ctx_not_applicable_upgrades_on_recorded_error() {
+        let session = flag_session([7]);
+        let subject = Subject(7);
+        let resource = Resource(7);
+        let c = ctx(&session, &subject, &resource);
+
+        assert!(matches!(c.fact(Flag(7)).await, FactLoadResult::Error(_)));
+        let result = c.not_applicable("not odd");
+
+        assert_eq!(result.decision(), Decision::Indeterminate);
+        let provenance = result.provenance();
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].outcome, FactOutcome::Error);
+        assert_eq!(provenance[0].error_kind, Some(FactLoadErrorKind::Backend));
+        // The policy's own reason is preserved through the upgrade.
+        assert_eq!(result.reason_str(), Some("not odd"));
+    }
+
+    #[tokio::test]
+    async fn explicit_provenance_alone_does_not_upgrade() {
+        let session = flag_session([]);
+        let subject = Subject(0);
+        let resource = Resource(0);
+        let c = ctx(&session, &subject, &resource);
+
+        // Error provenance constructed by hand (not witnessed by the
+        // context) leaves the author's variant choice untouched.
+        let explicit = FactProvenance::from_load_result::<bool>(
+            "flag",
+            "Flag(0)",
+            &FactLoadResult::Error(FactLoadError::backend_message("hand-rolled")),
+        );
+        let result = c.not_applicable_with_facts("treated as ordinary", vec![explicit]);
+
+        assert_eq!(result.decision(), Decision::NotApplicable);
+        assert_eq!(result.provenance().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ctx_finish_merges_leftover_recording_into_hand_built_results() {
+        let session = flag_session([]);
+        let subject = Subject(1);
+        let resource = Resource(1);
+        let c = ctx(&session, &subject, &resource);
+
+        c.fact(Flag(1)).await;
+        // Hand-built result bypasses the helpers; finish must merge.
+        let result = c.finish(PolicyEvalResult::granted("TestPolicy", None));
+        assert_eq!(result.provenance().len(), 1);
+
+        // Grants are never rewritten, even when a recorded load failed.
+        let session = flag_session([2]);
+        let c = ctx(&session, &subject, &resource);
+        c.fact(Flag(2)).await;
+        let result = c.finish(PolicyEvalResult::granted("TestPolicy", None));
+        assert!(result.is_granted());
+        assert_eq!(result.provenance().len(), 1);
+
+        // A recorded failure cannot merge directly into a Combined node, so
+        // finish preserves it on a synthetic child and fails closed.
+        let c = ctx(&session, &subject, &resource);
+        c.fact(Flag(2)).await;
+        let combined = c.finish(PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("C"),
+            operation: CombineOp::And,
+            children: vec![],
+            decision: Decision::Grant,
+        });
+        assert_eq!(combined.decision(), Decision::Indeterminate);
+        assert!(combined.format(0).contains("fact flag [error]"));
+
+        // A definite forbid still wins over the failed load.
+        let c = ctx(&session, &subject, &resource);
+        c.fact(Flag(2)).await;
+        let combined = c.finish(PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("C"),
+            operation: CombineOp::And,
+            children: vec![],
+            decision: Decision::Forbid,
+        });
+        assert_eq!(combined.decision(), Decision::Forbid);
+    }
+
+    #[tokio::test]
+    async fn ctx_facts_records_one_entry_per_key_in_order() {
+        let session = flag_session([2]);
+        let subject = Subject(0);
+        let resource = Resource(0);
+        let c = ctx(&session, &subject, &resource);
+
+        let results = c.facts(&[Flag(1), Flag(2)]).await;
+        assert!(matches!(results[0], FactLoadResult::Found(true)));
+        assert!(matches!(results[1], FactLoadResult::Error(_)));
+
+        let result = c.not_applicable("mixed");
+        // Upgraded because one recorded load failed; both entries attached
+        // in input order.
+        assert_eq!(result.decision(), Decision::Indeterminate);
+        let provenance = result.provenance();
+        assert_eq!(provenance.len(), 2);
+        assert_eq!(provenance[0].key, "Flag(1)");
+        assert_eq!(provenance[1].key, "Flag(2)");
+    }
+
+    #[tokio::test]
+    async fn ctx_record_attaches_caller_supplied_provenance() {
+        let session = EvaluationSession::empty();
+        let subject = Subject(0);
+        let resource = Resource(0);
+        let c = ctx(&session, &subject, &resource);
+
+        c.record(FactProvenance::new(
+            "external",
+            "loader-owned",
+            FactOutcome::Found,
+            None,
+        ));
+        let result = c.grant("externally verified");
+        assert_eq!(result.provenance().len(), 1);
+        assert_eq!(result.provenance()[0].fact_name, "external");
+    }
+
+    #[tokio::test]
+    async fn batch_ctx_finish_is_a_no_op_for_wrong_length_results() {
+        let session = flag_session([]);
+        let subject = Subject(0);
+        let resources = [Resource(1), Resource(2)];
+        let items = resources
+            .iter()
+            .map(|resource| PolicyBatchItem::<Domain> { resource })
+            .collect::<Vec<_>>();
+        let bctx = BatchEvalCtx::<Domain>::new(&session, &subject, &Action, &Ctx, &items, "Test");
+
+        let _ = bctx.facts_by(|Resource(id)| Flag(*id)).await;
+        // One result for two items: the merge must not misattribute.
+        let results = bctx.finish(vec![PolicyEvalResult::not_applicable("Test", "n/a")]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].provenance().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorded_provenance_precedes_explicit_provenance() {
+        let session = flag_session([]);
+        let subject = Subject(1);
+        let resource = Resource(1);
+        let c = ctx(&session, &subject, &resource);
+
+        c.fact(Flag(1)).await;
+        let explicit = FactProvenance::new("extra", "manual", FactOutcome::Missing, None);
+        let result = c.grant_with_facts("both", vec![explicit]);
+
+        let provenance = result.provenance();
+        assert_eq!(provenance.len(), 2);
+        assert_eq!(provenance[0].fact_name, "flag");
+        assert_eq!(provenance[1].fact_name, "extra");
     }
 }

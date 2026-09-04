@@ -39,7 +39,7 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    EvalCtx, EvaluationSession, FactKey, FactLoadResult, FactProvenance, FactRegistry, FactSource,
+    EvalCtx, EvaluationSession, FactKey, FactLoadResult, FactRegistry, FactSource,
     PermissionChecker, Policy, PolicyDomain, PolicyEvalResult,
 };
 use std::borrow::Cow;
@@ -195,28 +195,19 @@ struct RightSupplierPolicy;
 #[async_trait]
 impl Policy<SupplierInvoiceDomain> for RightSupplierPolicy {
     async fn evaluate(&self, ctx: &EvalCtx<'_, SupplierInvoiceDomain>) -> PolicyEvalResult {
-        // Ask the session, not the backend service directly. The
-        // first call inside this request triggers `load_many`; every
-        // subsequent call with the same key (e.g. another invoice in
-        // the same batch) hits the request-scoped cache.
-        let key = CustomerForOrg(ctx.subject.org_id);
-        let result = ctx.session.get(key.clone()).await;
-        let provenance = vec![FactProvenance::from_load_result(
-            CustomerForOrg::NAME,
-            format!("{key:?}"),
-            &result,
-        )];
-
-        match result {
+        // Ask the context, not the backend service directly. The first
+        // call inside this request triggers `load_many`; every subsequent
+        // call with the same key (e.g. another invoice in the same batch)
+        // hits the request-scoped cache. `ctx.fact` also records the
+        // consulted fact as provenance, so the result helpers below attach
+        // it automatically — and a failed load reported through
+        // `ctx.not_applicable` is upgraded to an indeterminate result.
+        match ctx.fact(CustomerForOrg(ctx.subject.org_id)).await {
             FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
-                ctx.grant_with_facts(
-                    "subject's supplier org bills under the invoice's customer",
-                    provenance,
-                )
+                ctx.grant("subject's supplier org bills under the invoice's customer")
             }
-            _ => ctx.not_applicable_with_facts(
+            _ => ctx.not_applicable(
                 "subject's supplier org does not bill under the invoice's customer",
-                provenance,
             ),
         }
     }

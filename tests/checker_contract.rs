@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use gatehouse::{
-    AccessEvaluation, AndPolicy, BatchEvalCtx, DelegatingPolicy, Effect, EvalCtx,
-    EvaluationSession, FactLoadResult, FactSource, Hydrator, LookupAuthorizedError, LookupPage,
-    LookupSource, NotPolicy, OrPolicy, PermissionChecker, Policy, PolicyBatchItem, PolicyBuilder,
-    PolicyDomain, PolicyEvalResult, RebacPolicy, RelationshipQuery,
+    AccessEvaluation, AndPolicy, BatchEvalCtx, Decision, DelegatingPolicy, Effect, EvalCtx,
+    EvaluationSession, FactLoadResult, FactOutcome, FactProvenance, FactSource, Hydrator,
+    LookupAuthorizedError, LookupPage, LookupSource, NotPolicy, OrPolicy, PermissionChecker,
+    Policy, PolicyBatchItem, PolicyBuilder, PolicyDomain, PolicyEvalResult, RebacPolicy,
+    RelationshipQuery,
 };
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -169,6 +170,10 @@ impl RandomStackPolicy {
             LeafOutcome::Forbid => {
                 PolicyEvalResult::forbidden(self.name.clone(), format!("{resource_id} forbidden"))
             }
+            LeafOutcome::Indeterminate => PolicyEvalResult::indeterminate(
+                self.name.clone(),
+                format!("{resource_id} indeterminate"),
+            ),
             LeafOutcome::NotApplicable => {
                 PolicyEvalResult::not_applicable(self.name.clone(), format!("{resource_id} denied"))
             }
@@ -180,6 +185,7 @@ impl RandomStackPolicy {
 struct RandomPolicySpec {
     grant_percent: u8,
     forbid_percent: u8,
+    indeterminate_percent: u8,
     salt: u16,
     effect: Effect,
 }
@@ -188,6 +194,7 @@ struct RandomPolicySpec {
 enum LeafOutcome {
     Grant,
     Forbid,
+    Indeterminate,
     NotApplicable,
 }
 
@@ -195,6 +202,7 @@ enum LeafOutcome {
 enum ExpectedDecision {
     Granted,
     Forbidden,
+    Indeterminate,
     Denied,
 }
 
@@ -203,11 +211,17 @@ impl RandomPolicySpec {
         let grant_score = ((resource_id as u16 * 37) ^ self.salt).wrapping_add(self.salt / 3) % 100;
         let forbid_score =
             ((resource_id as u16 * 53) ^ self.salt).wrapping_add(self.salt / 5) % 100;
+        let indeterminate_score =
+            ((resource_id as u16 * 71) ^ self.salt).wrapping_add(self.salt / 7) % 100;
         let grant_matched = grant_score < self.grant_percent as u16;
         let forbid_matched = forbid_score < self.forbid_percent as u16;
+        let indeterminate_matched = indeterminate_score < self.indeterminate_percent as u16;
 
         if self.effect.can_forbid() && forbid_matched {
             LeafOutcome::Forbid
+        } else if indeterminate_matched {
+            // Any policy can fail to load an input, regardless of effect.
+            LeafOutcome::Indeterminate
         } else if self.effect.can_grant() && grant_matched {
             LeafOutcome::Grant
         } else {
@@ -223,18 +237,41 @@ impl RandomPolicySpec {
     }
 }
 
+/// Deny-overrides oracle with four-valued leaves:
+///
+/// 1. Any observed `Forbid` denies — a definite veto beats everything,
+///    including indeterminate results.
+/// 2. Otherwise an `Indeterminate` from a veto-capable policy makes the
+///    evaluation indeterminate: its unresolved potential veto blocks every
+///    grant.
+/// 3. Otherwise the first grant wins. An `Indeterminate` from an allow-only
+///    policy never blocks a sibling grant (it could only have granted).
+/// 4. Otherwise, if anything was indeterminate the evaluation is
+///    indeterminate (the failed policy might have granted); else denied.
 fn oracle_decision(specs: &[RandomPolicySpec], resource_id: u8) -> ExpectedDecision {
     let mut saw_grant = false;
-    for outcome in specs.iter().map(|spec| spec.leaf_outcome(resource_id)) {
-        match outcome {
+    let mut saw_veto_indeterminate = false;
+    let mut saw_indeterminate = false;
+    for spec in specs {
+        match spec.leaf_outcome(resource_id) {
             LeafOutcome::Forbid => return ExpectedDecision::Forbidden,
             LeafOutcome::Grant => saw_grant = true,
+            LeafOutcome::Indeterminate => {
+                saw_indeterminate = true;
+                if spec.effect.can_forbid() {
+                    saw_veto_indeterminate = true;
+                }
+            }
             LeafOutcome::NotApplicable => {}
         }
     }
 
-    if saw_grant {
+    if saw_veto_indeterminate {
+        ExpectedDecision::Indeterminate
+    } else if saw_grant {
         ExpectedDecision::Granted
+    } else if saw_indeterminate {
+        ExpectedDecision::Indeterminate
     } else {
         ExpectedDecision::Denied
     }
@@ -245,6 +282,8 @@ fn access_decision(evaluation: &AccessEvaluation) -> ExpectedDecision {
         ExpectedDecision::Granted
     } else if evaluation.forbidden_by().is_some() {
         ExpectedDecision::Forbidden
+    } else if evaluation.is_indeterminate() {
+        ExpectedDecision::Indeterminate
     } else {
         ExpectedDecision::Denied
     }
@@ -255,6 +294,8 @@ fn policy_decision(result: &PolicyEvalResult) -> ExpectedDecision {
         ExpectedDecision::Forbidden
     } else if result.is_granted() {
         ExpectedDecision::Granted
+    } else if result.decision() == Decision::Indeterminate {
+        ExpectedDecision::Indeterminate
     } else {
         ExpectedDecision::Denied
     }
@@ -286,22 +327,29 @@ fn arc_policies_from_specs(specs: &[RandomPolicySpec]) -> Vec<Arc<dyn Policy<Dom
 
 fn policy_spec_strategy() -> impl Strategy<Value = RandomPolicySpec> {
     prop_oneof![
-        2 => (0u8..=100, any::<u16>()).prop_map(|(grant_percent, salt)| RandomPolicySpec {
-            grant_percent,
-            forbid_percent: 0,
-            salt,
-            effect: Effect::Allow,
-        }),
-        3 => (0u8..=100, any::<u16>()).prop_map(|(forbid_percent, salt)| RandomPolicySpec {
-            grant_percent: 0,
-            forbid_percent,
-            salt,
-            effect: Effect::Forbid,
-        }),
-        5 => (0u8..=100, 0u8..=100, any::<u16>()).prop_map(
-            |(grant_percent, forbid_percent, salt)| RandomPolicySpec {
+        2 => (0u8..=100, 0u8..=100, any::<u16>()).prop_map(
+            |(grant_percent, indeterminate_percent, salt)| RandomPolicySpec {
+                grant_percent,
+                forbid_percent: 0,
+                indeterminate_percent,
+                salt,
+                effect: Effect::Allow,
+            }
+        ),
+        3 => (0u8..=100, 0u8..=100, any::<u16>()).prop_map(
+            |(forbid_percent, indeterminate_percent, salt)| RandomPolicySpec {
+                grant_percent: 0,
+                forbid_percent,
+                indeterminate_percent,
+                salt,
+                effect: Effect::Forbid,
+            }
+        ),
+        5 => (0u8..=100, 0u8..=100, 0u8..=100, any::<u16>()).prop_map(
+            |(grant_percent, forbid_percent, indeterminate_percent, salt)| RandomPolicySpec {
                 grant_percent,
                 forbid_percent,
+                indeterminate_percent,
                 salt,
                 effect: Effect::AllowOrForbid,
             }
@@ -315,12 +363,14 @@ fn adversarial_policy_stack_strategy() -> impl Strategy<Value = Vec<RandomPolicy
             Just(RandomPolicySpec {
                 grant_percent: 0,
                 forbid_percent: 0,
+                indeterminate_percent: 0,
                 salt: 0,
                 effect: Effect::Allow,
             }),
             Just(RandomPolicySpec {
                 grant_percent: 0,
                 forbid_percent: 0,
+                indeterminate_percent: 0,
                 salt: 0,
                 effect: Effect::AllowOrForbid,
             }),
@@ -332,12 +382,14 @@ fn adversarial_policy_stack_strategy() -> impl Strategy<Value = Vec<RandomPolicy
             RandomPolicySpec {
                 grant_percent: 100,
                 forbid_percent: 0,
+                indeterminate_percent: 0,
                 salt: 0,
                 effect: Effect::AllowOrForbid,
             },
             RandomPolicySpec {
                 grant_percent: 0,
                 forbid_percent: 0,
+                indeterminate_percent: 0,
                 salt: 0,
                 effect: Effect::AllowOrForbid,
             },
@@ -345,6 +397,27 @@ fn adversarial_policy_stack_strategy() -> impl Strategy<Value = Vec<RandomPolicy
         specs.append(&mut tail);
         specs
     });
+
+    // A veto-capable policy that is always indeterminate, ahead of an
+    // allow-only policy that always grants: the unresolved potential veto
+    // must block the grant on every path. Distinguishes mutants that skip
+    // the veto-prefix indeterminate check or misplace the prefix boundary.
+    let veto_indeterminate_blocks_grant = Just(vec![
+        RandomPolicySpec {
+            grant_percent: 0,
+            forbid_percent: 0,
+            indeterminate_percent: 100,
+            salt: 0,
+            effect: Effect::AllowOrForbid,
+        },
+        RandomPolicySpec {
+            grant_percent: 100,
+            forbid_percent: 0,
+            indeterminate_percent: 0,
+            salt: 0,
+            effect: Effect::Allow,
+        },
+    ]);
 
     let veto_heavy = prop::collection::vec(policy_spec_strategy(), 2..=5).prop_filter(
         "at least two veto-capable policies, one mixed-capability policy",
@@ -357,7 +430,8 @@ fn adversarial_policy_stack_strategy() -> impl Strategy<Value = Vec<RandomPolicy
     );
 
     prop_oneof![
-        5 => exact_deferred_grant,
+        4 => exact_deferred_grant,
+        2 => veto_indeterminate_blocks_grant,
         7 => veto_heavy,
         2 => prop::collection::vec(policy_spec_strategy(), 1..=5),
     ]
@@ -580,14 +654,14 @@ async fn boxed_dyn_policy_dispatches_evaluate_batch_override() {
         .collect::<Vec<_>>();
 
     let results = boxed
-        .evaluate_batch(&BatchEvalCtx {
-            session: &session,
-            subject: &Subject,
-            action: &Action,
-            context: &Ctx,
-            items: &batch_items,
-            policy_type: boxed.policy_type(),
-        })
+        .evaluate_batch(&BatchEvalCtx::new(
+            &session,
+            &Subject,
+            &Action,
+            &Ctx,
+            &batch_items,
+            boxed.policy_type(),
+        ))
         .await;
 
     assert_eq!(results.len(), 2);
@@ -799,24 +873,24 @@ proptest! {
 
         let session = EvaluationSession::empty();
         let resource = Resource { id: resource_id };
-        let single = tokio_test::block_on(policy.evaluate(&EvalCtx {
-            session: &session,
-            subject: &Subject,
-            action: &Action,
-            resource: &resource,
-            context: &Ctx,
-            policy_type: policy.policy_type(),
-        }));
+        let single = tokio_test::block_on(policy.evaluate(&EvalCtx::new(
+            &session,
+            &Subject,
+            &Action,
+            &resource,
+            &Ctx,
+            policy.policy_type(),
+        )));
 
         let items = [PolicyBatchItem { resource: &resource }];
-        let batch = tokio_test::block_on(policy.evaluate_batch(&BatchEvalCtx {
-            session: &session,
-            subject: &Subject,
-            action: &Action,
-            context: &Ctx,
-            items: &items,
-            policy_type: policy.policy_type(),
-        }));
+        let batch = tokio_test::block_on(policy.evaluate_batch(&BatchEvalCtx::new(
+            &session,
+            &Subject,
+            &Action,
+            &Ctx,
+            &items,
+            policy.policy_type(),
+        )));
 
         prop_assert_eq!(batch.len(), 1);
         prop_assert_eq!(policy_decision(&single), policy_decision(&batch[0]));
@@ -1602,5 +1676,1101 @@ async fn wrong_length_batch_from_forbid_policy_fails_closed() {
             !evaluation.is_granted(),
             "items touched by a broken forbid policy must fail closed"
         );
+        assert!(
+            evaluation.is_indeterminate(),
+            "a broken batch contract means the items could not be evaluated"
+        );
     }
+}
+
+// ---- indeterminate semantics ---------------------------------------
+
+/// A policy that always reports it could not be evaluated (e.g. its fact
+/// backend is down), with a configurable declared effect.
+struct IndeterminatePolicy {
+    name: &'static str,
+    effect: Effect,
+}
+
+/// Models the explicit-provenance escape hatch: the leaf remains
+/// `NotApplicable`, but its provenance says a required fact load failed.
+struct ErrorBearingNotApplicablePolicy;
+
+#[async_trait]
+impl Policy<Domain> for ErrorBearingNotApplicablePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.not_applicable_with_facts(
+            "fact was unavailable",
+            vec![FactProvenance::new(
+                "membership",
+                "Membership(7)",
+                FactOutcome::Error,
+                Some("membership backend unavailable".to_string()),
+            )],
+        )
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ErrorBearingNotApplicablePolicy")
+    }
+}
+
+/// Negation must never manufacture a grant from a leaf that reports a failed
+/// fact load, even when the policy deliberately used the explicit-provenance
+/// escape hatch to keep the leaf itself `NotApplicable`.
+#[tokio::test]
+async fn not_policy_fail_closes_error_bearing_not_applicable() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(NotPolicy::new(ErrorBearingNotApplicablePolicy));
+    let session = EvaluationSession::empty();
+
+    let single = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    single.assert_indeterminate();
+    assert!(!single.is_granted());
+    assert_eq!(single.fact_load_errors().len(), 1);
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_indeterminate();
+    assert!(!batch.is_granted());
+    assert_eq!(batch.fact_load_errors().len(), 1);
+}
+
+#[async_trait]
+impl Policy<Domain> for IndeterminatePolicy {
+    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        PolicyEvalResult::indeterminate(self.name, "backing store unreachable")
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(self.name)
+    }
+
+    fn effect(&self) -> Effect {
+        self.effect
+    }
+}
+
+/// An indeterminate veto-capable policy blocks a sibling grant on every
+/// path: its unresolved potential veto must not let the grant through, and
+/// the outcome is `Indeterminate`, not `Denied`.
+#[tokio::test]
+async fn veto_indeterminate_blocks_grant_and_yields_indeterminate() {
+    let session = EvaluationSession::empty();
+    for indeterminate_registered_first in [true, false] {
+        let mut checker = PermissionChecker::new();
+        if indeterminate_registered_first {
+            checker.add_policy(IndeterminatePolicy {
+                name: "BrokenVeto",
+                effect: Effect::AllowOrForbid,
+            });
+            checker.add_policy(allow_everything("AllowAll"));
+        } else {
+            checker.add_policy(allow_everything("AllowAll"));
+            checker.add_policy(IndeterminatePolicy {
+                name: "BrokenVeto",
+                effect: Effect::AllowOrForbid,
+            });
+        }
+
+        let single = check_resource(&checker, &session, &Resource { id: 0 }).await;
+        single.assert_indeterminate();
+        assert!(!single.is_granted());
+        assert_eq!(single.forbidden_by(), None);
+        let reason = single.indeterminate_reason().unwrap();
+        assert!(reason.contains("BrokenVeto"), "reason: {reason}");
+        assert!(
+            reason.contains("backing store unreachable"),
+            "reason: {reason}"
+        );
+
+        let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }])
+            .await
+            .remove(0)
+            .1;
+        batch.assert_indeterminate();
+        assert_eq!(
+            batch.indeterminate_reason(),
+            single.indeterminate_reason(),
+            "single and batch paths must agree"
+        );
+
+        // The filter pipeline fails closed on indeterminate items.
+        let visible = filter_resources(&checker, &session, vec![Resource { id: 0 }]).await;
+        assert!(visible.is_empty());
+    }
+}
+
+/// A definite forbid observed later in the veto prefix downgrades an
+/// earlier indeterminate to an ordinary veto denial: deny overrides
+/// indeterminate. Distinguishes mutants that return `Indeterminate` before
+/// the veto prefix has fully run.
+#[tokio::test]
+async fn veto_indeterminate_then_real_forbid_is_denied() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(IndeterminatePolicy {
+        name: "BrokenVeto",
+        effect: Effect::AllowOrForbid,
+    });
+    checker.add_policy(forbid_odd_resources("OddBlock"));
+    checker.add_policy(allow_everything("AllowAll"));
+
+    let session = EvaluationSession::empty();
+
+    let single = check_resource(&checker, &session, &Resource { id: 1 }).await;
+    single.assert_forbidden_by("OddBlock");
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 1 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_forbidden_by("OddBlock");
+
+    // On even resources the forbid does not match, so the indeterminate
+    // veto policy is decisive again.
+    let even = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    even.assert_indeterminate();
+}
+
+/// An indeterminate *allow-only* policy cannot block a sibling grant: it
+/// could only have granted, so "first grant wins" is preserved.
+#[tokio::test]
+async fn allow_only_indeterminate_does_not_block_grant() {
+    let session = EvaluationSession::empty();
+    for indeterminate_registered_first in [true, false] {
+        let mut checker = PermissionChecker::new();
+        if indeterminate_registered_first {
+            checker.add_policy(IndeterminatePolicy {
+                name: "BrokenAllow",
+                effect: Effect::Allow,
+            });
+            checker.add_policy(allow_everything("AllowAll"));
+        } else {
+            checker.add_policy(allow_everything("AllowAll"));
+            checker.add_policy(IndeterminatePolicy {
+                name: "BrokenAllow",
+                effect: Effect::Allow,
+            });
+        }
+
+        let single = check_resource(&checker, &session, &Resource { id: 0 }).await;
+        single.assert_granted_by("AllowAll");
+
+        let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }])
+            .await
+            .remove(0)
+            .1;
+        batch.assert_granted_by("AllowAll");
+    }
+}
+
+/// With no grant on the table, an indeterminate allow-only policy makes the
+/// evaluation indeterminate rather than "All policies denied access": the
+/// failed policy might have granted.
+#[tokio::test]
+async fn allow_only_indeterminate_without_grant_is_indeterminate() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(NamedNoopPolicy { name: "NoOpinion" });
+    checker.add_policy(IndeterminatePolicy {
+        name: "BrokenAllow",
+        effect: Effect::Allow,
+    });
+
+    let session = EvaluationSession::empty();
+
+    let single = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    single.assert_indeterminate();
+    assert!(single
+        .indeterminate_reason()
+        .unwrap()
+        .contains("BrokenAllow"));
+    assert!(single.to_result(|reason| reason.to_string()).is_err());
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_indeterminate();
+    assert_eq!(batch.indeterminate_reason(), single.indeterminate_reason());
+}
+
+/// A custom combinator that reports a granting decision while keeping a
+/// `Forbidden` leaf in its children is still treated as forbidding: the
+/// whole-tree scan in `is_forbidden` is the fail-closed backstop.
+struct LyingGrantCombinator;
+
+#[async_trait]
+impl Policy<Domain> for LyingGrantCombinator {
+    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("LyingGrantCombinator"),
+            operation: gatehouse::CombineOp::And,
+            children: vec![PolicyEvalResult::forbidden("HiddenVeto", "buried veto")],
+            decision: Decision::Grant,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("LyingGrantCombinator")
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::AllowOrForbid
+    }
+}
+
+/// A custom node that carries `Decision::Forbid` without any `Forbidden`
+/// leaf still vetoes: the decision half of `is_forbidden` is honored too.
+struct DecisionOnlyForbidPolicy;
+
+#[async_trait]
+impl Policy<Domain> for DecisionOnlyForbidPolicy {
+    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("DecisionOnlyForbid"),
+            operation: gatehouse::CombineOp::And,
+            children: Vec::new(),
+            decision: Decision::Forbid,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("DecisionOnlyForbid")
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::Forbid
+    }
+}
+
+struct DecisionOnlyIndeterminatePolicy;
+
+#[async_trait]
+impl Policy<Domain> for DecisionOnlyIndeterminatePolicy {
+    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        PolicyEvalResult::Combined {
+            policy_type: std::borrow::Cow::Borrowed("DecisionOnlyIndeterminate"),
+            operation: gatehouse::CombineOp::And,
+            children: Vec::new(),
+            decision: Decision::Indeterminate,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("DecisionOnlyIndeterminate")
+    }
+}
+
+#[tokio::test]
+async fn decision_only_indeterminate_has_a_nonempty_fallback_reason() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(DecisionOnlyIndeterminatePolicy);
+    let session = EvaluationSession::empty();
+
+    let single = check_resource(&checker, &session, &Resource { id: 0 }).await;
+    single.assert_indeterminate();
+    assert_eq!(
+        single.indeterminate_reason(),
+        Some(
+            "Could not evaluate DecisionOnlyIndeterminate: indeterminate result did not contain an indeterminate leaf"
+        )
+    );
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 0 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_indeterminate();
+    assert_eq!(batch.indeterminate_reason(), single.indeterminate_reason());
+}
+
+#[tokio::test]
+async fn inconsistent_custom_combinator_nodes_still_fail_closed() {
+    let session = EvaluationSession::empty();
+
+    // Forbidden leaf under a lying `Grant` decision: the leaf scan wins.
+    let mut lying = PermissionChecker::new();
+    lying.add_policy(allow_everything("AllowAll"));
+    lying.add_policy(LyingGrantCombinator);
+    let evaluation = check_resource(&lying, &session, &Resource { id: 0 }).await;
+    evaluation.assert_forbidden_by("HiddenVeto");
+    let batch = evaluate_resources(&lying, &session, vec![Resource { id: 0 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_forbidden_by("HiddenVeto");
+
+    // `Decision::Forbid` with no Forbidden leaf: the decision wins.
+    let mut decision_only = PermissionChecker::new();
+    decision_only.add_policy(allow_everything("AllowAll"));
+    decision_only.add_policy(DecisionOnlyForbidPolicy);
+    let evaluation = check_resource(&decision_only, &session, &Resource { id: 0 }).await;
+    evaluation.assert_denied();
+    evaluation.assert_denied_with_reason_containing("Forbidden by");
+    let batch = evaluate_resources(&decision_only, &session, vec![Resource { id: 0 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_denied();
+}
+
+/// An indeterminate child checker propagates through `DelegatingPolicy`:
+/// the parent evaluation is indeterminate, and a veto-capable delegate
+/// blocks parent grants.
+#[tokio::test]
+async fn delegated_child_indeterminate_propagates_to_parent_checker() {
+    let session = EvaluationSession::empty();
+
+    let mut child: PermissionChecker<Domain> = PermissionChecker::new();
+    child.add_policy(IndeterminatePolicy {
+        name: "ChildBroken",
+        effect: Effect::AllowOrForbid,
+    });
+    let delegate = DelegatingPolicy::new(
+        "DelegatedDecision",
+        child,
+        |_subject: &Subject| Subject,
+        |_action: &Action| Action,
+        |_subject: &Subject, _action: &Action, resource: &Resource, _ctx: &Ctx| Resource {
+            id: resource.id,
+        },
+        |_subject: &Subject, _action: &Action, _ctx: &Ctx| Ctx,
+    );
+
+    let mut parent = PermissionChecker::new();
+    parent.add_policy(allow_everything("ParentAllow"));
+    parent.add_policy(delegate);
+
+    let evaluation = check_resource(&parent, &session, &Resource { id: 0 }).await;
+    evaluation.assert_indeterminate();
+    assert!(evaluation
+        .indeterminate_reason()
+        .unwrap()
+        .contains("ChildBroken"));
+}
+
+// ---- recording contexts (EvalCtx::fact / BatchEvalCtx::facts_by) ----
+
+/// Per-resource yes/no fact used to exercise provenance recording.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct OddFlag(u8);
+
+impl gatehouse::FactKey for OddFlag {
+    const NAME: &'static str = "odd_flag";
+    type Value = bool;
+}
+
+/// Answers `Found(id is odd)` and fails to load configured ids.
+struct OddFlagSource {
+    fail_ids: HashSet<u8>,
+}
+
+#[async_trait]
+impl FactSource<OddFlag> for OddFlagSource {
+    async fn load_many(&self, keys: &[OddFlag]) -> Vec<FactLoadResult<bool>> {
+        keys.iter()
+            .map(|OddFlag(id)| {
+                if self.fail_ids.contains(id) {
+                    FactLoadResult::Error(gatehouse::FactLoadError::backend_message(
+                        "flag store unreachable",
+                    ))
+                } else {
+                    FactLoadResult::Found(id % 2 == 1)
+                }
+            })
+            .collect()
+    }
+}
+
+fn odd_flag_session(fail_ids: impl IntoIterator<Item = u8>) -> EvaluationSession {
+    gatehouse::FactRegistry::builder()
+        .with::<OddFlag, _>(OddFlagSource {
+            fail_ids: fail_ids.into_iter().collect(),
+        })
+        .build()
+        .session()
+}
+
+/// A fact-backed policy that loads through the recording context but builds
+/// its results **by hand** with the plain constructors — the #58 case 3
+/// "forgetful" shape. Provenance (and the NotApplicable → Indeterminate
+/// upgrade after a failed load) must therefore come from the caller-side
+/// `EvalCtx::finish` / `BatchEvalCtx::finish` merge in the checker and
+/// combinators; removing any of those calls breaks these tests.
+struct HandBuiltOddPolicy;
+
+impl HandBuiltOddPolicy {
+    fn result_for(fact: FactLoadResult<bool>) -> PolicyEvalResult {
+        match fact {
+            FactLoadResult::Found(true) => {
+                PolicyEvalResult::granted("HandBuiltOddPolicy", Some("odd resource".into()))
+            }
+            _ => PolicyEvalResult::not_applicable("HandBuiltOddPolicy", "not odd"),
+        }
+    }
+}
+
+#[async_trait]
+impl Policy<Domain> for HandBuiltOddPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        Self::result_for(ctx.fact(OddFlag(ctx.resource.id)).await)
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        ctx.facts_by(|resource| OddFlag(resource.id))
+            .await
+            .into_iter()
+            .map(Self::result_for)
+            .collect()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("HandBuiltOddPolicy")
+    }
+}
+
+/// A custom combinator-shaped policy that records a fact on its outer
+/// context. `finish` must preserve a failed load even though `Combined` has no
+/// provenance field of its own.
+struct HandBuiltCombinedOddPolicy;
+
+#[async_trait]
+impl Policy<Domain> for HandBuiltCombinedOddPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        let _ = ctx.fact(OddFlag(ctx.resource.id)).await;
+        PolicyEvalResult::Combined {
+            policy_type: self.policy_type(),
+            operation: gatehouse::CombineOp::And,
+            children: Vec::new(),
+            decision: Decision::NotApplicable,
+        }
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("HandBuiltCombinedOddPolicy")
+    }
+}
+
+#[tokio::test]
+async fn combined_policy_preserves_recorded_load_failures() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(HandBuiltCombinedOddPolicy);
+    let session = odd_flag_session([3]);
+
+    let single = check_resource(&checker, &session, &Resource { id: 3 }).await;
+    single.assert_indeterminate();
+    assert_eq!(single.fact_load_errors().len(), 1);
+    assert!(single.trace().format().contains("fact odd_flag [error]"));
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 3 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_indeterminate();
+    assert_eq!(batch.fact_load_errors().len(), 1);
+    assert!(batch.trace().format().contains("fact odd_flag [error]"));
+}
+
+/// Facts recorded on the context reach the trace even when the policy
+/// builds results by hand: the checker merges them after evaluation, on
+/// both the single and the batch path.
+#[tokio::test]
+async fn recorded_facts_reach_the_trace_for_hand_built_results() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(HandBuiltOddPolicy);
+    let session = odd_flag_session([]);
+
+    let granted = check_resource(&checker, &session, &Resource { id: 1 }).await;
+    granted.assert_granted_by("HandBuiltOddPolicy");
+    assert!(
+        granted.trace().format().contains("fact odd_flag [found]"),
+        "single-path grant must carry recorded provenance:\n{}",
+        granted.trace().format()
+    );
+
+    let denied = check_resource(&checker, &session, &Resource { id: 2 }).await;
+    denied.assert_denied();
+    assert!(denied.trace().format().contains("fact odd_flag [found]"));
+
+    let batch = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 1 }, Resource { id: 2 }],
+    )
+    .await;
+    for (resource, evaluation) in &batch {
+        assert!(
+            evaluation
+                .trace()
+                .format()
+                .contains("fact odd_flag [found]"),
+            "batch item {} must carry recorded provenance:\n{}",
+            resource.id,
+            evaluation.trace().format()
+        );
+    }
+    assert!(batch[0].1.is_granted());
+    assert!(!batch[1].1.is_granted());
+}
+
+/// A recorded load failure upgrades a hand-built `NotApplicable` to
+/// `Indeterminate` when the checker merges the recorded facts — closing the
+/// silent #58-case-3 gap on both evaluation paths.
+#[tokio::test]
+async fn recorded_load_failure_upgrades_hand_built_not_applicable() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(HandBuiltOddPolicy);
+    let session = odd_flag_session([3]);
+
+    let single = check_resource(&checker, &session, &Resource { id: 3 }).await;
+    single.assert_indeterminate();
+    let errors = single.fact_load_errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].fact_name, "odd_flag");
+    assert_eq!(
+        errors[0].error_kind,
+        Some(gatehouse::FactLoadErrorKind::Backend)
+    );
+
+    let batch = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 3 }, Resource { id: 1 }],
+    )
+    .await;
+    batch[0].1.assert_indeterminate();
+    assert_eq!(batch[0].1.fact_load_errors().len(), 1);
+    batch[1].1.assert_granted_by("HandBuiltOddPolicy");
+    assert!(batch[1].1.fact_load_errors().is_empty());
+}
+
+/// The combinators perform the same recorded-fact merge for their children.
+/// If `AndPolicy` / `OrPolicy` / `NotPolicy` dropped their `finish` calls,
+/// the failing child would stay `NotApplicable` — turning the AND/OR result
+/// into an ordinary denial and, worse, letting `NOT` invert it into a grant.
+#[tokio::test]
+async fn combinators_merge_recorded_facts_for_hand_built_children() {
+    let failing = Resource { id: 3 };
+
+    // AND: the upgraded Indeterminate child taints the conjunction.
+    let mut and_checker = PermissionChecker::new();
+    and_checker.add_policy(
+        AndPolicy::try_new(vec![
+            Arc::new(HandBuiltOddPolicy),
+            Arc::new(allow_everything("AllowAll")) as Arc<dyn Policy<Domain>>,
+        ])
+        .unwrap(),
+    );
+    let session = odd_flag_session([3]);
+    let single = check_resource(&and_checker, &session, &failing).await;
+    single.assert_indeterminate();
+    assert!(single.trace().format().contains("fact odd_flag [error]"));
+    let batch = evaluate_resources(&and_checker, &session, vec![failing.clone()]).await;
+    batch[0].1.assert_indeterminate();
+
+    // OR: with no grant available, the disjunction is indeterminate.
+    let mut or_checker = PermissionChecker::new();
+    or_checker.add_policy(
+        OrPolicy::try_new(vec![
+            Arc::new(HandBuiltOddPolicy),
+            Arc::new(NamedNoopPolicy { name: "NoOpinion" }) as Arc<dyn Policy<Domain>>,
+        ])
+        .unwrap(),
+    );
+    let session = odd_flag_session([3]);
+    let single = check_resource(&or_checker, &session, &failing).await;
+    single.assert_indeterminate();
+    let batch = evaluate_resources(&or_checker, &session, vec![failing.clone()]).await;
+    batch[0].1.assert_indeterminate();
+
+    // NOT: without the merge the failed child would look like an ordinary
+    // non-grant and NOT would invert it into a grant.
+    let mut not_checker = PermissionChecker::new();
+    not_checker.add_policy(NotPolicy::new(HandBuiltOddPolicy));
+    let session = odd_flag_session([3]);
+    let single = check_resource(&not_checker, &session, &failing).await;
+    single.assert_indeterminate();
+    assert!(!single.is_granted());
+    let batch = evaluate_resources(&not_checker, &session, vec![failing]).await;
+    batch[0].1.assert_indeterminate();
+}
+
+/// A `Forbid`-effect policy that (in violation of its contract) grants,
+/// after consulting a fact through the recording context.
+struct MisbehavingFactBackedForbidPolicy;
+
+#[async_trait]
+impl Policy<Domain> for MisbehavingFactBackedForbidPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        let _ = ctx.fact(OddFlag(ctx.resource.id)).await;
+        ctx.grant("grants despite declaring Effect::Forbid")
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("MisbehavingFactBackedForbidPolicy")
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::Forbid
+    }
+}
+
+/// Normalizing a forbid-effect policy's contract-violating grant to
+/// `NotApplicable` keeps the facts the policy consulted in the trace, on
+/// both evaluation paths.
+#[tokio::test]
+async fn forbid_effect_grant_normalization_preserves_provenance() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(MisbehavingFactBackedForbidPolicy);
+    let session = odd_flag_session([]);
+
+    let single = check_resource(&checker, &session, &Resource { id: 1 }).await;
+    single.assert_denied();
+    let rendered = single.trace().format();
+    assert!(
+        rendered.contains("treated as not applicable"),
+        "trace should show the normalized contract violation:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("fact odd_flag [found]"),
+        "normalization must not drop the consulted facts:\n{rendered}"
+    );
+
+    let batch = evaluate_resources(&checker, &session, vec![Resource { id: 1 }])
+        .await
+        .remove(0)
+        .1;
+    batch.assert_denied();
+    let rendered = batch.trace().format();
+    assert!(rendered.contains("treated as not applicable"));
+    assert!(
+        rendered.contains("fact odd_flag [found]"),
+        "batch normalization must not drop the consulted facts:\n{rendered}"
+    );
+}
+
+/// A batch-shared fact loaded through `BatchEvalCtx::fact` records
+/// provenance against every item in the batch.
+struct SharedFactPolicy;
+
+#[async_trait]
+impl Policy<Domain> for SharedFactPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        match ctx.fact(OddFlag(0)).await {
+            FactLoadResult::Found(true) => ctx.grant("shared flag set"),
+            _ => ctx.not_applicable("shared flag not set"),
+        }
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        let fact = ctx.fact(OddFlag(0)).await;
+        ctx.items
+            .iter()
+            .map(|_| match &fact {
+                FactLoadResult::Found(true) => {
+                    PolicyEvalResult::granted("SharedFactPolicy", Some("shared flag set".into()))
+                }
+                _ => PolicyEvalResult::not_applicable("SharedFactPolicy", "shared flag not set"),
+            })
+            .collect()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("SharedFactPolicy")
+    }
+}
+
+#[tokio::test]
+async fn batch_shared_fact_records_against_every_item() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(SharedFactPolicy);
+
+    let session = odd_flag_session([]);
+    let batch = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 10 }, Resource { id: 11 }],
+    )
+    .await;
+    for (_, evaluation) in &batch {
+        assert!(evaluation
+            .trace()
+            .format()
+            .contains("fact odd_flag [found]"));
+    }
+
+    // A failing shared fact makes every hand-built NotApplicable item
+    // indeterminate through the same merge.
+    let session = odd_flag_session([0]);
+    let batch = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 10 }, Resource { id: 11 }],
+    )
+    .await;
+    for (_, evaluation) in &batch {
+        evaluation.assert_indeterminate();
+        assert_eq!(evaluation.fact_load_errors().len(), 1);
+    }
+}
+
+/// Combinator decision tables for indeterminate children. Distinguishes
+/// the veto-prefix rules (indeterminate outranks a definite non-grant when
+/// the child might have forbidden) from the allow-only rules (a definite
+/// answer outranks the indeterminate when it settles the aggregate).
+#[tokio::test]
+async fn combinator_indeterminate_decision_tables() {
+    let session = EvaluationSession::empty();
+    let resource = Resource { id: 0 };
+
+    async fn decide(
+        policy: &dyn Policy<Domain>,
+        session: &EvaluationSession,
+        resource: &Resource,
+    ) -> Decision {
+        let single = policy
+            .evaluate(&EvalCtx::new(
+                session,
+                &Subject,
+                &Action,
+                resource,
+                &Ctx,
+                policy.policy_type(),
+            ))
+            .await;
+        let items = [PolicyBatchItem { resource }];
+        let batch = policy
+            .evaluate_batch(&BatchEvalCtx::new(
+                session,
+                &Subject,
+                &Action,
+                &Ctx,
+                &items,
+                policy.policy_type(),
+            ))
+            .await;
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            single.decision(),
+            batch[0].decision(),
+            "single and batch combinator decisions must agree"
+        );
+        single.decision()
+    }
+
+    let veto_indet = || IndeterminatePolicy {
+        name: "BrokenVeto",
+        effect: Effect::AllowOrForbid,
+    };
+    let allow_indet = || IndeterminatePolicy {
+        name: "BrokenAllow",
+        effect: Effect::Allow,
+    };
+
+    // A veto-capable child that definitely grants must not be mistaken for a
+    // failed veto-prefix child on the batch path. This distinguishes the
+    // `!is_granted && !is_indeterminate` conjunction from `||`.
+    let and = AndPolicy::try_new(vec![Arc::new(MixedGrantPolicy)]).unwrap();
+    assert_eq!(decide(&and, &session, &resource).await, Decision::Grant);
+    let or = OrPolicy::try_new(vec![Arc::new(MixedGrantPolicy)]).unwrap();
+    assert_eq!(decide(&or, &session, &resource).await, Decision::Grant);
+
+    // AND: a veto-prefix indeterminate outranks both grants and definite
+    // non-grants from the prefix.
+    let and = AndPolicy::try_new(vec![Arc::new(veto_indet()), Arc::new(MixedGrantPolicy)]).unwrap();
+    assert_eq!(
+        decide(&and, &session, &resource).await,
+        Decision::Indeterminate
+    );
+    let and = AndPolicy::try_new(vec![
+        Arc::new(veto_indet()),
+        Arc::new(MixedNotApplicablePolicy),
+    ])
+    .unwrap();
+    assert_eq!(
+        decide(&and, &session, &resource).await,
+        Decision::Indeterminate
+    );
+
+    // AND: an allow-only indeterminate is outranked by a definite
+    // non-grant (the conjunction is definitely not satisfied…)
+    let and = AndPolicy::try_new(vec![
+        Arc::new(allow_indet()),
+        Arc::new(NamedNoopPolicy { name: "NoOpinion" }),
+    ])
+    .unwrap();
+    assert_eq!(
+        decide(&and, &session, &resource).await,
+        Decision::NotApplicable
+    );
+    // …but taints an otherwise-granting conjunction.
+    let and = AndPolicy::try_new(vec![
+        Arc::new(allow_indet()),
+        Arc::new(allow_everything("AllowAll")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide(&and, &session, &resource).await,
+        Decision::Indeterminate
+    );
+
+    // OR: a veto-prefix indeterminate blocks even a sibling grant from the
+    // prefix (the unresolved child might have forbidden the request)…
+    let or = OrPolicy::try_new(vec![Arc::new(veto_indet()), Arc::new(MixedGrantPolicy)]).unwrap();
+    assert_eq!(
+        decide(&or, &session, &resource).await,
+        Decision::Indeterminate
+    );
+    // …but an allow-only indeterminate cannot block a definite grant…
+    let or = OrPolicy::try_new(vec![
+        Arc::new(allow_indet()),
+        Arc::new(allow_everything("AllowAll")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(decide(&or, &session, &resource).await, Decision::Grant);
+    // …and with nothing granting, the disjunction is indeterminate.
+    let or = OrPolicy::try_new(vec![
+        Arc::new(allow_indet()),
+        Arc::new(NamedNoopPolicy { name: "NoOpinion" }),
+    ])
+    .unwrap();
+    assert_eq!(
+        decide(&or, &session, &resource).await,
+        Decision::Indeterminate
+    );
+
+    // NOT: inversion never manufactures certainty or neutralizes a veto.
+    let not = NotPolicy::new(allow_indet());
+    assert_eq!(
+        decide(&not, &session, &resource).await,
+        Decision::Indeterminate
+    );
+    let not = NotPolicy::new(forbid_odd_resources("OddBlock"));
+    assert_eq!(
+        decide(&not, &session, &Resource { id: 1 }).await,
+        Decision::Forbid
+    );
+    let not = NotPolicy::new(NamedNoopPolicy { name: "NoOpinion" });
+    assert_eq!(decide(&not, &session, &resource).await, Decision::Grant);
+    let not = NotPolicy::new(allow_everything("AllowAll"));
+    assert_eq!(
+        decide(&not, &session, &resource).await,
+        Decision::NotApplicable
+    );
+}
+
+// ---- wrong-length batches feed the normal combination rules ----------
+
+/// A policy whose batch override breaks the one-result-per-item contract,
+/// with a configurable declared effect. Its single-item path is an
+/// ordinary non-grant, so only batch evaluation observes the violation.
+struct WrongLengthBatchPolicy {
+    name: &'static str,
+    effect: Effect,
+}
+
+#[async_trait]
+impl Policy<Domain> for WrongLengthBatchPolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+        ctx.not_applicable("not applicable")
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        _ctx: &BatchEvalCtx<'item, Domain>,
+    ) -> Vec<PolicyEvalResult> {
+        Vec::new()
+    }
+
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(self.name)
+    }
+
+    fn effect(&self) -> Effect {
+        self.effect
+    }
+}
+
+fn wrong_length_allow() -> WrongLengthBatchPolicy {
+    WrongLengthBatchPolicy {
+        name: "BrokenAllowBatch",
+        effect: Effect::Allow,
+    }
+}
+
+fn wrong_length_veto() -> WrongLengthBatchPolicy {
+    WrongLengthBatchPolicy {
+        name: "BrokenVetoBatch",
+        effect: Effect::AllowOrForbid,
+    }
+}
+
+/// A malformed allow-only batch is an indeterminate that cannot block a
+/// later grant: the checker keeps evaluating instead of sealing the item.
+/// With nothing granting, it is what makes the item indeterminate.
+#[tokio::test]
+async fn wrong_length_allow_only_batch_does_not_suppress_later_grant() {
+    let session = EvaluationSession::empty();
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(wrong_length_allow());
+    checker.add_policy(allow_everything("AllowAll"));
+    let results = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 0 }, Resource { id: 1 }],
+    )
+    .await;
+    assert_eq!(results.len(), 2);
+    for (_item, evaluation) in &results {
+        evaluation.assert_granted_by("AllowAll");
+        evaluation.assert_trace_contains("BrokenAllowBatch INDETERMINATE");
+    }
+
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(wrong_length_allow());
+    checker.add_policy(NamedNoopPolicy { name: "NoOpinion" });
+    let results = evaluate_resources(&checker, &session, vec![Resource { id: 0 }]).await;
+    results[0].1.assert_indeterminate();
+    assert!(
+        results[0]
+            .1
+            .indeterminate_reason()
+            .is_some_and(|reason| reason.contains("BrokenAllowBatch")),
+        "unexpected reason: {:?}",
+        results[0].1.indeterminate_reason()
+    );
+}
+
+/// A malformed veto-capable batch is an unresolved veto: it blocks a later
+/// grant, but a later definite forbid in the prefix still wins and stays
+/// attributable through `forbidden_by`.
+#[tokio::test]
+async fn wrong_length_veto_batch_yields_to_later_forbid_but_blocks_grant() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(wrong_length_veto());
+    checker.add_policy(forbid_odd_resources("OddBlock"));
+    checker.add_policy(allow_everything("AllowAll"));
+    let session = EvaluationSession::empty();
+
+    let results = evaluate_resources(
+        &checker,
+        &session,
+        vec![Resource { id: 1 }, Resource { id: 2 }],
+    )
+    .await;
+    assert_eq!(results.len(), 2);
+    // Odd: the definite forbid later in the veto prefix overrides the
+    // indeterminate from the malformed batch.
+    results[0].1.assert_forbidden_by("OddBlock");
+    // Even: no forbid observed, so the unresolved veto blocks the grant.
+    results[1].1.assert_indeterminate();
+    assert!(
+        results[1]
+            .1
+            .indeterminate_reason()
+            .is_some_and(|reason| reason.contains("BrokenVetoBatch")),
+        "unexpected reason: {:?}",
+        results[1].1.indeterminate_reason()
+    );
+}
+
+/// Malformed child batches inside combinators are indeterminate children,
+/// not terminal: the remaining children still apply the combination rules.
+#[tokio::test]
+async fn wrong_length_child_batches_keep_combinator_items_pending() {
+    let session = EvaluationSession::empty();
+    let resource = Resource { id: 1 };
+
+    async fn decide_batch(
+        policy: &dyn Policy<Domain>,
+        session: &EvaluationSession,
+        resource: &Resource,
+    ) -> Decision {
+        let items = [PolicyBatchItem { resource }];
+        let results = policy
+            .evaluate_batch(&BatchEvalCtx::new(
+                session,
+                &Subject,
+                &Action,
+                &Ctx,
+                &items,
+                policy.policy_type(),
+            ))
+            .await;
+        assert_eq!(results.len(), 1);
+        results[0].decision()
+    }
+
+    // AND: allow-only malformed child, then a definite non-grant settles
+    // the conjunction as NotApplicable...
+    let and = AndPolicy::try_new(vec![
+        Arc::new(wrong_length_allow()),
+        Arc::new(NamedNoopPolicy { name: "NoOpinion" }),
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&and, &session, &resource).await,
+        Decision::NotApplicable
+    );
+    // ...while a later grant leaves it tainted.
+    let and = AndPolicy::try_new(vec![
+        Arc::new(wrong_length_allow()),
+        Arc::new(allow_everything("AllowAll")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&and, &session, &resource).await,
+        Decision::Indeterminate
+    );
+    // AND: veto-capable malformed child, then a definite forbid in the
+    // prefix still wins.
+    let and = AndPolicy::try_new(vec![
+        Arc::new(wrong_length_veto()),
+        Arc::new(forbid_odd_resources("OddBlock")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&and, &session, &resource).await,
+        Decision::Forbid
+    );
+
+    // OR: allow-only malformed child, then a grant resolves the disjunction.
+    let or = OrPolicy::try_new(vec![
+        Arc::new(wrong_length_allow()),
+        Arc::new(allow_everything("AllowAll")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&or, &session, &resource).await,
+        Decision::Grant
+    );
+    // OR: allow-only malformed child with nothing granting is indeterminate.
+    let or = OrPolicy::try_new(vec![
+        Arc::new(wrong_length_allow()),
+        Arc::new(NamedNoopPolicy { name: "NoOpinion" }),
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&or, &session, &resource).await,
+        Decision::Indeterminate
+    );
+    // OR: veto-capable malformed child, then a definite forbid still wins.
+    let or = OrPolicy::try_new(vec![
+        Arc::new(wrong_length_veto()),
+        Arc::new(forbid_odd_resources("OddBlock")) as Arc<dyn Policy<Domain>>,
+    ])
+    .unwrap();
+    assert_eq!(
+        decide_batch(&or, &session, &resource).await,
+        Decision::Forbid
+    );
 }

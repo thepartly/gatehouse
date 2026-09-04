@@ -95,8 +95,9 @@
 //! ```
 //!
 //! Use [`EvaluationSession::empty`] for fact-free decisions. Use a session from
-//! [`FactRegistry::session`] when any policy calls `ctx.session.get(...)`, such
-//! as [`RebacPolicy`] or a custom fact-backed policy.
+//! [`FactRegistry::session`] when any policy loads facts — via `ctx.fact(...)`
+//! (which also records provenance) or the raw session — such as [`RebacPolicy`]
+//! or a custom fact-backed policy.
 //!
 //! [`BoundEvaluator::evaluate`] preserves input order and returns one
 //! [`AccessEvaluation`] per input resource. [`BoundEvaluator::filter`] keeps
@@ -123,6 +124,15 @@
 //! - An empty checker denies with `"No policies configured"`.
 //! - [`PolicyEvalResult::NotApplicable`] means the policy did not grant.
 //!   [`PolicyEvalResult::Forbidden`] means the policy actively vetoed.
+//! - [`PolicyEvalResult::Indeterminate`] means the policy could not be
+//!   evaluated (typically a failed fact load). It never grants. An
+//!   indeterminate **veto-capable** policy blocks sibling grants — its
+//!   unresolved potential veto must not be short-circuited — and surfaces as
+//!   [`AccessEvaluation::Indeterminate`]; an observed `Forbidden` still
+//!   overrides it. An indeterminate **allow-only** policy never blocks a
+//!   sibling grant, but if nothing grants the evaluation is
+//!   [`AccessEvaluation::Indeterminate`] rather than an ordinary denial, so
+//!   callers can map authorization-data outages to a 5xx instead of a 403.
 //! - [`PolicyBuilder`] combines configured predicates with AND logic.
 //!   [`PolicyBuilder::forbid`] makes a matching built policy forbid; a
 //!   non-match remains not applicable and does not block.
@@ -153,9 +163,11 @@
 //!
 //! [`RebacPolicy`] is the built-in fact-backed policy. It extracts flat
 //! subject/resource IDs, builds [`RelationshipQuery`] keys, and grants only
-//! when the request session loads a `Found(true)` relationship fact. Missing
-//! sources, missing facts, backend errors, and fact-source contract violations
-//! fail closed to denied ReBAC decisions.
+//! when the request session loads a `Found(true)` relationship fact. A
+//! `Found(false)` or `Missing` fact is an ordinary non-grant; missing
+//! sources, backend errors, and fact-source contract violations fail closed
+//! as [`PolicyEvalResult::Indeterminate`] — never a grant, and structurally
+//! distinguishable from a policy denial.
 //!
 //! # Long-Lived Streams
 //!
@@ -252,7 +264,7 @@ pub(crate) use metadata::{DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POL
 pub use policies::{DelegatingPolicy, RbacPolicy, RebacPolicy};
 pub use policy::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyBatchItem, PolicyDomain};
 pub use results::{
-    AccessEvaluation, CombineOp, EvalTrace, FactOutcome, FactProvenance, PolicyEvalResult,
+    AccessEvaluation, CombineOp, Decision, EvalTrace, FactOutcome, FactProvenance, PolicyEvalResult,
 };
 pub use session::{EvaluationSession, FactRegistry, FactRegistryBuilder};
 

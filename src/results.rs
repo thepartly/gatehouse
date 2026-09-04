@@ -33,6 +33,46 @@ impl fmt::Display for CombineOp {
     }
 }
 
+/// The decision carried by one node of a [`PolicyEvalResult`] tree.
+///
+/// Every node — leaf and combinator alike — carries exactly one `Decision`,
+/// exposed through [`PolicyEvalResult::decision`]. Leaves map 1:1 onto their
+/// variant; [`PolicyEvalResult::Combined`] stores the decision produced by its
+/// combining rule, so callers never need to re-derive an aggregate outcome
+/// from the children.
+///
+/// `Indeterminate` is the fail-closed "could not evaluate" decision: the node
+/// consulted an input (typically a fact load) that was unavailable. It never
+/// grants, and inside [`crate::PermissionChecker`] an `Indeterminate` from a
+/// veto-capable policy also blocks sibling grants, because the failed policy
+/// might have forbidden the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
+pub enum Decision {
+    /// The node grants access.
+    Grant,
+    /// The node neither grants nor forbids.
+    NotApplicable,
+    /// The node actively forbids access.
+    Forbid,
+    /// The node consulted an input that was unavailable and could not
+    /// decide. Fail-closed: never treated as a grant.
+    Indeterminate,
+}
+
+impl fmt::Display for Decision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Grant => write!(f, "GRANT"),
+            Self::NotApplicable => write!(f, "NOT_APPLICABLE"),
+            Self::Forbid => write!(f, "FORBID"),
+            Self::Indeterminate => write!(f, "INDETERMINATE"),
+        }
+    }
+}
+
 /// How a fact load that informed a policy decision resolved.
 ///
 /// This mirrors [`crate::FactLoadResult`] without its value type, so it can be
@@ -226,9 +266,29 @@ pub enum PolicyEvalResult {
         /// policies that are not fact-backed.
         provenance: Vec<FactProvenance>,
     },
+    /// The policy could not be evaluated because an input it needed was
+    /// unavailable — typically a fact that failed to load.
+    ///
+    /// Fail-closed: an indeterminate policy never grants. Unlike
+    /// [`PolicyEvalResult::NotApplicable`] ("this policy does not grant"),
+    /// `Indeterminate` means "this policy might have granted or forbidden,
+    /// but its inputs were unavailable". [`crate::PermissionChecker`] blocks
+    /// grants when a veto-capable policy is indeterminate, and surfaces the
+    /// failure as [`AccessEvaluation::Indeterminate`] so callers can map an
+    /// authorization-data outage to a 5xx instead of a 403.
+    Indeterminate {
+        /// The name of the policy that could not be evaluated.
+        policy_type: Cow<'static, str>,
+        /// A human-readable reason describing the unavailable input.
+        reason: String,
+        /// Facts the policy consulted to reach this decision. By convention
+        /// at least one entry has [`FactOutcome::Error`], though custom
+        /// policies may leave this empty and explain via `reason`.
+        provenance: Vec<FactProvenance>,
+    },
     /// Combined result from multiple policy evaluations.
     /// Contains the policy type, the combining operation ([`CombineOp`]),
-    /// a list of child evaluation results, and the overall outcome.
+    /// a list of child evaluation results, and the aggregate decision.
     Combined {
         /// The name of the combinator policy (e.g. `"AndPolicy"`).
         policy_type: Cow<'static, str>,
@@ -236,8 +296,8 @@ pub enum PolicyEvalResult {
         operation: CombineOp,
         /// The individual results from each child policy.
         children: Vec<PolicyEvalResult>,
-        /// The overall outcome after applying the combining operation.
-        outcome: bool,
+        /// The aggregate decision after applying the combining operation.
+        decision: Decision,
     },
 }
 
@@ -288,6 +348,10 @@ pub enum PolicyEvalResult {
 ///         println!("Access denied: {}", reason);
 ///         println!("Full evaluation trace:\n{}", trace.format());
 ///     }
+///     AccessEvaluation::Indeterminate { reason, trace } => {
+///         println!("Could not evaluate access: {}", reason);
+///         println!("Full evaluation trace:\n{}", trace.format());
+///     }
 ///     _ => {
 ///         println!("Access denied: unknown decision variant");
 ///     }
@@ -317,6 +381,28 @@ pub enum AccessEvaluation {
         /// Summary reason for denial
         reason: String,
     },
+    /// The evaluation could not reach a decision: a policy that mattered was
+    /// [`PolicyEvalResult::Indeterminate`] and no veto fired.
+    ///
+    /// Fail-closed: this is never a grant. It is distinct from
+    /// [`AccessEvaluation::Denied`] so callers can map "authorization inputs
+    /// were unavailable" (usually a 5xx and a retry) differently from "the
+    /// policies decided against this request" (a 403). Produced when a
+    /// veto-capable policy was indeterminate (its potential veto is
+    /// unresolved, so a grant cannot be released), or when no policy granted
+    /// and at least one allow-only policy was indeterminate (it might have
+    /// granted).
+    ///
+    /// The classified fact-load failures are in the trace; use
+    /// [`Self::fact_load_errors`] to collect them and
+    /// [`FactProvenance::error_kind`] to distinguish transient backend
+    /// failures from permanent wiring bugs.
+    Indeterminate {
+        /// The complete evaluation trace showing all policy decisions
+        trace: EvalTrace,
+        /// Summary reason naming the policy that could not be evaluated
+        reason: String,
+    },
 }
 
 /// Walks a [`PolicyEvalResult`] tree looking for a `NotApplicable`
@@ -325,7 +411,9 @@ pub enum AccessEvaluation {
 fn leaf_not_applicable_matches(node: &PolicyEvalResult, expected: &str) -> bool {
     match node {
         PolicyEvalResult::NotApplicable { policy_type, .. } => policy_type.as_ref() == expected,
-        PolicyEvalResult::Granted { .. } | PolicyEvalResult::Forbidden { .. } => false,
+        PolicyEvalResult::Granted { .. }
+        | PolicyEvalResult::Forbidden { .. }
+        | PolicyEvalResult::Indeterminate { .. } => false,
         PolicyEvalResult::Combined { children, .. } => children
             .iter()
             .any(|child| leaf_not_applicable_matches(child, expected)),
@@ -338,7 +426,8 @@ fn collect_fact_load_errors<'a>(node: &'a PolicyEvalResult, out: &mut Vec<&'a Fa
     match node {
         PolicyEvalResult::Granted { provenance, .. }
         | PolicyEvalResult::NotApplicable { provenance, .. }
-        | PolicyEvalResult::Forbidden { provenance, .. } => {
+        | PolicyEvalResult::Forbidden { provenance, .. }
+        | PolicyEvalResult::Indeterminate { provenance, .. } => {
             for fact in provenance {
                 if fact.outcome == FactOutcome::Error {
                     out.push(fact);
@@ -360,7 +449,8 @@ fn trace_has_fact_load_error(node: &PolicyEvalResult) -> bool {
     match node {
         PolicyEvalResult::Granted { provenance, .. }
         | PolicyEvalResult::NotApplicable { provenance, .. }
-        | PolicyEvalResult::Forbidden { provenance, .. } => provenance
+        | PolicyEvalResult::Forbidden { provenance, .. }
+        | PolicyEvalResult::Indeterminate { provenance, .. } => provenance
             .iter()
             .any(|fact| fact.outcome == FactOutcome::Error),
         PolicyEvalResult::Combined { children, .. } => {
@@ -375,14 +465,28 @@ impl AccessEvaluation {
         matches!(self, Self::Granted { .. })
     }
 
+    /// Whether the evaluation was [`AccessEvaluation::Indeterminate`]:
+    /// a non-grant caused by unavailable authorization inputs rather than
+    /// by the policies deciding against the request.
+    ///
+    /// This is the structural, causal signal for mapping authorization
+    /// infrastructure failures to a 5xx. Compare
+    /// [`Self::denied_due_to_fact_load_error`], which is a coarser
+    /// any-error-in-trace scan.
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(self, Self::Indeterminate { .. })
+    }
+
     /// Returns the evaluation trace regardless of outcome.
     ///
-    /// Both variants carry an [`EvalTrace`]; this accessor saves callers
+    /// Every variant carries an [`EvalTrace`]; this accessor saves callers
     /// the `match` when they only need the trace — typically to render it
     /// with [`EvalTrace::format`] for logs or debugging output.
     pub fn trace(&self) -> &EvalTrace {
         match self {
-            Self::Granted { trace, .. } | Self::Denied { trace, .. } => trace,
+            Self::Granted { trace, .. }
+            | Self::Denied { trace, .. }
+            | Self::Indeterminate { trace, .. } => trace,
         }
     }
 
@@ -393,17 +497,30 @@ impl AccessEvaluation {
     pub fn granted_policy_type(&self) -> Option<&str> {
         match self {
             Self::Granted { policy_type, .. } => Some(policy_type),
-            Self::Denied { .. } => None,
+            Self::Denied { .. } | Self::Indeterminate { .. } => None,
         }
     }
 
     /// Returns the summary denial reason when the evaluation was a denial.
     ///
-    /// Mirrors [`Self::granted_policy_type`] for the denied case.
+    /// Mirrors [`Self::granted_policy_type`] for the denied case. Returns
+    /// `None` for [`AccessEvaluation::Indeterminate`]; use
+    /// [`Self::indeterminate_reason`] for that variant.
     pub fn denied_reason(&self) -> Option<&str> {
         match self {
             Self::Denied { reason, .. } => Some(reason),
-            Self::Granted { .. } => None,
+            Self::Granted { .. } | Self::Indeterminate { .. } => None,
+        }
+    }
+
+    /// Returns the summary reason when the evaluation was
+    /// [`AccessEvaluation::Indeterminate`].
+    ///
+    /// Mirrors [`Self::denied_reason`] for the indeterminate case.
+    pub fn indeterminate_reason(&self) -> Option<&str> {
+        match self {
+            Self::Indeterminate { reason, .. } => Some(reason),
+            Self::Granted { .. } | Self::Denied { .. } => None,
         }
     }
 
@@ -417,6 +534,8 @@ impl AccessEvaluation {
     /// for ordinary denials.
     pub fn forbidden_by(&self) -> Option<&str> {
         let Self::Denied { trace, .. } = self else {
+            // Grants have no veto; an indeterminate evaluation means no
+            // forbid was observed (an observed forbid produces `Denied`).
             return None;
         };
         let Some(PolicyEvalResult::Combined {
@@ -453,24 +572,13 @@ impl AccessEvaluation {
         errors
     }
 
-    /// Returns `true` when this evaluation is a **denial** and at least one
-    /// policy leaf in the trace consulted a fact that failed to load
+    /// Returns `true` when this evaluation is a **non-grant** and at least
+    /// one policy leaf in the trace consulted a fact that failed to load
     /// ([`FactOutcome::Error`]).
     ///
-    /// This is an **any-error-in-trace** check, not a causal one: it does
-    /// not prove the load failure was the sole reason for the denial, and
-    /// it treats every [`FactLoadError`](crate::FactLoadError) the same
-    /// (backend failure, missing source registration, contract violation,
-    /// loader cancel). Inspect [`Self::fact_load_errors`] and
-    /// [`Self::forbidden_by`] when you need a finer split (e.g. prefer a
-    /// forbid's 403 over a sibling's load-error signal).
-    ///
-    /// Grants always return `false`, even if some earlier policy recorded a
-    /// load error before a sibling granted. Ordinary denials with only
-    /// Found/Missing facts also return `false`.
-    ///
-    /// Typical use: a coarse signal for "something infrastructure-shaped
-    /// appeared during this denial" without hand-walking the trace:
+    /// Deprecated: use [`Self::is_indeterminate`]. Since the decision model
+    /// gained a structural [`AccessEvaluation::Indeterminate`] variant,
+    /// "could not evaluate" is a first-class, causal outcome:
     ///
     /// ```rust
     /// # use gatehouse::*;
@@ -478,21 +586,33 @@ impl AccessEvaluation {
     /// if evaluation.is_granted() {
     ///     200
     /// } else if evaluation.forbidden_by().is_some() {
-    ///     403 // active veto — check before load-error
-    /// } else if evaluation.denied_due_to_fact_load_error() {
-    ///     503 // at least one fact load failed in the trace
+    ///     403 // active veto — check before the infrastructure signal
+    /// } else if evaluation.is_indeterminate() {
+    ///     503 // authorization inputs unavailable — structural signal
     /// } else {
     ///     403
     /// }
     /// # }
     /// ```
     ///
-    /// Gatehouse still fails closed on the authorization decision itself
-    /// (a load error never grants). This helper only exposes *why* so
-    /// application layers can choose a response class.
+    /// This helper remains an **any-error-in-trace** scan, not a causal
+    /// check: it does not prove the load failure was the reason for the
+    /// denial (a policy may record a load error yet deny for ordinary
+    /// reasons). Its only remaining use is catching errors attached as
+    /// explicit `NotApplicable` provenance by policies that bypass the
+    /// recording context; with [`crate::EvalCtx::fact`] such failures are
+    /// upgraded to [`PolicyEvalResult::Indeterminate`] automatically. Use
+    /// [`Self::fact_load_errors`] when you need the failed loads
+    /// themselves.
+    #[deprecated(
+        since = "0.6.0",
+        note = "use is_indeterminate() for the structural signal, or fact_load_errors() to inspect failed loads; this any-error-in-trace scan will be removed in 0.7"
+    )]
     pub fn denied_due_to_fact_load_error(&self) -> bool {
         match self {
-            Self::Denied { trace, .. } => trace.root().is_some_and(trace_has_fact_load_error),
+            Self::Denied { trace, .. } | Self::Indeterminate { trace, .. } => {
+                trace.root().is_some_and(trace_has_fact_load_error)
+            }
             Self::Granted { .. } => false,
         }
     }
@@ -534,28 +654,61 @@ impl AccessEvaluation {
             Self::Denied { reason, .. } => {
                 panic!("expected grant by policy `{expected}`, but access was denied: {reason}");
             }
+            Self::Indeterminate { reason, .. } => {
+                panic!(
+                    "expected grant by policy `{expected}`, but the evaluation was \
+                     indeterminate: {reason}"
+                );
+            }
         }
     }
 
     /// Test helper: panic unless the evaluation is `Denied`.
     ///
-    /// Use [`Self::assert_denied_with_reason_containing`] when you also
+    /// An [`AccessEvaluation::Indeterminate`] outcome also panics: it is a
+    /// non-grant, but it means the policies could not be evaluated rather
+    /// than that they decided against the request. Use
+    /// [`Self::assert_indeterminate`] for that case, and
+    /// [`Self::assert_denied_with_reason_containing`] when you also
     /// need to assert on the denial reason.
     #[track_caller]
     pub fn assert_denied(&self) {
-        if let Self::Granted {
-            policy_type,
-            reason,
-            ..
-        } = self
-        {
-            panic!(
-                "expected denial, but access was granted by `{policy_type}`{}",
-                reason
-                    .as_ref()
-                    .map(|r| format!(": {r}"))
-                    .unwrap_or_default()
-            );
+        match self {
+            Self::Denied { .. } => {}
+            Self::Granted {
+                policy_type,
+                reason,
+                ..
+            } => {
+                panic!(
+                    "expected denial, but access was granted by `{policy_type}`{}",
+                    reason
+                        .as_ref()
+                        .map(|r| format!(": {r}"))
+                        .unwrap_or_default()
+                );
+            }
+            Self::Indeterminate { reason, .. } => {
+                panic!("expected denial, but the evaluation was indeterminate: {reason}");
+            }
+        }
+    }
+
+    /// Test helper: panic unless the evaluation is
+    /// [`AccessEvaluation::Indeterminate`].
+    #[track_caller]
+    pub fn assert_indeterminate(&self) {
+        match self {
+            Self::Indeterminate { .. } => {}
+            Self::Granted { policy_type, .. } => {
+                panic!(
+                    "expected an indeterminate evaluation, but access was granted by \
+                     `{policy_type}`"
+                );
+            }
+            Self::Denied { reason, .. } => {
+                panic!("expected an indeterminate evaluation, but access was denied: {reason}");
+            }
         }
     }
 
@@ -584,6 +737,12 @@ impl AccessEvaluation {
             Self::Granted { policy_type, .. } => {
                 panic!(
                     "expected denial containing `{needle}`, but access was granted by `{policy_type}`"
+                );
+            }
+            Self::Indeterminate { reason, .. } => {
+                panic!(
+                    "expected denial containing `{needle}`, but the evaluation was \
+                     indeterminate: {reason}"
                 );
             }
         }
@@ -626,6 +785,12 @@ impl AccessEvaluation {
             Self::Granted { policy_type, .. } => {
                 panic!(
                     "expected not-applicable by policy `{expected}`, but access was granted by `{policy_type}`"
+                );
+            }
+            Self::Indeterminate { reason, .. } => {
+                panic!(
+                    "expected not-applicable by policy `{expected}`, but the evaluation was \
+                     indeterminate: {reason}"
                 );
             }
             Self::Denied { trace, .. } => {
@@ -679,6 +844,12 @@ impl AccessEvaluation {
             Self::Granted { policy_type, .. } => {
                 panic!(
                     "expected forbid by policy `{expected}`, but access was granted by `{policy_type}`"
+                );
+            }
+            Self::Indeterminate { reason, .. } => {
+                panic!(
+                    "expected forbid by policy `{expected}`, but the evaluation was \
+                     indeterminate: {reason}"
                 );
             }
             Self::Denied { .. } => match self.forbidden_by() {
@@ -753,7 +924,12 @@ impl AccessEvaluation {
     pub fn to_result<E>(&self, error_fn: impl FnOnce(&str) -> E) -> Result<(), E> {
         match self {
             Self::Granted { .. } => Ok(()),
-            Self::Denied { reason, .. } => Err(error_fn(reason)),
+            // Indeterminate is fail-closed: it maps to an error like a
+            // denial. Callers that want to surface it differently (e.g.
+            // as a 5xx) should branch on `is_indeterminate()` first.
+            Self::Denied { reason, .. } | Self::Indeterminate { reason, .. } => {
+                Err(error_fn(reason))
+            }
         }
     }
 
@@ -791,6 +967,9 @@ impl fmt::Display for AccessEvaluation {
             }
             Self::Denied { reason, trace: _ } => {
                 write!(f, "[Denied] - {}", reason)
+            }
+            Self::Indeterminate { reason, trace: _ } => {
+                write!(f, "[INDETERMINATE] - {}", reason)
             }
         }
     }
@@ -950,19 +1129,99 @@ impl PolicyEvalResult {
         }
     }
 
-    /// Returns whether this evaluation resulted in access being granted
-    pub fn is_granted(&self) -> bool {
-        match self {
-            Self::Granted { .. } => true,
-            Self::NotApplicable { .. } | Self::Forbidden { .. } => false,
-            Self::Combined { outcome, .. } => *outcome,
+    /// Builds an indeterminate leaf result with no fact provenance.
+    ///
+    /// Use this when the policy could not be evaluated because an input it
+    /// needed was unavailable and the failure is explained by `reason`
+    /// alone. Prefer [`Self::indeterminate_with_facts`] (or
+    /// [`crate::EvalCtx::indeterminate`] inside policy bodies) when the
+    /// failed fact loads are known, so callers can classify the failure via
+    /// [`FactProvenance::error_kind`].
+    pub fn indeterminate(
+        policy_type: impl Into<Cow<'static, str>>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::Indeterminate {
+            policy_type: policy_type.into(),
+            reason: reason.into(),
+            provenance: Vec::new(),
         }
     }
 
-    /// Returns whether this result contains an active forbid
-    /// ([`PolicyEvalResult::Forbidden`]).
+    /// Builds an indeterminate leaf result carrying the facts that could not
+    /// be loaded (and any that were).
+    pub fn indeterminate_with_facts(
+        policy_type: impl Into<Cow<'static, str>>,
+        reason: impl Into<String>,
+        provenance: Vec<FactProvenance>,
+    ) -> Self {
+        Self::Indeterminate {
+            policy_type: policy_type.into(),
+            reason: reason.into(),
+            provenance,
+        }
+    }
+
+    /// Returns the decision carried by this node.
+    ///
+    /// Leaves map 1:1 onto their variant; [`PolicyEvalResult::Combined`]
+    /// returns its stored aggregate decision without walking children.
+    pub fn decision(&self) -> Decision {
+        match self {
+            Self::Granted { .. } => Decision::Grant,
+            Self::NotApplicable { .. } => Decision::NotApplicable,
+            Self::Forbidden { .. } => Decision::Forbid,
+            Self::Indeterminate { .. } => Decision::Indeterminate,
+            Self::Combined { decision, .. } => *decision,
+        }
+    }
+
+    /// Returns whether this evaluation resulted in access being granted
+    pub fn is_granted(&self) -> bool {
+        self.decision() == Decision::Grant
+    }
+
+    /// Returns whether this result contains an active forbid.
+    ///
+    /// True when this node's [`Self::decision`] is [`Decision::Forbid`]
+    /// **or** a [`PolicyEvalResult::Forbidden`] leaf survives anywhere in
+    /// the tree. The whole-tree scan is a fail-closed backstop: the crate's
+    /// combinators always keep a `Combined` node's decision consistent with
+    /// its children, but a custom combinator that (incorrectly) reports a
+    /// non-forbid decision while keeping a `Forbidden` leaf in its children
+    /// is still treated as forbidding — and a `WARN` names the inconsistent
+    /// node so the broken combinator is visible in logs rather than being
+    /// silently corrected forever. The warning fires on every call that
+    /// takes the backstop path (the checker and combinators consult
+    /// `is_forbidden` several times per evaluation), so one inconsistent
+    /// node can log more than once per request; that is accepted noise for
+    /// a condition that indicates a broken combinator. The scan
+    /// short-circuits as soon as a forbid is found.
     pub fn is_forbidden(&self) -> bool {
-        self.forbidden_leaf().is_some()
+        if self.decision() == Decision::Forbid {
+            return true;
+        }
+        match self.forbidden_leaf() {
+            Some((leaf_policy_type, _)) => {
+                if let Self::Combined {
+                    policy_type,
+                    decision,
+                    ..
+                } = self
+                {
+                    tracing::warn!(
+                        node.policy_type = policy_type.as_ref(),
+                        node.decision = %decision,
+                        forbidden_leaf.policy_type = leaf_policy_type,
+                        "Combined node reports a non-forbid decision but keeps a Forbidden \
+                         leaf in its children; treating it as forbidding (fail closed). \
+                         Fix the combinator that built this node."
+                    );
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn forbidden_leaf(&self) -> Option<(&str, Option<&str>)> {
@@ -973,7 +1232,32 @@ impl PolicyEvalResult {
                 ..
             } => Some((policy_type.as_ref(), Some(reason.as_str()))),
             Self::Combined { children, .. } => children.iter().find_map(Self::forbidden_leaf),
-            Self::Granted { .. } | Self::NotApplicable { .. } => None,
+            Self::Granted { .. } | Self::NotApplicable { .. } | Self::Indeterminate { .. } => None,
+        }
+    }
+
+    /// Returns the first indeterminate leaf along the indeterminate spine of
+    /// the tree, as `(policy_type, reason)`. Used to attribute an
+    /// [`AccessEvaluation::Indeterminate`] summary to the policy whose input
+    /// was unavailable. Combined nodes are only entered when they are
+    /// themselves indeterminate, so an incidental indeterminate leaf inside
+    /// a resolved subtree is not misattributed as the cause.
+    pub(crate) fn indeterminate_leaf(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Indeterminate {
+                policy_type,
+                reason,
+                ..
+            } => Some((policy_type.as_ref(), reason.as_str())),
+            Self::Combined {
+                children,
+                decision: Decision::Indeterminate,
+                ..
+            } => children.iter().find_map(Self::indeterminate_leaf),
+            Self::Combined { .. }
+            | Self::Granted { .. }
+            | Self::NotApplicable { .. }
+            | Self::Forbidden { .. } => None,
         }
     }
 
@@ -989,7 +1273,9 @@ impl PolicyEvalResult {
     pub fn reason_str(&self) -> Option<&str> {
         match self {
             Self::Granted { reason, .. } => reason.as_deref(),
-            Self::NotApplicable { reason, .. } | Self::Forbidden { reason, .. } => Some(reason),
+            Self::NotApplicable { reason, .. }
+            | Self::Forbidden { reason, .. }
+            | Self::Indeterminate { reason, .. } => Some(reason),
             Self::Combined { .. } => None,
         }
     }
@@ -1001,7 +1287,8 @@ impl PolicyEvalResult {
         match self {
             Self::Granted { provenance, .. }
             | Self::NotApplicable { provenance, .. }
-            | Self::Forbidden { provenance, .. } => provenance,
+            | Self::Forbidden { provenance, .. }
+            | Self::Indeterminate { provenance, .. } => provenance,
             Self::Combined { .. } => &[],
         }
     }
@@ -1039,16 +1326,29 @@ impl PolicyEvalResult {
                 let headline = format!("{}⛔ {} FORBIDDEN: {}", indent_str, policy_type, reason);
                 Self::append_provenance(headline, &indent_str, provenance)
             }
+            Self::Indeterminate {
+                policy_type,
+                reason,
+                provenance,
+            } => {
+                let headline = format!("{}⚠ {} INDETERMINATE: {}", indent_str, policy_type, reason);
+                Self::append_provenance(headline, &indent_str, provenance)
+            }
             Self::Combined {
                 policy_type,
                 operation,
                 children,
-                outcome,
+                decision,
             } => {
-                let outcome_char = if *outcome { "✔" } else { "✘" };
+                let decision_char = match decision {
+                    Decision::Grant => "✔",
+                    Decision::NotApplicable => "✘",
+                    Decision::Forbid => "⛔",
+                    Decision::Indeterminate => "⚠",
+                };
                 let mut result = format!(
                     "{}{} {} ({})",
-                    indent_str, outcome_char, policy_type, operation
+                    indent_str, decision_char, policy_type, operation
                 );
 
                 for child in children {

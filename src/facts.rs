@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// dropped when the session is dropped, so permission revocations or backend
 /// changes are observed by the next session rather than being held in a
 /// process-global cache.
-pub trait FactKey: Eq + Hash + Clone + Send + Sync + 'static {
+pub trait FactKey: Eq + Hash + Clone + fmt::Debug + Send + Sync + 'static {
     /// The value returned by a [`FactSource`] for this key.
     type Value: Clone + Send + Sync + 'static;
 
@@ -25,6 +25,18 @@ pub trait FactKey: Eq + Hash + Clone + Send + Sync + 'static {
     /// The session registry is keyed by [`std::any::TypeId`], not by this name, so two
     /// unrelated key types with the same name do not share a source or cache.
     const NAME: &'static str;
+
+    /// Renders the key for diagnostics: the [`crate::FactProvenance::key`]
+    /// string recorded when this key is loaded through
+    /// [`crate::EvalCtx::fact`] and friends.
+    ///
+    /// Defaults to the `Debug` representation. Override it when the key has
+    /// an established audit form (as [`RelationshipQuery`] does) — the
+    /// rendered string reaches evaluation traces, `tracing` subscribers, and
+    /// serialized audit logs, so treat it as audit surface.
+    fn render(&self) -> String {
+        format!("{self:?}")
+    }
 }
 
 /// Private error type backing [`FactLoadError::backend_message`], so callers
@@ -164,7 +176,8 @@ pub enum FactLoadResult<V> {
     Found(V),
     /// The fact source was reached, but no value exists for the key.
     Missing,
-    /// Loading failed. Policies should map this to a denied decision.
+    /// Loading failed. Policies that require the fact should map this to an
+    /// indeterminate decision.
     Error(FactLoadError),
 }
 
@@ -236,31 +249,25 @@ pub enum FactLoadResult<V> {
 ///     &self,
 ///     ctx: &EvalCtx<'_, InvoiceAccess>,
 /// ) -> PolicyEvalResult {
-///     let key = CustomerForOrg(ctx.subject.org_id);
-///     let result = ctx.session.get(key.clone()).await;
-///     let provenance = vec![FactProvenance::from_load_result(
-///         CustomerForOrg::NAME,
-///         format!("{key:?}"),
-///         &result,
-///     )];
-///
-///     match result {
+///     match ctx.fact(CustomerForOrg(ctx.subject.org_id)).await {
 ///         FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
-///             ctx.grant_with_facts(
-///                 "subject's org bills under the invoice's customer",
-///                 provenance,
-///             )
+///             ctx.grant("subject's org bills under the invoice's customer")
 ///         }
-///         _ => ctx.not_applicable_with_facts("not the billing customer", provenance),
+///         _ => ctx.not_applicable("not the billing customer"),
 ///     }
 /// }
 /// ```
 ///
-/// Recording provenance is operationally significant: it lets
-/// [`crate::AccessEvaluation::denied_due_to_fact_load_error`] distinguish a
-/// failed load from an ordinary authorization denial. Policies should use
+/// [`crate::EvalCtx::fact`] records the consulted fact as
+/// [`crate::FactProvenance`] and the context's result helpers attach it, so
+/// provenance is correct by construction — and a failed load reported
+/// through `ctx.not_applicable` is upgraded to an indeterminate result,
+/// which lets [`crate::AccessEvaluation::is_indeterminate`] distinguish a
+/// failed load from an ordinary authorization denial. Policies that load
+/// outside the context (via [`crate::EvalCtx::session`]) can still record
+/// provenance manually with
 /// [`FactProvenance::from_load_result`](crate::FactProvenance::from_load_result)
-/// whenever a load result contributes to a decision.
+/// and [`crate::EvalCtx::record`].
 ///
 /// The built-in [`RebacPolicy`](crate::RebacPolicy) generalises this idiom
 /// for relationship-shaped facts; the same plumbing handles arbitrary
@@ -383,11 +390,21 @@ pub struct RelationshipQuery<SubjectId, ResourceId, Relation> {
 
 impl<SubjectId, ResourceId, Relation> FactKey for RelationshipQuery<SubjectId, ResourceId, Relation>
 where
-    SubjectId: Eq + Hash + Clone + Send + Sync + 'static,
-    ResourceId: Eq + Hash + Clone + Send + Sync + 'static,
-    Relation: Eq + Hash + Clone + Send + Sync + 'static,
+    SubjectId: Eq + Hash + Clone + fmt::Debug + Send + Sync + 'static,
+    ResourceId: Eq + Hash + Clone + fmt::Debug + Send + Sync + 'static,
+    Relation: Eq + Hash + Clone + fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     type Value = bool;
 
     const NAME: &'static str = "relationship";
+
+    /// Renders the relationship in its established audit form,
+    /// `subject -[relation]-> resource`, preserving the key string recorded
+    /// on provenance by pre-0.6 `RebacPolicy` versions.
+    fn render(&self) -> String {
+        format!(
+            "{:?} -[{}]-> {:?}",
+            self.subject_id, self.relation, self.resource_id
+        )
+    }
 }
