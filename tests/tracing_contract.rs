@@ -1,7 +1,9 @@
+#![cfg(feature = "tracing")]
+
 use async_trait::async_trait;
 use gatehouse::{
-    BatchEvalCtx, CombineOp, Decision, EvalCtx, EvaluationSession, FactOutcome, FactProvenance,
-    PermissionChecker, Policy, PolicyBuilder, PolicyDomain, PolicyEvalResult,
+    BatchEvalCtx, EvalCtx, EvaluationSession, FactOutcome, FactProvenance, GrantResult,
+    PermissionChecker, Policy, PolicyBuilder, PolicyDomain, VetoPolicy, VetoResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -42,14 +44,11 @@ struct TracePolicy;
 
 #[async_trait]
 impl Policy<Domain> for TracePolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> GrantResult {
         result_for(ctx.resource.allowed)
     }
 
-    async fn evaluate_batch<'item>(
-        &self,
-        ctx: &BatchEvalCtx<'item, Domain>,
-    ) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, Domain>) -> Vec<GrantResult> {
         ctx.items
             .iter()
             .map(|item| result_for(item.resource.allowed))
@@ -65,7 +64,7 @@ struct IndeterminateTracePolicy;
 
 #[async_trait]
 impl Policy<Domain> for IndeterminateTracePolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> GrantResult {
         ctx.indeterminate("fact backend unreachable")
     }
 
@@ -74,85 +73,20 @@ impl Policy<Domain> for IndeterminateTracePolicy {
     }
 }
 
-struct GrantingForbidPolicy;
-
-#[async_trait]
-impl Policy<Domain> for GrantingForbidPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
-        ctx.grant("misbehaving forbid grant")
-    }
-
-    async fn evaluate_batch<'item>(
-        &self,
-        ctx: &BatchEvalCtx<'item, Domain>,
-    ) -> Vec<PolicyEvalResult> {
-        ctx.items
-            .iter()
-            .map(|_| PolicyEvalResult::granted(self.policy_type(), Some("misbehaving".into())))
-            .collect()
-    }
-
-    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("GrantingForbidPolicy")
-    }
-
-    fn effect(&self) -> gatehouse::Effect {
-        gatehouse::Effect::Forbid
-    }
-}
-
-struct ForbiddingAllowPolicy;
-
-#[async_trait]
-impl Policy<Domain> for ForbiddingAllowPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
-        ctx.forbid("forbid without declaring an effect")
-    }
-
-    async fn evaluate_batch<'item>(
-        &self,
-        ctx: &BatchEvalCtx<'item, Domain>,
-    ) -> Vec<PolicyEvalResult> {
-        ctx.items
-            .iter()
-            .map(|_| {
-                PolicyEvalResult::forbidden(
-                    self.policy_type(),
-                    "forbid without declaring an effect",
-                )
-            })
-            .collect()
-    }
-
-    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("ForbiddingAllowPolicy")
-    }
-
-    // Intentionally no `effect()` override: defaults to `Effect::Allow`, so
-    // forbidding here is the contract violation the checker should warn about.
-}
-
 struct WrongLengthTracePolicy;
 
 #[async_trait]
-impl Policy<Domain> for WrongLengthTracePolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
-        ctx.not_applicable("not applicable")
+impl VetoPolicy<Domain> for WrongLengthTracePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> VetoResult {
+        ctx.pass("not applicable")
     }
 
-    async fn evaluate_batch<'item>(
-        &self,
-        _ctx: &BatchEvalCtx<'item, Domain>,
-    ) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, _ctx: &BatchEvalCtx<'item, Domain>) -> Vec<VetoResult> {
         Vec::new()
     }
 
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("WrongLengthTracePolicy")
-    }
-
-    fn effect(&self) -> gatehouse::Effect {
-        gatehouse::Effect::Forbid
     }
 }
 
@@ -160,19 +94,14 @@ struct RecordedErrorCombinedPolicy;
 
 #[async_trait]
 impl Policy<Domain> for RecordedErrorCombinedPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> GrantResult {
         ctx.record(FactProvenance::new(
             "membership",
             "Membership(7)",
             FactOutcome::Error,
             Some("membership backend unavailable".to_string()),
         ));
-        PolicyEvalResult::Combined {
-            policy_type: self.policy_type(),
-            operation: CombineOp::And,
-            children: Vec::new(),
-            decision: Decision::NotApplicable,
-        }
+        GrantResult::all(self.policy_type(), Vec::new())
     }
 
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -180,11 +109,11 @@ impl Policy<Domain> for RecordedErrorCombinedPolicy {
     }
 }
 
-fn result_for(allowed: bool) -> PolicyEvalResult {
+fn result_for(allowed: bool) -> GrantResult {
     if allowed {
-        PolicyEvalResult::granted("TracePolicy", Some("allowed".to_string()))
+        GrantResult::granted("TracePolicy", Some("allowed".to_string()))
     } else {
-        PolicyEvalResult::not_applicable("TracePolicy", "denied")
+        GrantResult::not_applicable("TracePolicy", "denied")
     }
 }
 
@@ -650,11 +579,7 @@ fn tracing_fields_are_recorded_for_forbidden_decisions() {
     // An allow policy that would grant, vetoed by a forbid-effect policy.
     let mut checker = PermissionChecker::new();
     checker.add_policy(TracePolicy);
-    checker.add_policy(
-        PolicyBuilder::<Domain>::new("GlobalFreeze")
-            .forbid()
-            .build(),
-    );
+    checker.add_veto(PolicyBuilder::<Domain>::new("GlobalFreeze").build_veto());
 
     let session = EvaluationSession::empty();
     let (result, spans) = capture_async(|| async {
@@ -737,12 +662,12 @@ fn tracing_records_indeterminate_outcomes_and_batch_counts() {
 }
 
 #[test]
-fn tracing_warns_when_combined_result_preserves_recorded_errors() {
+fn tracing_records_combined_indeterminate_with_recorded_errors() {
     let mut checker = PermissionChecker::new();
     checker.add_policy(RecordedErrorCombinedPolicy);
     let session = EvaluationSession::empty();
 
-    let (result, _spans, events) = capture_async_with_events(|| async {
+    let (result, spans, events) = capture_async_with_events(|| async {
         checker
             .bind(&session, &Subject, &Action, &Ctx)
             .check(&Resource { allowed: false })
@@ -750,26 +675,30 @@ fn tracing_warns_when_combined_result_preserves_recorded_errors() {
     });
 
     result.assert_indeterminate();
+    assert_value(
+        span(&spans, "evaluate_one"),
+        "policy.type",
+        "RecordedErrorCombinedPolicy",
+    );
     assert_eq!(result.fact_load_errors().len(), 1);
 
-    let warning = events
+    let event = events
         .iter()
         .find(|event| {
-            event.level == "WARN"
-                && event.values.get("message").is_some_and(|message| {
-                    message.contains("preserving the failures on an Indeterminate child")
-                })
+            event
+                .values
+                .get("policy.type")
+                .is_some_and(|value| value == "RecordedErrorCombinedPolicy")
         })
-        .unwrap_or_else(|| panic!("missing combined-error warning; events: {events:#?}"));
-    assert_event_value(warning, "policy.type", "RecordedErrorCombinedPolicy");
-    assert_event_value(warning, "recorded_count", "1");
-    assert_event_value(warning, "error_count", "1");
+        .expect("aggregate security event");
+    assert_event_value(event, "event.outcome", "unknown");
+    assert!(!events.iter().any(|event| event.level == "WARN"));
 }
 
 #[test]
 fn tracing_records_wrong_length_batch_policy_denials() {
     let mut checker = PermissionChecker::new();
-    checker.add_policy(WrongLengthTracePolicy);
+    checker.add_veto(WrongLengthTracePolicy);
     let session = EvaluationSession::empty();
     let (_results, spans) = capture_async(|| async {
         checker
@@ -792,212 +721,140 @@ fn tracing_records_wrong_length_batch_policy_denials() {
     assert_value(policy, "policy.forbidden_count", "0");
 }
 
-/// A combinator node whose decision disagrees with a surviving `Forbidden`
-/// leaf is treated as forbidding, and the backstop names the inconsistent
-/// node in a `WARN` so the broken combinator is visible in logs.
-struct LyingGrantNodePolicy;
+#[test]
+fn wrong_length_veto_emits_contract_warning() {
+    let mut checker = PermissionChecker::new();
+    checker.add_veto(WrongLengthTracePolicy);
+    checker.add_policy(TracePolicy);
+    let session = EvaluationSession::empty();
+    let (results, spans, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .evaluate(vec![
+                Resource { allowed: true },
+                Resource { allowed: false },
+            ])
+            .await
+    });
+    assert!(results.iter().all(|(_, result)| result.is_indeterminate()));
+    let warning = events
+        .iter()
+        .find(|event| event.level == "WARN")
+        .expect("batch contract warning");
+    assert_event_value(warning, "policy.type", "WrongLengthTracePolicy");
+    assert_event_value(warning, "expected", "2");
+    assert_event_value(warning, "actual", "0");
+    assert!(!spans.iter().any(|span| span
+        .values
+        .get("policy.type")
+        .is_some_and(|name| name == "TracePolicy")));
+}
 
-#[async_trait]
-impl Policy<Domain> for LyingGrantNodePolicy {
-    async fn evaluate(&self, _ctx: &EvalCtx<'_, Domain>) -> PolicyEvalResult {
-        PolicyEvalResult::Combined {
-            policy_type: std::borrow::Cow::Borrowed("LyingGrantNodePolicy"),
-            operation: gatehouse::CombineOp::And,
-            children: vec![PolicyEvalResult::forbidden("HiddenVeto", "buried veto")],
-            decision: gatehouse::Decision::Grant,
+#[test]
+fn passing_veto_and_grant_report_separate_phase_events() {
+    let mut checker = PermissionChecker::new();
+    checker.add_veto(
+        PolicyBuilder::<Domain>::new("Freeze")
+            .when(|_, _, _, _| false)
+            .build_veto(),
+    );
+    checker.add_policy(TracePolicy);
+    let session = EvaluationSession::empty();
+    let (result, _, events) = capture_async_with_events(|| async {
+        checker
+            .bind(&session, &Subject, &Action, &Ctx)
+            .check(&Resource { allowed: true })
+            .await
+    });
+    assert!(result.is_granted());
+    assert!(!events.iter().any(|event| event.level == "WARN"));
+    let veto = events
+        .iter()
+        .find(|event| {
+            event
+                .values
+                .get("policy.type")
+                .is_some_and(|name| name == "Freeze")
+        })
+        .expect("veto event");
+    assert_event_value(veto, "policy.effect", "deny");
+    let grant = events
+        .iter()
+        .find(|event| {
+            event
+                .values
+                .get("policy.type")
+                .is_some_and(|name| name == "TracePolicy")
+        })
+        .expect("grant event");
+    assert_event_value(grant, "policy.effect", "allow");
+    assert_event_value(grant, "event.outcome", "success");
+}
+
+#[test]
+fn composed_and_delegated_rule_names_and_metadata_reach_security_events() {
+    use gatehouse::{DelegatingPolicy, PolicyExt, SecurityRuleMetadata};
+    let mut child = PermissionChecker::new();
+    child.add_policy(TracePolicy);
+    let delegate = DelegatingPolicy::new(
+        "NamedDelegate",
+        child,
+        |_: &Subject| Subject,
+        |_: &Action| Action,
+        |_: &Subject, _: &Action, resource: &Resource, _: &Ctx| resource.clone(),
+        |_: &Subject, _: &Action, _: &Ctx| Ctx,
+    )
+    .with_security_rule(
+        SecurityRuleMetadata::new()
+            .with_name("Delegated security rule")
+            .with_category("Document access")
+            .with_ruleset_name("Document rules")
+            .with_description("Delegated access check"),
+    );
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(PolicyBuilder::<Domain>::new("AlwaysGrant").build().not());
+    checker.add_delegate(delegate);
+    let session = EvaluationSession::empty();
+    for batch in [false, true] {
+        let (results, _spans, events) = capture_async_with_events(|| async {
+            let bound = checker.bind(&session, &Subject, &Action, &Ctx);
+            if batch {
+                bound
+                    .evaluate(vec![Resource { allowed: true }])
+                    .await
+                    .into_iter()
+                    .map(|(_, result)| result)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![bound.check(&Resource { allowed: true }).await]
+            }
+        });
+        assert!(results[0].is_granted());
+        let rule_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.target == "gatehouse::security")
+            .collect();
+        let negation = rule_events
+            .iter()
+            .find(|event| event.values.get("policy.type").map(String::as_str) == Some("NotPolicy"))
+            .expect("negation emits its public rule name");
+        assert_event_value(negation, "security_rule.name", "NotPolicy");
+        let delegates: Vec<_> = rule_events
+            .iter()
+            .filter(|event| {
+                event.values.get("policy.type").map(String::as_str) == Some("NamedDelegate")
+            })
+            .collect();
+        assert_eq!(
+            delegates.len(),
+            2,
+            "each delegated capability emits metadata"
+        );
+        for event in delegates {
+            assert_event_value(event, "security_rule.name", "Delegated security rule");
+            assert_event_value(event, "security_rule.category", "Document access");
+            assert_event_value(event, "security_rule.ruleset.name", "Document rules");
+            assert_event_value(event, "security_rule.description", "Delegated access check");
         }
     }
-
-    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("LyingGrantNodePolicy")
-    }
-
-    fn effect(&self) -> gatehouse::Effect {
-        gatehouse::Effect::AllowOrForbid
-    }
-}
-
-#[test]
-fn tracing_records_inconsistent_combined_node_warning() {
-    let mut checker = PermissionChecker::new();
-    checker.add_policy(LyingGrantNodePolicy);
-    let session = EvaluationSession::empty();
-
-    let (result, _spans, events) = capture_async_with_events(|| async {
-        checker
-            .bind(&session, &Subject, &Action, &Ctx)
-            .check(&Resource { allowed: true })
-            .await
-    });
-    assert!(!result.is_granted(), "the buried veto must fail closed");
-
-    let warning = events
-        .iter()
-        .find(|event| {
-            event.level == "WARN"
-                && event
-                    .values
-                    .get("message")
-                    .is_some_and(|message| message.contains("non-forbid decision"))
-        })
-        .unwrap_or_else(|| panic!("missing inconsistent-node warning; events: {events:#?}"));
-    assert_event_value(warning, "node.policy_type", "LyingGrantNodePolicy");
-    assert_event_value(warning, "node.decision", "GRANT");
-    assert_event_value(warning, "forbidden_leaf.policy_type", "HiddenVeto");
-
-    // Consistent trees never trigger the backstop warning.
-    let mut clean_checker = PermissionChecker::new();
-    clean_checker.add_policy(PolicyBuilder::<Domain>::new("CleanForbid").forbid().build());
-    let (_result, _spans, clean_events) = capture_async_with_events(|| async {
-        clean_checker
-            .bind(&session, &Subject, &Action, &Ctx)
-            .check(&Resource { allowed: true })
-            .await
-    });
-    assert!(
-        clean_events.iter().all(|event| {
-            !event
-                .values
-                .get("message")
-                .is_some_and(|message| message.contains("non-forbid decision"))
-        }),
-        "consistent nodes must not emit the backstop warning: {clean_events:#?}"
-    );
-}
-
-#[test]
-fn tracing_records_forbid_effect_contract_violation_warning() {
-    let mut checker = PermissionChecker::new();
-    checker.add_policy(GrantingForbidPolicy);
-    let session = EvaluationSession::empty();
-    let (_results, spans, events) = capture_async_with_events(|| async {
-        checker
-            .bind(&session, &Subject, &Action, &Ctx)
-            .evaluate(vec![Resource { allowed: true }])
-            .await
-    });
-
-    let policy = span(&spans, "gatehouse.batch_policy");
-    assert_value(policy, "policy.type", "GrantingForbidPolicy");
-    assert_value(policy, "policy.denied_count", "1");
-    assert_value(policy, "policy.granted_count", "0");
-
-    let warning = events
-        .iter()
-        .find(|event| {
-            event.level == "WARN"
-                && event.values.get("message").is_some_and(|message| {
-                    message.contains("Forbid-effect policy returned a grant")
-                })
-        })
-        .unwrap_or_else(|| panic!("missing contract-violation warning; events: {events:#?}"));
-    assert_event_value(warning, "policy.type", "GrantingForbidPolicy");
-    assert_event_value(warning, "item_count", "1");
-
-    let mut clean_checker = PermissionChecker::new();
-    clean_checker.add_policy(PolicyBuilder::<Domain>::new("CleanForbid").forbid().build());
-    let (_results, _spans, clean_events) = capture_async_with_events(|| async {
-        clean_checker
-            .bind(&session, &Subject, &Action, &Ctx)
-            .evaluate(vec![Resource { allowed: true }])
-            .await
-    });
-    assert!(
-        clean_events.iter().all(|event| {
-            !event
-                .values
-                .get("message")
-                .is_some_and(|message| message.contains("Forbid-effect policy returned a grant"))
-        }),
-        "well-behaved forbid policies must not emit contract-violation warnings: {clean_events:#?}"
-    );
-}
-
-#[test]
-fn tracing_records_allow_effect_contract_violation_warning() {
-    let mut checker = PermissionChecker::new();
-    checker.add_policy(ForbiddingAllowPolicy);
-    let session = EvaluationSession::empty();
-
-    // Batch path: the veto is still honored (fail-safe, not silently dropped)
-    // and a single warning records the contract violation with its count.
-    let (results, _spans, events) = capture_async_with_events(|| async {
-        checker
-            .bind(&session, &Subject, &Action, &Ctx)
-            .evaluate(vec![Resource { allowed: true }])
-            .await
-    });
-    assert!(!results[0].1.is_granted());
-
-    let warning = events
-        .iter()
-        .find(|event| {
-            event.level == "WARN"
-                && event.values.get("message").is_some_and(|message| {
-                    message.contains("Allow-effect policy returned a forbid")
-                })
-        })
-        .unwrap_or_else(|| panic!("missing contract-violation warning; events: {events:#?}"));
-    assert_event_value(warning, "policy.type", "ForbiddingAllowPolicy");
-    assert_event_value(warning, "item_count", "1");
-
-    // Single path: the same warning fires, and access is still denied.
-    let (single, _spans, single_events) = capture_async_with_events(|| async {
-        checker
-            .bind(&session, &Subject, &Action, &Ctx)
-            .check(&Resource { allowed: true })
-            .await
-    });
-    assert!(!single.is_granted());
-    assert!(
-        single_events.iter().any(|event| {
-            event.level == "WARN"
-                && event.values.get("message").is_some_and(|message| {
-                    message.contains("Allow-effect policy returned a forbid")
-                })
-        }),
-        "single-path evaluation must emit the contract-violation warning: {single_events:#?}"
-    );
-
-    // A policy that declares its forbid effect is well-behaved: no warning.
-    let mut clean_checker = PermissionChecker::new();
-    clean_checker.add_policy(PolicyBuilder::<Domain>::new("CleanForbid").forbid().build());
-    let (_results, _spans, clean_events) = capture_async_with_events(|| async {
-        clean_checker
-            .bind(&session, &Subject, &Action, &Ctx)
-            .evaluate(vec![Resource { allowed: true }])
-            .await
-    });
-    assert!(
-        clean_events.iter().all(|event| {
-            !event
-                .values
-                .get("message")
-                .is_some_and(|message| message.contains("Allow-effect policy returned a forbid"))
-        }),
-        "policies declaring their forbid effect must not emit contract-violation warnings: {clean_events:#?}"
-    );
-
-    // Single path, well-behaved: a plain `Effect::Allow` policy that does not
-    // forbid must emit no contract-violation warning. This pins that *both*
-    // operands matter — an `Allow` declaration alone (without a forbid result)
-    // is not enough to warn — so the guard cannot weaken from `&&` to `||`.
-    let mut allow_checker = PermissionChecker::new();
-    allow_checker.add_policy(TracePolicy);
-    let (granted, _spans, allow_events) = capture_async_with_events(|| async {
-        allow_checker
-            .bind(&session, &Subject, &Action, &Ctx)
-            .check(&Resource { allowed: true })
-            .await
-    });
-    assert!(granted.is_granted());
-    assert!(
-        allow_events.iter().all(|event| {
-            !event
-                .values
-                .get("message")
-                .is_some_and(|message| message.contains("Allow-effect policy returned a forbid"))
-        }),
-        "an allow policy that does not forbid must not emit the contract-violation warning: {allow_events:#?}"
-    );
 }

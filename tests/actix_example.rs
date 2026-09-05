@@ -210,3 +210,45 @@ async fn list_posts_filters_by_relationship() {
     );
     assert!(body.contains("published announcement"));
 }
+
+struct UnavailableRelationships;
+
+#[async_trait::async_trait]
+impl<K: gatehouse::FactKey<Value = bool>> gatehouse::FactSource<K> for UnavailableRelationships {
+    async fn load_many(&self, keys: &[K]) -> Vec<gatehouse::FactLoadResult<bool>> {
+        keys.iter()
+            .map(|_| {
+                gatehouse::FactLoadResult::Error(gatehouse::FactLoadError::backend_message(
+                    "injected outage",
+                ))
+            })
+            .collect()
+    }
+}
+
+#[actix_web::test]
+async fn authorization_outage_returns_503_for_single_and_list_but_admin_still_grants() {
+    let state = actix_example::AppState::demo().with_relationship_source(UnavailableRelationships);
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .route("/posts", web::get().to(actix_example::list_posts))
+            .route("/posts/{id}", web::get().to(actix_example::view_post)),
+    )
+    .await;
+    for uri in ["/posts", "/posts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"] {
+        let request = test::TestRequest::get().uri(uri).to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = test::read_body(response).await;
+        assert!(!String::from_utf8_lossy(&body).contains("injected outage"));
+        let request = test::TestRequest::get()
+            .uri(uri)
+            .insert_header(("x-roles", "admin"))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::OK
+        );
+    }
+}

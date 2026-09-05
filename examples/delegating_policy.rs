@@ -18,8 +18,8 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    DelegatingPolicy, EvalCtx, EvaluationSession, PermissionChecker, Policy, PolicyBuilder,
-    PolicyDomain, PolicyEvalResult,
+    DelegatingPolicy, EvalCtx, EvaluationSession, GrantResult, PermissionChecker, Policy,
+    PolicyBuilder, PolicyDomain,
 };
 use std::borrow::Cow;
 use uuid::Uuid;
@@ -99,7 +99,7 @@ struct AuthorCanEditComment;
 
 #[async_trait]
 impl Policy<CommentDomain> for AuthorCanEditComment {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, CommentDomain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, CommentDomain>) -> GrantResult {
         if ctx.subject.user_id == ctx.resource.author_id {
             ctx.grant("subject is the comment author")
         } else {
@@ -133,7 +133,7 @@ fn comment_checker() -> PermissionChecker<CommentDomain> {
 
     let mut checker = PermissionChecker::named("CommentChecker");
     checker.add_policy(AuthorCanEditComment);
-    checker.add_policy(inherit_from_document);
+    checker.add_delegate(inherit_from_document);
     checker
 }
 

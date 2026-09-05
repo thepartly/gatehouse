@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "gatehouse"
-version = "0.6.0"
+version = "0.6.0-alpha.1"
 dependencies = [
  "actix-web",
  "async-trait",

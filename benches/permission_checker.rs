@@ -556,7 +556,7 @@ impl gatehouse::Policy<SubjectOnlyDomain> for ManualSubjectOnlyDynamic {
     async fn evaluate(
         &self,
         ctx: &gatehouse::EvalCtx<'_, SubjectOnlyDomain>,
-    ) -> gatehouse::PolicyEvalResult {
+    ) -> gatehouse::GrantResult {
         if ctx.subject.is_staff {
             ctx.grant("staff")
         } else {
@@ -579,7 +579,7 @@ impl gatehouse::Policy<SubjectOnlyDomain> for ManualSubjectOnlyStatic {
     async fn evaluate(
         &self,
         ctx: &gatehouse::EvalCtx<'_, SubjectOnlyDomain>,
-    ) -> gatehouse::PolicyEvalResult {
+    ) -> gatehouse::GrantResult {
         if ctx.subject.is_staff {
             ctx.grant("staff")
         } else {

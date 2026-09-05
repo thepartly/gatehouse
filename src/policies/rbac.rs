@@ -1,4 +1,4 @@
-use crate::{EvalCtx, Policy, PolicyDomain, PolicyEvalResult};
+use crate::{EvalCtx, GrantResult, Policy, PolicyDomain};
 use async_trait::async_trait;
 use std::marker::PhantomData;
 
@@ -32,7 +32,7 @@ where
     F1: Fn(&D::Action, &D::Resource) -> Vec<RoleId> + Sync + Send,
     F2: Fn(&D::Subject) -> Vec<RoleId> + Sync + Send,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> GrantResult {
         let required_roles = (self.required_roles_resolver)(ctx.action, ctx.resource);
         let subject_roles = (self.subject_roles_resolver)(ctx.subject);
         let has_role = required_roles

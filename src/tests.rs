@@ -6,15 +6,24 @@ use std::sync::Arc;
 
 mod core_tests {
     use super::*;
-    use std::collections::{BTreeMap, HashSet};
+    #[cfg(feature = "tracing")]
+    use std::collections::BTreeMap;
+    use std::collections::HashSet;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc as StdArc, Mutex};
+    #[cfg(feature = "tracing")]
+    use std::sync::Arc as StdArc;
+    use std::sync::Mutex;
+    #[cfg(feature = "tracing")]
     use tracing::field::{Field, Visit};
+    #[cfg(feature = "tracing")]
     use tracing::{Event, Subscriber};
+    #[cfg(feature = "tracing")]
     use tracing_subscriber::layer::{Context, Layer};
+    #[cfg(feature = "tracing")]
     use tracing_subscriber::prelude::*;
+    #[cfg(feature = "tracing")]
     use tracing_subscriber::Registry;
 
     trait TestPolicyExt<D>: Policy<D>
@@ -55,7 +64,7 @@ mod core_tests {
                 let policy_type = self.policy_type();
                 let ctx = EvalCtx::new(&session, subject, action, resource, context, policy_type);
                 let result = self.evaluate(&ctx).await;
-                ctx.finish(result)
+                ctx.finish(result).into_trace()
             })
         }
 
@@ -72,6 +81,9 @@ mod core_tests {
                 let ctx = BatchEvalCtx::new(&session, subject, action, context, items, policy_type);
                 let results = self.evaluate_batch(&ctx).await;
                 ctx.finish(results)
+                    .into_iter()
+                    .map(PolicyResult::into_trace)
+                    .collect()
             })
         }
     }
@@ -216,17 +228,20 @@ mod core_tests {
         type Context = TestContext;
     }
 
+    #[cfg(feature = "tracing")]
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RecordedEvent {
         target: String,
         fields: BTreeMap<String, String>,
     }
 
+    #[cfg(feature = "tracing")]
     #[derive(Default)]
     struct FieldRecorder {
         fields: BTreeMap<String, String>,
     }
 
+    #[cfg(feature = "tracing")]
     impl Visit for FieldRecorder {
         fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
             self.fields
@@ -254,11 +269,13 @@ mod core_tests {
         }
     }
 
+    #[cfg(feature = "tracing")]
     #[derive(Clone, Default)]
     struct EventRecorder {
         events: StdArc<Mutex<Vec<RecordedEvent>>>,
     }
 
+    #[cfg(feature = "tracing")]
     impl<S> Layer<S> for EventRecorder
     where
         S: Subscriber,
@@ -284,7 +301,9 @@ mod core_tests {
     /// cache with `Interest::never`, and later threads using
     /// `with_default(...)` see zero events. This is the standard flake in
     /// tracing tests under parallel execution.
+    #[cfg(feature = "tracing")]
     struct PermissiveNoop;
+    #[cfg(feature = "tracing")]
     impl Subscriber for PermissiveNoop {
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
@@ -299,6 +318,7 @@ mod core_tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    #[cfg(feature = "tracing")]
     fn install_permissive_global() {
         use std::sync::Once;
         static ONCE: Once = Once::new();
@@ -310,6 +330,7 @@ mod core_tests {
         });
     }
 
+    #[cfg(feature = "tracing")]
     fn with_recorded_events<T>(f: impl FnOnce() -> T) -> (T, Vec<RecordedEvent>) {
         install_permissive_global();
         let recorder = EventRecorder::default();
@@ -320,6 +341,7 @@ mod core_tests {
         (result, events)
     }
 
+    #[cfg(feature = "tracing")]
     fn security_events(events: &[RecordedEvent]) -> Vec<&RecordedEvent> {
         events
             .iter()
@@ -354,8 +376,8 @@ mod core_tests {
 
     #[async_trait]
     impl Policy<TestDomain> for AlwaysAllowPolicy {
-        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
-            PolicyEvalResult::granted(
+        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> GrantResult {
+            GrantResult::granted(
                 self.policy_type().to_string(),
                 Some("Always allow policy".to_string()),
             )
@@ -371,8 +393,8 @@ mod core_tests {
 
     #[async_trait]
     impl Policy<TestDomain> for AlwaysDenyPolicy {
-        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
-            PolicyEvalResult::not_applicable(self.policy_type().to_string(), self.0)
+        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> GrantResult {
+            GrantResult::not_applicable(self.policy_type().to_string(), self.0)
         }
 
         fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -387,22 +409,22 @@ mod core_tests {
 
     #[async_trait]
     impl Policy<TestDomain> for EvenResourceBatchPolicy {
-        async fn evaluate(&self, ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
+        async fn evaluate(&self, ctx: &EvalCtx<'_, TestDomain>) -> GrantResult {
             self.single_calls.fetch_add(1, Ordering::SeqCst);
             if ctx.resource.id.as_u128() % 2 == 0 {
-                PolicyEvalResult::granted(
+                GrantResult::granted(
                     self.policy_type().to_string(),
                     Some("even resource".to_string()),
                 )
             } else {
-                PolicyEvalResult::not_applicable(self.policy_type().to_string(), "odd resource")
+                GrantResult::not_applicable(self.policy_type().to_string(), "odd resource")
             }
         }
 
         async fn evaluate_batch<'item>(
             &self,
             ctx: &BatchEvalCtx<'item, TestDomain>,
-        ) -> Vec<PolicyEvalResult> {
+        ) -> Vec<GrantResult> {
             self.batch_calls.fetch_add(1, Ordering::SeqCst);
             let mut results = Vec::with_capacity(ctx.items.len());
             for item in ctx.items {
@@ -429,8 +451,8 @@ mod core_tests {
 
     #[async_trait]
     impl Policy<TestDomain> for MismatchedBatchPolicy {
-        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
-            PolicyEvalResult::granted(
+        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> GrantResult {
+            GrantResult::granted(
                 self.policy_type().to_string(),
                 Some("single item fallback".to_string()),
             )
@@ -439,12 +461,12 @@ mod core_tests {
         async fn evaluate_batch<'item>(
             &self,
             ctx: &BatchEvalCtx<'item, TestDomain>,
-        ) -> Vec<PolicyEvalResult> {
+        ) -> Vec<GrantResult> {
             ctx.items
                 .iter()
                 .skip(1)
                 .map(|_| {
-                    PolicyEvalResult::granted(
+                    GrantResult::granted(
                         self.policy_type().to_string(),
                         Some("wrong batch length".to_string()),
                     )
@@ -457,15 +479,14 @@ mod core_tests {
         }
     }
 
+    #[cfg(feature = "tracing")]
     struct CustomMetadataDenyPolicy;
 
+    #[cfg(feature = "tracing")]
     #[async_trait]
     impl Policy<TestDomain> for CustomMetadataDenyPolicy {
-        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
-            PolicyEvalResult::not_applicable(
-                self.policy_type().to_string(),
-                "Blocked by custom rule",
-            )
+        async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> GrantResult {
+            GrantResult::not_applicable(self.policy_type().to_string(), "Blocked by custom rule")
         }
 
         fn policy_type(&self) -> std::borrow::Cow<'static, str> {
@@ -1003,7 +1024,7 @@ mod core_tests {
         struct OddResourcePolicy;
         #[async_trait]
         impl Policy<TestDomain> for OddResourcePolicy {
-            async fn evaluate(&self, ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
+            async fn evaluate(&self, ctx: &EvalCtx<'_, TestDomain>) -> GrantResult {
                 if ctx.resource.id.as_u128() % 2 == 1 {
                     ctx.grant("odd id")
                 } else {
@@ -1260,6 +1281,7 @@ mod core_tests {
         );
     }
 
+    #[cfg(feature = "tracing")]
     #[test]
     fn test_tracing_uses_default_security_rule_fallbacks() {
         let mut checker = PermissionChecker::new();
@@ -1325,6 +1347,7 @@ mod core_tests {
         );
     }
 
+    #[cfg(feature = "tracing")]
     #[test]
     fn test_tracing_uses_custom_security_rule_metadata() {
         let mut checker = PermissionChecker::new();
@@ -1541,7 +1564,10 @@ mod core_tests {
             provenance[0].key
         );
         // The rendered trace surfaces the fact inline.
-        assert!(result.format(0).contains("↳ fact relationship [found]"));
+        assert!(result
+            .trace()
+            .format(0)
+            .contains("↳ fact relationship [found]"));
     }
 
     #[tokio::test]
@@ -1678,7 +1704,7 @@ mod core_tests {
         assert_eq!(
             results
                 .iter()
-                .map(PolicyEvalResult::is_granted)
+                .map(GrantResult::is_granted)
                 .collect::<Vec<_>>(),
             vec![true, false, true, true, false]
         );
@@ -1922,6 +1948,7 @@ mod core_tests {
                 operation,
                 children,
                 decision,
+                ..
             } => {
                 assert_eq!(operation, CombineOp::And);
                 assert_eq!(decision, Decision::NotApplicable);
@@ -1975,6 +2002,7 @@ mod core_tests {
                 operation,
                 children,
                 decision,
+                ..
             } => {
                 assert_eq!(operation, CombineOp::Or);
                 assert_eq!(decision, Decision::NotApplicable);
@@ -2021,6 +2049,7 @@ mod core_tests {
                 operation,
                 children,
                 decision,
+                ..
             } => {
                 assert_eq!(operation, CombineOp::Not);
                 assert_eq!(decision, Decision::NotApplicable);
@@ -2100,17 +2129,14 @@ mod core_tests {
 
     #[async_trait]
     impl Policy<FeatureFlagDomain> for FeatureFlagPolicy {
-        async fn evaluate(&self, ctx: &EvalCtx<'_, FeatureFlagDomain>) -> PolicyEvalResult {
+        async fn evaluate(&self, ctx: &EvalCtx<'_, FeatureFlagDomain>) -> GrantResult {
             if ctx.context.feature_enabled {
-                PolicyEvalResult::granted(
+                GrantResult::granted(
                     self.policy_type().to_string(),
                     Some("Feature flag enabled".to_string()),
                 )
             } else {
-                PolicyEvalResult::not_applicable(
-                    self.policy_type().to_string(),
-                    "Feature flag disabled",
-                )
+                GrantResult::not_applicable(self.policy_type().to_string(), "Feature flag disabled")
             }
         }
 
@@ -2561,16 +2587,16 @@ mod core_tests {
 
         #[async_trait]
         impl Policy<TestDomain> for CountingPolicy {
-            async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> PolicyEvalResult {
+            async fn evaluate(&self, _ctx: &EvalCtx<'_, TestDomain>) -> GrantResult {
                 self.counter.fetch_add(1, Ordering::SeqCst);
 
                 if self.result {
-                    PolicyEvalResult::granted(
+                    GrantResult::granted(
                         self.policy_type().to_string(),
                         Some("Counting policy granted".to_string()),
                     )
                 } else {
-                    PolicyEvalResult::not_applicable(
+                    GrantResult::not_applicable(
                         self.policy_type().to_string(),
                         "Counting policy denied",
                     )
@@ -2874,6 +2900,7 @@ mod core_tests {
     #[test]
     fn test_policy_eval_result_reason_combined() {
         let result = PolicyEvalResult::Combined {
+            provenance: Vec::new(),
             policy_type: std::borrow::Cow::Borrowed("CombinedPolicy"),
             operation: CombineOp::And,
             children: vec![],
@@ -3118,6 +3145,7 @@ mod core_tests {
         assert_eq!(denied.reason_str(), Some("nope"));
 
         let combined = PolicyEvalResult::Combined {
+            provenance: Vec::new(),
             policy_type: "C".into(),
             operation: CombineOp::Or,
             children: vec![],
@@ -3276,10 +3304,9 @@ mod core_tests {
         // tree-walker checks policy_type, not reason — what we're pinning
         // is that it finds *any* matching leaf.)
         let custom = PolicyBuilder::<TestDomain>::new("SupplierBlock")
-            .forbid()
             .subjects(|_subject| false)
-            .build();
-        checker.add_policy(custom);
+            .build_veto();
+        checker.add_veto(custom);
         checker
     }
 
@@ -3323,11 +3350,7 @@ mod core_tests {
         }
 
         let mut checker = PermissionChecker::<UnitDomain>::new();
-        checker.add_policy(
-            PolicyBuilder::<UnitDomain>::new("GlobalFreeze")
-                .forbid()
-                .build(),
-        );
+        checker.add_veto(PolicyBuilder::<UnitDomain>::new("GlobalFreeze").build_veto());
         let session = EvaluationSession::empty();
         let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
         evaluation.assert_not_applicable_by("GlobalFreeze");
@@ -3520,7 +3543,28 @@ mod policy_builder_tests {
                 let policy_type = self.policy_type();
                 let ctx = EvalCtx::new(&session, subject, action, resource, context, policy_type);
                 let result = self.evaluate(&ctx).await;
-                ctx.finish(result)
+                ctx.finish(result).into_trace()
+            })
+        }
+    }
+
+    impl<D> PolicyBoxExt<D> for Box<dyn VetoPolicy<D>>
+    where
+        D: PolicyDomain,
+    {
+        fn evaluate_access<'a>(
+            &'a self,
+            subject: &'a D::Subject,
+            action: &'a D::Action,
+            resource: &'a D::Resource,
+            context: &'a D::Context,
+        ) -> Pin<Box<dyn Future<Output = PolicyEvalResult> + Send + 'a>> {
+            Box::pin(async move {
+                let session = EvaluationSession::new();
+                let policy_type = self.policy_type();
+                let ctx = EvalCtx::new(&session, subject, action, resource, context, policy_type);
+                let result = self.evaluate(&ctx).await;
+                ctx.finish(result).into_trace()
             })
         }
     }
@@ -3564,6 +3608,68 @@ mod policy_builder_tests {
             policy.policy_type(),
             std::borrow::Cow::Borrowed("AliasName")
         ));
+    }
+
+    #[tokio::test]
+    async fn veto_builder_preserves_borrowed_names_in_scalar_and_batch_results() {
+        let session = EvaluationSession::empty();
+        let subject = TestSubject {
+            name: "Alice".into(),
+        };
+        let items = [
+            PolicyBatchItem {
+                resource: &TestResource,
+            },
+            PolicyBatchItem {
+                resource: &TestResource,
+            },
+        ];
+        for matches_predicate in [false, true] {
+            for per_resource in [false, true] {
+                let builder = PolicyBuilder::<TestDomain>::new("StaticVeto");
+                let policy = if per_resource {
+                    builder.resources(move |_| matches_predicate)
+                } else {
+                    builder.subjects(move |_| matches_predicate)
+                }
+                .build_veto();
+                let scalar = EvalCtx::new(
+                    &session,
+                    &subject,
+                    &TestAction,
+                    &TestResource,
+                    &TestContext,
+                    policy.policy_type(),
+                );
+                let batch = BatchEvalCtx::new(
+                    &session,
+                    &subject,
+                    &TestAction,
+                    &TestContext,
+                    &items,
+                    policy.policy_type(),
+                );
+                let mut results = policy.evaluate_batch(&batch).await;
+                assert_eq!(results.len(), items.len());
+                results.push(policy.evaluate(&scalar).await);
+                for result in results {
+                    assert_eq!(result.is_forbidden(), matches_predicate);
+                    assert!(
+                        matches!(
+                            result.trace(),
+                            PolicyEvalResult::Forbidden {
+                                policy_type: std::borrow::Cow::Borrowed("StaticVeto"),
+                                ..
+                            } | PolicyEvalResult::NotApplicable {
+                                policy_type: std::borrow::Cow::Borrowed("StaticVeto"),
+                                ..
+                            }
+                        ),
+                        "static veto name should remain borrowed: {result:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -3679,12 +3785,10 @@ mod policy_builder_tests {
         );
     }
 
-    // Test that `.forbid()` turns an otherwise matching predicate into an active veto.
+    // A matching veto builder forbids without granting authority.
     #[tokio::test]
     async fn test_policy_builder_forbid() {
-        let policy = PolicyBuilder::<TestDomain>::new("ForbidPolicy")
-            .forbid()
-            .build();
+        let policy = PolicyBuilder::<TestDomain>::new("ForbidPolicy").build_veto();
 
         // Even though no predicate fails (so predicate returns true),
         // the forbid effect should result in a Denied outcome.
@@ -3710,9 +3814,8 @@ mod policy_builder_tests {
     async fn test_policy_builder_forbid_overrides_other_grants() {
         for block_registered_first in [true, false] {
             let block_policy = PolicyBuilder::<TestDomain>::new("BlockAlicePolicy")
-                .forbid()
                 .subjects(|subject| subject.name == "Alice")
-                .build();
+                .build_veto();
 
             let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
                 .subjects(|subject| subject.name == "Alice")
@@ -3720,11 +3823,11 @@ mod policy_builder_tests {
 
             let mut checker = PermissionChecker::new();
             if block_registered_first {
-                checker.add_policy(block_policy);
+                checker.add_veto(block_policy);
                 checker.add_policy(allow_policy);
             } else {
                 checker.add_policy(allow_policy);
-                checker.add_policy(block_policy);
+                checker.add_veto(block_policy);
             }
 
             let session = EvaluationSession::empty();
@@ -3767,17 +3870,23 @@ mod policy_builder_tests {
     }
 
     #[tokio::test]
-    async fn forbid_veto_composes_through_fluent_or_policy() {
+    async fn veto_any_of_overrides_sibling_grant() {
         let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
             .subjects(|subject| subject.name == "Alice")
             .build();
         let block_policy = PolicyBuilder::<TestDomain>::new("BlockAlicePolicy")
-            .forbid()
             .subjects(|subject| subject.name == "Alice")
-            .build();
+            .build_veto();
 
         let mut checker = PermissionChecker::new();
-        checker.add_policy(allow_policy.or(block_policy));
+        checker.add_policy(allow_policy);
+        checker.add_veto(
+            block_policy.any_of(
+                PolicyBuilder::<TestDomain>::new("NoMatch")
+                    .subjects(|_| false)
+                    .build_veto(),
+            ),
+        );
 
         let session = EvaluationSession::empty();
         let result = checker
@@ -3793,21 +3902,23 @@ mod policy_builder_tests {
             .await;
 
         result.assert_forbidden_by("BlockAlicePolicy");
-        result.assert_trace_contains("OrPolicy");
+        result.assert_trace_contains("AnyOfVeto");
     }
 
     #[tokio::test]
-    async fn forbid_veto_composes_through_fluent_and_policy_batch() {
+    async fn veto_all_of_overrides_sibling_grant_batch() {
         let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
             .subjects(|subject| subject.name == "Alice")
             .build();
         let block_policy = PolicyBuilder::<TestDomain>::new("BlockAlicePolicy")
-            .forbid()
             .subjects(|subject| subject.name == "Alice")
-            .build();
+            .build_veto();
 
         let mut checker = PermissionChecker::new();
-        checker.add_policy(allow_policy.and(block_policy));
+        checker.add_policy(allow_policy);
+        checker.add_veto(
+            block_policy.all_of(PolicyBuilder::<TestDomain>::new("SecondBlock").build_veto()),
+        );
 
         let session = EvaluationSession::empty();
         let results = checker
@@ -3825,7 +3936,7 @@ mod policy_builder_tests {
         assert_eq!(results.len(), 2);
         for (_resource, evaluation) in results {
             evaluation.assert_forbidden_by("BlockAlicePolicy");
-            evaluation.assert_trace_contains("AndPolicy");
+            evaluation.assert_trace_contains("AllOfVeto");
         }
     }
 
@@ -3834,9 +3945,8 @@ mod policy_builder_tests {
     #[tokio::test]
     async fn test_non_matching_deny_policy_does_not_block_grants() {
         let deny_policy = PolicyBuilder::<TestDomain>::new("BlockNobodyPolicy")
-            .forbid()
             .subjects(|_subject| false)
-            .build();
+            .build_veto();
 
         let allow_policy = PolicyBuilder::<TestDomain>::new("AllowAlicePolicy")
             .subjects(|subject| subject.name == "Alice")
@@ -3844,7 +3954,7 @@ mod policy_builder_tests {
 
         let mut checker = PermissionChecker::new();
         checker.add_policy(allow_policy);
-        checker.add_policy(deny_policy);
+        checker.add_veto(deny_policy);
 
         let session = EvaluationSession::empty();
         let result = checker
@@ -4375,7 +4485,7 @@ mod policy_builder_tests {
         let bctx = batch_ctx(&session, &subject, &action, &ctx, &items);
         let results = policy.evaluate_batch(&bctx).await;
 
-        assert!(results.iter().all(PolicyEvalResult::is_granted));
+        assert!(results.iter().all(GrantResult::is_granted));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -4557,7 +4667,7 @@ mod recording_ctx_tests {
         assert_eq!(provenance[0].outcome, FactOutcome::Error);
         assert_eq!(provenance[0].error_kind, Some(FactLoadErrorKind::Backend));
         // The policy's own reason is preserved through the upgrade.
-        assert_eq!(result.reason_str(), Some("not odd"));
+        assert_eq!(result.trace().reason_str(), Some("not odd"));
     }
 
     #[tokio::test]
@@ -4600,23 +4710,24 @@ mod recording_ctx_tests {
         assert!(result.is_granted());
         assert_eq!(result.provenance().len(), 1);
 
-        // A recorded failure cannot merge directly into a Combined node, so
-        // finish preserves it on a synthetic child and fails closed.
+        // An independently decisive aggregate grant matches a leaf grant.
         let c = ctx(&session, &subject, &resource);
         c.fact(Flag(2)).await;
         let combined = c.finish(PolicyEvalResult::Combined {
+            provenance: Vec::new(),
             policy_type: std::borrow::Cow::Borrowed("C"),
             operation: CombineOp::And,
             children: vec![],
             decision: Decision::Grant,
         });
-        assert_eq!(combined.decision(), Decision::Indeterminate);
+        assert_eq!(combined.decision(), Decision::Grant);
         assert!(combined.format(0).contains("fact flag [error]"));
 
         // A definite forbid still wins over the failed load.
         let c = ctx(&session, &subject, &resource);
         c.fact(Flag(2)).await;
         let combined = c.finish(PolicyEvalResult::Combined {
+            provenance: Vec::new(),
             policy_type: std::borrow::Cow::Borrowed("C"),
             operation: CombineOp::And,
             children: vec![],

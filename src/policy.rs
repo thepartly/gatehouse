@@ -1,6 +1,6 @@
 use crate::{
     EvaluationSession, FactKey, FactLoadError, FactLoadResult, FactOutcome, FactProvenance,
-    PolicyEvalResult, SecurityRuleMetadata,
+    GrantResult, PolicyEvalResult, PolicyResult, SecurityRuleMetadata, VetoResult,
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -23,53 +23,6 @@ pub trait PolicyDomain: Send + Sync + 'static {
     type Context: Send + Sync;
 }
 
-/// The declared effect of a policy: whether it can grant, forbid, or both.
-///
-/// `Allow` (the default everywhere) means the policy grants access when it
-/// matches. `Forbid` means the policy **forbids** access when it matches: a
-/// matched forbid produces [`PolicyEvalResult::Forbidden`], which
-/// [`crate::PermissionChecker`] honors over any grant from sibling policies.
-/// `AllowOrForbid` is for composed or custom policies that can produce either
-/// result depending on their inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Effect {
-    /// The policy may grant access, but must not actively forbid.
-    Allow,
-    /// The policy may actively forbid access, but must not grant.
-    Forbid,
-    /// The policy may either grant or actively forbid access.
-    AllowOrForbid,
-}
-
-impl Effect {
-    /// Whether this effect can produce a grant.
-    pub fn can_grant(self) -> bool {
-        matches!(self, Self::Allow | Self::AllowOrForbid)
-    }
-
-    /// Whether this effect can produce an active forbid.
-    pub fn can_forbid(self) -> bool {
-        matches!(self, Self::Forbid | Self::AllowOrForbid)
-    }
-
-    pub(crate) fn from_capabilities(can_grant: bool, can_forbid: bool) -> Self {
-        match (can_grant, can_forbid) {
-            (true, true) => Self::AllowOrForbid,
-            (false, true) => Self::Forbid,
-            _ => Self::Allow,
-        }
-    }
-
-    pub(crate) fn telemetry_label(self) -> &'static str {
-        match self {
-            Self::Allow => "allow",
-            Self::Forbid => "deny",
-            Self::AllowOrForbid => "allow_or_forbid",
-        }
-    }
-}
-
 /// A borrowed resource passed to batch policy evaluators.
 ///
 /// Values are borrowed from caller-owned batch items, so policy implementations
@@ -79,7 +32,7 @@ pub struct PolicyBatchItem<'a, D: PolicyDomain> {
     pub resource: &'a D::Resource,
 }
 
-/// Merges context-recorded fact provenance into a leaf result.
+/// Merges context-recorded fact provenance into a result node.
 ///
 /// Recorded entries precede any explicitly attached provenance (they were
 /// loaded before the result was constructed). When the recorded entries
@@ -88,11 +41,8 @@ pub struct PolicyBatchItem<'a, D: PolicyDomain> {
 /// was unavailable, so "did not grant" cannot be distinguished from "could
 /// not decide" — the context witnessed the failure and reports it
 /// structurally. Grants and forbids are decisive and are never rewritten.
-/// `Combined` nodes have no provenance field. When a recorded load failed,
-/// the entry is preserved on a synthetic `Indeterminate` child and every
-/// non-forbid aggregate decision is downgraded to `Indeterminate`. Benign
-/// recorded entries are dropped with a debug event.
-fn attach_recorded(
+/// Aggregate nodes follow the same rule and retain their own recorded facts.
+pub(crate) fn attach_recorded(
     result: PolicyEvalResult,
     mut recorded: Vec<FactProvenance>,
 ) -> PolicyEvalResult {
@@ -162,50 +112,21 @@ fn attach_recorded(
         PolicyEvalResult::Combined {
             policy_type,
             operation,
-            mut children,
+            children,
             decision,
+            provenance,
         } => {
-            if recorded_error {
-                let recorded_count = recorded.len();
-                let error_count = recorded
-                    .iter()
-                    .filter(|fact| fact.outcome == FactOutcome::Error)
-                    .count();
-                tracing::warn!(
-                    policy.type = %policy_type,
-                    recorded_count,
-                    error_count,
-                    "a policy returned a Combined result after recorded fact loads failed; \
-                     preserving the failures on an Indeterminate child and failing closed"
-                );
-                children.push(PolicyEvalResult::indeterminate_with_facts(
-                    policy_type.clone(),
-                    "Fact load recorded by combined policy failed",
-                    recorded,
-                ));
-                PolicyEvalResult::Combined {
-                    policy_type,
-                    operation,
-                    children,
-                    decision: if decision == crate::Decision::Forbid {
-                        crate::Decision::Forbid
-                    } else {
-                        crate::Decision::Indeterminate
-                    },
-                }
-            } else {
-                tracing::debug!(
-                    policy.type = %policy_type,
-                    recorded_count = recorded.len(),
-                    "facts recorded on an evaluation context were dropped: the policy \
-                     returned a Combined result, which has no provenance to merge into"
-                );
-                PolicyEvalResult::Combined {
-                    policy_type,
-                    operation,
-                    children,
-                    decision,
-                }
+            recorded.extend(provenance);
+            PolicyEvalResult::Combined {
+                policy_type,
+                operation,
+                children,
+                decision: if recorded_error && decision == crate::Decision::NotApplicable {
+                    crate::Decision::Indeterminate
+                } else {
+                    decision
+                },
+                provenance: recorded,
             }
         }
     }
@@ -368,30 +289,28 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     ///
     /// [`crate::PermissionChecker`] and the built-in combinators call this
     /// after every [`Policy::evaluate`], so a policy that loads facts through
-    /// [`Self::fact`] and then builds a [`PolicyEvalResult`] by hand still
+    /// [`Self::fact`] and then builds a [`GrantResult`] or [`VetoResult`] directly still
     /// produces full provenance — and a hand-built `NotApplicable` after a
     /// recorded load failure is upgraded to `Indeterminate` (see
     /// [`Self::not_applicable`]). Call it yourself when driving
-    /// [`Policy::evaluate`] directly. A `Combined` result has no provenance
-    /// field: recorded failures are preserved on a synthetic `Indeterminate`
-    /// child and make every non-forbid aggregate indeterminate; benign entries
-    /// are dropped with a debug event.
+    /// [`Policy::evaluate`] directly. Aggregate nodes retain their own facts
+    /// and follow the same decision rules as leaves.
     #[inline]
-    pub fn finish(self, result: PolicyEvalResult) -> PolicyEvalResult {
+    pub fn finish<R: PolicyResult>(self, result: R) -> R {
         let recorded = self.recorded.into_inner().expect("recorded facts poisoned");
         if recorded.is_empty() {
             return result;
         }
-        attach_recorded(result, recorded)
+        result.attach_recorded(recorded)
     }
 
     /// Builds a granted result tagged with `ctx.policy_type`, attaching all
     /// facts recorded on this context.
-    pub fn grant(&self, reason: impl Into<String>) -> PolicyEvalResult {
-        attach_recorded(
+    pub fn grant(&self, reason: impl Into<String>) -> GrantResult {
+        GrantResult(attach_recorded(
             PolicyEvalResult::granted(self.policy_type.clone(), Some(reason.into())),
             self.take_recorded(),
-        )
+        ))
     }
 
     /// Builds a not-applicable result tagged with `ctx.policy_type`,
@@ -405,26 +324,22 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// load looked identical to a genuine non-match. Use
     /// [`Self::session`] to load without recording when this behavior is
     /// truly not wanted.
-    pub fn not_applicable(&self, reason: impl Into<String>) -> PolicyEvalResult {
-        attach_recorded(
+    pub fn not_applicable(&self, reason: impl Into<String>) -> GrantResult {
+        GrantResult(attach_recorded(
             PolicyEvalResult::not_applicable(self.policy_type.clone(), reason),
             self.take_recorded(),
-        )
+        ))
     }
 
     /// Builds a forbidden result tagged with `ctx.policy_type`, attaching
     /// all facts recorded on this context.
     ///
-    /// Use this for an active veto. A hand-written policy that can only veto
-    /// should override [`Policy::effect`] to return [`Effect::Forbid`]. A policy
-    /// that can grant or veto should return [`Effect::AllowOrForbid`]. Both
-    /// make [`crate::PermissionChecker`] evaluate the policy before allow-only
-    /// policies so grant short-circuiting cannot skip the veto.
-    pub fn forbid(&self, reason: impl Into<String>) -> PolicyEvalResult {
-        attach_recorded(
+    /// Returns a veto result, which cannot be returned by a grant policy.
+    pub fn forbid(&self, reason: impl Into<String>) -> VetoResult {
+        VetoResult(attach_recorded(
             PolicyEvalResult::forbidden(self.policy_type.clone(), reason),
             self.take_recorded(),
-        )
+        ))
     }
 
     /// Builds an indeterminate result tagged with `ctx.policy_type`,
@@ -434,11 +349,27 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// unavailable — typically after [`Self::fact`] returned
     /// [`FactLoadResult::Error`]. Fail-closed: never treated as a grant, and
     /// surfaced as [`crate::AccessEvaluation::Indeterminate`] when decisive.
-    pub fn indeterminate(&self, reason: impl Into<String>) -> PolicyEvalResult {
-        attach_recorded(
+    pub fn indeterminate(&self, reason: impl Into<String>) -> GrantResult {
+        GrantResult(attach_recorded(
             PolicyEvalResult::indeterminate(self.policy_type.clone(), reason),
             self.take_recorded(),
-        )
+        ))
+    }
+
+    /// Builds a passing veto result and attaches recorded facts.
+    pub fn pass(&self, reason: impl Into<String>) -> VetoResult {
+        VetoResult(attach_recorded(
+            PolicyEvalResult::not_applicable(self.policy_type.clone(), reason),
+            self.take_recorded(),
+        ))
+    }
+
+    /// Builds an unresolved veto result and attaches recorded facts.
+    pub fn veto_indeterminate(&self, reason: impl Into<String>) -> VetoResult {
+        VetoResult(attach_recorded(
+            PolicyEvalResult::indeterminate(self.policy_type.clone(), reason),
+            self.take_recorded(),
+        ))
     }
 
     /// [`Self::grant`] with extra explicit provenance appended after the
@@ -447,15 +378,15 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
         &self,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
-    ) -> PolicyEvalResult {
-        attach_recorded(
+    ) -> GrantResult {
+        GrantResult(attach_recorded(
             PolicyEvalResult::granted_with_facts(
                 self.policy_type.clone(),
                 Some(reason.into()),
                 provenance,
             ),
             self.take_recorded(),
-        )
+        ))
     }
 
     /// [`Self::not_applicable`] with extra explicit provenance appended
@@ -472,15 +403,15 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
         &self,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
-    ) -> PolicyEvalResult {
-        attach_recorded(
+    ) -> GrantResult {
+        GrantResult(attach_recorded(
             PolicyEvalResult::not_applicable_with_facts(
                 self.policy_type.clone(),
                 reason,
                 provenance,
             ),
             self.take_recorded(),
-        )
+        ))
     }
 
     /// [`Self::forbid`] with extra explicit provenance appended after the
@@ -489,11 +420,11 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
         &self,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
-    ) -> PolicyEvalResult {
-        attach_recorded(
+    ) -> VetoResult {
+        VetoResult(attach_recorded(
             PolicyEvalResult::forbidden_with_facts(self.policy_type.clone(), reason, provenance),
             self.take_recorded(),
-        )
+        ))
     }
 
     /// [`Self::indeterminate`] with extra explicit provenance appended after
@@ -502,15 +433,15 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
         &self,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
-    ) -> PolicyEvalResult {
-        attach_recorded(
+    ) -> GrantResult {
+        GrantResult(attach_recorded(
             PolicyEvalResult::indeterminate_with_facts(
                 self.policy_type.clone(),
                 reason,
                 provenance,
             ),
             self.take_recorded(),
-        )
+        ))
     }
 }
 
@@ -635,7 +566,7 @@ impl<'a, D: PolicyDomain> BatchEvalCtx<'a, D> {
     /// A `results` vector whose length does not match [`Self::items`] is
     /// returned unchanged (the caller's wrong-length handling applies).
     #[inline]
-    pub fn finish(self, results: Vec<PolicyEvalResult>) -> Vec<PolicyEvalResult> {
+    pub fn finish<R: PolicyResult>(self, results: Vec<R>) -> Vec<R> {
         let recorded = self.recorded.into_inner().expect("recorded facts poisoned");
         if recorded.is_empty() || results.len() != recorded.len() {
             return results;
@@ -643,17 +574,21 @@ impl<'a, D: PolicyDomain> BatchEvalCtx<'a, D> {
         results
             .into_iter()
             .zip(recorded)
-            .map(|(result, recorded)| attach_recorded(result, recorded))
+            .map(|(result, recorded)| result.attach_recorded(recorded))
             .collect()
     }
 }
 
-/// A generic async trait representing a single authorization policy for one
-/// [`PolicyDomain`].
+/// A grant policy for one [`PolicyDomain`].
+///
+/// Returns [`GrantResult`], which can grant, abstain, or be indeterminate.
+/// Implement [`crate::VetoPolicy`] for rules that can veto; grant policies
+/// cannot return veto authority. Register grants with
+/// [`crate::PermissionChecker::add_policy`].
 #[async_trait]
 pub trait Policy<D: PolicyDomain>: Send + Sync {
     /// Evaluates whether access should be granted.
-    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult;
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> GrantResult;
 
     /// Evaluates access for a batch of resources.
     ///
@@ -661,7 +596,7 @@ pub trait Policy<D: PolicyDomain>: Send + Sync {
     /// each item sequentially. Policies with set-oriented backends can override
     /// this method to reduce round trips while returning one result per input
     /// item in the same order.
-    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<GrantResult> {
         let mut results = Vec::with_capacity(ctx.items.len());
         for item in ctx.items {
             let item_ctx = EvalCtx::new(
@@ -681,23 +616,6 @@ pub trait Policy<D: PolicyDomain>: Send + Sync {
     /// Policy name for debugging, trace trees, and telemetry fallbacks.
     fn policy_type(&self) -> Cow<'static, str>;
 
-    /// The declared effect of this policy. Defaults to [`Effect::Allow`].
-    ///
-    /// [`crate::PermissionChecker`] reads this declaration when the policy is
-    /// added. Policies declaring [`Effect::Forbid`] or
-    /// [`Effect::AllowOrForbid`] run before allow-only policies, so a matched
-    /// forbid is observed before a grant can short-circuit.
-    ///
-    /// A policy that returns [`PolicyEvalResult::Forbidden`] while leaving this
-    /// at the default [`Effect::Allow`] still vetoes wherever it is observed,
-    /// but the checker emits a contract-violation `WARN`: the veto is not
-    /// scheduled ahead of grants and an earlier grant can short-circuit before
-    /// it is reached. Declare [`Effect::Forbid`] or [`Effect::AllowOrForbid`]
-    /// for an order-independent veto.
-    fn effect(&self) -> Effect {
-        Effect::Allow
-    }
-
     /// Metadata describing the security rule that backs this policy.
     fn security_rule(&self) -> SecurityRuleMetadata {
         SecurityRuleMetadata::default()
@@ -709,20 +627,16 @@ impl<D> Policy<D> for Box<dyn Policy<D>>
 where
     D: PolicyDomain,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> GrantResult {
         (**self).evaluate(ctx).await
     }
 
-    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<GrantResult> {
         (**self).evaluate_batch(ctx).await
     }
 
     fn policy_type(&self) -> Cow<'static, str> {
         (**self).policy_type()
-    }
-
-    fn effect(&self) -> Effect {
-        (**self).effect()
     }
 
     fn security_rule(&self) -> SecurityRuleMetadata {
@@ -735,20 +649,16 @@ impl<D> Policy<D> for Arc<dyn Policy<D>>
 where
     D: PolicyDomain,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> GrantResult {
         (**self).evaluate(ctx).await
     }
 
-    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<GrantResult> {
         (**self).evaluate_batch(ctx).await
     }
 
     fn policy_type(&self) -> Cow<'static, str> {
         (**self).policy_type()
-    }
-
-    fn effect(&self) -> Effect {
-        (**self).effect()
     }
 
     fn security_rule(&self) -> SecurityRuleMetadata {
