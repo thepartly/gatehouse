@@ -49,9 +49,12 @@ evaluation.assert_forbidden_by("Suspended");
 ```
 
 For a custom rule that previously both granted and vetoed, split it into
-separate grant and veto policies and register both. Share backend inputs
-through a request-scoped fact session. The type checker now rejects a grant
-policy returning a veto, rather than relying on a correctly declared effect.
+separate grant and veto policies. Register both directly, or put both in a
+child checker and register it once with `add_delegate` to keep the two halves
+atomic. This is the replacement for an `AllowOrForbid` policy. Share backend
+inputs through a request-scoped fact session in either case. The type checker
+now rejects a grant policy returning a veto, rather than relying on a correctly
+declared effect.
 
 ## Composition and delegation
 
@@ -73,8 +76,15 @@ provenance, children, .. }`; policies cannot return it or convert an arbitrary
 raw tree into an authority-bearing result. Use `result.trace()` to inspect
 and `PolicyResult::into_trace()` to consume a typed result into its audit tree.
 
-Register a `DelegatingPolicy` with **`checker.add_delegate(delegate)`**, not
-`add_policy`. That one call installs both capabilities atomically. Child veto
+`DelegatingPolicy` no longer implements `Policy<D>`. Register it with
+**`checker.add_delegate(delegate)`**, not `add_policy`. It also cannot be passed
+to `and`, `or`, `not`, or `AndPolicy::try_new`. There is no direct replacement
+for a delegate inside a grant combinator: compose the grant rules inside the
+child checker and register the child with `add_delegate`, keeping its vetoes
+separate. Review the intended scope of those vetoes, since a delegated veto
+blocks every parent grant path.
+
+That one registration installs both capabilities atomically. Child veto
 uncertainty blocks parent grants; a child grant failure does not block an
 independent parent grant after the child's vetoes pass. Each child capability
 phase runs at most once for each parent evaluation; delegation retains batch
@@ -180,10 +190,16 @@ impl Policy<Documents> for Member {
 ```
 
 A recorded failure upgrades abstention or veto pass to `Indeterminate`.
+This also applies to explicit `*_with_facts` constructors when the result's
+own provenance contains `FactOutcome::Error`; the reason and facts are retained.
 Decisive grants and vetoes retain their decisions even if an optional recorded
 load failed. This rule is the same for leaf and aggregate results. `Combined`
 now stores its own provenance; child evidence remains on child nodes. There
 are no synthetic failure children and no shape-dependent loss of evidence.
+Negation uses the resulting decision, not errors elsewhere in the audit tree:
+`NOT(AND[indeterminate, definite-abstain])` grants because the conjunction is
+definitely unsatisfied. An irrelevant descendant failure does not make that
+settled aggregate uncertain again.
 
 When invoking a policy directly, call `ctx.finish(result)` or
 `batch_ctx.finish(results)`. Construct contexts with `EvalCtx::new` /

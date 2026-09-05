@@ -212,7 +212,7 @@ grant_combinator!(OrPolicy, false);
 fn invert(result: GrantResult) -> GrantResult {
     let decision = match result.decision() {
         Decision::Grant => Decision::NotApplicable,
-        Decision::NotApplicable if !has_fact_errors(result.trace()) => Decision::Grant,
+        Decision::NotApplicable => Decision::Grant,
         _ => Decision::Indeterminate,
     };
     GrantResult(combined(
@@ -253,7 +253,7 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
                 .iter()
                 .map(|_| {
                     GrantResult::indeterminate(
-                        self.policy_type(),
+                        self.policy.policy_type(),
                         "Policy batch result count did not match input count",
                     )
                 })
@@ -435,16 +435,3 @@ macro_rules! veto_combinator {
 }
 veto_combinator!(AllOfVeto, true);
 veto_combinator!(AnyOfVeto, false);
-
-fn has_fact_errors(result: &crate::PolicyEvalResult) -> bool {
-    result
-        .provenance()
-        .iter()
-        .any(|fact| fact.outcome == crate::FactOutcome::Error)
-        || match result {
-            crate::PolicyEvalResult::Combined { children, .. } => {
-                children.iter().any(has_fact_errors)
-            }
-            _ => false,
-        }
-}

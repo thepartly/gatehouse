@@ -392,13 +392,8 @@ impl<'a, D: PolicyDomain> EvalCtx<'a, D> {
     /// [`Self::not_applicable`] with extra explicit provenance appended
     /// after the recorded entries.
     ///
-    /// The upgrade to `Indeterminate` considers only **recorded** load
-    /// failures (witnessed by the context); explicit provenance passed here
-    /// is attached verbatim without changing the result variant, so policies
-    /// that deliberately report a failed load as not-applicable can still do
-    /// so by constructing provenance themselves. [`crate::NotPolicy`] still
-    /// treats an error-bearing not-applicable leaf as indeterminate instead of
-    /// inverting it to a grant.
+    /// Either recorded or explicit failed facts upgrade the abstention to
+    /// `Indeterminate`, preserving its reason and evidence.
     pub fn not_applicable_with_facts(
         &self,
         reason: impl Into<String>,

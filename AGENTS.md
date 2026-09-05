@@ -22,7 +22,7 @@ cargo mutants --in-place --in-diff=mutants.diff \
 - Clippy runs with `-D warnings`; any warning fails CI. `fmt` + `clippy` before committing.
 - A **diff-scoped `cargo-mutants` gate** covers `src/checker.rs`, `src/combinators.rs`, `src/capability.rs`, and `src/policies/delegating.rs`. When changing decisions or short-circuit logic, add a test that distinguishes the mutation (for example, inputs where `&&` and `||` diverge).
 - `main` is governed by a require-approval ruleset: PRs need an approving review (you cannot self-approve); repo/org admins can bypass.
-- Pushing a `v*` tag triggers irreversible crates.io publication, followed by creation of the GitHub Release. The tag must match the Cargo version and point to a commit with successful main CI. Prepare and validate the exact candidate before requesting publication approval; see `.github/workflows/release.yml`.
+- Pushing a `v*` tag triggers irreversible crates.io publication, followed by creation of the GitHub Release. The tag must match the Cargo version and point to a commit with successful main CI. Before tagging, a release-preparation PR must rename `CHANGELOG.md`'s `[Unreleased]` section to `[X.Y.Z] - <date>` and retain nonempty release notes. Prepare and validate the exact candidate before requesting publication approval; see `.github/workflows/release.yml`.
 
 ## Architecture
 

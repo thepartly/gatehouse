@@ -28,6 +28,8 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import os
+          import re
+          from pathlib import Path
           import sys
           import tomllib
 
@@ -43,7 +45,21 @@ jobs:
               )
               sys.exit(1)
 
-          print(f"Verified {tag} matches gatehouse {crate_version}")
+          heading = re.compile(rf"^## \[{re.escape(crate_version)}\](?: - \d{{4}}-\d{{2}}-\d{{2}})?$")
+          notes = []
+          inside = False
+          for line in Path("CHANGELOG.md").read_text().splitlines():
+              if heading.fullmatch(line):
+                  inside = True
+              elif inside and line.startswith("## ["):
+                  break
+              elif inside:
+                  notes.append(line)
+          if not "\n".join(notes).strip():
+              print(f"::error file=CHANGELOG.md::Missing release notes for {crate_version}")
+              sys.exit(1)
+
+          print(f"Verified {tag} matches gatehouse {crate_version} with release notes")
           PY
 
   candidate-ci:

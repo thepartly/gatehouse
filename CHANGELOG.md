@@ -36,7 +36,8 @@
   `Vec<GrantResult>`. `Effect`, `Policy::effect`, `add_forbid_policy`, and
   `PolicyBuilder::forbid` are removed. Register typed vetoes with `add_veto`.
 - **Breaking:** grant combinators accept only grant policies. Veto composition
-  uses its own combinators. `DelegatingPolicy` is registered with `add_delegate`.
+  uses its own combinators. `DelegatingPolicy` no longer implements `Policy`
+  and cannot be nested in grant combinators; register it with `add_delegate`.
 - **Breaking:** `PolicyEvalResult` is an audit representation, not an
   authority-bearing return type. `Combined` has `decision` instead of `outcome`
   and a `provenance` field. Typed aggregate constructors determine decisions;
@@ -48,12 +49,17 @@
   and session fields are private. Raw access remains through `session()`.
 - **Breaking:** `FactKey` requires `Debug` and supplies `render()` for audit
   keys. `RelationshipQuery` requires `Debug` on IDs/relations and `Display` on
-  relations. `FactProvenance` gains `error_kind`.
+  relations. Its `render()` preserves the 0.5 diagnostic key format
+  (`subject -[relation]-> resource`). `FactProvenance` gains `error_kind`.
 - Recorded failures upgrade abstention and veto pass to indeterminate. Decisive
   grants/vetoes retain their decisions. Aggregate provenance follows the same
   rules as leaves, without synthetic children or lost successful/missing facts.
+  Explicit `*_with_facts` constructors apply the same rule to their own error
+  provenance, preserving the supplied reason and facts.
 - `NotPolicy` preserves uncertainty, including explicit failed-load evidence
-  on an abstaining result. It cannot invert a veto policy.
+  on an abstaining result. It uses the child decision: errors retained in
+  descendants do not make an otherwise settled aggregate uncertain again.
+  It cannot invert a veto policy.
 - ReBAC reasons classify errors without interpolating backend text; detailed
   diagnostics remain in fact provenance. HTTP examples distinguish 403 from
   outages and use strict list APIs with failure-injection coverage.
@@ -75,6 +81,19 @@
   candidate-superset contract across both admin and viewer grant paths.
 - Correct benchmark fixtures so trailing grants and all-abstaining stacks
   evaluate every intended policy; previous measurements are not comparable.
+
+### Rationale
+
+- [#58](https://github.com/thepartly/gatehouse/issues/58) describes the lost
+  error classification and silently omitted provenance that motivated
+  [#59](https://github.com/thepartly/gatehouse/pull/59) and the recording contexts
+  in [#64](https://github.com/thepartly/gatehouse/pull/64). In particular, case 3
+  could turn a failed fact load into an ordinary denial without diagnostic evidence.
+- [#61](https://github.com/thepartly/gatehouse/issues/61) and
+  [#62](https://github.com/thepartly/gatehouse/issues/62) explain structural
+  uncertainty and automatic fact recording;
+  [#63](https://github.com/thepartly/gatehouse/issues/63) motivates enforcing
+  grant/veto authority through types in the same breaking release.
 
 ## [0.5.1] - 2026-09-01
 

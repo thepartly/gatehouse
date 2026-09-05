@@ -10,7 +10,7 @@ rust-version = "1.82"
 license = "MIT"
 repository = "https://github.com/thepartly/gatehouse"
 description = "An in-process authorization engine for Rust with composable policies and request-scoped fact loading."
-include = ["src/**", "tests/**", "examples/**", "benches/**", "Cargo.toml", "Cargo.lock", "README.md", "MIGRATION.md", "CHANGELOG.md", "LICENSE", ".github/logo.svg"]
+include = ["src/**/*.rs", "tests/**/*.rs", "examples/**/*.rs", "benches/**/*.rs", "benches/README.md", "Cargo.toml", "Cargo.lock", "README.md", "MIGRATION.md", "CHANGELOG.md", "LICENSE", ".github/logo.svg"]
 
 [dependencies]
 tracing = { version = "0.1", optional = true }

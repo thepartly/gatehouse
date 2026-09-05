@@ -676,10 +676,8 @@ impl AccessEvaluation {
     /// This helper remains an **any-error-in-trace** scan, not a causal
     /// check: it does not prove the load failure was the reason for the
     /// denial (a policy may record a load error yet deny for ordinary
-    /// reasons). Its only remaining use is catching errors attached as
-    /// explicit `NotApplicable` provenance by policies that bypass the
-    /// recording context; with [`crate::EvalCtx::fact`] such failures are
-    /// upgraded to [`PolicyEvalResult::Indeterminate`] automatically. Use
+    /// reasons). A settled aggregate may retain failed facts from an
+    /// inconclusive child without itself being indeterminate. Use
     /// [`Self::fact_load_errors`] when you need the failed loads
     /// themselves.
     #[deprecated(
@@ -1208,17 +1206,14 @@ impl PolicyEvalResult {
         }
     }
 
-    /// Builds a not-applicable leaf result carrying the facts that informed it.
+    /// Builds an abstention with explicit facts, or an indeterminate result if
+    /// any of those facts failed to load. The reason and facts are preserved.
     pub fn not_applicable_with_facts(
         policy_type: impl Into<Cow<'static, str>>,
         reason: impl Into<String>,
         provenance: Vec<FactProvenance>,
     ) -> Self {
-        Self::NotApplicable {
-            policy_type: policy_type.into(),
-            reason: reason.into(),
-            provenance,
-        }
+        crate::policy::attach_recorded(Self::not_applicable(policy_type, reason), provenance)
     }
 
     /// Builds a forbidden leaf result carrying the facts that informed it.

@@ -749,8 +749,7 @@ impl Policy<Domain> for ErrorBearingNotApplicablePolicy {
 }
 
 /// Negation must never manufacture a grant from a leaf that reports a failed
-/// fact load, even when the policy deliberately used the explicit-provenance
-/// escape hatch to keep the leaf itself `NotApplicable`.
+/// fact load through explicit provenance.
 #[tokio::test]
 async fn not_policy_fail_closes_error_bearing_not_applicable() {
     let mut checker = PermissionChecker::new();
@@ -1124,6 +1123,7 @@ fn all_truth(values: impl IntoIterator<Item = Truth>) -> Truth {
 #[derive(Clone, Debug)]
 enum Expression {
     Leaf([Truth; 3]),
+    RecordedLeaf([Truth; 3]),
     All(Box<Expression>, Box<Expression>),
     Any(Box<Expression>, Box<Expression>),
     Not(Box<Expression>),
@@ -1131,7 +1131,7 @@ enum Expression {
 impl Expression {
     fn interpret(&self, resource: u8) -> Truth {
         match self {
-            Self::Leaf(values) => values[usize::from(resource % 3)],
+            Self::Leaf(values) | Self::RecordedLeaf(values) => values[usize::from(resource % 3)],
             Self::All(left, right) => {
                 all_truth([left.interpret(resource), right.interpret(resource)])
             }
@@ -1148,6 +1148,7 @@ impl Expression {
     fn grant(&self) -> Box<dyn Policy<Domain>> {
         match self {
             Self::Leaf(values) => Box::new(GrantLeaf(*values)),
+            Self::RecordedLeaf(values) => Box::new(RecordedGrantLeaf(*values)),
             Self::All(left, right) => Box::new(left.grant().and(right.grant())),
             Self::Any(left, right) => Box::new(left.grant().or(right.grant())),
             Self::Not(child) => Box::new(child.grant().not()),
@@ -1156,6 +1157,7 @@ impl Expression {
     fn veto(&self) -> Box<dyn VetoPolicy<Domain>> {
         match self {
             Self::Leaf(values) => Box::new(VetoLeaf(*values)),
+            Self::RecordedLeaf(values) => Box::new(RecordedVetoLeaf(*values)),
             Self::All(left, right) => Box::new(left.veto().all_of(right.veto())),
             Self::Any(left, right) => Box::new(left.veto().any_of(right.veto())),
             Self::Not(_) => unreachable!("veto strategy has no negation"),
@@ -1271,8 +1273,14 @@ fn truth_strategy() -> impl Strategy<Value = Truth> {
     prop_oneof![Just(Truth::Yes), Just(Truth::No), Just(Truth::Unknown)]
 }
 fn expression_strategy(grant: bool) -> BoxedStrategy<Expression> {
-    prop::array::uniform3(truth_strategy())
-        .prop_map(Expression::Leaf)
+    (prop::array::uniform3(truth_strategy()), any::<bool>())
+        .prop_map(|(values, recorded)| {
+            if recorded {
+                Expression::RecordedLeaf(values)
+            } else {
+                Expression::Leaf(values)
+            }
+        })
         .prop_recursive(3, 24, 2, move |inner| {
             let binary = prop_oneof![
                 (inner.clone(), inner.clone())
@@ -2030,5 +2038,131 @@ async fn negation_preserves_failed_facts_nested_inside_custom_grant_aggregates()
     {
         result.assert_indeterminate();
         assert_eq!(result.fact_load_errors().len(), 1);
+    }
+}
+
+fn failed_fact() -> FactProvenance {
+    FactProvenance::from_load_result(
+        "membership",
+        "subject",
+        &FactLoadResult::<bool>::Error(gatehouse::FactLoadError::backend_message(
+            "backend unavailable",
+        )),
+    )
+}
+struct RecordedGrantLeaf([Truth; 3]);
+#[async_trait]
+impl Policy<Domain> for RecordedGrantLeaf {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> GrantResult {
+        if self.0[usize::from(ctx.resource.id % 3)] == Truth::Unknown {
+            ctx.record(failed_fact());
+        }
+        GrantLeaf(self.0).evaluate(ctx).await
+    }
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        "RecordedGrantLeaf".into()
+    }
+}
+struct RecordedVetoLeaf([Truth; 3]);
+#[async_trait]
+impl VetoPolicy<Domain> for RecordedVetoLeaf {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> VetoResult {
+        if self.0[usize::from(ctx.resource.id % 3)] == Truth::Unknown {
+            ctx.record(failed_fact());
+        }
+        VetoLeaf(self.0).evaluate(ctx).await
+    }
+    fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+        "RecordedVetoLeaf".into()
+    }
+}
+
+#[tokio::test]
+async fn negation_respects_settled_aggregates_with_failed_descendants() {
+    let session = EvaluationSession::empty();
+    for failed in [
+        RecordedGrantLeaf([Truth::Unknown; 3]).boxed(),
+        ErrorBearingNotApplicablePolicy.boxed(),
+    ] {
+        let mut checker = PermissionChecker::new();
+        checker.add_policy(failed.and(GrantLeaf([Truth::No; 3])).not());
+        let bound = bind(&checker, &session);
+        let single = bound.check(&Resource { id: 0 }).await;
+        assert!(single.is_granted(), "{single}");
+        assert_eq!(single.fact_load_errors().len(), 1);
+        for (_, result) in bound
+            .evaluate(vec![Resource { id: 0 }, Resource { id: 1 }])
+            .await
+        {
+            assert!(result.is_granted(), "{result}");
+            assert_eq!(result.fact_load_errors().len(), 1);
+        }
+        assert_eq!(
+            bound
+                .try_filter(vec![Resource { id: 0 }, Resource { id: 1 }])
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let page = bound
+            .try_lookup_page(
+                &StaticLookup {
+                    ids: vec![0, 1],
+                    next_cursor: None,
+                },
+                &ResourceHydrator,
+                None,
+                NonZeroUsize::new(2).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 2);
+    }
+}
+
+#[test]
+fn explicit_failed_facts_normalize_abstentions_and_passes() {
+    for outcome in [FactOutcome::Error, FactOutcome::Found, FactOutcome::Missing] {
+        let facts = vec![FactProvenance::new(
+            "membership",
+            "subject",
+            outcome.clone(),
+            None,
+        )];
+        let expected = if outcome == FactOutcome::Error {
+            Decision::Indeterminate
+        } else {
+            Decision::NotApplicable
+        };
+        let grant = GrantResult::not_applicable_with_facts("Grant", "reason", facts.clone());
+        let veto = VetoResult::pass_with_facts("Veto", "reason", facts.clone());
+        assert_eq!(grant.decision(), expected);
+        assert_eq!(veto.decision(), expected);
+        assert_eq!(grant.provenance(), facts);
+        assert_eq!(veto.provenance(), facts);
+        assert_eq!(grant.trace().reason_str(), Some("reason"));
+        assert_eq!(veto.trace().reason_str(), Some("reason"));
+        assert!(GrantResult::granted_with_facts("Grant", None, facts.clone()).is_granted());
+        assert!(VetoResult::forbid_with_facts("Veto", "reason", facts).is_forbidden());
+    }
+}
+
+#[tokio::test]
+async fn negated_malformed_batch_attributes_the_child() {
+    let session = EvaluationSession::empty();
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(WrongGrant(0).not());
+    for (_, result) in bind(&checker, &session)
+        .evaluate(vec![Resource { id: 0 }])
+        .await
+    {
+        assert!(
+            result
+                .indeterminate_reason()
+                .unwrap()
+                .contains("WrongGrant"),
+            "{result}"
+        );
     }
 }

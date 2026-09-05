@@ -4671,14 +4671,12 @@ mod recording_ctx_tests {
     }
 
     #[tokio::test]
-    async fn explicit_provenance_alone_does_not_upgrade() {
+    async fn explicit_failed_provenance_upgrades_abstention() {
         let session = flag_session([]);
         let subject = Subject(0);
         let resource = Resource(0);
         let c = ctx(&session, &subject, &resource);
 
-        // Error provenance constructed by hand (not witnessed by the
-        // context) leaves the author's variant choice untouched.
         let explicit = FactProvenance::from_load_result::<bool>(
             "flag",
             "Flag(0)",
@@ -4686,7 +4684,7 @@ mod recording_ctx_tests {
         );
         let result = c.not_applicable_with_facts("treated as ordinary", vec![explicit]);
 
-        assert_eq!(result.decision(), Decision::NotApplicable);
+        assert_eq!(result.decision(), Decision::Indeterminate);
         assert_eq!(result.provenance().len(), 1);
     }
 

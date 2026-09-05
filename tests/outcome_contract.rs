@@ -609,10 +609,18 @@ async fn indeterminate_attribution_retains_aggregate_and_negated_fact_causes() {
     let mut negated_aggregate = PermissionChecker::new();
     negated_aggregate.add_policy(ExplicitFailure { aggregate: true }.not().not());
     let session = odd_flag_session([3]);
-    for (checker, expected_policy) in [
-        (&aggregate, "RecordedAggregate"),
-        (&negated, "ExplicitFailure"),
-        (&negated_aggregate, "ExplicitFailure"),
+    for (checker, expected_policy, expected_reason) in [
+        (
+            &aggregate,
+            "RecordedAggregate",
+            "A consulted fact could not be loaded",
+        ),
+        (&negated, "ExplicitFailure", "membership not established"),
+        (
+            &negated_aggregate,
+            "ExplicitFailure",
+            "membership not established",
+        ),
     ] {
         let single = check_resource(checker, &session, &Resource { id: 3 }).await;
         let batch = evaluate_resources(checker, &session, vec![Resource { id: 3 }])
@@ -622,7 +630,10 @@ async fn indeterminate_attribution_retains_aggregate_and_negated_fact_causes() {
         for evaluation in [single, batch] {
             evaluation.assert_indeterminate();
             assert_eq!(evaluation.fact_load_errors().len(), 1);
-            assert_eq!(evaluation.indeterminate_reason(), Some(format!("Could not evaluate {expected_policy}: A consulted fact could not be loaded").as_str()));
+            assert_eq!(
+                evaluation.indeterminate_reason(),
+                Some(format!("Could not evaluate {expected_policy}: {expected_reason}").as_str())
+            );
             assert!(!evaluation.to_string().contains("private backend detail"));
         }
     }

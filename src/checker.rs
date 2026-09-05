@@ -735,9 +735,10 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     ///
     /// Indeterminate resources are excluded exactly like denials, so this
     /// method can return `Ok` with a shorter or empty page during an
-    /// authorization-data outage. Drive the lookup and hydration steps
-    /// directly, then use [`Self::evaluate`] if the caller must surface that
-    /// distinction.
+    /// authorization-data outage. Use [`Self::try_lookup_page`] if the caller
+    /// must surface that distinction. Although the return type is shared with
+    /// the strict API, this method never returns
+    /// [`LookupAuthorizedError::Evaluation`].
     pub async fn lookup_page<L, H>(
         &self,
         lookup: &L,

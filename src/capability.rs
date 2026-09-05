@@ -130,7 +130,8 @@ impl GrantResult {
     ) -> Self {
         Self(PolicyEvalResult::not_applicable(policy_type, reason))
     }
-    /// Creates an abstention with explicit evidence.
+    /// Creates an abstention with explicit evidence. Failed facts produce an
+    /// indeterminate result, preserving the reason and evidence.
     pub fn not_applicable_with_facts(
         policy_type: impl Into<Cow<'static, str>>,
         reason: impl Into<String>,
@@ -210,7 +211,8 @@ impl VetoResult {
     pub fn pass(policy_type: impl Into<Cow<'static, str>>, reason: impl Into<String>) -> Self {
         Self(PolicyEvalResult::not_applicable(policy_type, reason))
     }
-    /// Passes with explicit evidence.
+    /// Passes with explicit evidence. Failed facts produce an indeterminate
+    /// result, preserving the reason and evidence.
     pub fn pass_with_facts(
         policy_type: impl Into<Cow<'static, str>>,
         reason: impl Into<String>,
