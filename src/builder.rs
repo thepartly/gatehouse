@@ -1,4 +1,7 @@
-use crate::{BatchEvalCtx, EvalCtx, GrantResult, Policy, PolicyDomain, VetoPolicy, VetoResult};
+use crate::{
+    BatchEvalCtx, EvalCtx, GrantResult, Policy, PolicyDomain, PolicyEvalResult, VetoPolicy,
+    VetoResult,
+};
 use async_trait::async_trait;
 use std::borrow::Cow;
 use std::marker::PhantomData;
@@ -306,8 +309,15 @@ impl<D: PolicyDomain> VetoPolicy<D> for PredicateVeto<D> {
     }
 }
 fn predicate_veto_result(result: GrantResult) -> VetoResult {
-    let policy_type = result.policy_type().to_owned();
-    if result.is_granted() {
+    let matched = result.is_granted();
+    let policy_type = match result.0 {
+        PolicyEvalResult::Granted { policy_type, .. }
+        | PolicyEvalResult::NotApplicable { policy_type, .. }
+        | PolicyEvalResult::Forbidden { policy_type, .. }
+        | PolicyEvalResult::Indeterminate { policy_type, .. }
+        | PolicyEvalResult::Combined { policy_type, .. } => policy_type,
+    };
+    if matched {
         VetoResult::forbid(policy_type, "Policy forbids access")
     } else {
         VetoResult::pass(policy_type, "Policy predicate did not match")

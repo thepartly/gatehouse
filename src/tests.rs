@@ -3610,6 +3610,68 @@ mod policy_builder_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn veto_builder_preserves_borrowed_names_in_scalar_and_batch_results() {
+        let session = EvaluationSession::empty();
+        let subject = TestSubject {
+            name: "Alice".into(),
+        };
+        let items = [
+            PolicyBatchItem {
+                resource: &TestResource,
+            },
+            PolicyBatchItem {
+                resource: &TestResource,
+            },
+        ];
+        for matches_predicate in [false, true] {
+            for per_resource in [false, true] {
+                let builder = PolicyBuilder::<TestDomain>::new("StaticVeto");
+                let policy = if per_resource {
+                    builder.resources(move |_| matches_predicate)
+                } else {
+                    builder.subjects(move |_| matches_predicate)
+                }
+                .build_veto();
+                let scalar = EvalCtx::new(
+                    &session,
+                    &subject,
+                    &TestAction,
+                    &TestResource,
+                    &TestContext,
+                    policy.policy_type(),
+                );
+                let batch = BatchEvalCtx::new(
+                    &session,
+                    &subject,
+                    &TestAction,
+                    &TestContext,
+                    &items,
+                    policy.policy_type(),
+                );
+                let mut results = policy.evaluate_batch(&batch).await;
+                assert_eq!(results.len(), items.len());
+                results.push(policy.evaluate(&scalar).await);
+                for result in results {
+                    assert_eq!(result.is_forbidden(), matches_predicate);
+                    assert!(
+                        matches!(
+                            result.trace(),
+                            PolicyEvalResult::Forbidden {
+                                policy_type: std::borrow::Cow::Borrowed("StaticVeto"),
+                                ..
+                            } | PolicyEvalResult::NotApplicable {
+                                policy_type: std::borrow::Cow::Borrowed("StaticVeto"),
+                                ..
+                            }
+                        ),
+                        "static veto name should remain borrowed: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn new_with_owned_string_stores_owned_policy_type() {
         let dynamic = format!("Dynamic{}", 42);
