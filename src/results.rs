@@ -44,8 +44,8 @@ impl fmt::Display for CombineOp {
 /// `Indeterminate` is the fail-closed "could not evaluate" decision: the node
 /// consulted an input (typically a fact load) that was unavailable. It never
 /// grants, and inside [`crate::PermissionChecker`] an `Indeterminate` from a
-/// veto-capable policy also blocks sibling grants, because the failed policy
-/// might have forbidden the request.
+/// veto policy also blocks grants, because the failed policy might have
+/// forbidden the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -274,7 +274,7 @@ pub enum PolicyEvalResult {
     /// [`PolicyEvalResult::NotApplicable`] ("this policy does not grant"),
     /// `Indeterminate` means "this policy might have granted or forbidden,
     /// but its inputs were unavailable". [`crate::PermissionChecker`] blocks
-    /// grants when a veto-capable policy is indeterminate, and surfaces the
+    /// grants when a veto policy is indeterminate, and surfaces the
     /// failure as [`AccessEvaluation::Indeterminate`] so callers can map an
     /// authorization-data outage to a 5xx instead of a 403.
     Indeterminate {
@@ -391,10 +391,9 @@ pub enum AccessEvaluation {
     /// [`AccessEvaluation::Denied`] so callers can map "authorization inputs
     /// were unavailable" (usually a 5xx and a retry) differently from "the
     /// policies decided against this request" (a 403). Produced when a
-    /// veto-capable policy was indeterminate (its potential veto is
-    /// unresolved, so a grant cannot be released), or when no policy granted
-    /// and at least one allow-only policy was indeterminate (it might have
-    /// granted).
+    /// veto policy was indeterminate (its potential veto is unresolved, so a
+    /// grant cannot be released), or when no policy granted and at least one
+    /// grant policy was indeterminate (it might have granted).
     ///
     /// The classified fact-load failures are in the trace; use
     /// [`Self::fact_load_errors`] to collect them and
@@ -1321,9 +1320,10 @@ impl PolicyEvalResult {
     /// Attributes uncertainty along the active indeterminate spine.
     ///
     /// Resolved subtrees are skipped. An aggregate's own recorded failures
-    /// are attributed to that aggregate. Indeterminate NOT also admits
-    /// explicit error evidence on an abstaining child, since that evidence
-    /// prevents inversion even when the child has no indeterminate leaf.
+    /// are attributed to that aggregate. Every indeterminate aggregate the
+    /// crate produces either contains an indeterminate leaf or carries a
+    /// failed fact in its own provenance, so this search always names a
+    /// policy for a crate-built tree.
     pub(crate) fn indeterminate_leaf(&self) -> Option<(&str, &str)> {
         const FACT_FAILURE_REASON: &str = "A consulted fact could not be loaded";
         match self {
@@ -1335,45 +1335,22 @@ impl PolicyEvalResult {
             Self::Combined {
                 policy_type,
                 children,
-                operation,
                 provenance,
                 decision: Decision::Indeterminate,
+                ..
             } => children
                 .iter()
                 .find_map(Self::indeterminate_leaf)
                 .or_else(|| {
-                    if provenance
+                    provenance
                         .iter()
                         .any(|fact| fact.outcome == FactOutcome::Error)
-                    {
-                        Some((policy_type.as_ref(), FACT_FAILURE_REASON))
-                    } else if *operation == CombineOp::Not {
-                        children
-                            .iter()
-                            .find_map(Self::fact_error_policy)
-                            .map(|policy_type| (policy_type, FACT_FAILURE_REASON))
-                    } else {
-                        None
-                    }
+                        .then(|| (policy_type.as_ref(), FACT_FAILURE_REASON))
                 }),
             Self::Combined { .. }
             | Self::Granted { .. }
             | Self::NotApplicable { .. }
             | Self::Forbidden { .. } => None,
-        }
-    }
-
-    fn fact_error_policy(&self) -> Option<&str> {
-        if self
-            .provenance()
-            .iter()
-            .any(|fact| fact.outcome == FactOutcome::Error)
-        {
-            return Some(self.policy_type());
-        }
-        match self {
-            Self::Combined { children, .. } => children.iter().find_map(Self::fact_error_policy),
-            _ => None,
         }
     }
 

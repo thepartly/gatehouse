@@ -576,7 +576,7 @@ fn named_checker_records_name_on_batch_span() {
 
 #[test]
 fn tracing_fields_are_recorded_for_forbidden_decisions() {
-    // An allow policy that would grant, vetoed by a forbid-effect policy.
+    // A grant policy that would grant, blocked by a registered veto.
     let mut checker = PermissionChecker::new();
     checker.add_policy(TracePolicy);
     checker.add_veto(PolicyBuilder::<Domain>::new("GlobalFreeze").build_veto());

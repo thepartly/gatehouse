@@ -15,7 +15,7 @@ An in-process authorization engine for Rust. Gatehouse keeps policy logic in Rus
 - **Batch-safe list endpoints**: Authorize already-loaded resources or enumerate candidate IDs with `LookupSource` and `Hydrator`.
 - **Evaluation traces and telemetry**: Inspect the policies and fact provenance that were actually evaluated.
 
-This README describes the unreleased 0.6 API. For migration from the published 0.5.1 release, see [MIGRATION.md](MIGRATION.md).
+Upgrading from 0.5? See [MIGRATION.md](MIGRATION.md).
 
 ## Cargo features
 

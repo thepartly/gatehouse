@@ -789,7 +789,7 @@ mod core_tests {
 
         // The malformed policy's own (wrong-length) grants are discarded:
         // each item gets a synthesized indeterminate for it, and evaluation
-        // continues, so a healthy allow-only sibling still grants on its own
+        // continues, so a healthy grant sibling still grants on its own
         // merits and the trace keeps the contract violation visible.
         let mut checker = PermissionChecker::new();
         checker.add_policy(MismatchedBatchPolicy);
@@ -3298,7 +3298,7 @@ mod core_tests {
         let mut checker = PermissionChecker::new();
         checker.add_policy(AlwaysDenyPolicy("first denial reason"));
         // A second policy with a different name and reason. Its
-        // forbid-effect predicate never matches, so it lands in the trace as
+        // predicate never matches, so it lands in the trace as
         // a not-applicable leaf rather than vetoing the whole
         // evaluation before the first policy is consulted. (The
         // tree-walker checks policy_type, not reason — what we're pinning
@@ -3808,7 +3808,7 @@ mod policy_builder_tests {
         );
     }
 
-    /// The headline deny-overrides behavior: a matched `Effect::Forbid` policy
+    /// The headline deny-overrides behavior: a matched veto policy
     /// vetoes a sibling grant, regardless of registration order.
     #[tokio::test]
     async fn test_policy_builder_forbid_overrides_other_grants() {
@@ -3940,7 +3940,7 @@ mod policy_builder_tests {
         }
     }
 
-    /// A non-matching `Effect::Forbid` policy contributes nothing: the allow
+    /// A non-matching veto policy contributes nothing: the allow
     /// set still decides, and the trace root reflects deny-overrides.
     #[tokio::test]
     async fn test_non_matching_deny_policy_does_not_block_grants() {

@@ -725,8 +725,9 @@ async fn delegated_child_forbid_propagates_to_parent_checker() {
     denied.assert_forbidden_by("ChildBlock");
 }
 
-/// A hand-written policy that declares `Effect::Forbid` and forbids via
-/// `ctx.forbid` is honored on both evaluation paths.
+/// A grant policy that reports a failed fact load as explicit provenance on
+/// an abstention. The constructor upgrades the result to `Indeterminate`, so
+/// negation can never turn the failed load into a grant.
 struct ErrorBearingNotApplicablePolicy;
 
 #[async_trait]
@@ -1077,10 +1078,11 @@ async fn batch_shared_fact_records_against_every_item() {
     }
 }
 
-/// Combinator decision tables for indeterminate children. Distinguishes
-/// the veto-prefix rules (indeterminate outranks a definite non-grant when
-/// the child might have forbidden) from the allow-only rules (a definite
-/// answer outranks the indeterminate when it settles the aggregate).
+/// Three-valued model for grant and veto composition. `Unknown` is an
+/// indeterminate child; `all_truth` / `any_truth` encode that a definite
+/// abstention (or pass) settles a conjunction and a definite grant (or veto)
+/// settles a disjunction, while anything else involving `Unknown` stays
+/// `Unknown`.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Truth {
