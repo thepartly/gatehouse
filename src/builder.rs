@@ -1,4 +1,7 @@
-use crate::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyDomain, PolicyEvalResult};
+use crate::{
+    BatchEvalCtx, EvalCtx, GrantResult, Policy, PolicyDomain, PolicyEvalResult, VetoPolicy,
+    VetoResult,
+};
 use async_trait::async_trait;
 use std::borrow::Cow;
 use std::marker::PhantomData;
@@ -21,7 +24,6 @@ type WhenPredicate<D> = Box<
 /// An internal policy type constructed by [`PolicyBuilder`].
 struct InternalPolicy<D: PolicyDomain> {
     name: Cow<'static, str>,
-    effect: Effect,
     subject_pred: Option<SubjectPredicate<D>>,
     action_pred: Option<ActionPredicate<D>>,
     resource_pred: Option<ResourcePredicate<D>>,
@@ -31,26 +33,18 @@ struct InternalPolicy<D: PolicyDomain> {
 }
 
 impl<D: PolicyDomain> InternalPolicy<D> {
-    fn build_result(&self, all_axes_pass: bool) -> PolicyEvalResult {
+    fn build_result(&self, all_axes_pass: bool) -> GrantResult {
         if all_axes_pass {
-            match self.effect {
-                Effect::Allow | Effect::AllowOrForbid => PolicyEvalResult::granted(
-                    self.name.clone(),
-                    Some("Policy allowed access".into()),
-                ),
-                Effect::Forbid => {
-                    PolicyEvalResult::forbidden(self.name.clone(), "Policy forbids access")
-                }
-            }
+            GrantResult::granted(self.name.clone(), Some("Policy allowed access".into()))
         } else {
-            PolicyEvalResult::not_applicable(self.name.clone(), "Policy predicate did not match")
+            GrantResult::not_applicable(self.name.clone(), "Policy predicate did not match")
         }
     }
 }
 
 #[async_trait]
 impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> GrantResult {
         let pass = self.subject_pred.as_ref().is_none_or(|f| f(ctx.subject))
             && self.action_pred.as_ref().is_none_or(|f| f(ctx.action))
             && self.resource_pred.as_ref().is_none_or(|f| f(ctx.resource))
@@ -62,7 +56,7 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
         self.build_result(pass)
     }
 
-    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<GrantResult> {
         let n = ctx.items.len();
 
         let subject_ok = self.subject_pred.as_ref().is_none_or(|f| f(ctx.subject));
@@ -95,13 +89,13 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
     fn policy_type(&self) -> Cow<'static, str> {
         self.name.clone()
     }
-
-    fn effect(&self) -> Effect {
-        self.effect
-    }
 }
 
 /// Fluent builder for synchronous predicate policies.
+///
+/// [`Self::build`] creates a grant policy. [`Self::build_veto`] creates a
+/// veto policy: a matching predicate vetoes and a non-match passes. Register
+/// the latter with [`crate::PermissionChecker::add_veto`].
 ///
 /// The builder is parameterized by one [`PolicyDomain`], so call sites name the
 /// domain once:
@@ -128,19 +122,17 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 ///
 /// [`PolicyBuilder::new`] takes `impl Into<Cow<'static, str>>`, so a
 /// `'static` string literal (`new("Owner")`) is stored as
-/// [`Cow::Borrowed`] and is zero-allocation end-to-end on the trace /
-/// `ctx.grant` helper path — the same accounting as a hand-written
-/// `Policy` that returns `Cow::Borrowed("MyPolicy")`.
+/// [`Cow::Borrowed`] and does not allocate when the name is copied into a
+/// result. Reasons, evidence, and trace storage may allocate independently.
 ///
 /// Runtime-constructed names (`new(format!("p-{id}"))`,
 /// [`Self::new_owned`], `new(owned_string)`) store [`Cow::Owned`]. Each
-/// evaluation clones that owned name into the `PolicyEvalResult` leaf
+/// evaluation clones that owned name into the `GrantResult` leaf
 /// (and again if the checker captures `policy_type` into an
 /// [`EvalCtx`](crate::EvalCtx)), so the cost is paid when building the
 /// trace, not only when calling `policy_type()` in isolation.
 pub struct PolicyBuilder<D: PolicyDomain> {
     name: Cow<'static, str>,
-    effect: Effect,
     subject_pred: Option<SubjectPredicate<D>>,
     action_pred: Option<ActionPredicate<D>>,
     resource_pred: Option<ResourcePredicate<D>>,
@@ -184,7 +176,6 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
     pub fn new(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),
-            effect: Effect::Allow,
             subject_pred: None,
             action_pred: None,
             resource_pred: None,
@@ -227,12 +218,6 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
     /// the method name.
     pub fn new_static(name: &'static str) -> Self {
         Self::new(name)
-    }
-
-    /// Makes this policy forbid when its combined predicate matches.
-    pub fn forbid(mut self) -> Self {
-        self.effect = Effect::Forbid;
-        self
     }
 
     /// Adds a predicate that tests the subject.
@@ -285,11 +270,15 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
         self
     }
 
+    /// Builds a veto that forbids when the predicate matches.
+    pub fn build_veto(self) -> Box<dyn VetoPolicy<D>> {
+        Box::new(PredicateVeto(self.build()))
+    }
+
     /// Builds the policy.
     pub fn build(self) -> Box<dyn Policy<D>> {
         Box::new(InternalPolicy {
             name: self.name,
-            effect: self.effect,
             subject_pred: self.subject_pred,
             action_pred: self.action_pred,
             resource_pred: self.resource_pred,
@@ -297,5 +286,40 @@ impl<D: PolicyDomain> PolicyBuilder<D> {
             when_pred: self.when_pred,
             _domain: PhantomData,
         })
+    }
+}
+
+struct PredicateVeto<D: PolicyDomain>(Box<dyn Policy<D>>);
+
+#[async_trait]
+impl<D: PolicyDomain> VetoPolicy<D> for PredicateVeto<D> {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> VetoResult {
+        predicate_veto_result(self.0.evaluate(ctx).await)
+    }
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<VetoResult> {
+        self.0
+            .evaluate_batch(ctx)
+            .await
+            .into_iter()
+            .map(predicate_veto_result)
+            .collect()
+    }
+    fn policy_type(&self) -> Cow<'static, str> {
+        self.0.policy_type()
+    }
+}
+fn predicate_veto_result(result: GrantResult) -> VetoResult {
+    let matched = result.is_granted();
+    let policy_type = match result.0 {
+        PolicyEvalResult::Granted { policy_type, .. }
+        | PolicyEvalResult::NotApplicable { policy_type, .. }
+        | PolicyEvalResult::Forbidden { policy_type, .. }
+        | PolicyEvalResult::Indeterminate { policy_type, .. }
+        | PolicyEvalResult::Combined { policy_type, .. } => policy_type,
+    };
+    if matched {
+        VetoResult::forbid(policy_type, "Policy forbids access")
+    } else {
+        VetoResult::pass(policy_type, "Policy predicate did not match")
     }
 }

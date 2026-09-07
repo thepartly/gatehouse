@@ -8,8 +8,8 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    EvalCtx, EvaluationSession, Hydrator, LookupAuthorizedError, LookupPage, LookupSource,
-    PermissionChecker, Policy, PolicyDomain, PolicyEvalResult,
+    EvalCtx, EvaluationSession, GrantResult, Hydrator, LookupAuthorizedError, LookupPage,
+    LookupSource, PermissionChecker, Policy, PolicyDomain,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -62,13 +62,13 @@ struct OwnerPolicy {
 
 #[async_trait]
 impl Policy<AuthDomain> for OwnerPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, AuthDomain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, AuthDomain>) -> GrantResult {
         match self.owns.get(&ctx.resource.id) {
-            Some(owner) if *owner == ctx.subject.id => PolicyEvalResult::granted(
+            Some(owner) if *owner == ctx.subject.id => GrantResult::granted(
                 self.policy_type().to_string(),
                 Some(format!("user {} owns doc {}", owner, ctx.resource.id)),
             ),
-            _ => PolicyEvalResult::not_applicable(
+            _ => GrantResult::not_applicable(
                 self.policy_type().to_string(),
                 format!(
                     "user {} does not own doc {}",
@@ -89,11 +89,11 @@ struct PublicDocPolicy;
 
 #[async_trait]
 impl Policy<AuthDomain> for PublicDocPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, AuthDomain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, AuthDomain>) -> GrantResult {
         if ctx.resource.public {
-            PolicyEvalResult::granted(self.policy_type().to_string(), Some("public doc".into()))
+            GrantResult::granted(self.policy_type().to_string(), Some("public doc".into()))
         } else {
-            PolicyEvalResult::not_applicable(self.policy_type().to_string(), "doc is not public")
+            GrantResult::not_applicable(self.policy_type().to_string(), "doc is not public")
         }
     }
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {

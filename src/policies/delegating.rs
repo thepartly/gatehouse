@@ -1,66 +1,14 @@
+use crate::capability::combined;
+use crate::checker::{Phase, PhasePolicy, PhaseScope};
 use crate::{
-    AccessEvaluation, BatchEvalCtx, CombineOp, Decision, Effect, EvalCtx, PermissionChecker,
-    Policy, PolicyDomain, PolicyEvalResult, SecurityRuleMetadata, PERMISSION_CHECKER_POLICY_TYPE,
+    BatchEvalCtx, CombineOp, EvalCtx, PermissionChecker, PolicyBatchItem, PolicyDomain,
+    PolicyEvalResult, SecurityRuleMetadata,
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-fn delegated_evaluation_to_result(
-    policy_type: std::borrow::Cow<'static, str>,
-    evaluation: AccessEvaluation,
-) -> PolicyEvalResult {
-    let (decision, child) = match evaluation {
-        AccessEvaluation::Granted {
-            policy_type: child_policy_type,
-            reason,
-            trace,
-        } => (
-            Decision::Grant,
-            trace
-                .root()
-                .cloned()
-                .unwrap_or(PolicyEvalResult::granted(child_policy_type, reason)),
-        ),
-        AccessEvaluation::Denied { reason, trace } => {
-            let child = trace
-                .root()
-                .cloned()
-                .unwrap_or(PolicyEvalResult::not_applicable(
-                    PERMISSION_CHECKER_POLICY_TYPE,
-                    reason,
-                ));
-            // A child-checker denial is either a veto (which must propagate
-            // so the parent checker honors it over sibling grants) or an
-            // ordinary "nothing granted".
-            let decision = if child.is_forbidden() {
-                Decision::Forbid
-            } else {
-                Decision::NotApplicable
-            };
-            (decision, child)
-        }
-        AccessEvaluation::Indeterminate { reason, trace } => (
-            Decision::Indeterminate,
-            trace
-                .root()
-                .cloned()
-                .unwrap_or(PolicyEvalResult::indeterminate(
-                    PERMISSION_CHECKER_POLICY_TYPE,
-                    reason,
-                )),
-        ),
-    };
-
-    PolicyEvalResult::Combined {
-        policy_type,
-        operation: CombineOp::Delegate,
-        children: vec![child],
-        decision,
-    }
-}
-
-/// A policy that maps the current domain into a child domain and delegates to
-/// another [`PermissionChecker`].
+/// Maps inputs into a child checker. Install with [`PermissionChecker::add_delegate`].
 pub struct DelegatingPolicy<ParentD: PolicyDomain, ChildD: PolicyDomain> {
     policy_type: std::borrow::Cow<'static, str>,
     security_rule: SecurityRuleMetadata,
@@ -127,65 +75,153 @@ impl<ParentD: PolicyDomain, ChildD: PolicyDomain> DelegatingPolicy<ParentD, Chil
         self.security_rule = security_rule;
         self
     }
+    pub(crate) fn into_phases(
+        self,
+        registration: usize,
+    ) -> (Arc<dyn PhasePolicy<ParentD>>, Arc<dyn PhasePolicy<ParentD>>) {
+        let delegate = Arc::new(self);
+        (
+            Arc::new(DelegatePhase {
+                delegate: delegate.clone(),
+                phase: Phase::Veto,
+                registration,
+            }),
+            Arc::new(DelegatePhase {
+                delegate,
+                phase: Phase::Grant,
+                registration,
+            }),
+        )
+    }
 }
 
-#[async_trait]
-impl<ParentD, ChildD> Policy<ParentD> for DelegatingPolicy<ParentD, ChildD>
-where
-    ParentD: PolicyDomain,
-    ChildD: PolicyDomain,
-{
-    async fn evaluate(&self, ctx: &EvalCtx<'_, ParentD>) -> PolicyEvalResult {
-        let child_subject = (self.subject)(ctx.subject);
-        let child_action = (self.action)(ctx.action);
-        let child_resource = (self.resource)(ctx.subject, ctx.action, ctx.resource, ctx.context);
-        let child_context = (self.context)(ctx.subject, ctx.action, ctx.context);
-        let evaluation = self
-            .checker
-            .bind(ctx.session(), &child_subject, &child_action, &child_context)
-            .check(&child_resource)
-            .await;
-
-        delegated_evaluation_to_result(self.policy_type.clone(), evaluation)
+struct DelegatePhase<ParentD: PolicyDomain, ChildD: PolicyDomain> {
+    delegate: Arc<DelegatingPolicy<ParentD, ChildD>>,
+    phase: Phase,
+    registration: usize,
+}
+struct PreparedInputs<D: PolicyDomain> {
+    subject: D::Subject,
+    action: D::Action,
+    context: D::Context,
+    resources: HashMap<usize, D::Resource>,
+}
+impl<ParentD: PolicyDomain, ChildD: PolicyDomain> DelegatePhase<ParentD, ChildD> {
+    async fn run(
+        &self,
+        ctx: &BatchEvalCtx<'_, ParentD>,
+        single: bool,
+        scope: &mut PhaseScope<'_>,
+    ) -> Vec<PolicyEvalResult> {
+        let delegate = &self.delegate;
+        let mut path = scope.path.to_vec();
+        path.push(self.registration);
+        let mut prepared = match scope.state.delegates.remove(&path) {
+            Some(prepared) => prepared
+                .downcast::<PreparedInputs<ChildD>>()
+                .expect("delegate registration has one child domain"),
+            None => Box::new(PreparedInputs::<ChildD> {
+                subject: (delegate.subject)(ctx.subject),
+                action: (delegate.action)(ctx.action),
+                context: (delegate.context)(ctx.subject, ctx.action, ctx.context),
+                resources: HashMap::new(),
+            }),
+        };
+        for (&index, item) in scope.item_indices.iter().zip(ctx.items) {
+            prepared.resources.entry(index).or_insert_with(|| {
+                (delegate.resource)(ctx.subject, ctx.action, item.resource, ctx.context)
+            });
+        }
+        let items: Vec<_> = scope
+            .item_indices
+            .iter()
+            .map(|index| PolicyBatchItem {
+                resource: &prepared.resources[index],
+            })
+            .collect();
+        let inner = BatchEvalCtx::new(
+            ctx.session(),
+            &prepared.subject,
+            &prepared.action,
+            &prepared.context,
+            &items,
+            delegate.policy_type.clone(),
+        );
+        let mut child_scope = PhaseScope {
+            state: scope.state,
+            item_indices: scope.item_indices,
+            path: &path,
+        };
+        let children = if single {
+            let inner = EvalCtx::new(
+                ctx.session(),
+                &prepared.subject,
+                &prepared.action,
+                items[0].resource,
+                &prepared.context,
+                delegate.policy_type.clone(),
+            );
+            vec![
+                delegate
+                    .checker
+                    .evaluate_phase_one(self.phase, &inner, &mut child_scope)
+                    .await,
+            ]
+        } else {
+            delegate
+                .checker
+                .evaluate_phase(self.phase, &inner, &mut child_scope)
+                .await
+        };
+        let results = children
+            .into_iter()
+            .map(|child| {
+                let decision = child.decision();
+                combined(
+                    delegate.policy_type.clone(),
+                    CombineOp::Delegate,
+                    vec![child],
+                    decision,
+                )
+            })
+            .collect();
+        scope.state.delegates.insert(path, prepared);
+        results
     }
-
+}
+#[async_trait]
+impl<ParentD: PolicyDomain, ChildD: PolicyDomain> PhasePolicy<ParentD>
+    for DelegatePhase<ParentD, ChildD>
+{
+    async fn evaluate(
+        &self,
+        ctx: &EvalCtx<'_, ParentD>,
+        scope: &mut PhaseScope<'_>,
+    ) -> PolicyEvalResult {
+        let items = [PolicyBatchItem {
+            resource: ctx.resource,
+        }];
+        let batch = BatchEvalCtx::new(
+            ctx.session(),
+            ctx.subject,
+            ctx.action,
+            ctx.context,
+            &items,
+            ctx.policy_type.clone(),
+        );
+        self.run(&batch, true, scope).await.remove(0)
+    }
     async fn evaluate_batch<'item>(
         &self,
         ctx: &BatchEvalCtx<'item, ParentD>,
+        scope: &mut PhaseScope<'_>,
     ) -> Vec<PolicyEvalResult> {
-        if ctx.items.is_empty() {
-            return Vec::new();
-        }
-
-        let child_subject = (self.subject)(ctx.subject);
-        let child_action = (self.action)(ctx.action);
-        let child_context = (self.context)(ctx.subject, ctx.action, ctx.context);
-        let child_resources = ctx
-            .items
-            .iter()
-            .map(|item| (self.resource)(ctx.subject, ctx.action, item.resource, ctx.context))
-            .collect::<Vec<_>>();
-
-        self.checker
-            .bind(ctx.session(), &child_subject, &child_action, &child_context)
-            .evaluate(child_resources)
-            .await
-            .into_iter()
-            .map(|(_resource, evaluation)| {
-                delegated_evaluation_to_result(self.policy_type.clone(), evaluation)
-            })
-            .collect()
+        self.run(ctx, false, scope).await
     }
-
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
-        self.policy_type.clone()
+        self.delegate.policy_type.clone()
     }
-
-    fn effect(&self) -> Effect {
-        self.checker.aggregate_effect()
-    }
-
     fn security_rule(&self) -> SecurityRuleMetadata {
-        self.security_rule.clone()
+        self.delegate.security_rule.clone()
     }
 }

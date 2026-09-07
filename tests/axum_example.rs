@@ -177,3 +177,49 @@ async fn edit_invoice_denies_stale_invoice() {
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+struct UnavailableRelationships;
+
+#[async_trait::async_trait]
+impl<K: gatehouse::FactKey<Value = bool>> gatehouse::FactSource<K> for UnavailableRelationships {
+    async fn load_many(&self, keys: &[K]) -> Vec<gatehouse::FactLoadResult<bool>> {
+        keys.iter()
+            .map(|_| {
+                gatehouse::FactLoadResult::Error(gatehouse::FactLoadError::backend_message(
+                    "injected outage",
+                ))
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn authorization_outage_returns_503_for_single_and_list_but_admin_still_grants() {
+    let state = axum_example::AppState::demo().with_relationship_source(UnavailableRelationships);
+    let app = Router::new()
+        .route("/invoices", get(axum_example::list_invoices_handler))
+        .route(
+            "/invoices/{invoice_id}",
+            get(axum_example::view_invoice_handler),
+        )
+        .with_state(state);
+    for uri in [
+        "/invoices",
+        "/invoices/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    ] {
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("injected outage"));
+        let request = Request::builder()
+            .uri(uri)
+            .header("x-roles", "admin")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+}

@@ -1,6 +1,6 @@
 use crate::{
-    BatchEvalCtx, EvalCtx, FactLoadError, FactLoadErrorKind, FactLoadResult, Policy, PolicyDomain,
-    PolicyEvalResult, RelationshipQuery,
+    BatchEvalCtx, EvalCtx, FactLoadError, FactLoadErrorKind, FactLoadResult, GrantResult, Policy,
+    PolicyDomain, RelationshipQuery,
 };
 use async_trait::async_trait;
 use std::fmt;
@@ -47,7 +47,7 @@ where
     ResourceId: Eq + Hash + Clone + Send + Sync + fmt::Debug + 'static,
     Relation: Eq + Hash + Clone + Send + Sync + fmt::Display + fmt::Debug + 'static,
 {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, D>) -> GrantResult {
         let key = RelationshipQuery {
             subject_id: (self.subject_id)(ctx.subject),
             resource_id: (self.resource_id)(ctx.resource),
@@ -62,7 +62,7 @@ where
         }
     }
 
-    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<PolicyEvalResult> {
+    async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<GrantResult> {
         let subject_id = (self.subject_id)(ctx.subject);
         // `facts_by` performs one deduplicated `get_many` and records
         // provenance against each originating item; the caller's
@@ -79,7 +79,7 @@ where
                 .items
                 .iter()
                 .map(|_| {
-                    PolicyEvalResult::indeterminate(
+                    GrantResult::indeterminate(
                         self.policy_type(),
                         "Relationship fact source returned the wrong number of results",
                     )
@@ -132,16 +132,16 @@ where
         &self,
         policy_type: std::borrow::Cow<'static, str>,
         fact: FactLoadResult<bool>,
-    ) -> PolicyEvalResult {
+    ) -> GrantResult {
         match fact {
             FactLoadResult::Found(true) => {
-                PolicyEvalResult::granted(policy_type, Some(self.granted_reason()))
+                GrantResult::granted(policy_type, Some(self.granted_reason()))
             }
             FactLoadResult::Found(false) => {
-                PolicyEvalResult::not_applicable(policy_type, self.no_relationship_reason())
+                GrantResult::not_applicable(policy_type, self.no_relationship_reason())
             }
             FactLoadResult::Missing => {
-                PolicyEvalResult::not_applicable(policy_type, self.missing_reason())
+                GrantResult::not_applicable(policy_type, self.missing_reason())
             }
             // Fail closed, but structurally: the relationship could not be
             // loaded, so the policy could not decide. This surfaces as
@@ -149,7 +149,7 @@ where
             // denial, letting callers map an authorization-data outage to a
             // 5xx instead of a 403.
             FactLoadResult::Error(error) => {
-                PolicyEvalResult::indeterminate(policy_type, self.error_reason(&error))
+                GrantResult::indeterminate(policy_type, self.error_reason(&error))
             }
         }
     }

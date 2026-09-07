@@ -1,0 +1,2 @@
+# The default metadata method already returns Default::default().
+exclude_re = ['replace VetoPolicy::security_rule -> SecurityRuleMetadata with Default::default\(\)']

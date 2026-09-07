@@ -259,6 +259,17 @@ impl AppState {
         }
     }
 
+    /// Replaces the relationship backend while retaining the demo checker and resources.
+    pub fn with_relationship_source<S: FactSource<InvoiceRelationship> + 'static>(
+        mut self,
+        source: S,
+    ) -> Self {
+        self.fact_registry = FactRegistry::builder()
+            .with::<InvoiceRelationship, _>(source)
+            .build();
+        self
+    }
+
     fn request_session(&self) -> EvaluationSession {
         self.fact_registry.session()
     }
@@ -368,7 +379,7 @@ fn invoice_editing_policy() -> Box<dyn Policy<InvoiceDomain>> {
 }
 
 /// (D) Combine the policies into a single `PermissionChecker`. With no
-/// forbid-effect policies registered, deny-overrides reduces to OR semantics:
+/// veto policies registered, deny-overrides reduces to OR semantics:
 /// if any policy grants, access is allowed (and evaluation short-circuits).
 pub fn build_permission_checker() -> PermissionChecker<InvoiceDomain> {
     let mut checker = PermissionChecker::named("InvoiceChecker");
@@ -382,6 +393,17 @@ pub fn build_permission_checker() -> PermissionChecker<InvoiceDomain> {
 // 4) Using in Axum Route Handlers
 // ---------------------------------
 
+fn authorization_error_response(error: AccessError) -> axum::response::Response {
+    match error {
+        AccessError::Denied { .. } => (StatusCode::FORBIDDEN, "Access denied").into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Authorization temporarily unavailable",
+        )
+            .into_response(),
+    }
+}
+
 pub async fn view_invoice_handler(
     Path(invoice_id): Path<Uuid>,
     State(state): State<AppState>,
@@ -393,20 +415,15 @@ pub async fn view_invoice_handler(
     let session = state.request_session();
     let context = RequestContext::now();
 
-    if state
+    match state
         .checker
         .bind(&session, &user, &Action::View, &context)
         .check(&invoice)
         .await
-        .is_granted()
+        .into_result()
     {
-        (StatusCode::OK, format!("{invoice:?}")).into_response()
-    } else {
-        (
-            StatusCode::FORBIDDEN,
-            "You are not authorized to view this invoice",
-        )
-            .into_response()
+        Ok(()) => (StatusCode::OK, format!("{invoice:?}")).into_response(),
+        Err(error) => authorization_error_response(error),
     }
 }
 
@@ -421,11 +438,22 @@ pub async fn list_invoices_handler(
     // The session is request-scoped: app state owns the source, this request
     // registers it, and the batch authorization call uses it for every invoice
     // — relationship loads are batched and deduplicated.
-    let visible = state
+    let visible = match state
         .checker
         .bind(&session, &user, &Action::View, &context)
-        .filter(candidates)
+        .try_filter(candidates)
         .await
+    {
+        Ok(visible) => visible,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authorization temporarily unavailable",
+            )
+                .into_response()
+        }
+    };
+    let visible = visible
         .into_iter()
         .map(InvoiceSummary::from)
         .collect::<Vec<_>>();
@@ -443,20 +471,15 @@ pub async fn edit_invoice_handler(
     let session = state.request_session();
     let context = RequestContext::now();
 
-    if state
+    match state
         .checker
         .bind(&session, &user, &Action::Edit, &context)
         .check(&invoice)
         .await
-        .is_granted()
+        .into_result()
     {
-        (StatusCode::OK, "Invoice edited successfully").into_response()
-    } else {
-        (
-            StatusCode::FORBIDDEN,
-            "You are not authorized to edit this invoice",
-        )
-            .into_response()
+        Ok(()) => (StatusCode::OK, "Invoice edited successfully").into_response(),
+        Err(error) => authorization_error_response(error),
     }
 }
 

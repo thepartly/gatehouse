@@ -334,8 +334,9 @@ async fn main() {
             let session = session_with(&source);
             checker
                 .bind(&session, &subject, &View, &())
-                .filter(sample.clone())
+                .try_filter(sample.clone())
                 .await
+                .unwrap_or_else(|error| panic!("{error}"))
                 .len()
         })
         .await;

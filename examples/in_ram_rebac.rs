@@ -129,8 +129,9 @@ async fn main() {
     let first_request = request_session(&registry);
     let visible = checker
         .bind(&first_request, &user, &View, &context)
-        .filter(documents.clone())
-        .await;
+        .try_filter(documents.clone())
+        .await
+        .expect("authorization must complete");
     println!(
         "batch list — visible documents: {:?}",
         visible
@@ -169,8 +170,9 @@ async fn main() {
                 let context = ();
                 checker
                     .bind(&session, &user, &View, &context)
-                    .filter(documents)
+                    .try_filter(documents)
                     .await
+                    .expect("authorization must complete")
                     .len()
             })
         })

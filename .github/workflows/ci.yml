@@ -23,6 +23,8 @@ jobs:
           key: "v2"
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
       - name: Build
         run: cargo build --verbose
       - name: Lint
@@ -31,6 +33,51 @@ jobs:
         run: cargo doc --verbose
       - name: Test
         run: cargo test --all-targets --all-features
+
+  feature-contracts:
+    name: Feature contracts (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - name: none
+            args: --no-default-features
+          - name: tracing
+            args: --no-default-features --features tracing
+          - name: serde
+            args: --no-default-features --features serde
+          - name: all
+            args: --all-features
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check library dependency graph
+        if: matrix.features.name == 'none'
+        run: |
+          cargo tree --edges normal --no-default-features > dependencies.txt
+          if grep -q tracing dependencies.txt; then
+            cat dependencies.txt
+            exit 1
+          fi
+      - name: Lint
+        run: cargo clippy --all-targets ${{ matrix.features.args }} -- -D warnings
+      - name: Test contracts and examples
+        run: cargo test --lib --tests --examples ${{ matrix.features.args }}
+      - name: Test documentation
+        run: cargo test --doc ${{ matrix.features.args }}
+
+  msrv:
+    name: Minimum supported Rust (1.82)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --lib --all-features --locked
+      - run: cargo check --lib --no-default-features --locked
 
   loom-tests:
     name: Loom permutation tests
@@ -57,7 +104,7 @@ jobs:
     needs: build-and-test
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -73,15 +120,18 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
-      - name: Capture checker/combinator diff
-        run: git diff origin/${{ github.base_ref }}...HEAD -- src/checker.rs src/combinators.rs > mutants.diff
+      - name: Capture authorization diff
+        run: git diff origin/${{ github.base_ref }}...HEAD -- src/checker.rs src/combinators.rs src/capability.rs src/policies/delegating.rs > mutants.diff
       - name: Run focused mutation tests
         run: >
           cargo mutants
-          --in-place
+          --jobs=2
+          --jobserver-tasks=2
           --in-diff=mutants.diff
           --file src/checker.rs
           --file src/combinators.rs
+          --file src/capability.rs
+          --file src/policies/delegating.rs
           --baseline=skip
           --timeout=60
           --build-timeout=300
@@ -89,8 +139,7 @@ jobs:
           --
           --test checker_contract
           --test tracing_contract
-        env:
-          PROPTEST_CASES: 128
+          --test outcome_contract
       - name: Upload mutation test report
         uses: actions/upload-artifact@v7
         if: always()

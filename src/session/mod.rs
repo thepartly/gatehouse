@@ -9,8 +9,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::num::NonZeroUsize;
+#[cfg(feature = "tracing")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+#[cfg(feature = "tracing")]
 use tracing::Instrument;
 
 const FACT_STATE_STRIPES: usize = 64;
@@ -27,6 +29,7 @@ type StripeCore<K> = FactStripeCore<K, StripeWaiter>;
 #[derive(Default)]
 struct EvaluationSessionInner {
     states: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    #[cfg(feature = "tracing")]
     next_load_id: AtomicU64,
     shared_empty: bool,
 }
@@ -478,7 +481,9 @@ impl EvaluationSession {
                     .max(1);
 
                 for chunk in load_plan.keys.chunks(chunk_size) {
+                    #[cfg(feature = "tracing")]
                     let load_id = self.inner.next_load_id.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "tracing")]
                     let load_span = tracing::debug_span!(
                         "gatehouse.fact_load",
                         fact.name = K::NAME,
@@ -486,7 +491,10 @@ impl EvaluationSession {
                         fact.key_count = chunk.len(),
                         fact.unique_key_count = chunk.len(),
                     );
-                    let loaded = source.load_many(chunk).instrument(load_span).await;
+                    let loaded = source.load_many(chunk);
+                    #[cfg(feature = "tracing")]
+                    let loaded = loaded.instrument(load_span);
+                    let loaded = loaded.await;
                     let results = if loaded.len() == chunk.len() {
                         loaded
                     } else {

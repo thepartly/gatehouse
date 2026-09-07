@@ -31,7 +31,7 @@
 // Each handler pulls the shared `AppState` from Actix Web's `Data` extractor,
 // builds a request-scoped `EvaluationSession`, and evaluates with
 // `bind(...).check(...)` (single resource) or
-// `bind(...).filter(...)` (the list endpoint).
+// `bind(...).try_filter(...)` (the list endpoint).
 //
 // Note: on denial these handlers echo the evaluation trace back in the HTTP
 // response so you can see the decision from `curl`. That is a demo convenience,
@@ -42,9 +42,8 @@ use actix_web::{
 };
 use async_trait::async_trait;
 use gatehouse::{
-    AccessEvaluation, AndPolicy, EvalTrace, EvaluationSession, FactLoadResult, FactRegistry,
-    FactSource, PermissionChecker, Policy, PolicyBuilder, PolicyDomain, RebacPolicy,
-    RelationshipQuery,
+    AccessError, AndPolicy, EvalTrace, EvaluationSession, FactLoadResult, FactRegistry, FactSource,
+    PermissionChecker, Policy, PolicyBuilder, PolicyDomain, RebacPolicy, RelationshipQuery,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -249,6 +248,17 @@ impl AppState {
         }
     }
 
+    /// Replaces the relationship backend while retaining the demo checker and resources.
+    pub fn with_relationship_source<S: FactSource<PostRelationship> + 'static>(
+        mut self,
+        source: S,
+    ) -> Self {
+        self.fact_registry = FactRegistry::builder()
+            .with::<PostRelationship, _>(source)
+            .build();
+        self
+    }
+
     fn request_session(&self) -> EvaluationSession {
         self.fact_registry.session()
     }
@@ -444,11 +454,17 @@ pub async fn list_posts(
     let context = RequestContext::now();
     let candidates = state.posts.as_ref().clone();
 
-    let visible = state
+    let visible = match state
         .checker
         .bind(&session, &user, &Action::View, &context)
-        .filter(candidates)
-        .await;
+        .try_filter(candidates)
+        .await
+    {
+        Ok(visible) => visible,
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable().body("Authorization temporarily unavailable")
+        }
+    };
 
     let summaries = visible.iter().map(PostSummary::from).collect::<Vec<_>>();
     HttpResponse::Ok().json(summaries)
@@ -469,12 +485,11 @@ pub async fn view_post(
         .bind(&session, &user, &Action::View, &context)
         .check(&post)
         .await
+        .into_result()
     {
-        AccessEvaluation::Granted { .. } => {
-            HttpResponse::Ok().body(format!("Viewing '{}'", post.title))
-        }
-        AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
-        _ => HttpResponse::Forbidden().body("Access denied"),
+        Ok(()) => HttpResponse::Ok().body(format!("Viewing '{}'", post.title)),
+        Err(AccessError::Denied { reason, trace }) => forbidden(&reason, &trace),
+        Err(_) => HttpResponse::ServiceUnavailable().body("Authorization temporarily unavailable"),
     }
 }
 
@@ -493,10 +508,11 @@ pub async fn edit_post(
         .bind(&session, &user, &Action::Edit, &context)
         .check(&post)
         .await
+        .into_result()
     {
-        AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post updated"),
-        AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
-        _ => HttpResponse::Forbidden().body("Access denied"),
+        Ok(()) => HttpResponse::Ok().body("Post updated"),
+        Err(AccessError::Denied { reason, trace }) => forbidden(&reason, &trace),
+        Err(_) => HttpResponse::ServiceUnavailable().body("Authorization temporarily unavailable"),
     }
 }
 
@@ -515,10 +531,11 @@ pub async fn publish_post(
         .bind(&session, &user, &Action::Publish, &context)
         .check(&post)
         .await
+        .into_result()
     {
-        AccessEvaluation::Granted { .. } => HttpResponse::Ok().body("Post published"),
-        AccessEvaluation::Denied { reason, trace } => forbidden(&reason, &trace),
-        _ => HttpResponse::Forbidden().body("Access denied"),
+        Ok(()) => HttpResponse::Ok().body("Post published"),
+        Err(AccessError::Denied { reason, trace }) => forbidden(&reason, &trace),
+        Err(_) => HttpResponse::ServiceUnavailable().body("Authorization temporarily unavailable"),
     }
 }
 

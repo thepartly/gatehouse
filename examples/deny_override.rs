@@ -3,17 +3,17 @@
 //! Almost every real authorization system eventually needs a rule that
 //! overrides all the others: a suspended account is locked out regardless of
 //! role, a document under legal hold is frozen even for its owner and for
-//! admins. In gatehouse this is exactly what [`Effect::Forbid`] does: a policy
-//! built with `.forbid()` **forbids** the request when its
+//! admins. In gatehouse this is exactly what [`VetoPolicy`] does: a policy
+//! built with `.build_veto()` **forbids** the request when its
 //! predicate matches, and [`PermissionChecker`] honors a forbid over any
 //! grant from sibling policies — deny-overrides semantics, in the style of
 //! Cedar and AWS IAM.
 //!
-//! The shape is flat: block rules are ordinary policies registered with
-//! `add_policy`, in natural polarity (predicate matches ⇒ forbidden), in any
+//! The shape is flat: block rules are veto policies registered with
+//! `add_veto`, in natural polarity (predicate matches ⇒ forbidden), in any
 //! order. The decision rule is fixed:
 //!
-//! 1. any matching `Effect::Forbid` policy ⇒ **denied** (the trace names it);
+//! 1. any matching `VetoPolicy` policy ⇒ **denied** (the trace names it);
 //! 2. otherwise any granting policy ⇒ **granted**;
 //! 3. otherwise ⇒ **denied** (default deny).
 //!
@@ -29,7 +29,8 @@
 //! ```
 
 use gatehouse::{
-    AndPolicy, EvaluationSession, NotPolicy, PermissionChecker, Policy, PolicyBuilder, PolicyDomain,
+    AndPolicy, EvaluationSession, PermissionChecker, Policy, PolicyBuilder, PolicyDomain,
+    PolicyExt, VetoPolicy,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -86,33 +87,28 @@ fn document_owner() -> DocPolicy {
 // ---- the block rules -----------------------------------------------
 
 /// Account suspension: predicate matches ⇒ the request is forbidden. The
-/// effect travels with the policy, so this reads exactly as it behaves —
-/// no inverted polarity, no special registration call.
-fn account_suspended() -> DocPolicy {
+/// distinct return type requires registration with `add_veto`.
+fn account_suspended() -> Box<dyn VetoPolicy<DocumentDomain>> {
     PolicyBuilder::<DocumentDomain>::new("AccountSuspended")
         .subjects(|user| user.suspended)
-        .forbid()
-        .build()
+        .build_veto()
 }
 
 /// Legal hold: a frozen document is blocked for everyone, owner and admin
 /// included.
-fn legal_hold() -> DocPolicy {
+fn legal_hold() -> Box<dyn VetoPolicy<DocumentDomain>> {
     PolicyBuilder::<DocumentDomain>::new("LegalHold")
         .resources(|document| document.legal_hold)
-        .forbid()
-        .build()
+        .build_veto()
 }
 
 fn document_checker() -> PermissionChecker<DocumentDomain> {
     let mut checker = PermissionChecker::named("DocumentChecker");
-    // Flat registration, any order: the deny policies' effect is declared
-    // on the policies themselves, and the checker evaluates forbid-effect
-    // policies first so a veto can never be raced by a grant.
+    // Vetoes are evaluated before any grant can short-circuit.
     checker.add_policy(admin_override());
     checker.add_policy(document_owner());
-    checker.add_policy(account_suspended());
-    checker.add_policy(legal_hold());
+    checker.add_veto(account_suspended());
+    checker.add_veto(legal_hold());
     checker
 }
 
@@ -212,7 +208,7 @@ async fn main() {
     stranger_decision.assert_denied();
     assert_eq!(stranger_decision.forbidden_by(), None);
 
-    // Show the mechanism on the headline case: the forbid-effect policy is
+    // Show the mechanism on the headline case: the veto policy is
     // evaluated first and ends the evaluation; the allow set is never
     // consulted.
     println!("\nWhy 'admin, LEGAL-HOLD doc' is blocked:");
@@ -227,12 +223,12 @@ async fn main() {
 
 // ---- scoped exclusion: a deny that gates only one grant path --------
 
-/// `Effect::Forbid` is a *global* veto: it blocks every grant path in the
+/// `VetoPolicy` is a *global* veto: it blocks every grant path in the
 /// checker. When a block rule should only gate one grant path — here,
 /// muted users lose collaborator access but owners and admins keep
 /// theirs — scope it with combinators instead:
 /// `AndPolicy[ grant_arm, NotPolicy(block) ]`. The block policy in this local
-/// shape should be an ordinary grant-style predicate, not `.forbid()`;
+/// shape should be an ordinary grant-style predicate, not `.build_veto()`;
 /// `Forbidden` is active and would still veto globally.
 async fn scoped_exclusion_demo() {
     #[derive(Debug, Clone)]
@@ -263,16 +259,16 @@ async fn scoped_exclusion_demo() {
     );
     // The block rule for the scoped case *grants when it matches* so that
     // `NotPolicy` can invert it into a local gate. Compare with the
-    // checker-level rules above, where `Effect::Forbid` keeps natural
+    // checker-level rules above, where `VetoPolicy` keeps natural
     // polarity — this inversion is the price of scoping, which is why a
-    // global block should prefer `Effect::Forbid`.
+    // global block should prefer `VetoPolicy`.
     let muted = PolicyBuilder::<ThreadDomain>::new("Muted")
         .subjects(|member| member.muted)
         .build();
 
     let collaborator_unless_muted = AndPolicy::try_new(vec![
         collaborator_policy,
-        Arc::new(NotPolicy::new(muted)) as Arc<dyn Policy<ThreadDomain>>,
+        Arc::new(muted.not()) as Arc<dyn Policy<ThreadDomain>>,
     ])
     .expect("gate has the grant arm and the guard");
 
@@ -301,7 +297,7 @@ async fn scoped_exclusion_demo() {
         .check(&Thread)
         .await
         .assert_denied();
-    // ...the owner path is untouched, which a global Effect::Forbid mute
+    // ...the owner path is untouched, which a global VetoPolicy mute
     // could not express.
     checker
         .bind(&session, &muted_owner, &action, &context)

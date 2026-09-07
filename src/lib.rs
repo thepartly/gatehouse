@@ -89,9 +89,9 @@
 //!
 //! let decision = bound.check(&resource).await;
 //! let decisions = bound.evaluate(resources.clone()).await;
-//! let authorized = bound.filter(resources).await;
-//! let authorized_rows = bound.filter_by(rows, |row| &row.authz_resource).await;
-//! let page = bound.lookup_page(&lookup, &hydrator, cursor.as_deref(), limit).await?;
+//! let authorized = bound.try_filter(resources).await?;
+//! let authorized_rows = bound.try_filter_by(rows, |row| &row.authz_resource).await?;
+//! let page = bound.try_lookup_page(&lookup, &hydrator, cursor.as_deref(), limit).await?;
 //! ```
 //!
 //! Use [`EvaluationSession::empty`] for fact-free decisions. Use a session from
@@ -99,59 +99,63 @@
 //! (which also records provenance) or the raw session — such as [`RebacPolicy`]
 //! or a custom fact-backed policy.
 //!
-//! [`BoundEvaluator::evaluate`] preserves input order and returns one
-//! [`AccessEvaluation`] per input resource. [`BoundEvaluator::filter`] keeps
-//! only granted resources. [`BoundEvaluator::evaluate_by`] and
-//! [`BoundEvaluator::filter_by`] are for wide caller-owned rows where
-//! authorization uses a projected resource. [`BoundEvaluator::lookup_page`] is
-//! for list endpoints where the application cannot load every possible
-//! candidate first; the [`LookupSource`] enumerates candidate IDs, a
-//! [`Hydrator`] resolves them, and the full policy stack authorizes the
-//! hydrated resources.
+//! [`BoundEvaluator::evaluate`] preserves input order and retains every item
+//! and decision. [`BoundEvaluator::try_filter`] excludes definite denials but
+//! fails on indeterminate decisions; [`BoundEvaluator::try_filter_by`] applies
+//! the same rule to projected caller-owned rows. Errors retain all input items
+//! and evaluations. The original `filter` helpers deliberately omit outages.
+//!
+//! [`BoundEvaluator::try_lookup_page`] enumerates candidate IDs, hydrates them,
+//! and strictly authorizes one page. [`LookupSource`] must cover every grant
+//! path, including admin overrides. On evaluation failure, no next cursor is
+//! returned: retry the same cursor with a fresh session after recovery.
 //!
 //! # Decision Semantics
 //!
-//! Gatehouse deliberately keeps combining semantics fixed:
+//! [`Policy`] returns [`GrantResult`]: grant, abstention, or indeterminate.
+//! [`VetoPolicy`] returns [`VetoResult`]: veto, pass, or indeterminate. Register
+//! them with [`PermissionChecker::add_policy`] and [`PermissionChecker::add_veto`].
+//! These types prevent grant policies from returning veto authority.
 //!
-//! - [`PermissionChecker`] applies deny-overrides. Any evaluated result
-//!   containing [`PolicyEvalResult::Forbidden`] denies the request and
-//!   overrides grants.
-//! - Policies declaring [`Effect::Forbid`] or [`Effect::AllowOrForbid`] are
-//!   evaluated before allow-only policies so a veto cannot be skipped by grant
-//!   short-circuiting.
-//! - If no policy forbids, the first grant wins.
-//! - If nothing grants, the checker denies with `"All policies denied access"`.
-//! - An empty checker denies with `"No policies configured"`.
-//! - [`PolicyEvalResult::NotApplicable`] means the policy did not grant.
-//!   [`PolicyEvalResult::Forbidden`] means the policy actively vetoed.
-//! - [`PolicyEvalResult::Indeterminate`] means the policy could not be
-//!   evaluated (typically a failed fact load). It never grants. An
-//!   indeterminate **veto-capable** policy blocks sibling grants — its
-//!   unresolved potential veto must not be short-circuited — and surfaces as
-//!   [`AccessEvaluation::Indeterminate`]; an observed `Forbidden` still
-//!   overrides it. An indeterminate **allow-only** policy never blocks a
-//!   sibling grant, but if nothing grants the evaluation is
-//!   [`AccessEvaluation::Indeterminate`] rather than an ordinary denial, so
-//!   callers can map authorization-data outages to a 5xx instead of a 403.
-//! - [`PolicyBuilder`] combines configured predicates with AND logic.
-//!   [`PolicyBuilder::forbid`] makes a matching built policy forbid; a
-//!   non-match remains not applicable and does not block.
-//! - [`AndPolicy`] and [`OrPolicy`] evaluate veto-capable children before
-//!   allow-only children, then short-circuit normally. [`NotPolicy`] inverts
-//!   grants and non-grants, but never turns `Forbidden` into a grant.
-//! - `Forbidden` propagates through [`AndPolicy`], [`OrPolicy`], [`NotPolicy`],
-//!   and [`DelegatingPolicy`].
-//! - [`NotPolicy`] does not neutralize a veto. `admin.or(blocked.not())` still
-//!   denies when `blocked` returns `Forbidden`. For "grant unless blocked", use
-//!   an allow-only `blocked` predicate under `not()`, or register an explicit
-//!   forbid policy when the block should be global.
-//! - `grant.and(forbid_only)` can never grant: a forbid-only child does not
-//!   satisfy AND's "all children grant" rule. Use
-//!   `grant.and(blocked_allow_predicate.not())` for a local exclusion.
+//! A definite veto denies access. An unresolved veto blocks grants. After
+//! vetoes pass, any grant authorizes, including a grant after another grant
+//! policy failed. With no grant, uncertainty yields [`AccessEvaluation::Indeterminate`];
+//! otherwise access is denied. An empty checker denies access.
 //!
-//! Denials from [`AccessEvaluation`] are summary-level. Use
-//! [`AccessEvaluation::display_trace`] or the attached [`EvalTrace`] to inspect
-//! individual policy reasons and fact provenance.
+//! [`AndPolicy`], [`OrPolicy`], and [`NotPolicy`] compose grants only. A definite
+//! abstention settles AND; a definite grant settles OR; NOT retains uncertainty.
+//! Use `grant.and(blocked.not())` for a local exclusion. Vetoes use
+//! [`AllOfVeto`] or [`AnyOfVeto`]; a pass settles all-of and a veto settles any-of,
+//! otherwise uncertainty remains. Veto negation is not supported.
+//!
+//! [`PolicyBuilder::build`] produces a grant policy;
+//! [`PolicyBuilder::build_veto`] produces a veto when its predicate matches.
+//! Register [`DelegatingPolicy`] once with [`PermissionChecker::add_delegate`]
+//! to preserve both child capabilities and their distinct failure semantics.
+//!
+//! [`PolicyEvalResult`] is the inspectable audit tree, not a policy return type.
+//! Typed result constructors compute aggregate decisions; arbitrary raw trees
+//! cannot be promoted into typed authority. [`GrantResult::all`] and
+//! [`GrantResult::any`] support custom grant aggregates.
+//!
+//! Use [`AccessEvaluation::into_result`] to distinguish [`AccessError::Denied`]
+//! from [`AccessError::Indeterminate`] without parsing reasons. Both errors retain
+//! the full trace and classified fact errors. The original `to_result` combines
+//! both outcomes into one reason-only callback.
+//!
+//! Recorded successful, missing, and failed facts are retained on every node,
+//! including aggregates. Recorded errors upgrade abstention/pass to indeterminate;
+//! decisive grants and vetoes remain decisive. Attaching evidence has the same
+//! behavior for leaves and aggregate nodes. Call `ctx.finish(result)` when
+//! evaluating a policy directly; the checker and built-in combinators do this
+//! automatically.
+//!
+//! # Cargo Features
+//!
+//! `tracing` is enabled by default. Disable default features to remove its
+//! instrumentation and dependency; decisions, returned [`EvalTrace`], and fact
+//! provenance remain available. No telemetry events or contract warnings are
+//! emitted without tracing. `serde` independently enables audit serialization.
 //!
 //! # Fact-Loaded Authorization
 //!
@@ -176,8 +180,8 @@
 //! for the stream lifetime.
 //!
 //! If your product contract authorizes once at stream open, create a fresh
-//! session, compute the visible ID set with [`BoundEvaluator::filter`] or
-//! [`BoundEvaluator::filter_by`], drop the session, and only emit frames for
+//! session, compute the visible ID set with [`BoundEvaluator::try_filter`] or
+//! [`BoundEvaluator::try_filter_by`], drop the session, and only emit frames for
 //! that set. If the stream must observe mid-stream permission revocation, run
 //! periodic reauthorization with a fresh [`FactRegistry::session`] and re-bind
 //! the checker for that pass.
@@ -197,7 +201,8 @@
 //! # Custom Policies
 //!
 //! Implement [`Policy`] directly when a rule needs async work, custom batching,
-//! custom telemetry metadata, or hand-written forbid behavior:
+//! or custom telemetry metadata. Implement [`VetoPolicy`] for custom vetoes.
+//! A grant policy looks like this:
 //!
 //! ```rust
 //! # use async_trait::async_trait;
@@ -217,7 +222,7 @@
 //!
 //! #[async_trait]
 //! impl Policy<Documents> for OwnerPolicy {
-//!     async fn evaluate(&self, ctx: &EvalCtx<'_, Documents>) -> PolicyEvalResult {
+//!     async fn evaluate(&self, ctx: &EvalCtx<'_, Documents>) -> GrantResult {
 //!         if ctx.subject.id == ctx.resource.owner_id {
 //!             ctx.grant("subject owns the document")
 //!         } else {
@@ -242,6 +247,7 @@
 #![allow(clippy::type_complexity)]
 
 mod builder;
+mod capability;
 mod checker;
 mod combinators;
 mod facts;
@@ -253,18 +259,25 @@ mod results;
 mod session;
 
 pub use builder::PolicyBuilder;
+pub use capability::{GrantResult, PolicyResult, VetoPolicy, VetoResult};
 pub use checker::{BoundEvaluator, PermissionChecker};
-pub use combinators::{AndPolicy, EmptyPoliciesError, NotPolicy, OrPolicy, PolicyExt};
+pub use combinators::{
+    AllOfVeto, AndPolicy, AnyOfVeto, EmptyPoliciesError, NotPolicy, OrPolicy, PolicyExt,
+    VetoPolicyExt,
+};
 pub use facts::{
     FactKey, FactLoadError, FactLoadErrorKind, FactLoadResult, FactSource, RelationshipQuery,
 };
 pub use lookup::{Hydrator, LookupAuthorizedError, LookupAuthorizedPage, LookupPage, LookupSource};
 pub use metadata::SecurityRuleMetadata;
-pub(crate) use metadata::{DEFAULT_SECURITY_RULE_CATEGORY, PERMISSION_CHECKER_POLICY_TYPE};
+#[cfg(feature = "tracing")]
+pub(crate) use metadata::DEFAULT_SECURITY_RULE_CATEGORY;
+pub(crate) use metadata::PERMISSION_CHECKER_POLICY_TYPE;
 pub use policies::{DelegatingPolicy, RbacPolicy, RebacPolicy};
-pub use policy::{BatchEvalCtx, Effect, EvalCtx, Policy, PolicyBatchItem, PolicyDomain};
+pub use policy::{BatchEvalCtx, EvalCtx, Policy, PolicyBatchItem, PolicyDomain};
 pub use results::{
-    AccessEvaluation, CombineOp, Decision, EvalTrace, FactOutcome, FactProvenance, PolicyEvalResult,
+    AccessError, AccessEvaluation, CombineOp, Decision, EvalTrace, FactOutcome, FactProvenance,
+    FilterError, PolicyEvalResult,
 };
 pub use session::{EvaluationSession, FactRegistry, FactRegistryBuilder};
 

@@ -39,8 +39,8 @@
 
 use async_trait::async_trait;
 use gatehouse::{
-    EvalCtx, EvaluationSession, FactKey, FactLoadResult, FactRegistry, FactSource,
-    PermissionChecker, Policy, PolicyDomain, PolicyEvalResult,
+    EvalCtx, EvaluationSession, FactKey, FactLoadResult, FactRegistry, FactSource, GrantResult,
+    PermissionChecker, Policy, PolicyDomain,
 };
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -129,7 +129,7 @@ struct WrongSupplierPolicy {
 
 #[async_trait]
 impl Policy<SupplierInvoiceDomain> for WrongSupplierPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, SupplierInvoiceDomain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, SupplierInvoiceDomain>) -> GrantResult {
         // N+1: every item in a batch re-asks the hierarchy for the
         // same org -> customer mapping.
         let resolved = self.hierarchy.resolve_customer(ctx.subject.org_id).await;
@@ -194,7 +194,7 @@ struct RightSupplierPolicy;
 
 #[async_trait]
 impl Policy<SupplierInvoiceDomain> for RightSupplierPolicy {
-    async fn evaluate(&self, ctx: &EvalCtx<'_, SupplierInvoiceDomain>) -> PolicyEvalResult {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, SupplierInvoiceDomain>) -> GrantResult {
         // Ask the context, not the backend service directly. The first
         // call inside this request triggers `load_many`; every subsequent
         // call with the same key (e.g. another invoice in the same batch)
@@ -247,8 +247,9 @@ async fn main() {
     let session = EvaluationSession::empty();
     let visible = wrong_checker
         .bind(&session, &supplier, &ViewAction, &())
-        .filter(invoices.clone())
-        .await;
+        .try_filter(invoices.clone())
+        .await
+        .expect("authorization must complete");
     let wrong_calls = hierarchy.calls();
     println!(
         "[wrong] {} invoices -> {} hierarchy lookups (N+1, redundant)",
@@ -279,8 +280,9 @@ async fn main() {
         .session();
     let visible = right_checker
         .bind(&session, &supplier, &ViewAction, &())
-        .filter(invoices)
-        .await;
+        .try_filter(invoices)
+        .await
+        .expect("authorization must complete");
     let right_calls = hierarchy.calls();
     let batch_calls = load_many_calls.load(Ordering::SeqCst);
     println!(
