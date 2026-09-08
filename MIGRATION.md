@@ -1,9 +1,10 @@
-# Migrating from 0.5.1 to the 0.6 prerelease
+# Migrating from 0.5.1 to 0.6.0-alpha.1
 
-This guide describes the unreleased 0.6 API, including typed grant and veto
-capabilities. The intended first prerelease is `0.6.0-alpha.1`; it is not yet
-published. Rust 1.82 remains the minimum supported compiler. The historical
-0.4 → 0.5 guide follows at the end and describes that older API only.
+This guide describes the 0.6 prerelease API, including typed grant and veto
+capabilities. `0.6.0-alpha.1` is the first prerelease of that line; expect
+further breaking changes before 0.6.0. Rust 1.82 remains the minimum supported
+compiler. The historical 0.4 → 0.5 guide follows at the end and describes that
+older API only.
 
 ## Separate grants from vetoes
 
