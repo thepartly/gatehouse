@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.6.0-alpha.1] - 2026-09-08
 
 ### Added
 
@@ -68,6 +68,8 @@
   outages must be surfaced.
 - Indeterminate evaluations have separate telemetry outcomes and counters.
   Contract warnings are emitted only when the tracing feature is enabled.
+- Refresh the locked dependency graph to current compatible releases. Direct
+  dependencies are unchanged.
 
 ### Deprecated
 
