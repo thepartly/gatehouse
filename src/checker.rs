@@ -640,6 +640,19 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     }
 
     /// Evaluates a batch of already-loaded resources, preserving input order.
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use gatehouse::{BoundEvaluator, PolicyDomain};
+    ///
+    /// async fn discard<D: PolicyDomain>(
+    ///     bound: &BoundEvaluator<'_, D>,
+    ///     resources: &[D::Resource],
+    /// ) {
+    ///     bound.evaluate(resources).await;
+    /// }
+    /// ```
+    #[must_use = "inspect the authorization decision for each resource"]
     pub async fn evaluate<I>(&self, resources: I) -> Vec<(I::Item, AccessEvaluation)>
     where
         I: IntoIterator,
@@ -665,6 +678,19 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     /// ```rust,ignore
     /// let decisions = bound.evaluate_by(rows, |row| &row.authz_resource).await;
     /// ```
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use gatehouse::{BoundEvaluator, PolicyDomain};
+    ///
+    /// async fn discard<D: PolicyDomain>(
+    ///     bound: &BoundEvaluator<'_, D>,
+    ///     resources: Vec<D::Resource>,
+    /// ) {
+    ///     bound.evaluate_by(resources, |resource| resource).await;
+    /// }
+    /// ```
+    #[must_use = "inspect the authorization decision for each resource"]
     pub async fn evaluate_by<I, F>(
         &self,
         items: I,

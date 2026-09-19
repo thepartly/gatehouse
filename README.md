@@ -116,7 +116,7 @@ The checker first resolves vetoes. A definite veto denies access even if another
 
 At application boundaries, use `bound.authorize(&resource).await?`, or `evaluation.into_result()` when you already have a decision. Both return `Ok(())`, `AccessError::Denied { reason, trace }`, or `AccessError::Indeterminate { reason, trace }`. Map denial to a forbidden response and indeterminate to an appropriate service error. Both the evaluation and typed error expose `fact_load_errors()` with structured `FactProvenance::error_kind`. An error recorded on an otherwise successful decision need not be its cause; classify the final decision first.
 
-`AccessEvaluation`, `GrantResult`, and `VetoResult` are `#[must_use]`: discarding them warns by default and fails compilation under `#![deny(unused_must_use)]`. This catches accidental omissions; callers can still deliberately ignore results.
+`AccessEvaluation`, `GrantResult`, and `VetoResult` are `#[must_use]`: discarding them warns by default and fails compilation under `#![deny(unused_must_use)]`. The batch methods `evaluate` and `evaluate_by` also warn when their awaited results are discarded. This catches accidental omissions; callers can still deliberately ignore results.
 
 ```rust
 use gatehouse::{AccessError, AccessEvaluation, EvalTrace};
