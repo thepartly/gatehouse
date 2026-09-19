@@ -2,10 +2,9 @@
 name = "gatehouse"
 version = "0.6.0-alpha.1"
 edition = "2021"
-# 1.82 is required for `Option::is_none_or` (stabilized 2024-10-17), used
-# in the builder's per-axis predicate evaluation. Other dependencies on
-# stable stdlib features (OnceLock, is_some_and, let-else) are older and
-# not binding.
+# 1.82 is the supported compiler floor, verified by the MSRV job in CI.
+# Nothing in the crate currently requires a newer compiler; the stable
+# stdlib features in use (OnceLock, is_some_and, let-else) are all older.
 rust-version = "1.82"
 license = "MIT"
 repository = "https://github.com/thepartly/gatehouse"

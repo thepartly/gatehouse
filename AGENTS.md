@@ -9,18 +9,19 @@ cargo run --example axum        # HTTP server on :8000
 cargo run --example actix_web   # HTTP server on :8080
 
 # Reproduce the PR mutation gate locally (see "CI gates" below)
-git diff origin/main...HEAD -- src/checker.rs src/combinators.rs src/capability.rs src/policies/delegating.rs > mutants.diff
+git diff origin/main...HEAD -- src/builder.rs src/checker.rs src/combinators.rs src/capability.rs src/policies/delegating.rs > mutants.diff
 cargo mutants --in-place --in-diff=mutants.diff \
-  --file src/checker.rs --file src/combinators.rs --file src/capability.rs \
-  --file src/policies/delegating.rs \
+  --file src/builder.rs --file src/checker.rs --file src/combinators.rs \
+  --file src/capability.rs --file src/policies/delegating.rs \
   --baseline=skip --timeout=60 --build-timeout=300 --all-features \
-  -- --test checker_contract --test tracing_contract --test outcome_contract
+  -- --test builder_contract --test checker_contract --test tracing_contract \
+  --test outcome_contract
 ```
 
 ## CI gates that bite
 
 - Clippy runs with `-D warnings`; any warning fails CI. `fmt` + `clippy` before committing.
-- A **diff-scoped `cargo-mutants` gate** covers `src/checker.rs`, `src/combinators.rs`, `src/capability.rs`, and `src/policies/delegating.rs`. When changing decisions or short-circuit logic, add a test that distinguishes the mutation (for example, inputs where `&&` and `||` diverge).
+- A **diff-scoped `cargo-mutants` gate** covers `src/builder.rs`, `src/checker.rs`, `src/combinators.rs`, `src/capability.rs`, and `src/policies/delegating.rs`. When changing decisions or short-circuit logic, add a test that distinguishes the mutation (for example, inputs where `&&` and `||` diverge).
 - `main` is governed by a require-approval ruleset: PRs need an approving review (you cannot self-approve); repo/org admins can bypass.
 - Pushing a `v*` tag triggers irreversible crates.io publication, followed by creation of the GitHub Release. The tag must match the Cargo version and point to a commit with successful main CI. Before tagging, a release-preparation PR must rename `CHANGELOG.md`'s `[Unreleased]` section to `[X.Y.Z] - <date>` and retain nonempty release notes. Prepare and validate the exact candidate before requesting publication approval; see `.github/workflows/release.yml`.
 

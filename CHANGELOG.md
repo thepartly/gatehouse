@@ -1,5 +1,43 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `PolicyBuilder::allow_all` and `PolicyBuilder::forbid_all` build an
+  unconditional grant policy and an unconditional veto policy. Unconditional
+  authority is now written out at the call site instead of being implied by an
+  empty builder.
+- `Unconditional` and `Conditional` builder states and the sealed
+  `BuilderState` trait. A builder starts out `Unconditional`; the first
+  predicate moves it to `Conditional`, the only state that has `build` and
+  `build_veto`.
+- A dedicated `builder_contract` integration test suite, and `src/builder.rs`
+  is now covered by the diff-scoped mutation gate.
+
+### Changed
+
+- **Breaking:** repeated `subjects`, `actions`, `resources`, `context`, and
+  `when` calls accumulate with AND semantics instead of replacing the earlier
+  predicate. Every predicate on every axis must match. Adding a predicate can
+  therefore only narrow a grant, and narrows when a veto fires. Broaden a
+  grant with `PolicyExt::or` over two built policies. No replace or clear
+  operation is provided; a restriction is removed by deleting its call, not by
+  a later one.
+- **Breaking:** `build` and `build_veto` require at least one predicate. An
+  empty builder is a compile-time error. Use `allow_all` / `forbid_all` for a
+  policy that applies to every request.
+
+### Rationale
+
+- [#67](https://github.com/thepartly/gatehouse/issues/67) reports that a
+  repeated setter silently discarded the earlier predicate:
+  `new("ActiveAdmin").subjects(|u| u.active).subjects(|u| u.is_admin)` checked
+  only `is_admin`, so an inactive admin passed. Adding a security check could
+  remove one. A forgotten predicate should not become unrestricted authority
+  either, so unconditional policies are named rather than inferred from an
+  empty builder.
+
 ## [0.6.0-alpha.1] - 2026-09-08
 
 ### Added

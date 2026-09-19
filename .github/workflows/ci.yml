@@ -121,13 +121,14 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Capture authorization diff
-        run: git diff origin/${{ github.base_ref }}...HEAD -- src/checker.rs src/combinators.rs src/capability.rs src/policies/delegating.rs > mutants.diff
+        run: git diff origin/${{ github.base_ref }}...HEAD -- src/builder.rs src/checker.rs src/combinators.rs src/capability.rs src/policies/delegating.rs > mutants.diff
       - name: Run focused mutation tests
         run: >
           cargo mutants
           --jobs=2
           --jobserver-tasks=2
           --in-diff=mutants.diff
+          --file src/builder.rs
           --file src/checker.rs
           --file src/combinators.rs
           --file src/capability.rs
@@ -137,6 +138,7 @@ jobs:
           --build-timeout=300
           --all-features
           --
+          --test builder_contract
           --test checker_contract
           --test tracing_contract
           --test outcome_contract

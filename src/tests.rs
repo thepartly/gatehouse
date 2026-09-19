@@ -3350,7 +3350,7 @@ mod core_tests {
         }
 
         let mut checker = PermissionChecker::<UnitDomain>::new();
-        checker.add_veto(PolicyBuilder::<UnitDomain>::new("GlobalFreeze").build_veto());
+        checker.add_veto(PolicyBuilder::<UnitDomain>::new("GlobalFreeze").forbid_all());
         let session = EvaluationSession::empty();
         let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
         evaluation.assert_not_applicable_by("GlobalFreeze");
@@ -3592,7 +3592,7 @@ mod policy_builder_tests {
 
     #[test]
     fn new_with_static_literal_stores_borrowed_policy_type() {
-        let policy = PolicyBuilder::<TestDomain>::new("StaticName").build();
+        let policy = PolicyBuilder::<TestDomain>::new("StaticName").allow_all();
         match policy.policy_type() {
             std::borrow::Cow::Borrowed(name) => assert_eq!(name, "StaticName"),
             std::borrow::Cow::Owned(name) => {
@@ -3603,7 +3603,7 @@ mod policy_builder_tests {
 
     #[test]
     fn new_static_is_alias_for_borrowed_name() {
-        let policy = PolicyBuilder::<TestDomain>::new_static("AliasName").build();
+        let policy = PolicyBuilder::<TestDomain>::new_static("AliasName").allow_all();
         assert!(matches!(
             policy.policy_type(),
             std::borrow::Cow::Borrowed("AliasName")
@@ -3675,7 +3675,7 @@ mod policy_builder_tests {
     #[test]
     fn new_with_owned_string_stores_owned_policy_type() {
         let dynamic = format!("Dynamic{}", 42);
-        let policy = PolicyBuilder::<TestDomain>::new(dynamic.clone()).build();
+        let policy = PolicyBuilder::<TestDomain>::new(dynamic.clone()).allow_all();
         match policy.policy_type() {
             std::borrow::Cow::Owned(name) => assert_eq!(name, dynamic),
             std::borrow::Cow::Borrowed(name) => {
@@ -3687,7 +3687,7 @@ mod policy_builder_tests {
     #[test]
     fn new_owned_accepts_non_static_str() {
         let from_config: &str = "tenant-override";
-        let policy = PolicyBuilder::<TestDomain>::new_owned(from_config).build();
+        let policy = PolicyBuilder::<TestDomain>::new_owned(from_config).allow_all();
         match policy.policy_type() {
             std::borrow::Cow::Owned(name) => assert_eq!(name, "tenant-override"),
             std::borrow::Cow::Borrowed(name) => {
@@ -3728,10 +3728,11 @@ mod policy_builder_tests {
         }
     }
 
-    // Test that with no predicates the builder returns a policy that always "matches"
+    // `allow_all` is the explicit way to build a policy with no predicate:
+    // it matches every request.
     #[tokio::test]
-    async fn test_policy_builder_allows_when_no_predicates() {
-        let policy = PolicyBuilder::<TestDomain>::new("NoPredicatesPolicy").build();
+    async fn test_policy_builder_allow_all_grants_every_request() {
+        let policy = PolicyBuilder::<TestDomain>::new("AllowAllPolicy").allow_all();
 
         let result = policy
             .evaluate_access(
@@ -3743,7 +3744,7 @@ mod policy_builder_tests {
             .await;
         assert!(
             result.is_granted(),
-            "Policy built with no predicates should allow access (default true)"
+            "allow_all should grant access to every request"
         );
     }
 
@@ -3785,13 +3786,12 @@ mod policy_builder_tests {
         );
     }
 
-    // A matching veto builder forbids without granting authority.
+    // `forbid_all` is the explicit way to build a veto with no predicate:
+    // it forbids every request and never grants.
     #[tokio::test]
-    async fn test_policy_builder_forbid() {
-        let policy = PolicyBuilder::<TestDomain>::new("ForbidPolicy").build_veto();
+    async fn test_policy_builder_forbid_all_forbids_every_request() {
+        let policy = PolicyBuilder::<TestDomain>::new("ForbidAllPolicy").forbid_all();
 
-        // Even though no predicate fails (so predicate returns true),
-        // the forbid effect should result in a Denied outcome.
         let result = policy
             .evaluate_access(
                 &TestSubject {
@@ -3803,9 +3803,10 @@ mod policy_builder_tests {
             )
             .await;
         assert!(
-            !result.is_granted(),
-            "forbid policy should not grant even if the predicate passes"
+            result.is_forbidden(),
+            "forbid_all should forbid every request"
         );
+        assert!(!result.is_granted(), "a veto never carries grant authority");
     }
 
     /// The headline deny-overrides behavior: a matched veto policy
@@ -3917,7 +3918,7 @@ mod policy_builder_tests {
         let mut checker = PermissionChecker::new();
         checker.add_policy(allow_policy);
         checker.add_veto(
-            block_policy.all_of(PolicyBuilder::<TestDomain>::new("SecondBlock").build_veto()),
+            block_policy.all_of(PolicyBuilder::<TestDomain>::new("SecondBlock").forbid_all()),
         );
 
         let session = EvaluationSession::empty();
@@ -4561,6 +4562,350 @@ mod policy_builder_tests {
         let results = policy.evaluate_batch(&bctx).await;
 
         assert!(results.is_empty());
+    }
+
+    // ----- predicate accumulation (AND) ---------------------------------
+
+    /// The example from issue #67: the second `subjects` call must narrow the
+    /// policy, not replace the first check.
+    #[tokio::test]
+    async fn repeated_subjects_calls_both_apply_for_active_admin() {
+        #[derive(Debug, Clone, Copy)]
+        struct User {
+            active: bool,
+            is_admin: bool,
+        }
+        struct Documents;
+        impl PolicyDomain for Documents {
+            type Subject = User;
+            type Action = TestAction;
+            type Resource = TestResource;
+            type Context = TestContext;
+        }
+
+        let policy = PolicyBuilder::<Documents>::new("ActiveAdmin")
+            .subjects(|user: &User| user.active)
+            .subjects(|user: &User| user.is_admin)
+            .build();
+
+        let mut checker = PermissionChecker::<Documents>::new();
+        checker.add_policy(policy);
+        let session = EvaluationSession::empty();
+
+        for (user, expected) in [
+            (
+                User {
+                    active: false,
+                    is_admin: true,
+                },
+                false,
+            ),
+            (
+                User {
+                    active: true,
+                    is_admin: false,
+                },
+                false,
+            ),
+            (
+                User {
+                    active: true,
+                    is_admin: true,
+                },
+                true,
+            ),
+        ] {
+            let evaluation = checker
+                .bind(&session, &user, &TestAction, &TestContext)
+                .check(&TestResource)
+                .await;
+            assert_eq!(
+                evaluation.is_granted(),
+                expected,
+                "ActiveAdmin must require both predicates, got {evaluation:?} for {user:?}"
+            );
+        }
+    }
+
+    /// Each accumulation axis carries two independent flags so a truth table can
+    /// disagree in both directions.
+    #[derive(Debug, Clone, Copy)]
+    struct AccFlags {
+        first: bool,
+        second: bool,
+    }
+
+    struct AccDomain;
+
+    impl PolicyDomain for AccDomain {
+        type Subject = AccFlags;
+        type Action = AccFlags;
+        type Resource = AccFlags;
+        type Context = AccFlags;
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum AccAxis {
+        Subject,
+        Action,
+        Resource,
+        Context,
+        When,
+    }
+
+    const ALL_AXES: [AccAxis; 5] = [
+        AccAxis::Subject,
+        AccAxis::Action,
+        AccAxis::Resource,
+        AccAxis::Context,
+        AccAxis::When,
+    ];
+
+    /// Two predicates on one axis: the first reads `first`, the second `second`.
+    fn accumulating_builder(axis: AccAxis) -> PolicyBuilder<AccDomain, Conditional> {
+        let builder = PolicyBuilder::<AccDomain>::new("Accumulated");
+        match axis {
+            AccAxis::Subject => builder
+                .subjects(|s: &AccFlags| s.first)
+                .subjects(|s: &AccFlags| s.second),
+            AccAxis::Action => builder
+                .actions(|a: &AccFlags| a.first)
+                .actions(|a: &AccFlags| a.second),
+            AccAxis::Resource => builder
+                .resources(|r: &AccFlags| r.first)
+                .resources(|r: &AccFlags| r.second),
+            AccAxis::Context => builder
+                .context(|c: &AccFlags| c.first)
+                .context(|c: &AccFlags| c.second),
+            // The `when` pair reads the resource so this case exercises the
+            // per-item batch path as well.
+            AccAxis::When => builder
+                .when(|_s, _a, r: &AccFlags, _c| r.first)
+                .when(|_s, _a, r: &AccFlags, _c| r.second),
+        }
+    }
+
+    /// Inputs where only `axis` carries the truth-table pair; the rest pass.
+    fn accumulating_inputs(axis: AccAxis, flags: AccFlags) -> [AccFlags; 4] {
+        let pass = AccFlags {
+            first: true,
+            second: true,
+        };
+        let mut inputs = [pass; 4];
+        let slot = match axis {
+            AccAxis::Subject => 0,
+            AccAxis::Action => 1,
+            // `when` reads the resource here.
+            AccAxis::Resource | AccAxis::When => 2,
+            AccAxis::Context => 3,
+        };
+        inputs[slot] = flags;
+        inputs
+    }
+
+    /// Runs a built grant policy through the point path and a two-item batch,
+    /// returning `(point granted, per-item granted)`.
+    async fn grant_decisions(
+        policy: &dyn Policy<AccDomain>,
+        inputs: &[AccFlags; 4],
+    ) -> (bool, Vec<bool>) {
+        let [subject, action, resource, context] = inputs;
+        let session = EvaluationSession::empty();
+        let point = EvalCtx::new(
+            &session,
+            subject,
+            action,
+            resource,
+            context,
+            policy.policy_type(),
+        );
+        let point = policy.evaluate(&point).await.is_granted();
+
+        let items = [
+            PolicyBatchItem { resource },
+            PolicyBatchItem { resource },
+            PolicyBatchItem { resource },
+        ];
+        let batch = BatchEvalCtx::new(
+            &session,
+            subject,
+            action,
+            context,
+            &items,
+            policy.policy_type(),
+        );
+        let batch = policy.evaluate_batch(&batch).await;
+        assert_eq!(batch.len(), items.len(), "one result per batch item");
+        (point, batch.iter().map(GrantResult::is_granted).collect())
+    }
+
+    /// Same, for a built veto: `(point forbidden, per-item forbidden)`.
+    async fn veto_decisions(
+        policy: &dyn VetoPolicy<AccDomain>,
+        inputs: &[AccFlags; 4],
+    ) -> (bool, Vec<bool>) {
+        let [subject, action, resource, context] = inputs;
+        let session = EvaluationSession::empty();
+        let point = EvalCtx::new(
+            &session,
+            subject,
+            action,
+            resource,
+            context,
+            policy.policy_type(),
+        );
+        let point = policy.evaluate(&point).await.is_forbidden();
+
+        let items = [
+            PolicyBatchItem { resource },
+            PolicyBatchItem { resource },
+            PolicyBatchItem { resource },
+        ];
+        let batch = BatchEvalCtx::new(
+            &session,
+            subject,
+            action,
+            context,
+            &items,
+            policy.policy_type(),
+        );
+        let batch = policy.evaluate_batch(&batch).await;
+        assert_eq!(batch.len(), items.len(), "one result per batch item");
+        (point, batch.iter().map(VetoResult::is_forbidden).collect())
+    }
+
+    /// Truth table shared by both build modes: the match condition holds only
+    /// when both predicates hold. The mixed rows are what separates AND from
+    /// OR and from "only one of the predicates survived".
+    const ACCUMULATION_TRUTH_TABLE: [(bool, bool, bool); 4] = [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+        (false, false, false),
+    ];
+
+    #[tokio::test]
+    async fn repeated_predicates_accumulate_for_grants_on_every_axis() {
+        for axis in ALL_AXES {
+            for (first, second, expected) in ACCUMULATION_TRUTH_TABLE {
+                let policy = accumulating_builder(axis).build();
+                let inputs = accumulating_inputs(axis, AccFlags { first, second });
+                let (point, batch) = grant_decisions(policy.as_ref(), &inputs).await;
+
+                assert_eq!(
+                    point, expected,
+                    "{axis:?}: point grant for ({first}, {second})"
+                );
+                assert!(
+                    batch.iter().all(|granted| *granted == expected),
+                    "{axis:?}: batch grants {batch:?} for ({first}, {second}), expected all {expected}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_predicates_accumulate_for_vetoes_on_every_axis() {
+        for axis in ALL_AXES {
+            for (first, second, expected) in ACCUMULATION_TRUTH_TABLE {
+                let policy = accumulating_builder(axis).build_veto();
+                let inputs = accumulating_inputs(axis, AccFlags { first, second });
+                let (point, batch) = veto_decisions(policy.as_ref(), &inputs).await;
+
+                assert_eq!(
+                    point, expected,
+                    "{axis:?}: point veto for ({first}, {second})"
+                );
+                assert!(
+                    batch.iter().all(|forbidden| *forbidden == expected),
+                    "{axis:?}: batch vetoes {batch:?} for ({first}, {second}), expected all {expected}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_runs_each_accumulated_subject_predicate_at_most_once() {
+        let resources: Vec<BatchResource> = (0..12)
+            .map(|i| BatchResource {
+                category: format!("doc-{i}"),
+            })
+            .collect();
+        let items = make_items(&resources);
+        let action = BatchAction;
+        let ctx = BatchContext;
+
+        // The first predicate decides whether the second one is reached at all.
+        for (role, expect_granted, expect_second_calls) in
+            [("staff", true, 1usize), ("guest", false, 0usize)]
+        {
+            let first_calls = Arc::new(AtomicUsize::new(0));
+            let second_calls = Arc::new(AtomicUsize::new(0));
+            let first_inner = Arc::clone(&first_calls);
+            let second_inner = Arc::clone(&second_calls);
+
+            let policy = PolicyBuilder::<BatchDomain>::new("StaffWithShortName")
+                .subjects(move |s: &BatchSubject| {
+                    first_inner.fetch_add(1, Ordering::SeqCst);
+                    s.role == "staff"
+                })
+                .subjects(move |s: &BatchSubject| {
+                    second_inner.fetch_add(1, Ordering::SeqCst);
+                    s.role.len() < 10
+                })
+                .build();
+
+            let subject = BatchSubject { role: role.into() };
+            let session = EvaluationSession::new();
+            let bctx = batch_ctx(&session, &subject, &action, &ctx, &items);
+            let results = policy.evaluate_batch(&bctx).await;
+
+            assert_eq!(results.len(), resources.len(), "one result per batch item");
+            assert!(
+                results.iter().all(|r| r.is_granted() == expect_granted),
+                "{role}: every item should be granted={expect_granted}"
+            );
+            assert_eq!(
+                first_calls.load(Ordering::SeqCst),
+                1,
+                "{role}: first subject predicate runs once per batch"
+            );
+            assert_eq!(
+                second_calls.load(Ordering::SeqCst),
+                expect_second_calls,
+                "{role}: second subject predicate runs at most once per batch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_all_and_forbid_all_decide_through_the_checker() {
+        let session = EvaluationSession::empty();
+        let subject = TestSubject {
+            name: "Anyone".into(),
+        };
+
+        let mut checker = PermissionChecker::<TestDomain>::new();
+        checker.add_policy(PolicyBuilder::<TestDomain>::new("AllowAll").allow_all());
+
+        let evaluation = checker
+            .bind(&session, &subject, &TestAction, &TestContext)
+            .check(&TestResource)
+            .await;
+        evaluation.assert_granted_by("AllowAll");
+
+        checker.add_veto(PolicyBuilder::<TestDomain>::new("GlobalFreeze").forbid_all());
+
+        let evaluation = checker
+            .bind(&session, &subject, &TestAction, &TestContext)
+            .check(&TestResource)
+            .await;
+        evaluation.assert_forbidden_by("GlobalFreeze");
+        assert_eq!(
+            evaluation.denied_reason(),
+            Some("Forbidden by GlobalFreeze: Policy forbids access"),
+            "forbid_all keeps the veto reason text"
+        );
     }
 }
 

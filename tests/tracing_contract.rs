@@ -579,7 +579,7 @@ fn tracing_fields_are_recorded_for_forbidden_decisions() {
     // A grant policy that would grant, blocked by a registered veto.
     let mut checker = PermissionChecker::new();
     checker.add_policy(TracePolicy);
-    checker.add_veto(PolicyBuilder::<Domain>::new("GlobalFreeze").build_veto());
+    checker.add_veto(PolicyBuilder::<Domain>::new("GlobalFreeze").forbid_all());
 
     let session = EvaluationSession::empty();
     let (result, spans) = capture_async(|| async {
@@ -812,7 +812,11 @@ fn composed_and_delegated_rule_names_and_metadata_reach_security_events() {
             .with_description("Delegated access check"),
     );
     let mut checker = PermissionChecker::new();
-    checker.add_policy(PolicyBuilder::<Domain>::new("AlwaysGrant").build().not());
+    checker.add_policy(
+        PolicyBuilder::<Domain>::new("AlwaysGrant")
+            .allow_all()
+            .not(),
+    );
     checker.add_delegate(delegate);
     let session = EvaluationSession::empty();
     for batch in [false, true] {

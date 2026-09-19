@@ -524,7 +524,7 @@ async fn mixed_policy_stack_uses_in_memory_policy_and_rebac_session() {
 // ---- deny-overrides semantics -------------------------------------
 
 fn allow_everything(name: &str) -> Box<dyn Policy<Domain>> {
-    PolicyBuilder::<Domain>::new(name.to_string()).build()
+    PolicyBuilder::<Domain>::new(name.to_string()).allow_all()
 }
 
 fn forbid_odd_resources(name: &str) -> Box<dyn VetoPolicy<Domain>> {
@@ -1602,7 +1602,7 @@ async fn dormant_veto_descendant_does_not_override_all_of_pass_or_steal_attribut
     let result = bind(&checker, &session).check(&Resource { id: 0 }).await;
     assert!(result.is_granted());
     assert_eq!(result.forbidden_by(), None);
-    checker.add_veto(PolicyBuilder::<Domain>::new("ActiveVeto").build_veto());
+    checker.add_veto(PolicyBuilder::<Domain>::new("ActiveVeto").forbid_all());
     let denied = bind(&checker, &session).check(&Resource { id: 0 }).await;
     denied.assert_forbidden_by("ActiveVeto");
     assert_eq!(
