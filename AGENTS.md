@@ -13,8 +13,8 @@ git diff origin/main...HEAD -- src/builder.rs src/checker.rs src/combinators.rs 
 cargo mutants --in-place --in-diff=mutants.diff \
   --file src/builder.rs --file src/checker.rs --file src/combinators.rs \
   --file src/capability.rs --file src/policies/delegating.rs \
-  --baseline=skip --timeout=60 --build-timeout=300 --all-features \
-  -- --test builder_contract --test checker_contract --test tracing_contract \
+  --timeout=60 --build-timeout=300 --all-features \
+  -- --lib --test checker_contract --test tracing_contract \
   --test outcome_contract
 ```
 

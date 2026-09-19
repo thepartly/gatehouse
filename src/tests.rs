@@ -4703,6 +4703,33 @@ mod policy_builder_tests {
         inputs
     }
 
+    #[tokio::test]
+    async fn empty_builder_batches_never_run_predicates() {
+        let session = EvaluationSession::empty();
+        let flags = AccFlags {
+            first: true,
+            second: true,
+        };
+        let batch = BatchEvalCtx::new(&session, &flags, &flags, &flags, &[], "Empty");
+        for axis in ALL_AXES {
+            for veto in [false, true] {
+                let builder = PolicyBuilder::<AccDomain>::new("Empty");
+                let builder = match axis {
+                    AccAxis::Subject => builder.subjects(|_| panic!("empty subject")),
+                    AccAxis::Action => builder.actions(|_| panic!("empty action")),
+                    AccAxis::Context => builder.context(|_| panic!("empty context")),
+                    AccAxis::Resource => builder.resources(|_| panic!("empty resource")),
+                    AccAxis::When => builder.when(|_, _, _, _| panic!("empty when")),
+                };
+                if veto {
+                    assert!(builder.build_veto().evaluate_batch(&batch).await.is_empty());
+                } else {
+                    assert!(builder.build().evaluate_batch(&batch).await.is_empty());
+                }
+            }
+        }
+    }
+
     /// Runs a built grant policy through the point path and a two-item batch,
     /// returning `(point granted, per-item granted)`.
     async fn grant_decisions(

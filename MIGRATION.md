@@ -96,8 +96,13 @@ execution and nested evidence.
 `subjects`, `actions`, `resources`, `context`, and `when` now append to their
 axis instead of replacing it. Every predicate on every axis must return `true`
 for the builder's condition to hold. Builders that set each axis at most once
-are unaffected. A builder that set one axis twice changes meaning without any
-source change:
+retain their decisions for deterministic predicates, but scalar evaluation now
+runs context predicates before resource predicates. Callers relying on evaluation
+order must account for that change. Predicates must return deterministic results
+for the supplied inputs: subject, action, and context predicates run at most once
+per nonempty batch, and no predicates run for an empty batch.
+
+A builder that set one axis twice changes meaning without any source change:
 
 ```rust,ignore
 // The same source, before and after.
@@ -111,9 +116,8 @@ let active_admin = PolicyBuilder::<Documents>::new("ActiveAdmin")
 // After: both predicates must hold, and an inactive admin no longer matches.
 ```
 
-Review every call site that sets one axis more than once; this is the one
-change that alters behavior silently. To keep only the later predicate, delete
-the earlier call. To keep the broader behavior, build one policy per predicate
+Review every call site that sets one axis more than once. To keep only the later
+predicate, delete the earlier call. To keep the broader behavior, build one policy per predicate
 and combine them with `PolicyExt::or`:
 
 ```rust,ignore

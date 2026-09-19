@@ -133,12 +133,11 @@ jobs:
           --file src/combinators.rs
           --file src/capability.rs
           --file src/policies/delegating.rs
-          --baseline=skip
           --timeout=60
           --build-timeout=300
           --all-features
           --
-          --test builder_contract
+          --lib
           --test checker_contract
           --test tracing_contract
           --test outcome_contract

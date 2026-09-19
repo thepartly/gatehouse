@@ -45,7 +45,8 @@
 //   # an id the store does not hold -> 404, for admins too
 //   curl -i localhost:8000/invoices/99999999-9999-9999-9999-999999999999 -H 'x-roles: admin'
 //
-//   # two edits racing for the same invoice: the loser's version guard fails -> 409
+//   # overlapping authorization snapshots can produce 409; sequential edits both get 200
+//   # the guard protects the server's authorization snapshot, not a client-held version
 //   for _ in 1 2; do curl -s -o /dev/null -w '%{http_code}\n' \
 //     -X POST localhost:8000/invoices/11111111-1111-1111-1111-111111111111/edit \
 //     -H 'x-user-id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' \
@@ -313,6 +314,15 @@ pub struct AppState {
     checker: PermissionChecker<InvoiceDomain>,
     fact_registry: FactRegistry,
     invoices: InvoiceStore,
+    #[cfg(test)]
+    edit_pause: Option<Arc<EditPause>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct EditPause {
+    authorized: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 impl AppState {
@@ -342,6 +352,8 @@ impl AppState {
                 .with_arc::<InvoiceRelationship>(Arc::new(InMemoryRelationshipSource::new(grants)))
                 .build(),
             invoices: InvoiceStore::new(invoices),
+            #[cfg(test)]
+            edit_pause: None,
         }
     }
 
@@ -607,14 +619,13 @@ pub async fn edit_invoice_handler(
         return authorization_error_response(error);
     }
 
-    // That decision is about the snapshot just read: this invoice, as it looked
-    // then — owned by this caller, unlocked, inside the edit window. It says
-    // nothing about the row a write will land on. Between the read and the write
-    // another request can lock the invoice or move it out of the window, and an
-    // unconditional write would commit an edit that nothing ever authorized.
-    // Naming the version that was checked closes that gap: the store applies the
-    // change only while the row is still the one the policies saw, and otherwise
-    // refuses so the caller can re-read and be authorized again.
+    #[cfg(test)]
+    if let Some(pause) = &state.edit_pause {
+        pause.authorized.notify_one();
+        pause.resume.notified().await;
+    }
+
+    // The write must target the same version that was authorized.
     match state
         .invoices
         .update_if_version(invoice_id, invoice.version, |invoice| {
@@ -930,6 +941,39 @@ mod integration_tests {
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).expect("handler returned JSON")
+    }
+
+    #[tokio::test]
+    async fn edit_invoice_handler_rejects_a_lock_after_authorization() {
+        let mut state = AppState::demo();
+        let pause = Arc::new(EditPause::default());
+        state.edit_pause = Some(pause.clone());
+        let invoice_id = Uuid::parse_str(EDITABLE_INVOICE).unwrap();
+        let original = state.invoices.get(invoice_id).unwrap();
+        let app = app_with_state(state.clone());
+        let pending = app
+            .clone()
+            .oneshot(edit_request(EDITABLE_INVOICE, OWNER, 9_999));
+        tokio::pin!(pending);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                response = &mut pending => panic!("edit finished before pause: {:?}", response.unwrap().status()),
+                () = pause.authorized.notified() => {}
+            }
+            state.invoices.update_if_version(invoice_id, original.version, |invoice| {
+                invoice.locked = true;
+            }).unwrap();
+            pause.resume.notify_one();
+            let response = pending.await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let stored = state.invoices.get(invoice_id).unwrap();
+            assert_eq!(stored.amount_cents, original.amount_cents);
+            assert!(stored.locked);
+            assert_eq!(stored.version, original.version + 1);
+
+            let response = app.oneshot(edit_request(EDITABLE_INVOICE, OWNER, 9_999)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }).await.expect("edit race must finish without hanging");
     }
 
     #[tokio::test]

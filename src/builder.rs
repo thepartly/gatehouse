@@ -109,6 +109,9 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 
     async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<GrantResult> {
         let n = ctx.items.len();
+        if n == 0 {
+            return Vec::new();
+        }
 
         if !self.shared_axes_pass(ctx.subject, ctx.action, ctx.context) {
             let result = self.build_result(false);
@@ -212,8 +215,12 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 /// ```
 ///
 /// Predicates run subject, action, context, resource, then [`Self::when`], in
-/// insertion order within an axis, and stop at the first `false`. Single and
-/// batch evaluation use the same order, so predicate side effects agree.
+/// insertion order within an axis, and stop at the first `false`. Predicates
+/// must return deterministic results for the supplied inputs. In a nonempty
+/// batch, subject, action, and context predicates run at most once; resource
+/// and `when` predicates run per item. Empty batches run no predicates.
+/// Repeated scalar evaluations can therefore invoke predicates more often than
+/// one batch evaluation; side-effect counts are not equivalent.
 ///
 /// [`Self::build_veto`] shares that match condition, so for a veto each extra
 /// predicate narrows *when the veto fires* — it never widens what the veto
