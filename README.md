@@ -192,6 +192,12 @@ let active_admin = PolicyBuilder::<Documents>::new("ActiveAdmin")
     .build();
 
 // Broaden by composing two built policies instead.
+let active = PolicyBuilder::<Documents>::new("Active")
+    .subjects(|user| user.active)
+    .build();
+let admin = PolicyBuilder::<Documents>::new("Admin")
+    .subjects(|user| user.is_admin)
+    .build();
 let active_or_admin = active.or(admin);
 
 // Unconditional policies are named, never implied by an empty builder.
