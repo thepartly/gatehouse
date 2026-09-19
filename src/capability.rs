@@ -11,11 +11,31 @@ use std::{borrow::Cow, sync::Arc};
 /// use gatehouse::{GrantResult, PolicyEvalResult};
 /// let result: GrantResult = PolicyEvalResult::forbidden("blocked", "disabled").into();
 /// ```
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use gatehouse::{EvalCtx, Policy, PolicyDomain};
+///
+/// async fn discard<D: PolicyDomain>(policy: &impl Policy<D>, ctx: &EvalCtx<'_, D>) {
+///     policy.evaluate(ctx).await;
+/// }
+/// ```
 #[derive(Clone, Debug)]
+#[must_use = "return or inspect the grant policy result"]
 pub struct GrantResult(pub(crate) PolicyEvalResult);
 
 /// A veto policy's authority-bearing result. It cannot grant access.
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use gatehouse::{EvalCtx, PolicyDomain, VetoPolicy};
+///
+/// async fn discard<D: PolicyDomain>(policy: &impl VetoPolicy<D>, ctx: &EvalCtx<'_, D>) {
+///     policy.evaluate(ctx).await;
+/// }
+/// ```
 #[derive(Clone, Debug)]
+#[must_use = "return or inspect the veto policy result"]
 pub struct VetoResult(pub(crate) PolicyEvalResult);
 
 mod sealed {
