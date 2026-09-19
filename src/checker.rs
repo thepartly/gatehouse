@@ -2,10 +2,10 @@ use crate::capability::combined;
 #[cfg(feature = "tracing")]
 use crate::DEFAULT_SECURITY_RULE_CATEGORY;
 use crate::{
-    AccessEvaluation, BatchEvalCtx, CombineOp, Decision, DelegatingPolicy, EvalCtx, EvalTrace,
-    EvaluationSession, FilterError, Hydrator, LookupAuthorizedError, LookupAuthorizedPage,
-    LookupSource, Policy, PolicyBatchItem, PolicyDomain, PolicyEvalResult, SecurityRuleMetadata,
-    VetoPolicy, PERMISSION_CHECKER_POLICY_TYPE,
+    AccessError, AccessEvaluation, BatchEvalCtx, CombineOp, Decision, DelegatingPolicy, EvalCtx,
+    EvalTrace, EvaluationSession, FilterError, Hydrator, LookupAuthorizedError,
+    LookupAuthorizedPage, LookupSource, Policy, PolicyBatchItem, PolicyDomain, PolicyEvalResult,
+    SecurityRuleMetadata, VetoPolicy, PERMISSION_CHECKER_POLICY_TYPE,
 };
 use async_trait::async_trait;
 use std::any::Any;
@@ -595,6 +595,18 @@ pub struct BoundEvaluator<'a, D: PolicyDomain> {
 
 impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     /// Evaluates one resource.
+    ///
+    /// Inspect the decision or use [`Self::authorize`] to propagate non-grants.
+    /// Discarding an awaited decision is an error under `deny(unused_must_use)`:
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use gatehouse::{BoundEvaluator, PolicyDomain};
+    ///
+    /// async fn discard<D: PolicyDomain>(bound: &BoundEvaluator<'_, D>, resource: &D::Resource) {
+    ///     bound.check(resource).await;
+    /// }
+    /// ```
     pub async fn check(&self, resource: &D::Resource) -> AccessEvaluation {
         self.checker
             .evaluate_one(
@@ -607,7 +619,40 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
             .await
     }
 
+    /// Authorizes one resource, returning `Ok(())` only when access is granted.
+    ///
+    /// Equivalent to `self.check(resource).await.into_result()`. Denied and
+    /// indeterminate errors retain their reason and complete audit evidence.
+    ///
+    /// ```
+    /// use gatehouse::{AccessError, BoundEvaluator, PolicyDomain};
+    ///
+    /// async fn enforce<D: PolicyDomain>(
+    ///     bound: &BoundEvaluator<'_, D>,
+    ///     resource: &D::Resource,
+    /// ) -> Result<(), AccessError> {
+    ///     bound.authorize(resource).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn authorize(&self, resource: &D::Resource) -> Result<(), AccessError> {
+        self.check(resource).await.into_result()
+    }
+
     /// Evaluates a batch of already-loaded resources, preserving input order.
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use gatehouse::{BoundEvaluator, PolicyDomain};
+    ///
+    /// async fn discard<D: PolicyDomain>(
+    ///     bound: &BoundEvaluator<'_, D>,
+    ///     resources: &[D::Resource],
+    /// ) {
+    ///     bound.evaluate(resources).await;
+    /// }
+    /// ```
+    #[must_use = "inspect the authorization decision for each resource"]
     pub async fn evaluate<I>(&self, resources: I) -> Vec<(I::Item, AccessEvaluation)>
     where
         I: IntoIterator,
@@ -633,6 +678,19 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     /// ```rust,ignore
     /// let decisions = bound.evaluate_by(rows, |row| &row.authz_resource).await;
     /// ```
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use gatehouse::{BoundEvaluator, PolicyDomain};
+    ///
+    /// async fn discard<D: PolicyDomain>(
+    ///     bound: &BoundEvaluator<'_, D>,
+    ///     resources: Vec<D::Resource>,
+    /// ) {
+    ///     bound.evaluate_by(resources, |resource| resource).await;
+    /// }
+    /// ```
+    #[must_use = "inspect the authorization decision for each resource"]
     pub async fn evaluate_by<I, F>(
         &self,
         items: I,

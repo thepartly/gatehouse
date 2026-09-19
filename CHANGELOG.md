@@ -4,6 +4,9 @@
 
 ### Added
 
+- `BoundEvaluator::authorize` returns `Result<(), AccessError>` for enforcement
+  with `?`. `AccessEvaluation`, `GrantResult`, and `VetoResult` now warn when unused.
+  Discarding awaited `BoundEvaluator::evaluate` / `evaluate_by` results also warns.
 - `PolicyBuilder::allow_all` and `PolicyBuilder::forbid_all` build an
   unconditional grant policy and an unconditional veto policy. Unconditional
   authority is now written out at the call site instead of being implied by an

@@ -1,10 +1,19 @@
 use async_trait::async_trait;
 use gatehouse::{
-    AccessEvaluation, BatchEvalCtx, Decision, EvalCtx, EvaluationSession, FactLoadResult,
-    FactOutcome, FactProvenance, FactSource, GrantResult, Hydrator, LookupAuthorizedError,
-    LookupPage, LookupSource, PermissionChecker, Policy, PolicyBuilder, PolicyDomain, PolicyResult,
+    AccessError, AccessEvaluation, BatchEvalCtx, Decision, EvalCtx, EvaluationSession,
+    FactLoadResult, FactOutcome, FactProvenance, FactSource, GrantResult, Hydrator,
+    LookupAuthorizedError, LookupPage, LookupSource, PermissionChecker, Policy, PolicyBuilder,
+    PolicyDomain, PolicyResult,
 };
-use std::{collections::HashSet, convert::Infallible, num::NonZeroUsize};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 #[derive(Debug, Clone)]
 struct Subject;
 
@@ -159,6 +168,81 @@ impl Policy<Domain> for HandBuiltOddPolicy {
 
     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("HandBuiltOddPolicy")
+    }
+}
+
+#[tokio::test]
+async fn authorize_matches_check_preserves_evidence_and_evaluates_once() {
+    struct CountingPolicy(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Policy<Domain> for CountingPolicy {
+        async fn evaluate(&self, ctx: &EvalCtx<'_, Domain>) -> GrantResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            HandBuiltOddPolicy.evaluate(ctx).await
+        }
+
+        fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+            HandBuiltOddPolicy.policy_type()
+        }
+    }
+
+    let grant_calls = Arc::new(AtomicUsize::new(0));
+    let veto_calls = Arc::new(AtomicUsize::new(0));
+    let veto_counter = Arc::clone(&veto_calls);
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(CountingPolicy(Arc::clone(&grant_calls)));
+    checker.add_veto(
+        PolicyBuilder::<Domain>::new("BlockedResource")
+            .resources(move |resource| {
+                veto_counter.fetch_add(1, Ordering::SeqCst);
+                resource.id == 5
+            })
+            .build_veto(),
+    );
+
+    for id in [1, 2, 3, 5] {
+        let resource = Resource { id };
+        let expected = bind(&checker, &odd_flag_session([3]))
+            .check(&resource)
+            .await
+            .into_result();
+        grant_calls.store(0, Ordering::SeqCst);
+        veto_calls.store(0, Ordering::SeqCst);
+
+        let session = odd_flag_session([3]);
+        let actual = bind(&checker, &session).authorize(&resource).await;
+
+        assert_eq!(veto_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(grant_calls.load(Ordering::SeqCst), usize::from(id != 5));
+        match (&actual, &expected) {
+            (Ok(()), Ok(())) => assert_eq!(id, 1),
+            (
+                Err(AccessError::Denied { reason, trace }),
+                Err(AccessError::Denied {
+                    reason: expected_reason,
+                    trace: expected_trace,
+                }),
+            )
+            | (
+                Err(AccessError::Indeterminate { reason, trace }),
+                Err(AccessError::Indeterminate {
+                    reason: expected_reason,
+                    trace: expected_trace,
+                }),
+            ) => {
+                assert_eq!(reason, expected_reason);
+                assert_eq!(format!("{trace:?}"), format!("{expected_trace:?}"));
+                let error = actual.as_ref().unwrap_err();
+                assert_eq!(
+                    error.fact_load_errors(),
+                    expected.as_ref().unwrap_err().fact_load_errors()
+                );
+                assert_eq!(matches!(error, AccessError::Indeterminate { .. }), id == 3);
+                assert_eq!(error.fact_load_errors().len(), usize::from(id == 3));
+            }
+            _ => panic!("authorize disagreed with check for {id}: {actual:?} vs {expected:?}"),
+        }
     }
 }
 
