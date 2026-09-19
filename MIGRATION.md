@@ -34,7 +34,7 @@ impl PolicyDomain for Accounts {
 }
 
 let mut checker = PermissionChecker::<Accounts>::new();
-checker.add_policy(PolicyBuilder::<Accounts>::new("Member").build());
+checker.add_policy(PolicyBuilder::<Accounts>::new("Member").allow_all());
 checker.add_veto(
     PolicyBuilder::<Accounts>::new("Suspended")
         .subjects(|account| account.suspended)
@@ -90,6 +90,136 @@ uncertainty blocks parent grants; a child grant failure does not block an
 independent parent grant after the child's vetoes pass. Each child capability
 phase runs at most once for each parent evaluation; delegation retains batch
 execution and nested evidence.
+
+## PolicyBuilder predicates accumulate
+
+`subjects`, `actions`, `resources`, `context`, and `when` now append to their
+axis instead of replacing it. Every predicate on every axis must return `true`
+for the builder's condition to hold. Builders that set each axis at most once
+retain their decisions for deterministic predicates, but scalar evaluation now
+runs context predicates before resource predicates. Callers relying on evaluation
+order must account for that change. Predicates must return deterministic results
+for the supplied inputs: subject, action, and context predicates run at most once
+per nonempty batch, and no predicates run for an empty batch.
+
+A builder that set one axis twice changes meaning without any source change:
+
+```rust,ignore
+// The same source, before and after.
+let active_admin = PolicyBuilder::<Documents>::new("ActiveAdmin")
+    .subjects(|user| user.active)
+    .subjects(|user| user.is_admin)
+    .build();
+
+// Before: the second call replaced the first, so only `is_admin` was checked
+// and an inactive admin was granted access.
+// After: both predicates must hold, and an inactive admin no longer matches.
+```
+
+To preserve the previous behavior, retain only the final predicate on each
+repeated axis. To deliberately broaden the new conjunction, compose separate
+policies with `PolicyExt::or`. This is an intentional policy change: the example
+below also admits active non-admins, whereas the old repeated-setter policy
+required `is_admin`:
+
+```rust,ignore
+let active = PolicyBuilder::<Documents>::new("Active")
+    .subjects(|user| user.active)
+    .build();
+let admin = PolicyBuilder::<Documents>::new("Admin")
+    .subjects(|user| user.is_admin)
+    .build();
+
+checker.add_policy(active.or(admin));
+```
+
+There is deliberately no replace or clear operation. Adding a predicate can
+only narrow a grant.
+
+`build_veto` shares the same match condition, so a second predicate narrows
+*when the veto fires*, not what it blocks once fired. **Upgrading an existing
+repeated-setter veto can therefore increase the set of requests ultimately
+permitted.** A veto that must fire on
+either condition is two vetoes combined with `VetoPolicyExt::any_of`, or
+`AnyOfVeto::try_new` for a dynamic list:
+
+```rust,ignore
+// Fires only when the account is suspended AND the document is on legal hold.
+let narrow = PolicyBuilder::<Documents>::new("Blocked")
+    .subjects(|user| user.suspended)
+    .resources(|document| document.legal_hold)
+    .build_veto();
+
+// Fires when either condition holds.
+let suspended = PolicyBuilder::<Documents>::new("Suspended")
+    .subjects(|user| user.suspended)
+    .build_veto();
+let legal_hold = PolicyBuilder::<Documents>::new("LegalHold")
+    .resources(|document| document.legal_hold)
+    .build_veto();
+
+checker.add_veto(suspended.any_of(legal_hold));
+```
+
+An empty builder no longer builds anything. `build` and `build_veto` exist
+only after at least one predicate, so a policy that applies to every request
+names itself:
+
+```rust,ignore
+// Before
+let allow_all = PolicyBuilder::<Documents>::new("AllowAll").build();
+let freeze = PolicyBuilder::<Documents>::new("Freeze").build_veto();
+
+// After
+let allow_all = PolicyBuilder::<Documents>::new("AllowAll").allow_all();
+let freeze = PolicyBuilder::<Documents>::new("Freeze").forbid_all();
+```
+
+`allow_all` grants every request; `forbid_all` forbids every request. Result
+reasons are unchanged. Calling `build()` or `build_veto()` without a predicate
+is now a compile error, so the compiler locates every site for you.
+
+Helpers that supply predicates must return `PolicyBuilder<Documents, Conditional>`
+instead of the default `PolicyBuilder<Documents>` (which means `Unconditional`).
+A decorator accepting either state must also return `Conditional` after adding a
+predicate:
+
+```rust,ignore
+use gatehouse::{BuilderState, Conditional, PolicyBuilder};
+
+fn active_users() -> PolicyBuilder<Documents, Conditional> {
+    PolicyBuilder::<Documents>::new("Active").subjects(|user| user.active)
+}
+
+fn require_admin<S: BuilderState>(
+    builder: PolicyBuilder<Documents, S>,
+) -> PolicyBuilder<Documents, Conditional> {
+    builder.subjects(|user| user.is_admin)
+}
+
+let active_admin = require_admin(active_users()).build();
+```
+
+Checklist for this section:
+
+1. Find builders that set the same axis twice. Retain only the final predicate
+   to preserve the old behavior, or explicitly choose the new conjunction or
+   separate alternatives with `or` (grants) or `any_of` (vetoes).
+2. Replace empty `build()` with `allow_all()` and empty `build_veto()` with
+   `forbid_all()`.
+3. Re-run authorization tests covering subjects that satisfy only part of a
+   rule, such as an inactive admin or a suspended owner.
+
+Searches for this section:
+
+```shell
+rg "\\.(subjects|actions|resources|context|when)\\("
+rg "new(_owned|_static)?\\([^)]*\\)\\s*\\.\\s*build(_veto)?\\(\\)"
+```
+
+The first lists every predicate call, so a chain that repeats one axis is easy
+to spot; the second finds the empty builders that must become `allow_all` /
+`forbid_all`.
 
 ## Preserve outages at application boundaries
 

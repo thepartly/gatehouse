@@ -52,7 +52,7 @@ fn build_trailing_allow_checker(policy_count: usize) -> PermissionChecker<UnitDo
     }
 
     let allow_policy =
-        PolicyBuilder::<UnitDomain>::new(format!("allow_policy_{}", policy_count - 1)).build();
+        PolicyBuilder::<UnitDomain>::new(format!("allow_policy_{}", policy_count - 1)).allow_all();
     checker.add_policy(allow_policy);
 
     checker

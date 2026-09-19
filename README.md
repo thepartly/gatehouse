@@ -180,6 +180,31 @@ let suspended_account = PolicyBuilder::<Documents>::new("SuspendedAccount")
 checker.add_veto(suspended_account);
 ```
 
+Predicates accumulate with AND semantics. Repeated calls on the same axis, and predicates on different axes, must all match for the policy to apply, so adding a predicate can only narrow a grant, and narrows when a veto fires. Broaden a grant by building one policy per condition and composing them with `PolicyExt::or`; broaden a veto with `AnyOfVeto` / `VetoPolicyExt::any_of`. There is no replace or clear operation.
+
+`build` and `build_veto` require at least one predicate. A policy that applies to every request is written with `allow_all()` or `forbid_all()`, so an empty builder is a compile-time error rather than unrestricted authority.
+
+```rust,ignore
+// Both predicates must match: an inactive admin is not granted.
+let active_admin = PolicyBuilder::<Documents>::new("ActiveAdmin")
+    .subjects(|user| user.active)
+    .subjects(|user| user.is_admin)
+    .build();
+
+// Broaden by composing two built policies instead.
+let active = PolicyBuilder::<Documents>::new("Active")
+    .subjects(|user| user.active)
+    .build();
+let admin = PolicyBuilder::<Documents>::new("Admin")
+    .subjects(|user| user.is_admin)
+    .build();
+let active_or_admin = active.or(admin);
+
+// Unconditional policies are named, never implied by an empty builder.
+let allow_all = PolicyBuilder::<Documents>::new("AllowAll").allow_all();
+let freeze = PolicyBuilder::<Documents>::new("Freeze").forbid_all();
+```
+
 Implement `Policy<D>` for asynchronous grants or `VetoPolicy<D>` for asynchronous vetoes. Both support custom batching and security-rule metadata.
 
 ```rust

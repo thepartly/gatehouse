@@ -710,7 +710,7 @@ impl AccessEvaluation {
     /// #     type Context = ();
     /// # }
     /// # let mut checker = PermissionChecker::<Domain>::new();
-    /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").build());
+    /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").allow_all());
     /// # let session = EvaluationSession::empty();
     /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
     /// evaluation.assert_granted_by("AllowAll");
@@ -902,10 +902,10 @@ impl AccessEvaluation {
     /// #     type Context = ();
     /// # }
     /// # let mut checker = PermissionChecker::<Domain>::new();
-    /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").build());
+    /// # checker.add_policy(PolicyBuilder::<Domain>::new("AllowAll").allow_all());
     /// # checker.add_veto(
     /// #     PolicyBuilder::<Domain>::new("GlobalFreeze")
-    /// #         .build_veto(),
+    /// #         .forbid_all(),
     /// # );
     /// # let session = EvaluationSession::empty();
     /// # let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;

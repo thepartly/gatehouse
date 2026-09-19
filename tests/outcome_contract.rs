@@ -405,7 +405,7 @@ async fn aggregate_provenance_is_lossless_and_decisive_grants_remain_decisive() 
 #[tokio::test]
 async fn explicit_veto_is_a_typed_denial_and_is_excluded_from_strict_lists() {
     let mut checker = PermissionChecker::new();
-    checker.add_policy(PolicyBuilder::<Domain>::new("Allow").build());
+    checker.add_policy(PolicyBuilder::<Domain>::new("Allow").allow_all());
     checker.add_veto(
         PolicyBuilder::<Domain>::new("Block")
             .resources(|resource| resource.id == 2)

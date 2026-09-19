@@ -130,6 +130,10 @@
 //!
 //! [`PolicyBuilder::build`] produces a grant policy;
 //! [`PolicyBuilder::build_veto`] produces a veto when its predicate matches.
+//! Repeated predicate calls accumulate: every predicate on every axis must hold,
+//! so a later call narrows the match and never widens it. A policy with no
+//! predicate must be spelled out with [`PolicyBuilder::allow_all`] or
+//! [`PolicyBuilder::forbid_all`].
 //! Register [`DelegatingPolicy`] once with [`PermissionChecker::add_delegate`]
 //! to preserve both child capabilities and their distinct failure semantics.
 //!
@@ -258,7 +262,7 @@ mod policy;
 mod results;
 mod session;
 
-pub use builder::PolicyBuilder;
+pub use builder::{BuilderState, Conditional, PolicyBuilder, Unconditional};
 pub use capability::{GrantResult, PolicyResult, VetoPolicy, VetoResult};
 pub use checker::{BoundEvaluator, PermissionChecker};
 pub use combinators::{

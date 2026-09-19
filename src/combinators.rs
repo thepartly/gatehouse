@@ -22,8 +22,8 @@ impl std::error::Error for EmptyPoliciesError {}
 /// use gatehouse::{PolicyDomain,PolicyBuilder,PolicyExt};
 /// struct D;
 /// impl PolicyDomain for D { type Subject=(); type Action=(); type Resource=(); type Context=(); }
-/// let grant = PolicyBuilder::<D>::new("grant").build();
-/// let veto = PolicyBuilder::<D>::new("veto").build_veto();
+/// let grant = PolicyBuilder::<D>::new("grant").allow_all();
+/// let veto = PolicyBuilder::<D>::new("veto").forbid_all();
 /// let invalid = grant.and(veto);
 /// ```
 pub trait PolicyExt<D: PolicyDomain>: Policy<D> + Sized + 'static {
