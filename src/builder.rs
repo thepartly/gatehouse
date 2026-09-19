@@ -75,7 +75,7 @@ impl<D: PolicyDomain> InternalPolicy<D> {
             && self.context_preds.iter().all(|pred| pred(context))
     }
 
-    /// Predicates that read the resource, so they are per item in a batch.
+    /// Predicates that read the resource, so a batch runs them per item.
     fn per_resource_axes_pass(
         &self,
         subject: &D::Subject,
@@ -88,11 +88,6 @@ impl<D: PolicyDomain> InternalPolicy<D> {
                 .when_preds
                 .iter()
                 .all(|pred| pred(subject, action, resource, context))
-    }
-
-    /// True when the batch path can decide every item without touching it.
-    fn has_no_per_resource_predicates(&self) -> bool {
-        self.resource_preds.is_empty() && self.when_preds.is_empty()
     }
 
     fn build_result(&self, all_axes_pass: bool) -> GrantResult {
@@ -120,7 +115,8 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
             return std::iter::repeat_with(|| result.clone()).take(n).collect();
         }
 
-        if self.has_no_per_resource_predicates() {
+        // Nothing left reads the resource, so one decision covers the batch.
+        if self.resource_preds.is_empty() && self.when_preds.is_empty() {
             let result = self.build_result(true);
             return std::iter::repeat_with(|| result.clone()).take(n).collect();
         }
@@ -182,7 +178,7 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 /// # use gatehouse::*;
 /// # tokio_test::block_on(async {
 /// struct User { active: bool, is_admin: bool }
-/// struct Documents;
+/// # struct Documents;
 /// # impl PolicyDomain for Documents {
 /// #     type Subject = User;
 /// #     type Action = ();
