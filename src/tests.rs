@@ -4730,7 +4730,7 @@ mod policy_builder_tests {
         }
     }
 
-    /// Runs a built grant policy through the point path and a two-item batch,
+    /// Runs a built grant policy through the point path and a three-item batch,
     /// returning `(point granted, per-item granted)`.
     async fn grant_decisions(
         policy: &dyn Policy<AccDomain>,
@@ -4847,6 +4847,183 @@ mod policy_builder_tests {
                     batch.iter().all(|forbidden| *forbidden == expected),
                     "{axis:?}: batch vetoes {batch:?} for ({first}, {second}), expected all {expected}"
                 );
+            }
+        }
+    }
+
+    async fn builder_matches(
+        builder: PolicyBuilder<AccDomain, Conditional>,
+        veto: bool,
+        batched: bool,
+        resources: &[AccFlags],
+    ) -> Vec<bool> {
+        let session = EvaluationSession::empty();
+        let shared = AccFlags {
+            first: true,
+            second: true,
+        };
+        let items: Vec<_> = resources
+            .iter()
+            .map(|resource| PolicyBatchItem { resource })
+            .collect();
+        let batch = BatchEvalCtx::new(&session, &shared, &shared, &shared, &items, "Contract");
+        let mut matches = Vec::new();
+        if veto {
+            let policy = builder.build_veto();
+            if batched {
+                return policy
+                    .evaluate_batch(&batch)
+                    .await
+                    .iter()
+                    .map(VetoResult::is_forbidden)
+                    .collect();
+            }
+            for resource in resources {
+                let point = EvalCtx::new(&session, &shared, &shared, resource, &shared, "Contract");
+                matches.push(policy.evaluate(&point).await.is_forbidden());
+            }
+        } else {
+            let policy = builder.build();
+            if batched {
+                return policy
+                    .evaluate_batch(&batch)
+                    .await
+                    .iter()
+                    .map(GrantResult::is_granted)
+                    .collect();
+            }
+            for resource in resources {
+                let point = EvalCtx::new(&session, &shared, &shared, resource, &shared, "Contract");
+                matches.push(policy.evaluate(&point).await.is_granted());
+            }
+        }
+        matches
+    }
+
+    #[tokio::test]
+    async fn builder_guards_prevent_unsafe_callbacks() {
+        let resources = [
+            AccFlags {
+                first: false,
+                second: true,
+            },
+            AccFlags {
+                first: true,
+                second: true,
+            },
+        ];
+        for veto in [false, true] {
+            for batched in [false, true] {
+                let resource_guard = PolicyBuilder::<AccDomain>::new("ResourceGuard")
+                    .when(|_, _, resource, _| {
+                        assert!(
+                            resource.first,
+                            "when must only run after the resource guard"
+                        );
+                        resource.second
+                    })
+                    .resources(|resource| resource.first);
+                assert_eq!(
+                    builder_matches(resource_guard, veto, batched, &resources).await,
+                    [false, true]
+                );
+
+                let subject_guard = PolicyBuilder::<AccDomain>::new("SubjectGuard")
+                    .subjects(|_| false)
+                    .actions(|_| panic!("action after failed subject"))
+                    .context(|_| panic!("context after failed subject"))
+                    .resources(|_| panic!("resource after failed subject"))
+                    .when(|_, _, _, _| panic!("when after failed subject"));
+                assert_eq!(
+                    builder_matches(subject_guard, veto, batched, &resources).await,
+                    [false, false]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_preserves_axis_order_insertion_order_and_short_circuiting() {
+        const ORDER: [&str; 10] = [
+            "subject1",
+            "subject2",
+            "action1",
+            "action2",
+            "context1",
+            "context2",
+            "resource1",
+            "resource2",
+            "when1",
+            "when2",
+        ];
+        let resources = [AccFlags {
+            first: true,
+            second: true,
+        }; 2];
+        for veto in [false, true] {
+            for batched in [false, true] {
+                for stop_at in 0..=ORDER.len() {
+                    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let record = |index: usize| {
+                        let calls = calls.clone();
+                        move |_: &AccFlags| {
+                            calls.lock().unwrap().push(ORDER[index]);
+                            index != stop_at
+                        }
+                    };
+                    let first_when = record(8);
+                    let second_when = record(9);
+                    let builder = PolicyBuilder::<AccDomain>::new("Order")
+                        .when(move |_, _, resource, _| first_when(resource))
+                        .resources(record(6))
+                        .context(record(4))
+                        .actions(record(2))
+                        .subjects(record(0))
+                        .when(move |_, _, resource, _| second_when(resource))
+                        .resources(record(7))
+                        .context(record(5))
+                        .actions(record(3))
+                        .subjects(record(1));
+                    let results = builder_matches(builder, veto, batched, &resources).await;
+                    assert_eq!(results, vec![stop_at == ORDER.len(); resources.len()]);
+                    let end = (stop_at + 1).min(ORDER.len());
+                    let expected = if !batched {
+                        ORDER[..end].repeat(resources.len())
+                    } else if stop_at < 6 {
+                        ORDER[..end].to_vec()
+                    } else {
+                        let mut expected = ORDER[..6].to_vec();
+                        expected.extend(ORDER[6..end].repeat(resources.len()));
+                        expected
+                    };
+                    assert_eq!(
+                        *calls.lock().unwrap(),
+                        expected,
+                        "veto={veto}, batched={batched}, stop_at={stop_at}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accumulated_resource_predicates_preserve_heterogeneous_batch_order() {
+        let resources: Vec<_> = ACCUMULATION_TRUTH_TABLE
+            .iter()
+            .map(|&(first, second, _)| AccFlags { first, second })
+            .collect();
+        for axis in [AccAxis::Resource, AccAxis::When] {
+            for veto in [false, true] {
+                for batched in [false, true] {
+                    let decisions =
+                        builder_matches(accumulating_builder(axis), veto, batched, &resources)
+                            .await;
+                    assert_eq!(
+                        decisions,
+                        [true, false, false, false],
+                        "{axis:?}, veto={veto}, batched={batched}"
+                    );
+                }
             }
         }
     }

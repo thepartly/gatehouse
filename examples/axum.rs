@@ -78,10 +78,11 @@ pub struct User {
     pub roles: Vec<String>,
 }
 
+/// Demo-only identity from caller-supplied headers; performs no authentication.
 #[derive(Debug, Clone)]
-pub struct AuthenticatedUser(pub User);
+pub struct DemoUser(pub User);
 
-impl<S> FromRequestParts<S> for AuthenticatedUser
+impl<S> FromRequestParts<S> for DemoUser
 where
     S: Send + Sync,
 {
@@ -107,7 +108,7 @@ where
             })
             .unwrap_or_else(|| vec!["viewer".to_string()]);
 
-        Ok(AuthenticatedUser(User { id, roles }))
+        Ok(DemoUser(User { id, roles }))
     }
 }
 
@@ -492,9 +493,7 @@ fn invoice_editing_policy() -> Box<dyn Policy<InvoiceDomain>> {
         .when(move |_user, _action, invoice, ctx: &RequestContext| {
             ctx.current_time
                 .duration_since(invoice.created_at)
-                .unwrap_or_default()
-                .as_secs()
-                <= THIRTY_DAYS
+                .is_ok_and(|age| age < Duration::from_secs(THIRTY_DAYS))
         })
         .build();
 
@@ -538,7 +537,7 @@ fn not_found_response() -> axum::response::Response {
 pub async fn view_invoice_handler(
     Path(invoice_id): Path<Uuid>,
     State(state): State<AppState>,
-    AuthenticatedUser(user): AuthenticatedUser,
+    DemoUser(user): DemoUser,
 ) -> impl IntoResponse {
     // Load first, then authorize the row that was loaded. An id the store does
     // not hold is a 404 for every caller, admins included: there is no resource
@@ -565,7 +564,7 @@ pub async fn view_invoice_handler(
 
 pub async fn list_invoices_handler(
     State(state): State<AppState>,
-    AuthenticatedUser(user): AuthenticatedUser,
+    DemoUser(user): DemoUser,
 ) -> impl IntoResponse {
     let session = state.request_session();
     let candidates = state.invoices.list();
@@ -600,7 +599,7 @@ pub async fn list_invoices_handler(
 pub async fn edit_invoice_handler(
     Path(invoice_id): Path<Uuid>,
     State(state): State<AppState>,
-    AuthenticatedUser(user): AuthenticatedUser,
+    DemoUser(user): DemoUser,
     Json(edit): Json<EditInvoice>,
 ) -> impl IntoResponse {
     let Some(invoice) = state.invoices.get(invoice_id) else {
@@ -657,8 +656,10 @@ async fn main() {
         .route("/invoices/{invoice_id}/edit", post(edit_invoice_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
-    println!("Listening on http://0.0.0.0:8000");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8000")
+        .await
+        .unwrap();
+    println!("Listening on http://127.0.0.1:8000");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -742,6 +743,50 @@ mod tests {
             result.is_granted(),
             "owner should edit an unlocked invoice under 30 days old"
         );
+    }
+
+    #[tokio::test]
+    async fn invoice_edit_age_uses_a_strict_duration_boundary() {
+        let checker = build_permission_checker();
+        let user = User {
+            id: Uuid::new_v4(),
+            roles: vec!["user".into()],
+        };
+        let current_time = SystemTime::UNIX_EPOCH + Duration::from_secs(60 * 24 * 60 * 60);
+        let context = RequestContext { current_time };
+        let boundary = current_time - Duration::from_secs(30 * 24 * 60 * 60);
+        let tick = Duration::from_nanos(1);
+        let session = EvaluationSession::empty();
+        for (created_at, expected) in [
+            (current_time + tick, false),
+            (current_time, true),
+            (boundary + tick, true),
+            (boundary, false),
+            (boundary - tick, false),
+        ] {
+            let invoice = Invoice {
+                id: Uuid::new_v4(),
+                owner_id: user.id,
+                locked: false,
+                created_at,
+                amount_cents: 100,
+                version: 1,
+            };
+            let decision = checker
+                .bind(&session, &user, &Action::Edit, &context)
+                .check(&invoice)
+                .await;
+            assert_eq!(decision.is_granted(), expected, "created_at={created_at:?}");
+            let decisions = checker
+                .bind(&session, &user, &Action::Edit, &context)
+                .evaluate([invoice])
+                .await;
+            assert_eq!(
+                decisions[0].1.is_granted(),
+                expected,
+                "batch created_at={created_at:?}"
+            );
+        }
     }
 
     #[tokio::test]

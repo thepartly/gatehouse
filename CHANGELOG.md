@@ -12,8 +12,9 @@
   `BuilderState` trait. A builder starts out `Unconditional`; the first
   predicate moves it to `Conditional`, the only state that has `build` and
   `build_veto`.
-- A dedicated `builder_contract` integration test suite, and `src/builder.rs`
-  is now covered by the diff-scoped mutation gate.
+- Builder contract coverage in library unit tests, selected with `--lib` by
+  the diff-scoped mutation gate, which now includes `src/builder.rs` and
+  validates the unmodified baseline.
 
 ### Changed
 
@@ -27,6 +28,16 @@
 - **Breaking:** `build` and `build_veto` require at least one predicate. An
   empty builder is a compile-time error. Use `allow_all` / `forbid_all` for a
   policy that applies to every request.
+
+- Scalar builder evaluation now runs subject, action, context, resource, then
+  `when` predicates, preserving insertion order and short-circuiting within each
+  axis. Shared predicates run at most once per nonempty batch; empty batches
+  invoke no predicates.
+- The Axum demo reads authoritative invoice snapshots from an in-process store
+  and applies edits only if the authorized version still matches. Unknown IDs
+  return 404 and concurrent changes return 409. The demo uses loopback and an
+  explicitly unauthenticated `DemoUser` extractor; invoice editing rejects
+  future creation times and ages of 30 days or more.
 
 ### Rationale
 

@@ -286,6 +286,39 @@ impl<D: PolicyDomain> Policy<D> for InternalPolicy<D> {
 /// [`Self::allow_all`] and [`Self::forbid_all`] are the only way to build a
 /// policy with no predicate, and they exist only on [`Unconditional`].
 ///
+/// A conditional builder cannot discard its predicates through either
+/// unconditional constructor:
+///
+/// ```compile_fail
+/// use gatehouse::{PolicyBuilder, PolicyDomain};
+/// struct User { active: bool }
+/// struct Documents;
+/// impl PolicyDomain for Documents {
+///     type Subject = User;
+///     type Action = ();
+///     type Resource = ();
+///     type Context = ();
+/// }
+/// PolicyBuilder::<Documents>::new("Restricted")
+///     .subjects(|user| user.active)
+///     .allow_all();
+/// ```
+///
+/// ```compile_fail
+/// use gatehouse::{PolicyBuilder, PolicyDomain};
+/// struct User { active: bool }
+/// struct Documents;
+/// impl PolicyDomain for Documents {
+///     type Subject = User;
+///     type Action = ();
+///     type Resource = ();
+///     type Context = ();
+/// }
+/// PolicyBuilder::<Documents>::new("Restricted")
+///     .subjects(|user| user.active)
+///     .forbid_all();
+/// ```
+///
 /// # Allocation cost
 ///
 /// [`PolicyBuilder::new`] takes `impl Into<Cow<'static, str>>`, so a

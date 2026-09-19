@@ -116,9 +116,11 @@ let active_admin = PolicyBuilder::<Documents>::new("ActiveAdmin")
 // After: both predicates must hold, and an inactive admin no longer matches.
 ```
 
-Review every call site that sets one axis more than once. To keep only the later
-predicate, delete the earlier call. To keep the broader behavior, build one policy per predicate
-and combine them with `PolicyExt::or`:
+To preserve the previous behavior, retain only the final predicate on each
+repeated axis. To deliberately broaden the new conjunction, compose separate
+policies with `PolicyExt::or`. This is an intentional policy change: the example
+below also admits active non-admins, whereas the old repeated-setter policy
+required `is_admin`:
 
 ```rust,ignore
 let active = PolicyBuilder::<Documents>::new("Active")
@@ -135,7 +137,9 @@ There is deliberately no replace or clear operation. Adding a predicate can
 only narrow a grant.
 
 `build_veto` shares the same match condition, so a second predicate narrows
-*when the veto fires*, not what it blocks once fired. A veto that must fire on
+*when the veto fires*, not what it blocks once fired. **Upgrading an existing
+repeated-setter veto can therefore increase the set of requests ultimately
+permitted.** A veto that must fire on
 either condition is two vetoes combined with `VetoPolicyExt::any_of`, or
 `AnyOfVeto::try_new` for a dynamic list:
 
@@ -175,11 +179,32 @@ let freeze = PolicyBuilder::<Documents>::new("Freeze").forbid_all();
 reasons are unchanged. Calling `build()` or `build_veto()` without a predicate
 is now a compile error, so the compiler locates every site for you.
 
+Helpers that supply predicates must return `PolicyBuilder<Documents, Conditional>`
+instead of the default `PolicyBuilder<Documents>` (which means `Unconditional`).
+A decorator accepting either state must also return `Conditional` after adding a
+predicate:
+
+```rust,ignore
+use gatehouse::{BuilderState, Conditional, PolicyBuilder};
+
+fn active_users() -> PolicyBuilder<Documents, Conditional> {
+    PolicyBuilder::<Documents>::new("Active").subjects(|user| user.active)
+}
+
+fn require_admin<S: BuilderState>(
+    builder: PolicyBuilder<Documents, S>,
+) -> PolicyBuilder<Documents, Conditional> {
+    builder.subjects(|user| user.is_admin)
+}
+
+let active_admin = require_admin(active_users()).build();
+```
+
 Checklist for this section:
 
-1. Find builders that set the same axis twice. Decide whether the narrower
-   conjunction is what the rule meant, or split the predicates and combine
-   them with `or` (grants) or `any_of` (vetoes).
+1. Find builders that set the same axis twice. Retain only the final predicate
+   to preserve the old behavior, or explicitly choose the new conjunction or
+   separate alternatives with `or` (grants) or `any_of` (vetoes).
 2. Replace empty `build()` with `allow_all()` and empty `build_veto()` with
    `forbid_all()`.
 3. Re-run authorization tests covering subjects that satisfy only part of a
