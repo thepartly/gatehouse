@@ -381,6 +381,8 @@ impl EvaluationSession {
     /// tight loops. Only use it when no fact-backed policies are expected.
     /// Fact-backed paths should build a [`FactRegistry`] during application
     /// setup and call [`FactRegistry::session`] per request.
+    /// Accidental fact reads return [`FactLoadError::SourceNotRegistered`]
+    /// without retaining keys, cache entries, or fact state.
     pub fn shared_empty() -> &'static Self {
         static SHARED_EMPTY: OnceLock<EvaluationSession> = OnceLock::new();
         SHARED_EMPTY.get_or_init(|| EvaluationSession {
@@ -463,6 +465,15 @@ impl EvaluationSession {
     {
         if keys.is_empty() {
             return Vec::new();
+        }
+
+        if self.inner.shared_empty {
+            return keys
+                .iter()
+                .map(|_| {
+                    FactLoadResult::Error(FactLoadError::SourceNotRegistered { fact_name: K::NAME })
+                })
+                .collect();
         }
 
         let state = self.state::<K>();
@@ -614,5 +625,77 @@ where
             .map(|_| FactLoadResult::Error(FactLoadError::LoaderCancelled { fact_name: K::NAME }))
             .collect();
         self.state.finish_keys(&cancelled, results);
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+    struct UnregisteredKey(u64);
+
+    impl FactKey for UnregisteredKey {
+        const NAME: &'static str = "unregistered";
+        type Value = bool;
+    }
+
+    struct UnusedSource;
+
+    #[async_trait]
+    impl FactSource<UnregisteredKey> for UnusedSource {
+        async fn load_many(&self, _: &[UnregisteredKey]) -> Vec<FactLoadResult<bool>> {
+            panic!("a shared empty session must never install a source");
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_empty_reads_never_allocate_fact_state() {
+        let session = EvaluationSession::shared_empty();
+        for start in [0, 1_000, 2_000] {
+            let mut keys = (start..start + 1_000)
+                .rev()
+                .map(UnregisteredKey)
+                .collect::<Vec<_>>();
+            keys.extend([
+                UnregisteredKey(start + 7),
+                UnregisteredKey(start),
+                UnregisteredKey(start + 7),
+            ]);
+            let results = session.get_many(&keys).await;
+            assert_eq!(results.len(), keys.len());
+            for result in results {
+                assert!(matches!(
+                    result,
+                    FactLoadResult::Error(FactLoadError::SourceNotRegistered {
+                        fact_name: "unregistered"
+                    })
+                ));
+            }
+            assert!(session.inner.states.lock().unwrap().is_empty());
+        }
+        assert!(session.get_many::<UnregisteredKey>(&[]).await.is_empty());
+        assert!(matches!(
+            session.get(UnregisteredKey(5_000)).await,
+            FactLoadResult::Error(FactLoadError::SourceNotRegistered {
+                fact_name: "unregistered"
+            })
+        ));
+        assert!(session.inner.states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shared_empty_still_rejects_source_installation_and_replacement() {
+        let session = EvaluationSession::shared_empty().clone();
+        for replace in [false, true] {
+            assert!(matches!(
+                session.insert_source::<UnregisteredKey>(Arc::new(UnusedSource), replace),
+                Err(FactSourceRegistrationError::SharedEmptySession {
+                    fact_name: "unregistered"
+                })
+            ));
+        }
+        assert!(session.inner.states.lock().unwrap().is_empty());
     }
 }

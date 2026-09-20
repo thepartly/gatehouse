@@ -28,6 +28,9 @@
   resource-state overrides are removed. MFA freshness rejects future assertions.
 - PostgreSQL example setup uses a connection-local temporary table and requires
   `DATABASE_URL`. Fact-loading documentation now compiles as doctests.
+- Lookup pages exceeding their requested limit return `LookupPageTooLarge`
+  before hydration or authorization. Accidental fact reads through
+  `EvaluationSession::shared_empty()` no longer retain fact state or cache entries.
 - **Breaking:** repeated `subjects`, `actions`, `resources`, `context`, and
   `when` calls accumulate with AND semantics instead of replacing the earlier
   predicate. Every predicate on every axis must match. Adding a predicate can

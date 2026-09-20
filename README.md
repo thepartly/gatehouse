@@ -322,6 +322,8 @@ A `LookupSource` must enumerate a superset of every resource that any policy cou
 
 `try_lookup_page` distinguishes source errors, hydration errors, contract violations, and indeterminate evaluations. An evaluation error retains every hydrated resource with its decision and returns no next cursor; retry the same input cursor with a fresh session after recovery. It never returns an incomplete authorized page as success because of an authorization outage. An atomic response spanning several pages must collect them before sending any output.
 
+Both lookup methods reject pages containing more candidate IDs than the requested limit with `LookupPageTooLarge { limit, actual }`, before hydration or policy evaluation. Pages are never truncated: their opaque cursor may already advance past the omitted IDs.
+
 ## Long-Lived Streams
 
 `EvaluationSession` caches are scoped to one authorization pass. For SSE, WebSocket, and other long-lived streams, do not keep one fact-backed session for the stream lifetime.
