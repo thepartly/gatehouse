@@ -27,7 +27,7 @@ Create a binary crate with `cargo new gatehouse-quickstart`, then add these depe
 
 ```toml
 [dependencies]
-gatehouse = "=0.6.0-alpha.1"
+gatehouse = "=0.6.0-alpha.2"
 tokio = { version = "1", features = ["macros", "rt"] }
 ```
 
@@ -67,7 +67,7 @@ async fn main() -> Result<(), AccessError> {
     let session = EvaluationSession::empty();
     let bound = checker.bind(&session, &user, &Read, &());
 
-    bound.check(&document).await.into_result()?;
+    bound.authorize(&document).await?;
     println!("Access granted");
     Ok(())
 }
