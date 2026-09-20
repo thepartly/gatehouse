@@ -387,4 +387,6 @@ Criterion benchmarks in `benches/permission_checker.rs` exercise bound checker e
 cargo bench
 ```
 
-The `postgres_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` with one batched `WITH ORDINALITY` query per request. It expects a live PostgreSQL database and reads `DATABASE_URL`.
+The `postgres_bulk_rebac` example demonstrates a SQL-backed ReBAC `FactSource` with one batched `WITH ORDINALITY` query per request. Set `DATABASE_URL` to a live PostgreSQL database. Its fixture is a connection-local temporary table, so concurrent runs are isolated and existing permanent tables are untouched. Run the database contract with `cargo test --example postgres_bulk_rebac -- --ignored`; CI provisions PostgreSQL and runs both this contract and the example program.
+
+CI also runs the self-contained example programs to execute assertions in their `main` functions. `factsource_n_plus_one` covers both repeated-key caching and a custom `facts_by` policy that sends 25 distinct questions in one source call, with exact per-item decision checks.

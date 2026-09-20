@@ -125,24 +125,18 @@ impl FactSource<RelationshipKey> for PgRelationshipSource {
 }
 
 async fn assert_point_and_bulk_agree(source: &PgRelationshipSource, keys: &[RelationshipKey]) {
-    for key in keys {
-        let point = source.load_point(key).await;
-        let bulk = source
-            .load_bulk(std::slice::from_ref(key))
-            .await
-            .into_iter()
-            .next()
-            .expect("bulk load for one key should return one result");
-
-        match (point, bulk) {
+    let bulk = source.load_bulk(keys).await;
+    assert_eq!(
+        bulk.len(),
+        keys.len(),
+        "bulk results must preserve cardinality"
+    );
+    for (key, bulk) in keys.iter().zip(bulk) {
+        match (source.load_point(key).await, bulk) {
             (FactLoadResult::Found(point), FactLoadResult::Found(bulk)) => {
                 assert_eq!(point, bulk, "point and bulk SQL should agree for {key:?}");
             }
-            (point, bulk) => {
-                panic!(
-                    "point and bulk SQL should both succeed in the example: {point:?} vs {bulk:?}"
-                );
-            }
+            (point, bulk) => panic!("queries must succeed: {point:?} vs {bulk:?}"),
         }
     }
 }
@@ -170,11 +164,9 @@ fn session_with(source: &Arc<dyn FactSource<RelationshipKey>>) -> EvaluationSess
         .session()
 }
 
-#[tokio::main]
-async fn main() {
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "host=localhost port=15432 user=postgres password=test dbname=awa_test".to_string()
-    });
+async fn connect() -> Arc<Client> {
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("set DATABASE_URL to a PostgreSQL database; fixtures use a connection-local temporary table");
 
     let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
         .await
@@ -184,20 +176,14 @@ async fn main() {
             eprintln!("postgres connection error: {error}");
         }
     });
-    let client = Arc::new(client);
+    Arc::new(client)
+}
 
-    let version: String = client
-        .query_one("SELECT version()", &[])
-        .await
-        .expect("version query should succeed")
-        .get(0);
-    println!("{version}");
-
+async fn prepare_source(client: Arc<Client>, grants: &[RelationshipKey]) -> PgRelationshipSource {
     client
         .batch_execute(
             "
-            DROP TABLE IF EXISTS gatehouse_example_post_relationships;
-            CREATE UNLOGGED TABLE gatehouse_example_post_relationships (
+            CREATE TEMPORARY TABLE gatehouse_example_post_relationships (
                 subject_id uuid NOT NULL,
                 post_id uuid NOT NULL,
                 relationship text NOT NULL,
@@ -208,25 +194,16 @@ async fn main() {
         .await
         .expect("setup schema");
 
-    let subject = User { id: Uuid::new_v4() };
-    let posts = (0..10_000)
-        .map(|index| Post {
-            id: Uuid::new_v4(),
-            public: index % 5 == 0,
-        })
-        .collect::<Vec<_>>();
-    let granted_ids = posts
+    let subject_ids = grants.iter().map(|key| key.subject_id).collect::<Vec<_>>();
+    let granted_ids = grants.iter().map(|key| key.resource_id).collect::<Vec<_>>();
+    let relationships = grants
         .iter()
-        .enumerate()
-        .filter_map(|(index, post)| (!post.public && index % 2 == 0).then_some(post.id))
+        .map(|key| key.relation.as_str())
         .collect::<Vec<_>>();
-    let relationships = vec![Relation::Viewer.as_str(); granted_ids.len()];
-    let subject_ids = vec![subject.id; granted_ids.len()];
-
     client
         .execute(
             "
-            INSERT INTO gatehouse_example_post_relationships (subject_id, post_id, relationship)
+            INSERT INTO pg_temp.gatehouse_example_post_relationships (subject_id, post_id, relationship)
             SELECT *
             FROM unnest($1::uuid[], $2::uuid[], $3::text[])
             ",
@@ -241,7 +218,7 @@ async fn main() {
                 "
                 SELECT EXISTS (
                     SELECT 1
-                    FROM gatehouse_example_post_relationships
+                    FROM pg_temp.gatehouse_example_post_relationships
                     WHERE subject_id = $1
                       AND relationship = $2
                       AND post_id = $3
@@ -263,7 +240,7 @@ async fn main() {
                 SELECT
                     COALESCE(bool_or(g.post_id IS NOT NULL), false) AS allowed
                 FROM candidate_relationships c
-                LEFT JOIN gatehouse_example_post_relationships g
+                LEFT JOIN pg_temp.gatehouse_example_post_relationships g
                   ON g.subject_id = c.subject_id
                  AND g.relationship = c.relationship
                  AND g.post_id = c.post_id
@@ -275,11 +252,44 @@ async fn main() {
             .expect("prepare bulk query"),
     );
 
-    let source = Arc::new(PgRelationshipSource {
+    PgRelationshipSource {
         client,
         point_stmt,
         bulk_stmt,
-    });
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let client = connect().await;
+    let version: String = client
+        .query_one("SELECT version()", &[])
+        .await
+        .expect("version query should succeed")
+        .get(0);
+    println!("{version}");
+
+    let subject = User { id: Uuid::new_v4() };
+    let posts = (0..10_000)
+        .map(|index| Post {
+            id: Uuid::new_v4(),
+            public: index % 5 == 0,
+        })
+        .collect::<Vec<_>>();
+    let granted_ids = posts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, post)| (!post.public && index % 2 == 0).then_some(post.id))
+        .collect::<Vec<_>>();
+    let grants = granted_ids
+        .iter()
+        .map(|post_id| RelationshipQuery {
+            subject_id: subject.id,
+            resource_id: *post_id,
+            relation: Relation::Viewer,
+        })
+        .collect::<Vec<_>>();
+    let source = Arc::new(prepare_source(client, &grants).await);
     assert_point_and_bulk_agree(
         &source,
         &[
@@ -378,5 +388,60 @@ where
     Measurement {
         elapsed: best_elapsed,
         output: best_output.expect("measurement should run at least once"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL; run by the PostgreSQL CI job"]
+    async fn heterogeneous_bulk_preserves_order_and_fixtures_are_connection_local() {
+        let first_subject = Uuid::from_u128(1);
+        let second_subject = Uuid::from_u128(2);
+        let first_post = Uuid::from_u128(10);
+        let second_post = Uuid::from_u128(20);
+        let key = |subject_id, resource_id| RelationshipQuery {
+            subject_id,
+            resource_id,
+            relation: Relation::Viewer,
+        };
+        let grants = [
+            key(first_subject, first_post),
+            key(second_subject, second_post),
+        ];
+        let (first_client, second_client) = tokio::join!(connect(), connect());
+        let (source, empty_source) = tokio::join!(
+            prepare_source(first_client, &grants),
+            prepare_source(second_client, &[]),
+        );
+        let keys = [
+            key(second_subject, second_post),
+            key(first_subject, second_post),
+            key(first_subject, first_post),
+            key(second_subject, second_post),
+            key(second_subject, first_post),
+            key(first_subject, Uuid::nil()),
+            key(first_subject, first_post),
+        ];
+        assert_point_and_bulk_agree(&source, &keys).await;
+        let decisions = source
+            .load_many(&keys)
+            .await
+            .into_iter()
+            .map(|result| match result {
+                FactLoadResult::Found(allowed) => allowed,
+                other => panic!("expected a decision, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decisions, [true, false, true, true, false, false, true]);
+        assert!(source.load_many(&[]).await.is_empty());
+        let empty_results = empty_source.load_many(&keys).await;
+        assert_eq!(empty_results.len(), keys.len());
+        assert!(empty_results
+            .iter()
+            .all(|result| matches!(result, FactLoadResult::Found(false))));
+        assert_point_and_bulk_agree(&source, &keys).await;
     }
 }

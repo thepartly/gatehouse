@@ -4,6 +4,8 @@
 
 ### Added
 
+- PostgreSQL bulk-ordering and temporary-fixture isolation tests, executable
+  example smoke checks in CI, and a distinct-key `facts_by` batching scenario.
 - `BoundEvaluator::authorize` returns `Result<(), AccessError>` for enforcement
   with `?`. `AccessEvaluation`, `GrantResult`, and `VetoResult` now warn when unused.
   Discarding awaited `BoundEvaluator::evaluate` / `evaluate_by` results also warns.
@@ -24,6 +26,8 @@
 - Actix authorizes stored posts, returns 404 for unknown IDs and generic denial
   responses, and labels its write routes as authorization-only demos. HTTP
   resource-state overrides are removed. MFA freshness rejects future assertions.
+- PostgreSQL example setup uses a connection-local temporary table and requires
+  `DATABASE_URL`. Fact-loading documentation now compiles as doctests.
 - **Breaking:** repeated `subjects`, `actions`, `resources`, `context`, and
   `when` calls accumulate with AND semantics instead of replacing the earlier
   predicate. Every predicate on every axis must match. Adding a predicate can
