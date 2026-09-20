@@ -131,9 +131,20 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
+  released-consumer:
+    name: Verify released quick-start consumer
+    needs: publish-crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run quick start against crates.io without a path override
+        run: python3 scripts/check-quickstart.py --released
+
   github-release:
     name: Publish GitHub Release
-    needs: publish-crate
+    needs: released-consumer
     permissions:
       contents: write
     runs-on: ubuntu-latest

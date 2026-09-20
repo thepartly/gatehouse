@@ -67,7 +67,7 @@ async fn main() -> Result<(), AccessError> {
     let session = EvaluationSession::empty();
     let bound = checker.bind(&session, &user, &Read, &());
 
-    bound.check(&document).await.into_result()?;
+    bound.authorize(&document).await?;
     println!("Access granted");
     Ok(())
 }
