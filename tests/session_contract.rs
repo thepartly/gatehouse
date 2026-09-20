@@ -555,7 +555,11 @@ fn source_panics_propagate_but_clean_in_flight_state() {
     assert!(panic_result.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    let cached = tokio_test::block_on(session.get(TestKey(1)));
+    let cached = tokio_test::block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), session.get(TestKey(1)))
+            .await
+            .expect("cancelled loader should leave a readable cached result")
+    });
     assert_load_cancelled(&cached);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -774,7 +778,9 @@ async fn cancelling_leader_get_cleans_in_flight_entry() {
 
     let leader_session = session.clone();
     let leader = tokio::spawn(async move { leader_session.get(TestKey(7)).await });
-    started.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .expect("source should start loading");
     leader.abort();
     assert!(leader.await.unwrap_err().is_cancelled());
 
@@ -796,7 +802,9 @@ async fn cancelled_parallel_loader_wakes_waiters_and_preserves_unrelated_keys() 
 
     let leader_session = session.clone();
     let leader = tokio::spawn(async move { leader_session.get(TestKey(7)).await });
-    started.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .expect("source should start loading");
 
     let waiter_session = session.clone();
     let waiter = tokio::spawn(async move { waiter_session.get(TestKey(7)).await });
@@ -831,7 +839,9 @@ async fn concurrent_waiters_observe_same_source_error() {
 
     let leader_session = session.clone();
     let leader = tokio::spawn(async move { leader_session.get(TestKey(8)).await });
-    started.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .expect("source should start loading");
 
     let waiter_session = session.clone();
     let waiter = tokio::spawn(async move { waiter_session.get(TestKey(8)).await });
@@ -932,6 +942,19 @@ impl FactSource<TestKey> for CompletingPrefixSource {
     }
 }
 
+#[derive(Default)]
+struct CountingWake(AtomicUsize);
+
+impl std::task::Wake for CountingWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 async fn assert_cancellation_after_chunks(completed_chunks: usize) {
     use std::future::{poll_fn, Future};
     use std::task::Poll;
@@ -956,17 +979,23 @@ async fn assert_cancellation_after_chunks(completed_chunks: usize) {
     let second_input = [1, 3, 4, 6, 1].map(TestKey);
     let mut first_waiter = Box::pin(session.get_many(&first_input));
     let mut second_waiter = Box::pin(session.get_many(&second_input));
-    assert!(
-        poll_fn(|context| Poll::Ready(first_waiter.as_mut().poll(context)))
-            .await
-            .is_pending()
-    );
-    assert!(
-        poll_fn(|context| Poll::Ready(second_waiter.as_mut().poll(context)))
-            .await
-            .is_pending()
-    );
+    let first_wake = Arc::new(CountingWake::default());
+    let second_wake = Arc::new(CountingWake::default());
+    let first_waker = std::task::Waker::from(Arc::clone(&first_wake));
+    let second_waker = std::task::Waker::from(Arc::clone(&second_wake));
+    assert!(first_waiter
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(&first_waker))
+        .is_pending());
+    assert!(second_waiter
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(&second_waker))
+        .is_pending());
+    first_wake.0.store(0, Ordering::SeqCst);
+    second_wake.0.store(0, Ordering::SeqCst);
     drop(leader);
+    assert!(first_wake.0.load(Ordering::SeqCst) > 0);
+    assert!(second_wake.0.load(Ordering::SeqCst) > 0);
 
     for (keys, results) in [
         (

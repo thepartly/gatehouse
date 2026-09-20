@@ -1738,7 +1738,9 @@ mod core_tests {
         let first_key = key.clone();
         let first = tokio::spawn(async move { first_session.get(first_key).await });
 
-        started.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("source should start loading");
 
         let second_session = session.clone();
         let second = tokio::spawn(async move { second_session.get(key).await });
