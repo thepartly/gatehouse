@@ -21,6 +21,9 @@
 
 ### Changed
 
+- Actix authorizes stored posts, returns 404 for unknown IDs and generic denial
+  responses, and labels its write routes as authorization-only demos. HTTP
+  resource-state overrides are removed. MFA freshness rejects future assertions.
 - **Breaking:** repeated `subjects`, `actions`, `resources`, `context`, and
   `when` calls accumulate with AND semantics instead of replacing the earlier
   predicate. Every predicate on every axis must match. Adding a predicate can
