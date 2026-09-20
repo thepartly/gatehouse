@@ -33,6 +33,37 @@ jobs:
         run: cargo doc --verbose
       - name: Test
         run: cargo test --all-targets --all-features
+      - name: Run self-contained example scenarios
+        run: |
+          for example in combinator_policy delegating_policy deny_override factsource_n_plus_one in_ram_rebac lookup_in_ram mfa_freshness_context policy_builder rbac_policy rebac_policy; do
+            cargo run --example "$example" --all-features
+          done
+
+  postgres-contracts:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: gatehouse-test
+          POSTGRES_DB: gatehouse_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d gatehouse_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:gatehouse-test@localhost:5432/gatehouse_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test PostgreSQL bulk ordering and fixture isolation
+        run: cargo test --example postgres_bulk_rebac --all-features -- --ignored
+      - name: Run PostgreSQL example scenarios
+        run: cargo run --example postgres_bulk_rebac --all-features
 
   feature-contracts:
     name: Feature contracts (${{ matrix.features.name }})

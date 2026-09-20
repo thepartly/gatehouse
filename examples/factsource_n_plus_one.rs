@@ -17,6 +17,10 @@
 //! `org_id` because the authorization question is org-scoped; `user_id`
 //! is present only to show where the caller identity would live.
 //!
+//! A second scenario asks 25 distinct invoice-visibility questions. Its custom
+//! `evaluate_batch` collects them with `facts_by` into one source call and
+//! checks every returned decision in input order.
+//!
 //! Run with:
 //!
 //! ```text
@@ -220,6 +224,7 @@ impl Policy<SupplierInvoiceDomain> for RightSupplierPolicy {
 
 #[tokio::main]
 async fn main() {
+    distinct_key_batch_scenario().await;
     // Same supplier, same hierarchy, same invoices for both shapes.
     let supplier_org = Uuid::new_v4();
     let customer = Uuid::new_v4();
@@ -300,4 +305,127 @@ async fn main() {
         "the session batches: one load_many call covering the unique key set",
     );
     assert_eq!(visible.len(), 25);
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct InvoiceVisibility {
+    supplier_org: Uuid,
+    invoice_id: Uuid,
+}
+
+impl FactKey for InvoiceVisibility {
+    const NAME: &'static str = "invoice_visibility";
+    type Value = bool;
+}
+
+struct InvoiceVisibilitySource {
+    visible: std::collections::HashSet<InvoiceVisibility>,
+    calls: Arc<std::sync::Mutex<Vec<Vec<InvoiceVisibility>>>>,
+}
+
+#[async_trait]
+impl FactSource<InvoiceVisibility> for InvoiceVisibilitySource {
+    async fn load_many(&self, keys: &[InvoiceVisibility]) -> Vec<FactLoadResult<bool>> {
+        self.calls.lock().unwrap().push(keys.to_vec());
+        keys.iter()
+            .map(|key| FactLoadResult::Found(self.visible.contains(key)))
+            .collect()
+    }
+}
+
+struct BatchInvoicePolicy;
+
+impl BatchInvoicePolicy {
+    fn result(fact: FactLoadResult<bool>) -> GrantResult {
+        match fact {
+            FactLoadResult::Found(true) => GrantResult::granted("BatchInvoicePolicy", None),
+            _ => GrantResult::not_applicable("BatchInvoicePolicy", "invoice not visible"),
+        }
+    }
+}
+
+#[async_trait]
+impl Policy<SupplierInvoiceDomain> for BatchInvoicePolicy {
+    async fn evaluate(&self, ctx: &EvalCtx<'_, SupplierInvoiceDomain>) -> GrantResult {
+        Self::result(
+            ctx.fact(InvoiceVisibility {
+                supplier_org: ctx.subject.org_id,
+                invoice_id: ctx.resource.id,
+            })
+            .await,
+        )
+    }
+
+    async fn evaluate_batch<'item>(
+        &self,
+        ctx: &gatehouse::BatchEvalCtx<'item, SupplierInvoiceDomain>,
+    ) -> Vec<GrantResult> {
+        ctx.facts_by(|invoice| InvoiceVisibility {
+            supplier_org: ctx.subject.org_id,
+            invoice_id: invoice.id,
+        })
+        .await
+        .into_iter()
+        .map(Self::result)
+        .collect()
+    }
+
+    fn policy_type(&self) -> Cow<'static, str> {
+        Cow::Borrowed("BatchInvoicePolicy")
+    }
+}
+
+async fn distinct_key_batch_scenario() {
+    let supplier = Supplier {
+        user_id: Uuid::nil(),
+        org_id: Uuid::from_u128(1),
+    };
+    let invoices = (0..25)
+        .rev()
+        .map(|index| Invoice {
+            id: Uuid::from_u128(index),
+            customer_id: Uuid::nil(),
+        })
+        .collect::<Vec<_>>();
+    let keys = invoices
+        .iter()
+        .map(|invoice| InvoiceVisibility {
+            supplier_org: supplier.org_id,
+            invoice_id: invoice.id,
+        })
+        .collect::<Vec<_>>();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let session = FactRegistry::builder()
+        .with::<InvoiceVisibility, _>(InvoiceVisibilitySource {
+            visible: keys
+                .iter()
+                .filter(|key| key.invoice_id.as_u128() % 2 == 0)
+                .cloned()
+                .collect(),
+            calls: Arc::clone(&calls),
+        })
+        .build()
+        .session();
+    let mut checker = PermissionChecker::<SupplierInvoiceDomain>::new();
+    checker.add_policy(BatchInvoicePolicy);
+    let decisions = checker
+        .bind(&session, &supplier, &ViewAction, &())
+        .evaluate(invoices)
+        .await;
+    assert_eq!(*calls.lock().unwrap(), vec![keys]);
+    assert_eq!(decisions.len(), 25);
+    for (index, (invoice, decision)) in decisions.iter().enumerate() {
+        assert_eq!(invoice.id.as_u128(), 24 - index as u128);
+        assert_eq!(decision.is_granted(), invoice.id.as_u128() % 2 == 0);
+        assert!(!decision.is_indeterminate());
+    }
+    println!("[distinct] 25 different invoice questions -> 1 source call containing 25 keys");
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn distinct_questions_are_loaded_in_one_ordered_batch() {
+        super::distinct_key_batch_scenario().await;
+    }
 }

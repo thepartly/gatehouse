@@ -211,7 +211,7 @@ pub enum FactLoadResult<V> {
 /// then guarantees one round trip per unique key per request, regardless of
 /// how many policies or items in a list endpoint consult it.
 ///
-/// ```rust,ignore
+/// ```rust
 /// use async_trait::async_trait;
 /// use gatehouse::{FactKey, FactLoadResult, FactSource};
 ///
@@ -244,11 +244,32 @@ pub enum FactLoadResult<V> {
 ///
 /// Inside the policy, the canonical pattern is:
 ///
-/// ```rust,ignore
+/// ```rust
+/// # use async_trait::async_trait;
+/// # use gatehouse::{EvalCtx, FactKey, FactLoadResult, GrantResult, Policy, PolicyDomain};
+/// # use std::borrow::Cow;
+/// # struct User { org_id: uuid::Uuid }
+/// # struct Invoice { customer_id: uuid::Uuid }
+/// # struct InvoiceAccess;
+/// # impl PolicyDomain for InvoiceAccess {
+/// #     type Subject = User;
+/// #     type Action = ();
+/// #     type Resource = Invoice;
+/// #     type Context = ();
+/// # }
+/// # #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+/// # struct CustomerForOrg(uuid::Uuid);
+/// # impl FactKey for CustomerForOrg {
+/// #     const NAME: &'static str = "customer_for_org";
+/// #     type Value = Option<uuid::Uuid>;
+/// # }
+/// # struct BillingCustomer;
+/// # #[async_trait]
+/// # impl Policy<InvoiceAccess> for BillingCustomer {
 /// async fn evaluate(
 ///     &self,
 ///     ctx: &EvalCtx<'_, InvoiceAccess>,
-/// ) -> PolicyEvalResult {
+/// ) -> GrantResult {
 ///     match ctx.fact(CustomerForOrg(ctx.subject.org_id)).await {
 ///         FactLoadResult::Found(Some(customer_id)) if customer_id == ctx.resource.customer_id => {
 ///             ctx.grant("subject's org bills under the invoice's customer")
@@ -256,6 +277,8 @@ pub enum FactLoadResult<V> {
 ///         _ => ctx.not_applicable("not the billing customer"),
 ///     }
 /// }
+/// # fn policy_type(&self) -> Cow<'static, str> { Cow::Borrowed("BillingCustomer") }
+/// # }
 /// ```
 ///
 /// [`crate::EvalCtx::fact`] records the consulted fact as
