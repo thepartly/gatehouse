@@ -4,6 +4,10 @@
 
 ### Added
 
+- Explicit `filter_lossy`, `filter_by_lossy`, and `lookup_page_lossy` methods;
+  ambiguous names are deprecated aliases with unchanged semantics.
+- A runnable README quick start, verified as a separate public-API consumer.
+
 - PostgreSQL bulk-ordering and temporary-fixture isolation tests, executable
   example smoke checks in CI, and a distinct-key `facts_by` batching scenario.
 - `BoundEvaluator::authorize` returns `Result<(), AccessError>` for enforcement

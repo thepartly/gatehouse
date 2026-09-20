@@ -276,7 +276,7 @@ with a fresh session after recovery. Previously returned pages cannot be
 retracted, so an endpoint requiring an atomic multi-page response must collect
 all pages before sending it.
 
-The original `filter`, `filter_by`, and `lookup_page` remain deliberately
+The explicit `filter_lossy`, `filter_by_lossy`, and `lookup_page_lossy` methods are deliberately
 lossy: they exclude both denials and indeterminate items. The old `to_result`
 also merges both outcomes into one reason-only error callback.
 `denied_due_to_fact_load_error()` is deprecated; it detects any error in the
@@ -395,7 +395,7 @@ If you are upgrading from 0.2 or 0.3, first read the release notes for 0.3 and 0
 4. Replace `ctx.deny(...)` with `ctx.not_applicable(...)`.
 5. Replace `PolicyEvalResult::Denied` with `PolicyEvalResult::NotApplicable`.
 6. Replace `PolicyBuilder::<S, A, R, C>` with `PolicyBuilder::<Domain>`.
-7. Replace `checker.check(...)`, `evaluate_in_session(...)`, batch, filter, and lookup checker methods with `checker.bind(...).check(...)`, `.evaluate(...)`, `.filter(...)`, or `.lookup_page(...)`.
+7. Replace `checker.check(...)`, `evaluate_in_session(...)`, batch, filter, and lookup checker methods with `checker.bind(...).check(...)`, `.evaluate(...)`, `.try_filter(...)`, or `.try_lookup_page(...)`.
 8. Build request sessions through `FactRegistry` for fact-backed policies.
 9. Replace `AbacPolicy` with `PolicyBuilder::when` or a hand-written `Policy`.
 10. Update direct `BatchEvalCtx` / `PolicyBatchItem` construction in tests.
@@ -581,7 +581,7 @@ let bound = checker.bind(&session, &user, &Read, &request_context);
 
 let decision = bound.check(&document).await;
 let decisions = bound.evaluate(documents.clone()).await;
-let visible = bound.filter(documents).await;
+let visible = bound.try_filter(documents).await?;
 ```
 
 When the list item is a wider row than the authorization resource, use the extractor variants and keep returning the original rows:
@@ -592,8 +592,8 @@ let decisions = bound
     .await;
 
 let visible_rows = bound
-    .filter_by(invoice_rows, |row| &row.authz_resource)
-    .await;
+    .try_filter_by(invoice_rows, |row| &row.authz_resource)
+    .await?;
 ```
 
 For fact-backed policies, create the session from a registry:
@@ -614,7 +614,7 @@ let decision = checker
 
 ## Batch evaluation
 
-`BoundEvaluator::evaluate` and `BoundEvaluator::filter` accept caller-owned resources. Items only need to borrow as `D::Resource`:
+`BoundEvaluator::evaluate` and `BoundEvaluator::try_filter` accept caller-owned resources. Items only need to borrow as `D::Resource`:
 
 ```rust,ignore
 let results: Vec<(Document, AccessEvaluation)> = bound.evaluate(documents).await;
@@ -644,7 +644,7 @@ let ctx = BatchEvalCtx {
 
 `EvaluationSession` is still scoped to one authorization pass. For SSE, WebSocket, and other long-lived streams, do not keep one fact-backed session for the stream lifetime.
 
-If your product contract authorizes once at stream open, create a fresh session, compute the visible ID set with `filter` / `filter_by`, drop the session, and only emit frames for that set. If the stream must observe mid-stream permission revocation, run periodic reauthorization with a fresh `registry.session()` each tick and re-bind the checker for that pass.
+If your product contract authorizes once at stream open, create a fresh session, compute the visible ID set with `try_filter` / `try_filter_by`, drop the session, and only emit frames for that set. If the stream must observe mid-stream permission revocation, run periodic reauthorization with a fresh `registry.session()` each tick and re-bind the checker for that pass.
 
 ## Lookup APIs
 
@@ -674,7 +674,7 @@ Call lookup through the bound evaluator:
 ```rust,ignore
 let page = checker
     .bind(&session, &user, &Read, &request_context)
-    .lookup_page(&lookup, &hydrator, cursor.as_deref(), limit)
+    .try_lookup_page(&lookup, &hydrator, cursor.as_deref(), limit)
     .await?;
 ```
 
@@ -776,3 +776,7 @@ rg "evaluate_in_session|filter_authorized|lookup_authorized|\\.check\\(&"
 rg "AbacPolicy|Effect::Deny"
 rg "AccessEvaluation::|PolicyEvalResult::|FactLoadResult::|LookupAuthorizedError::"
 ```
+
+## Explicit lossy collection names
+
+`filter`, `filter_by`, and `lookup_page` are deprecated forwarding aliases; their behavior is unchanged. Use `try_filter`, `try_filter_by`, and `try_lookup_page` to surface authorization outages. If dropping indeterminate resources is intentional, migrate to `filter_lossy`, `filter_by_lossy`, and `lookup_page_lossy`. Lossy lookup still returns lookup, hydration, and adapter-contract errors.

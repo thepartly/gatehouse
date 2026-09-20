@@ -103,7 +103,8 @@
 //! and decision. [`BoundEvaluator::try_filter`] excludes definite denials but
 //! fails on indeterminate decisions; [`BoundEvaluator::try_filter_by`] applies
 //! the same rule to projected caller-owned rows. Errors retain all input items
-//! and evaluations. The original `filter` helpers deliberately omit outages.
+//! and evaluations. The explicit `filter_lossy` / `filter_by_lossy` helpers deliberately omit outages.
+//! The original `filter` / `filter_by` names are deprecated aliases.
 //!
 //! [`BoundEvaluator::try_lookup_page`] enumerates candidate IDs, hydrates them,
 //! and strictly authorizes one page. [`LookupSource`] must cover every grant

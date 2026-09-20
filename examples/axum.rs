@@ -553,9 +553,8 @@ pub async fn view_invoice_handler(
     match state
         .checker
         .bind(&session, &user, &Action::View, &context)
-        .check(&invoice)
+        .authorize(&invoice)
         .await
-        .into_result()
     {
         Ok(()) => Json(InvoiceSummary::from(invoice)).into_response(),
         Err(error) => authorization_error_response(error),
@@ -611,9 +610,8 @@ pub async fn edit_invoice_handler(
     if let Err(error) = state
         .checker
         .bind(&session, &user, &Action::Edit, &context)
-        .check(&invoice)
+        .authorize(&invoice)
         .await
-        .into_result()
     {
         return authorization_error_response(error);
     }

@@ -684,7 +684,7 @@ mod core_tests {
             .into_iter()
             .map(|(row, _)| row)
             .collect::<Vec<_>>();
-        let authorized = bound.filter_by(rows, |row| &row.authz_resource).await;
+        let authorized = bound.filter_by_lossy(rows, |row| &row.authz_resource).await;
 
         assert_eq!(
             authorized

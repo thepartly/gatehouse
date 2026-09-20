@@ -211,7 +211,7 @@ async fn run_collected(
 
     loop {
         let page = bound
-            .lookup_page(lookup, hydrator, cursor.as_deref(), page_size())
+            .lookup_page_lossy(lookup, hydrator, cursor.as_deref(), page_size())
             .await?;
         authorized.extend(page.resources);
         match page.next_cursor {
@@ -250,7 +250,7 @@ where
 
     loop {
         let page = bound
-            .lookup_page(lookup, hydrator, cursor.as_deref(), limit)
+            .lookup_page_lossy(lookup, hydrator, cursor.as_deref(), limit)
             .await?;
         authorized.extend(page.resources);
         match page.next_cursor {
@@ -387,7 +387,7 @@ async fn page_mode_cursor_stuck_is_detected() {
 
     // First call: cursor None, source returns Some("x") -> legitimate advance.
     let first = bound
-        .lookup_page(&Echo, &hydrate, None, limit)
+        .lookup_page_lossy(&Echo, &hydrate, None, limit)
         .await
         .expect("first page legitimately advances");
     let cursor = first
@@ -396,7 +396,7 @@ async fn page_mode_cursor_stuck_is_detected() {
 
     // Second call: cursor Some("x"), source echoes Some("x") -> stuck.
     let second = bound
-        .lookup_page(&Echo, &hydrate, Some(&cursor), limit)
+        .lookup_page_lossy(&Echo, &hydrate, Some(&cursor), limit)
         .await;
     match second {
         Err(LookupAuthorizedError::LookupCursorStuck) => {}
@@ -689,7 +689,7 @@ async fn page_oriented_api_lets_caller_stream() {
     let pages = Arc::new(Mutex::new(Vec::new()));
     loop {
         let page = bound
-            .lookup_page(&lookup, &hydrate, cursor.as_deref(), page_size)
+            .lookup_page_lossy(&lookup, &hydrate, cursor.as_deref(), page_size)
             .await
             .expect("ok");
         pages

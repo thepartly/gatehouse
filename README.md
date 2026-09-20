@@ -23,61 +23,63 @@ Upgrading from 0.5? See [MIGRATION.md](MIGRATION.md).
 
 ## Quick Start
 
-```rust
-use gatehouse::*;
+Create a binary crate with `cargo new gatehouse-quickstart`, then add these dependencies to `Cargo.toml`:
 
-#[derive(Debug, Clone)]
+```toml
+[dependencies]
+gatehouse = "=0.6.0-alpha.1"
+tokio = { version = "1", features = ["macros", "rt"] }
+```
+
+Replace `src/main.rs` with this program and run `cargo run`:
+
+```rust
+use gatehouse::{AccessError, EvaluationSession, PermissionChecker, PolicyBuilder, PolicyDomain};
+
 struct User {
     id: u64,
-    roles: Vec<&'static str>,
 }
 
-#[derive(Debug, Clone)]
 struct Document {
     owner_id: u64,
 }
 
-#[derive(Debug, Clone)]
-struct ReadAction;
-
+struct Read;
 struct Documents;
+
 impl PolicyDomain for Documents {
     type Subject = User;
-    type Action = ReadAction;
+    type Action = Read;
     type Resource = Document;
     type Context = ();
 }
 
-let admin_policy = PolicyBuilder::<Documents>::new("AdminOnly")
-    .subjects(|user: &User| user.roles.contains(&"admin"))
-    .build();
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), AccessError> {
+    let owner_policy = PolicyBuilder::<Documents>::new("Owner")
+        .when(|user, _action, document, _context| user.id == document.owner_id)
+        .build();
+    let mut checker = PermissionChecker::<Documents>::new();
+    checker.add_policy(owner_policy);
 
-let owner_policy = PolicyBuilder::<Documents>::new("OwnerOnly")
-    .when(|user: &User, _action: &ReadAction, doc: &Document, _ctx: &()| {
-        user.id == doc.owner_id
-    })
-    .build();
+    let user = User { id: 7 };
+    let document = Document { owner_id: 7 };
+    let session = EvaluationSession::empty();
+    let bound = checker.bind(&session, &user, &Read, &());
 
-let mut checker = PermissionChecker::<Documents>::new();
-checker.add_policy(admin_policy);
-checker.add_policy(owner_policy);
-
-# tokio_test::block_on(async {
-let session = EvaluationSession::empty();
-let action = ReadAction;
-let document = Document { owner_id: 7 };
-
-let admin = User { id: 1, roles: vec!["admin"] };
-let owner = User { id: 7, roles: vec!["user"] };
-let guest = User { id: 2, roles: vec!["user"] };
-
-assert!(checker.bind(&session, &admin, &action, &()).check(&document).await.is_granted());
-assert!(checker.bind(&session, &owner, &action, &()).check(&document).await.is_granted());
-assert!(!checker.bind(&session, &guest, &action, &()).check(&document).await.is_granted());
-# });
+    bound.check(&document).await.into_result()?;
+    println!("Access granted");
+    Ok(())
+}
 ```
 
 Use `EvaluationSession::empty()` for fact-free checkers. When any policy reads facts through `ctx.fact(...)`, build a `FactRegistry` at application setup and create a fresh `registry.session()` for each request.
+
+Start with this synchronous owner policy, then progress through:
+
+1. [Fact-backed policies](examples/factsource_n_plus_one.rs): register a source and load facts in a request session.
+2. [Strict list endpoints](examples/axum.rs): use `try_filter` so an authorization outage returns an error.
+3. [Version-checked mutations](examples/axum.rs): authorize the stored snapshot, then verify its version when writing. `authorize` does not lock resources or provide transactional guarantees.
 
 ## Core Flow
 
@@ -87,6 +89,7 @@ Most call sites bind request-wide inputs once and evaluate one or more resources
 let session = registry.session();
 let bound = checker.bind(&session, &subject, &action, &request_context);
 
+bound.authorize(&resource).await?;
 let decision = bound.check(&resource).await;
 let decisions = bound.evaluate(resources.clone()).await;
 let authorized = bound.try_filter(resources).await?;
@@ -106,7 +109,7 @@ flowchart LR
     Policies --> Decision[AccessEvaluation + EvalTrace]
 ```
 
-`evaluate` / `evaluate_by` preserve input order and return each item with its complete decision. `try_filter` / `try_filter_by` return the original granted items, exclude definite denials, and fail if any final decision is indeterminate. `FilterError<Item>` retains all original items and decisions; its `indeterminate()` iterator selects unresolved items. The older `filter` / `filter_by` helpers intentionally omit outages as well as denials.
+`evaluate` / `evaluate_by` preserve input order and return each item with its complete decision. `try_filter` / `try_filter_by` return the original granted items, exclude definite denials, and fail if any final decision is indeterminate. `FilterError<Item>` retains all original items and decisions; its `indeterminate()` iterator selects unresolved items. Use `filter_lossy` / `filter_by_lossy` only to deliberately omit indeterminate outcomes as well as denials. `lookup_page_lossy` makes the same authorization choice, but still returns lookup, hydration, and adapter-contract errors. The ambiguous `filter`, `filter_by`, and `lookup_page` names are deprecated forwarding aliases with unchanged behavior.
 
 ## Decisions and capabilities
 

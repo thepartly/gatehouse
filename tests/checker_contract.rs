@@ -201,7 +201,7 @@ async fn resource_batch_uses_unit_context() {
     assert_eq!(decisions, vec![(1, false), (2, true), (3, false)]);
 
     let visible = bound
-        .filter(vec![
+        .filter_lossy(vec![
             Resource { id: 1 },
             Resource { id: 2 },
             Resource { id: 3 },
@@ -642,7 +642,7 @@ async fn projected_row_helpers_evaluate_and_filter_original_items() {
         vec![("one", false), ("two", true), ("four", true)]
     );
 
-    let authorized = bound.filter_by(rows, |row| &row.authz_resource).await;
+    let authorized = bound.filter_by_lossy(rows, |row| &row.authz_resource).await;
     assert_eq!(
         authorized.iter().map(|row| row.row_id).collect::<Vec<_>>(),
         vec!["two", "four"]
@@ -662,7 +662,7 @@ async fn lookup_page_accepts_exhausted_initial_page_and_rejects_stuck_cursor() {
         next_cursor: None,
     };
     let empty_page = bound
-        .lookup_page(&exhausted, &ResourceHydrator, None, page_size)
+        .lookup_page_lossy(&exhausted, &ResourceHydrator, None, page_size)
         .await
         .unwrap();
     assert!(empty_page.resources.is_empty());
@@ -674,7 +674,7 @@ async fn lookup_page_accepts_exhausted_initial_page_and_rejects_stuck_cursor() {
         next_cursor: Some(cursor.clone()),
     };
     let err = bound
-        .lookup_page(&stuck, &ResourceHydrator, Some(&cursor), page_size)
+        .lookup_page_lossy(&stuck, &ResourceHydrator, Some(&cursor), page_size)
         .await
         .unwrap_err();
     assert!(matches!(err, LookupAuthorizedError::LookupCursorStuck));
