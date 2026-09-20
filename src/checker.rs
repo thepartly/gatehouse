@@ -623,6 +623,7 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     ///
     /// Equivalent to `self.check(resource).await.into_result()`. Denied and
     /// indeterminate errors retain their reason and complete audit evidence.
+    /// This does not lock the resource or provide transactional guarantees.
     ///
     /// ```
     /// use gatehouse::{AccessError, BoundEvaluator, PolicyDomain};
@@ -712,12 +713,58 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
             .await
     }
 
+    /// Deprecated alias for [`Self::filter_lossy`]; preserves lossy behavior.
+    #[deprecated(
+        since = "0.6.0-alpha.2",
+        note = "use try_filter to surface authorization outages, or filter_lossy to omit them"
+    )]
+    pub async fn filter<I>(&self, resources: I) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<D::Resource>,
+    {
+        self.filter_lossy(resources).await
+    }
+
+    /// Deprecated alias for [`Self::filter_by_lossy`]; preserves lossy behavior.
+    #[deprecated(
+        since = "0.6.0-alpha.2",
+        note = "use try_filter_by to surface authorization outages, or filter_by_lossy to omit them"
+    )]
+    pub async fn filter_by<I, F>(&self, items: I, resource_of: F) -> Vec<I::Item>
+    where
+        I: IntoIterator,
+        F: for<'item> Fn(&'item I::Item) -> &'item D::Resource,
+    {
+        self.filter_by_lossy(items, resource_of).await
+    }
+
+    /// Deprecated alias for [`Self::lookup_page_lossy`]; preserves lossy behavior.
+    #[deprecated(
+        since = "0.6.0-alpha.2",
+        note = "use try_lookup_page to surface authorization outages, or lookup_page_lossy to omit them"
+    )]
+    pub async fn lookup_page<L, H>(
+        &self,
+        lookup: &L,
+        hydrator: &H,
+        cursor: Option<&[u8]>,
+        limit: NonZeroUsize,
+    ) -> Result<LookupAuthorizedPage<D::Resource>, LookupAuthorizedError<L::Error, H::Error>>
+    where
+        L: LookupSource<D>,
+        H: Hydrator<L::Id, Resource = D::Resource>,
+    {
+        self.lookup_page_lossy(lookup, hydrator, cursor, limit)
+            .await
+    }
+
     /// Returns only the resources granted by [`Self::evaluate`].
     ///
     /// Denied and indeterminate resources are both excluded. Use
-    /// [`Self::evaluate`] and inspect each [`AccessEvaluation`] when callers
-    /// must distinguish an authorization-data outage from an ordinary denial.
-    pub async fn filter<I>(&self, resources: I) -> Vec<I::Item>
+    /// [`Self::try_filter`] to surface unresolved authorization, or
+    /// [`Self::evaluate`] to inspect every decision.
+    pub async fn filter_lossy<I>(&self, resources: I) -> Vec<I::Item>
     where
         I: IntoIterator,
         I::Item: Borrow<D::Resource>,
@@ -733,8 +780,9 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     ///
     /// The returned values are the original input items, not cloned projected
     /// resources. Denied and indeterminate items are both excluded; use
-    /// [`Self::evaluate_by`] when callers must distinguish them.
-    pub async fn filter_by<I, F>(&self, items: I, resource_of: F) -> Vec<I::Item>
+    /// [`Self::try_filter_by`] to surface unresolved authorization, or
+    /// [`Self::evaluate_by`] to inspect every decision.
+    pub async fn filter_by_lossy<I, F>(&self, items: I, resource_of: F) -> Vec<I::Item>
     where
         I: IntoIterator,
         F: for<'item> Fn(&'item I::Item) -> &'item D::Resource,
@@ -796,8 +844,9 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
     /// authorization-data outage. Use [`Self::try_lookup_page`] if the caller
     /// must surface that distinction. Although the return type is shared with
     /// the strict API, this method never returns
-    /// [`LookupAuthorizedError::Evaluation`].
-    pub async fn lookup_page<L, H>(
+    /// [`LookupAuthorizedError::Evaluation`]. Lookup failures, hydration failures,
+    /// and adapter-contract violations still return errors.
+    pub async fn lookup_page_lossy<L, H>(
         &self,
         lookup: &L,
         hydrator: &H,
@@ -812,7 +861,7 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
             .lookup_candidates(lookup, hydrator, cursor, limit)
             .await?;
         Ok(LookupAuthorizedPage {
-            resources: self.filter(page.resources).await,
+            resources: self.filter_lossy(page.resources).await,
             next_cursor: page.next_cursor,
         })
     }

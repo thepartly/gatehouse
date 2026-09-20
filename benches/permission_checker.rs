@@ -284,7 +284,7 @@ fn bench_in_ram_fact_source(c: &mut Criterion) {
                     let result = runtime.block_on(
                         checker
                             .bind(&session, &subject, &action, &context)
-                            .filter(black_box(resources.clone())),
+                            .filter_lossy(black_box(resources.clone())),
                     );
                     black_box(result)
                 });
@@ -341,7 +341,7 @@ fn bench_latency_fact_source(c: &mut Criterion) {
                             let session = batch_registry.session();
                             let mut visible = checker
                                 .bind(&session, &subject, &action, &context)
-                                .filter(vec![resource])
+                                .filter_lossy(vec![resource])
                                 .await;
                             authorized.append(&mut visible);
                         }
@@ -361,7 +361,7 @@ fn bench_latency_fact_source(c: &mut Criterion) {
                     let result = runtime.block_on(
                         checker
                             .bind(&session, &subject, &action, &context)
-                            .filter(black_box(resources.clone())),
+                            .filter_lossy(black_box(resources.clone())),
                     );
                     black_box(result)
                 });

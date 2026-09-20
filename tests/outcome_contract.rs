@@ -850,7 +850,9 @@ async fn lookup_page_limits_are_enforced_before_hydration_and_policy_evaluation(
                 );
             } else {
                 assert_page(
-                    bound.lookup_page(&lookup, &hydrator, None, limit).await,
+                    bound
+                        .lookup_page_lossy(&lookup, &hydrator, None, limit)
+                        .await,
                     &ids,
                 );
             }
@@ -865,4 +867,107 @@ async fn lookup_page_limits_are_enforced_before_hydration_and_policy_evaluation(
             );
         }
     }
+}
+
+#[tokio::test]
+#[allow(deprecated)]
+async fn lossy_aliases_preserve_order_duplicates_and_outage_omission() {
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(HandBuiltOddPolicy);
+    let session = odd_flag_session([3]);
+    let bound = bind(&checker, &session);
+    let resources = vec![
+        Resource { id: 3 },
+        Resource { id: 1 },
+        Resource { id: 2 },
+        Resource { id: 1 },
+    ];
+    for allowed in [
+        bound.filter(resources.clone()).await,
+        bound.filter_lossy(resources.clone()).await,
+    ] {
+        assert_eq!(
+            allowed
+                .iter()
+                .map(|resource| resource.id)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
+    }
+    let items: Vec<_> = resources.into_iter().enumerate().collect();
+    for allowed in [
+        bound.filter_by(items.clone(), |item| &item.1).await,
+        bound.filter_by_lossy(items, |item| &item.1).await,
+    ] {
+        assert_eq!(
+            allowed.iter().map(|item| item.0).collect::<Vec<_>>(),
+            [1, 3]
+        );
+    }
+    let lookup = StaticLookup {
+        ids: vec![3, 1, 2, 1],
+        next_cursor: Some(b"next".to_vec()),
+    };
+    let limit = NonZeroUsize::new(4).unwrap();
+    for page in [
+        bound
+            .lookup_page(&lookup, &ResourceHydrator, None, limit)
+            .await
+            .unwrap(),
+        bound
+            .lookup_page_lossy(&lookup, &ResourceHydrator, None, limit)
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
+        assert_eq!(page.next_cursor.as_deref(), Some(b"next".as_slice()));
+    }
+}
+
+#[tokio::test]
+async fn lossy_lookup_preserves_pipeline_errors() {
+    let checker = PermissionChecker::<Domain>::new();
+    let session = EvaluationSession::empty();
+    let bound = bind(&checker, &session);
+    let limit = NonZeroUsize::new(2).unwrap();
+    assert!(matches!(
+        bound
+            .lookup_page_lossy(&FailingLookup, &ResourceHydrator, None, limit)
+            .await,
+        Err(LookupAuthorizedError::Lookup(_))
+    ));
+    let lookup = StaticLookup {
+        ids: vec![1, 3],
+        next_cursor: Some(b"next".to_vec()),
+    };
+    let failing_hydrator =
+        |_: &[u8]| async { Err::<Vec<Option<Resource>>, _>(std::io::Error::other("unavailable")) };
+    assert!(matches!(
+        bound
+            .lookup_page_lossy(&lookup, &failing_hydrator, None, limit)
+            .await,
+        Err(LookupAuthorizedError::Hydrate(_))
+    ));
+    let short_hydrator = |_: &[u8]| async { Ok::<Vec<Option<Resource>>, Infallible>(vec![]) };
+    assert!(matches!(
+        bound
+            .lookup_page_lossy(&lookup, &short_hydrator, None, limit)
+            .await,
+        Err(LookupAuthorizedError::HydratorContractViolation {
+            expected: 2,
+            actual: 0
+        })
+    ));
+    assert!(matches!(
+        bound
+            .lookup_page_lossy(&lookup, &ResourceHydrator, Some(b"next"), limit)
+            .await,
+        Err(LookupAuthorizedError::LookupCursorStuck)
+    ));
 }
