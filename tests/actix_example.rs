@@ -411,6 +411,22 @@ async fn write_routes_explicitly_demonstrate_authorization_only() {
 #[actix_web::test]
 async fn author_edit_window_rejects_future_and_exact_thirty_day_ages() {
     use std::time::{Duration, SystemTime};
+
+    struct NoRelationships;
+
+    #[async_trait::async_trait]
+    impl<K: gatehouse::FactKey<Value = bool>> gatehouse::FactSource<K> for NoRelationships {
+        async fn load_many(&self, keys: &[K]) -> Vec<gatehouse::FactLoadResult<bool>> {
+            vec![gatehouse::FactLoadResult::Found(false); keys.len()]
+        }
+    }
+
+    let session = gatehouse::FactRegistry::builder()
+        .with::<gatehouse::RelationshipQuery<Uuid, Uuid, actix_example::Relation>, _>(
+            NoRelationships,
+        )
+        .build()
+        .session();
     let current_time = SystemTime::UNIX_EPOCH + Duration::from_secs(60 * 24 * 60 * 60);
     let boundary = current_time - Duration::from_secs(30 * 24 * 60 * 60);
     let tick = Duration::from_nanos(1);
@@ -434,11 +450,16 @@ async fn author_edit_window_rejects_future_and_exact_thirty_day_ages() {
             published_at: None,
             created_at,
         };
-        let session = gatehouse::EvaluationSession::empty();
         let decision = checker
             .bind(&session, &user, &actix_example::Action::Edit, &context)
             .check(&post)
             .await;
         assert_eq!(decision.is_granted(), allowed, "created_at={created_at:?}");
+        if !allowed {
+            assert!(
+                matches!(decision, gatehouse::AccessEvaluation::Denied { .. }),
+                "created_at={created_at:?}: {decision:?}"
+            );
+        }
     }
 }
