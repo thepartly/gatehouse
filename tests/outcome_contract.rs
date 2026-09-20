@@ -765,3 +765,104 @@ async fn indeterminate_attribution_skips_resolved_subtrees() {
         Some("Could not evaluate ActiveFailure: required input unavailable")
     );
 }
+
+#[tokio::test]
+async fn lookup_page_limits_are_enforced_before_hydration_and_policy_evaluation() {
+    struct CountingHydrator(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Hydrator<u8> for CountingHydrator {
+        type Resource = Resource;
+        type Error = Infallible;
+        async fn hydrate(&self, ids: &[u8]) -> Result<Vec<Option<Resource>>, Infallible> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ResourceHydrator.hydrate(ids).await
+        }
+    }
+
+    fn assert_page<R>(
+        result: Result<
+            gatehouse::LookupAuthorizedPage<Resource>,
+            LookupAuthorizedError<Infallible, Infallible, R>,
+        >,
+        ids: &[u8],
+    ) {
+        if ids.len() > 2 {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, LookupAuthorizedError::LookupPageTooLarge { limit: 2, actual } if actual == ids.len())
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "lookup source returned {} ids exceeding the requested limit of 2",
+                    ids.len()
+                )
+            );
+            assert!(std::error::Error::source(&error).is_none());
+        } else {
+            let page = result.unwrap();
+            assert_eq!(
+                page.resources
+                    .iter()
+                    .map(|resource| resource.id)
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(page.next_cursor, Some(b"next".to_vec()));
+        }
+    }
+
+    let hydration_calls = Arc::new(AtomicUsize::new(0));
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let policy_counter = Arc::clone(&policy_calls);
+    let mut checker = PermissionChecker::new();
+    checker.add_policy(
+        PolicyBuilder::<Domain>::new("CountedGrant")
+            .resources(move |_| {
+                policy_counter.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .build(),
+    );
+    let hydrator = CountingHydrator(Arc::clone(&hydration_calls));
+    let session = EvaluationSession::empty();
+    let bound = bind(&checker, &session);
+    for ids in [
+        vec![],
+        vec![1],
+        vec![2, 1],
+        vec![1, 1],
+        vec![1, 2, 3],
+        vec![1, 1, 1],
+    ] {
+        let lookup = StaticLookup {
+            ids: ids.clone(),
+            next_cursor: Some(b"next".to_vec()),
+        };
+        let limit = NonZeroUsize::new(2).unwrap();
+        for strict in [false, true] {
+            hydration_calls.store(0, Ordering::SeqCst);
+            policy_calls.store(0, Ordering::SeqCst);
+            if strict {
+                assert_page(
+                    bound.try_lookup_page(&lookup, &hydrator, None, limit).await,
+                    &ids,
+                );
+            } else {
+                assert_page(
+                    bound.lookup_page(&lookup, &hydrator, None, limit).await,
+                    &ids,
+                );
+            }
+            let accepted = ids.len() <= limit.get();
+            assert_eq!(
+                hydration_calls.load(Ordering::SeqCst),
+                usize::from(accepted && !ids.is_empty())
+            );
+            assert_eq!(
+                policy_calls.load(Ordering::SeqCst),
+                if accepted { ids.len() } else { 0 }
+            );
+        }
+    }
+}

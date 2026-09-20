@@ -169,6 +169,14 @@ pub enum LookupAuthorizedError<LookupErr, HydrateErr, Resource = ()> {
     Lookup(LookupErr),
     /// The [`Hydrator`] returned an error for the current page.
     Hydrate(HydrateErr),
+    /// The lookup source exceeded the requested page limit. Hydration and
+    /// authorization are not attempted; the page is not truncated.
+    LookupPageTooLarge {
+        /// Maximum number of candidate IDs requested.
+        limit: usize,
+        /// Number of candidate IDs returned, including duplicates.
+        actual: usize,
+    },
     /// The hydrator returned a `Vec<Option<_>>` whose length did not match
     /// the input ID slice length. Treated as fail-closed.
     HydratorContractViolation {
@@ -189,6 +197,11 @@ impl<L: fmt::Debug, H: fmt::Debug, R> fmt::Debug for LookupAuthorizedError<L, H,
             Self::Evaluation(error) => f.debug_tuple("Evaluation").field(error).finish(),
             Self::Lookup(error) => f.debug_tuple("Lookup").field(error).finish(),
             Self::Hydrate(error) => f.debug_tuple("Hydrate").field(error).finish(),
+            Self::LookupPageTooLarge { limit, actual } => f
+                .debug_struct("LookupPageTooLarge")
+                .field("limit", limit)
+                .field("actual", actual)
+                .finish(),
             Self::HydratorContractViolation { expected, actual } => f
                 .debug_struct("HydratorContractViolation")
                 .field("expected", expected)
@@ -209,6 +222,10 @@ where
             Self::Evaluation(err) => fmt::Display::fmt(err, f),
             Self::Lookup(err) => write!(f, "lookup source error: {err}"),
             Self::Hydrate(err) => write!(f, "hydrator error: {err}"),
+            Self::LookupPageTooLarge { limit, actual } => write!(
+                f,
+                "lookup source returned {actual} ids exceeding the requested limit of {limit}"
+            ),
             Self::HydratorContractViolation { expected, actual } => write!(
                 f,
                 "hydrator returned {actual} entries for {expected} ids; \
@@ -232,7 +249,9 @@ where
             Self::Evaluation(_) => None,
             Self::Lookup(err) => Some(err),
             Self::Hydrate(err) => Some(err),
-            Self::HydratorContractViolation { .. } | Self::LookupCursorStuck => None,
+            Self::HydratorContractViolation { .. }
+            | Self::LookupPageTooLarge { .. }
+            | Self::LookupCursorStuck => None,
         }
     }
 }

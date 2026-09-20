@@ -870,6 +870,13 @@ impl<'a, D: PolicyDomain> BoundEvaluator<'a, D> {
         let page = page.instrument(lookup_span);
         let page = page.await.map_err(LookupAuthorizedError::Lookup)?;
 
+        if page.ids.len() > limit.get() {
+            return Err(LookupAuthorizedError::LookupPageTooLarge {
+                limit: limit.get(),
+                actual: page.ids.len(),
+            });
+        }
+
         if cursor.is_some() && page.next_cursor.as_deref() == cursor {
             return Err(LookupAuthorizedError::LookupCursorStuck);
         }
