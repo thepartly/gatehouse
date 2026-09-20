@@ -8,8 +8,11 @@
 //
 // - `GET  /posts`                 lists the posts the caller may view (batched).
 // - `GET  /posts/{id}`            reads a post when it is published or the caller is privileged.
-// - `PUT  /posts/{id}`            edits a post if the caller is allowed.
-// - `POST /posts/{id}/publish`    publishes a post for editors.
+// - `PUT  /posts/{id}`            checks whether editing would be allowed.
+// - `POST /posts/{id}/publish`    checks whether publishing would be allowed.
+//
+// These are authorization-only demonstrations; the stored fixtures never change.
+// Identity and roles come from unauthenticated demo headers. Run on loopback only.
 //
 // Try it with curl (the demo grants user 2222… an editor relationship on the
 // demo posts, so they can view drafts and edit without being the author):
@@ -19,30 +22,26 @@
 // curl -s http://127.0.0.1:8080/posts \
 //   -H "x-user-id: 11111111-1111-1111-1111-111111111111"
 //
-// # A collaborator (editor relationship) edits a draft they did not author
+// # Check whether a collaborator may edit a draft they did not author
 // curl -i -X PUT http://127.0.0.1:8080/posts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa \
 //   -H "x-user-id: 22222222-2222-2222-2222-222222222222"
 //
 // # Anyone can view a published post
-// curl -i http://127.0.0.1:8080/posts/00000000-0000-0000-0000-000000000000 \
-//   -H "x-post-published: true"
+// curl -i http://127.0.0.1:8080/posts/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb
 // ```
 //
 // Each handler pulls the shared `AppState` from Actix Web's `Data` extractor,
 // builds a request-scoped `EvaluationSession`, and evaluates with
-// `bind(...).check(...)` (single resource) or
+// `bind(...).authorize(...)` (single resource) or
 // `bind(...).try_filter(...)` (the list endpoint).
 //
-// Note: on denial these handlers echo the evaluation trace back in the HTTP
-// response so you can see the decision from `curl`. That is a demo convenience,
-// not a production pattern — see `forbidden` below.
 
 use actix_web::{
     dev::Payload, web, App, FromRequest, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use async_trait::async_trait;
 use gatehouse::{
-    AccessError, AndPolicy, EvalTrace, EvaluationSession, FactLoadResult, FactRegistry, FactSource,
+    AccessError, AndPolicy, EvaluationSession, FactLoadResult, FactRegistry, FactSource,
     PermissionChecker, Policy, PolicyBuilder, PolicyDomain, RebacPolicy, RelationshipQuery,
 };
 use serde::Serialize;
@@ -63,10 +62,11 @@ pub struct User {
     pub roles: Vec<String>,
 }
 
+/// Unauthenticated identity supplied by the caller for this loopback demo.
 #[derive(Debug, Clone)]
-pub struct AuthenticatedUser(pub User);
+pub struct DemoUser(pub User);
 
-impl FromRequest for AuthenticatedUser {
+impl FromRequest for DemoUser {
     type Error = actix_web::Error;
     type Future = Ready<Result<Self, Self::Error>>;
 
@@ -90,45 +90,7 @@ impl FromRequest for AuthenticatedUser {
             })
             .unwrap_or_default();
 
-        ready(Ok(AuthenticatedUser(User { id, roles })))
-    }
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Some(true),
-        "false" | "0" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-/// Header overrides so a single demo post can be coerced into different shapes
-/// (locked, published, older than the draft window) from `curl`.
-#[derive(Debug, Clone, Default)]
-pub struct PostOverrides {
-    locked: Option<bool>,
-    published: Option<bool>,
-    age_days: Option<u64>,
-}
-
-impl PostOverrides {
-    pub fn from_request(req: &HttpRequest) -> Self {
-        let header_bool = |name: &str| {
-            req.headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_bool)
-        };
-
-        Self {
-            locked: header_bool("x-post-locked"),
-            published: header_bool("x-post-published"),
-            age_days: req
-                .headers()
-                .get("x-post-age-days")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|raw| raw.parse::<u64>().ok()),
-        }
+        ready(Ok(DemoUser(User { id, roles })))
     }
 }
 
@@ -291,6 +253,22 @@ fn demo_posts(author_id: Uuid) -> Vec<BlogPost> {
             published_at: Some(now - Duration::from_secs(2 * 24 * 60 * 60)),
             created_at: now - Duration::from_secs(10 * 24 * 60 * 60),
         },
+        BlogPost {
+            id: Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap(),
+            title: "locked draft".into(),
+            author_id,
+            locked: true,
+            published_at: None,
+            created_at: now - Duration::from_secs(3 * 24 * 60 * 60),
+        },
+        BlogPost {
+            id: Uuid::parse_str("dddddddd-dddd-dddd-dddd-dddddddddddd").unwrap(),
+            title: "old draft".into(),
+            author_id,
+            locked: false,
+            published_at: None,
+            created_at: now - Duration::from_secs(31 * 24 * 60 * 60),
+        },
     ]
 }
 
@@ -317,8 +295,7 @@ fn author_can_edit_policy() -> Box<dyn Policy<BlogDomain>> {
                 && ctx
                     .current_time
                     .duration_since(post.created_at)
-                    .unwrap_or_default()
-                    <= MAX_AGE
+                    .is_ok_and(|age| age < MAX_AGE)
         })
         .build()
 }
@@ -330,7 +307,9 @@ fn author_can_edit_policy() -> Box<dyn Policy<BlogDomain>> {
 fn collaborator_policy() -> Box<dyn Policy<BlogDomain>> {
     let is_view_or_edit: Arc<dyn Policy<BlogDomain>> = Arc::from(
         PolicyBuilder::<BlogDomain>::new("IsViewOrEdit")
-            .when(|_user, action, _post, _ctx| matches!(action, Action::View | Action::Edit))
+            .when(|_user, action, post, _ctx| {
+                matches!(action, Action::View) || (matches!(action, Action::Edit) && !post.locked)
+            })
             .build(),
     );
     let has_editor_relationship: Arc<dyn Policy<BlogDomain>> =
@@ -399,57 +378,14 @@ impl From<&BlogPost> for PostSummary {
     }
 }
 
-/// Build the 403 response for a denied request.
-///
-/// This demo echoes the full evaluation trace back to the caller so you can see
-/// *why* a request was denied from `curl` alone. Don't do this in production:
-/// the reason strings and trace are an internal audit surface (see the README's
-/// "Tracing And Telemetry" section) and can expose policy structure or any data
-/// a policy interpolates into a reason. In a real service, log the trace
-/// server-side and return a generic message to the client.
-fn forbidden(reason: &str, trace: &EvalTrace) -> HttpResponse {
-    HttpResponse::Forbidden().body(format!("Denied: {}\n{}", reason, trace.format()))
-}
-
-/// Load a single post by id, applying any header overrides. A miss falls back
-/// to a synthesized post so the demo works for arbitrary ids from `curl`.
-fn load_post(state: &AppState, post_id: Uuid, overrides: &PostOverrides) -> BlogPost {
-    if let Some(post) = state.posts.iter().find(|post| post.id == post_id) {
-        let mut post = post.clone();
-        if let Some(locked) = overrides.locked {
-            post.locked = locked;
-        }
-        if let Some(published) = overrides.published {
-            post.published_at =
-                published.then(|| SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60));
-        }
-        if let Some(age_days) = overrides.age_days {
-            post.created_at = SystemTime::now() - Duration::from_secs(age_days * 24 * 60 * 60);
-        }
-        return post;
-    }
-
-    BlogPost {
-        id: post_id,
-        title: "untitled".into(),
-        author_id: demo_author_id(),
-        locked: overrides.locked.unwrap_or(false),
-        published_at: overrides
-            .published
-            .unwrap_or(false)
-            .then(|| SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60)),
-        created_at: SystemTime::now()
-            - Duration::from_secs(overrides.age_days.unwrap_or(7) * 24 * 60 * 60),
-    }
+fn load_post(state: &AppState, post_id: Uuid) -> Option<&BlogPost> {
+    state.posts.iter().find(|post| post.id == post_id)
 }
 
 /// List the posts the caller is allowed to view. The relationship checks for
 /// every candidate are batched and deduplicated through one request-scoped
 /// session.
-pub async fn list_posts(
-    AuthenticatedUser(user): AuthenticatedUser,
-    state: web::Data<AppState>,
-) -> impl Responder {
+pub async fn list_posts(DemoUser(user): DemoUser, state: web::Data<AppState>) -> impl Responder {
     let session = state.request_session();
     let context = RequestContext::now();
     let candidates = state.posts.as_ref().clone();
@@ -472,69 +408,69 @@ pub async fn list_posts(
 
 pub async fn view_post(
     path: web::Path<Uuid>,
-    req: HttpRequest,
-    AuthenticatedUser(user): AuthenticatedUser,
+    DemoUser(user): DemoUser,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let post = load_post(&state, *path, &PostOverrides::from_request(&req));
+    let Some(post) = load_post(&state, *path) else {
+        return HttpResponse::NotFound().body("Post not found");
+    };
     let session = state.request_session();
     let context = RequestContext::now();
 
     match state
         .checker
         .bind(&session, &user, &Action::View, &context)
-        .check(&post)
+        .authorize(post)
         .await
-        .into_result()
     {
         Ok(()) => HttpResponse::Ok().body(format!("Viewing '{}'", post.title)),
-        Err(AccessError::Denied { reason, trace }) => forbidden(&reason, &trace),
+        Err(AccessError::Denied { .. }) => HttpResponse::Forbidden().body("Access denied"),
         Err(_) => HttpResponse::ServiceUnavailable().body("Authorization temporarily unavailable"),
     }
 }
 
 pub async fn edit_post(
     path: web::Path<Uuid>,
-    req: HttpRequest,
-    AuthenticatedUser(user): AuthenticatedUser,
+    DemoUser(user): DemoUser,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let post = load_post(&state, *path, &PostOverrides::from_request(&req));
+    let Some(post) = load_post(&state, *path) else {
+        return HttpResponse::NotFound().body("Post not found");
+    };
     let session = state.request_session();
     let context = RequestContext::now();
 
     match state
         .checker
         .bind(&session, &user, &Action::Edit, &context)
-        .check(&post)
+        .authorize(post)
         .await
-        .into_result()
     {
-        Ok(()) => HttpResponse::Ok().body("Post updated"),
-        Err(AccessError::Denied { reason, trace }) => forbidden(&reason, &trace),
+        Ok(()) => HttpResponse::Ok().body("Edit authorized; no changes made"),
+        Err(AccessError::Denied { .. }) => HttpResponse::Forbidden().body("Access denied"),
         Err(_) => HttpResponse::ServiceUnavailable().body("Authorization temporarily unavailable"),
     }
 }
 
 pub async fn publish_post(
     path: web::Path<Uuid>,
-    req: HttpRequest,
-    AuthenticatedUser(user): AuthenticatedUser,
+    DemoUser(user): DemoUser,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let post = load_post(&state, *path, &PostOverrides::from_request(&req));
+    let Some(post) = load_post(&state, *path) else {
+        return HttpResponse::NotFound().body("Post not found");
+    };
     let session = state.request_session();
     let context = RequestContext::now();
 
     match state
         .checker
         .bind(&session, &user, &Action::Publish, &context)
-        .check(&post)
+        .authorize(post)
         .await
-        .into_result()
     {
-        Ok(()) => HttpResponse::Ok().body("Post published"),
-        Err(AccessError::Denied { reason, trace }) => forbidden(&reason, &trace),
+        Ok(()) => HttpResponse::Ok().body("Publish authorized; no changes made"),
+        Err(AccessError::Denied { .. }) => HttpResponse::Forbidden().body("Access denied"),
         Err(_) => HttpResponse::ServiceUnavailable().body("Authorization temporarily unavailable"),
     }
 }

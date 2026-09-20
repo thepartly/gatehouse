@@ -126,11 +126,9 @@ impl VetoPolicy<RefundApprovalDomain> for HighValueRequiresFreshMfa {
             ));
         };
 
-        let age = ctx
-            .context
-            .current_time
-            .duration_since(verified_at)
-            .unwrap_or_default();
+        let Ok(age) = ctx.context.current_time.duration_since(verified_at) else {
+            return ctx.forbid("MFA verification time is in the future");
+        };
         if age <= self.max_age {
             ctx.pass(format!(
                 "MFA reasserted {}s ago, within freshness window; rule not applicable",
@@ -247,5 +245,54 @@ fn verdict(eval: &AccessEvaluation) -> &'static str {
         "GRANTED"
     } else {
         "DENIED"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mfa_freshness_and_amount_boundaries_use_the_request_clock() {
+        let checker = build_checker();
+        let session = EvaluationSession::empty();
+        let user = User {
+            id: Uuid::nil(),
+            roles: vec!["finance".into()],
+        };
+        let current_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let boundary = current_time - Duration::from_secs(5 * 60);
+        let tick = Duration::from_nanos(1);
+        for (mfa_verified_at, fresh) in [
+            (None, false),
+            (Some(current_time + tick), false),
+            (Some(current_time), true),
+            (Some(boundary + tick), true),
+            (Some(boundary), true),
+            (Some(boundary - tick), false),
+        ] {
+            let context = ApprovalContext {
+                current_time,
+                mfa_verified_at,
+            };
+            for amount_cents in [999_999, 1_000_000] {
+                let refund = RefundRequest {
+                    id: Uuid::nil(),
+                    amount_cents,
+                };
+                let decision = checker
+                    .bind(&session, &user, &Approve, &context)
+                    .check(&refund)
+                    .await;
+                assert_eq!(
+                    decision.is_granted(),
+                    amount_cents < 1_000_000 || fresh,
+                    "amount={amount_cents}, mfa={mfa_verified_at:?}"
+                );
+                if !decision.is_granted() {
+                    decision.assert_forbidden_by("HighValueRequiresFreshMfa");
+                }
+            }
+        }
     }
 }
