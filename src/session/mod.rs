@@ -197,7 +197,7 @@ where
         // strand waiters: if a caller passed unequal-length slices the
         // shorter `zip` below would silently finish only the prefix while
         // the caller's `InFlightGuard::mark_finished` cleared the whole
-        // chunk from `remaining`, leaving the unfinished tails as in-flight
+        // chunk in its completed prefix, leaving the unfinished tails as in-flight
         // entries with no one to wake them.
         assert_eq!(
             keys.len(),
@@ -526,7 +526,7 @@ impl EvaluationSession {
                     // drop guard's cancellation cleanup only fires for keys
                     // that have not yet been finished.
                     state.finish_keys(chunk, results);
-                    in_flight_guard.mark_finished(chunk);
+                    in_flight_guard.mark_finished(chunk.len());
                 }
             } else {
                 let results = load_plan
@@ -539,7 +539,7 @@ impl EvaluationSession {
                     })
                     .collect();
                 state.finish_keys(&load_plan.keys, results);
-                in_flight_guard.mark_finished(&load_plan.keys);
+                in_flight_guard.mark_finished(load_plan.keys.len());
             }
         }
 
@@ -583,7 +583,8 @@ where
     K: FactKey,
 {
     state: Arc<FactState<K>>,
-    remaining: Vec<K>,
+    keys: Vec<K>,
+    completed: usize,
 }
 
 impl<K> InFlightGuard<K>
@@ -593,21 +594,15 @@ where
     fn new(state: Arc<FactState<K>>, keys: Vec<K>) -> Self {
         Self {
             state,
-            remaining: keys,
+            keys,
+            completed: 0,
         }
     }
 
-    /// Mark `keys` as finished by the leader so the drop guard does not
-    /// re-finish them with `LoaderCancelled` on cancellation.
-    fn mark_finished(&mut self, keys: &[K]) {
-        if self.remaining.is_empty() {
-            return;
-        }
-        let finished = keys
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        self.remaining.retain(|key| !finished.contains(key));
+    /// Chunks finish sequentially. Advance synchronously after caching each chunk,
+    /// before any await can allow cancellation to revisit completed facts.
+    fn mark_finished(&mut self, count: usize) {
+        self.completed += count;
     }
 }
 
@@ -616,15 +611,15 @@ where
     K: FactKey,
 {
     fn drop(&mut self) {
-        if self.remaining.is_empty() {
+        let cancelled = &self.keys[self.completed..];
+        if cancelled.is_empty() {
             return;
         }
-        let cancelled = std::mem::take(&mut self.remaining);
         let results = cancelled
             .iter()
             .map(|_| FactLoadResult::Error(FactLoadError::LoaderCancelled { fact_name: K::NAME }))
             .collect();
-        self.state.finish_keys(&cancelled, results);
+        self.state.finish_keys(cancelled, results);
     }
 }
 

@@ -27,6 +27,10 @@
 
 ### Changed
 
+- Sequential fact loading tracks a completed prefix instead of rescanning the
+  remaining keys after every chunk. Cancellation preserves completed facts and
+  wakes waiters for the unfinished suffix.
+
 - Actix authorizes stored posts, returns 404 for unknown IDs and generic denial
   responses, and labels its write routes as authorization-only demos. HTTP
   resource-state overrides are removed. MFA freshness rejects future assertions.
