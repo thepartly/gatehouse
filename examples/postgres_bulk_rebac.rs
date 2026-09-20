@@ -437,9 +437,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(decisions, [true, false, true, true, false, false, true]);
         assert!(source.load_many(&[]).await.is_empty());
-        for result in empty_source.load_many(&keys).await {
-            assert!(matches!(result, FactLoadResult::Found(false)));
-        }
+        let empty_results = empty_source.load_many(&keys).await;
+        assert_eq!(empty_results.len(), keys.len());
+        assert!(empty_results
+            .iter()
+            .all(|result| matches!(result, FactLoadResult::Found(false))));
         assert_point_and_bulk_agree(&source, &keys).await;
     }
 }
