@@ -909,3 +909,105 @@ proptest! {
         }
     }
 }
+
+struct CompletingPrefixSource {
+    completed_chunks: usize,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl FactSource<TestKey> for CompletingPrefixSource {
+    fn max_batch_size(&self) -> Option<NonZeroUsize> {
+        NonZeroUsize::new(2)
+    }
+
+    async fn load_many(&self, keys: &[TestKey]) -> Vec<FactLoadResult<u16>> {
+        let chunk_index = self.calls.fetch_add(1, Ordering::SeqCst);
+        if chunk_index == self.completed_chunks {
+            std::future::pending::<()>().await;
+        }
+        keys.iter()
+            .map(|key| FactLoadResult::Found(key.0))
+            .collect()
+    }
+}
+
+async fn assert_cancellation_after_chunks(completed_chunks: usize) {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let session = session_with_source(CompletingPrefixSource {
+        completed_chunks,
+        calls: Arc::clone(&calls),
+    });
+    let input = [6, 2, 4, 6, 1, 2, 5, 3, 4].map(TestKey);
+    let unique_keys = [6, 2, 4, 1, 5, 3];
+    let completed = &unique_keys[..completed_chunks * 2];
+    let mut leader = Box::pin(session.get_many(&input));
+    assert!(
+        poll_fn(|context| Poll::Ready(leader.as_mut().poll(context)))
+            .await
+            .is_pending()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), completed_chunks + 1);
+
+    let first_input = [3, 6, 5, 2, 3].map(TestKey);
+    let second_input = [1, 3, 4, 6, 1].map(TestKey);
+    let mut first_waiter = Box::pin(session.get_many(&first_input));
+    let mut second_waiter = Box::pin(session.get_many(&second_input));
+    assert!(
+        poll_fn(|context| Poll::Ready(first_waiter.as_mut().poll(context)))
+            .await
+            .is_pending()
+    );
+    assert!(
+        poll_fn(|context| Poll::Ready(second_waiter.as_mut().poll(context)))
+            .await
+            .is_pending()
+    );
+    drop(leader);
+
+    for (keys, results) in [
+        (
+            first_input.as_slice(),
+            tokio::time::timeout(Duration::from_secs(1), first_waiter)
+                .await
+                .expect("first waiter must wake"),
+        ),
+        (
+            second_input.as_slice(),
+            tokio::time::timeout(Duration::from_secs(1), second_waiter)
+                .await
+                .expect("second waiter must wake"),
+        ),
+        (
+            input.as_slice(),
+            tokio::time::timeout(Duration::from_secs(1), session.get_many(&input))
+                .await
+                .expect("cached results must remain readable"),
+        ),
+    ] {
+        assert_eq!(results.len(), keys.len());
+        for (key, result) in keys.iter().zip(&results) {
+            if completed.contains(&key.0) {
+                assert_found(result, key.0);
+            } else {
+                assert_load_cancelled(result);
+            }
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), completed_chunks + 1);
+}
+
+#[tokio::test]
+async fn cancellation_before_first_chunk_wakes_overlapping_waiters() {
+    assert_cancellation_after_chunks(0).await;
+}
+
+#[tokio::test]
+async fn cancellation_after_completed_chunks_preserves_prefix_and_duplicate_order() {
+    for completed_chunks in [1, 2] {
+        assert_cancellation_after_chunks(completed_chunks).await;
+    }
+}

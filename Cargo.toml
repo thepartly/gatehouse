@@ -77,3 +77,7 @@ all-features = true
 # harness. It is not a feature, so register it with `check-cfg` so default
 # builds do not warn about an unexpected cfg.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[[bench]]
+name = "fact_chunks"
+harness = false

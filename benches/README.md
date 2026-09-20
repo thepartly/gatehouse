@@ -113,3 +113,56 @@ A separate allocation counter used a warmed current-thread runtime/session, stat
 | 64 | 321 / 15,598 | 322 / 15,619 |
 
 The final scalar path adds one allocation request and 21 requested bytes at these sizes; the discarded vector-based scalar path required 21 requests and 1,289 bytes for one policy. No wall-clock threshold is enforced by CI.
+
+## Sequential fact-chunk completion
+
+Run `cargo bench --bench fact_chunks --no-default-features -- --save-baseline before`
+on the original implementation, then `cargo bench --bench fact_chunks
+--no-default-features -- --baseline before` on the prefix implementation. Both
+runs must have `benches/fact_chunks.rs` and its manifest entry. The benchmark uses
+unique integer keys, a cheap in-memory source, a current-thread runtime, and a
+fresh session for each iteration. Session creation, planning, loading, result
+expansion, and destruction are included. Tracing is disabled to isolate the
+bookkeeping. Allocation counting is enabled only for a separate warmed sample;
+the allocator's disabled flag check remains in both timing runs.
+
+Measured 2026-09-20 on Linux x86_64, Ryzen 9 5900X, Rust 1.95.0. The baseline was
+`60404ab` plus the benchmark; the second run used the completed-prefix change.
+Criterion used 20 samples, 200 ms warm-up, and a 1 second target measurement
+window (extended for slow cases). These are local exploratory measurements, not
+CI thresholds or predictions for a network-backed source. Some development
+builds ran on the same host; small timing differences need a quieter rerun.
+
+| Source limit | Unique keys | Original time interval | Prefix time interval |
+|---|---:|---:|---:|
+| 1 | 256 | 384–386 µs | 58–60 µs |
+| 1 | 1,024 | 5.25–5.29 ms | 235–241 µs |
+| 1 | 4,096 | 81.0–81.4 ms | 966–977 µs |
+| 8 | 256 | 97–98 µs | 50–51 µs |
+| 8 | 1,024 | 879–896 µs | 203–222 µs |
+| 8 | 4,096 | 11.54–11.64 ms | 820–850 µs |
+| 64 | 256 | 59–62 µs | 49–52 µs |
+| 64 | 1,024 | 300–301 µs | 195–196 µs |
+| 64 | 4,096 | 2.31–2.57 ms | 815–831 µs |
+| Unlimited | 256 | 54–55 µs | 48–49 µs |
+| Unlimited | 1,024 | 216–217 µs | 195–196 µs |
+| Unlimited | 4,096 | 911–953 µs | 811–841 µs |
+
+At limit 1, increasing keys 16-fold increased the original midpoint time about
+211-fold, versus about 16.5-fold with the prefix. At limit 8 those ratios were
+about 119 and 16.5. Unlimited loading was already approximately linear. The
+prefix removes repeated scans while leaving sequential source calls unchanged.
+
+Allocation/reallocation requests for 4,096 keys (requested bytes are allocation
+traffic, not peak live memory):
+
+| Source limit | Original requests / bytes | Prefix requests / bytes |
+|---|---:|---:|
+| 1 | 13,072 / 2,208,928 | 8,976 / 1,995,936 |
+| 8 | 2,320 / 1,963,168 | 1,808 / 1,881,248 |
+| 64 | 976 / 1,941,664 | 912 / 1,866,912 |
+| Unlimited | 787 / 1,938,640 | 786 / 1,864,896 |
+
+The reduction is one set allocation per completed chunk. The original key
+vector stays alive until the guard drops; cancellation finishes only its
+unfinished suffix. The existing load plan also retains its original keys.
