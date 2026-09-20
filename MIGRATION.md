@@ -1,4 +1,4 @@
-# Migrating from 0.5.1 to 0.6.0-alpha.1
+# Migrating from 0.5.1 to 0.6.0-alpha.2
 
 This guide describes the 0.6 prerelease API, including typed grant and veto
 capabilities. `0.6.0-alpha.1` is the first prerelease of that line; expect

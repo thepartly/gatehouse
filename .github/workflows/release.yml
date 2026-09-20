@@ -110,6 +110,8 @@ jobs:
         run: cargo audit
       - name: Verify publishable crate
         run: cargo publish --dry-run --locked
+      - name: Verify packaged quick-start consumer
+        run: python3 scripts/check-quickstart.py --packaged
 
   publish-crate:
     name: Publish to crates.io
