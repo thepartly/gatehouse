@@ -136,8 +136,10 @@ pub struct FactProvenance {
     pub key: String,
     /// How the load resolved.
     pub outcome: FactOutcome,
-    /// Optional extra detail, such as the backend error message when
-    /// `outcome` is [`FactOutcome::Error`].
+    /// Optional extra detail. For [`FactOutcome::Error`] recorded through
+    /// [`Self::from_load_result`], this is
+    /// [`crate::FactLoadError::audit_detail`], which withholds backend error
+    /// messages that were not written for audit output.
     pub detail: Option<String>,
     /// Machine-readable classification when this provenance records a fact
     /// load error.
@@ -171,15 +173,18 @@ impl FactProvenance {
     ///
     /// This is the canonical constructor for fact-backed policies. It records
     /// the value-erased [`FactOutcome`], preserves a structured
-    /// [`FactLoadErrorKind`], and renders the error message into [`Self::detail`]
-    /// without requiring every policy to repeat that mapping by hand.
+    /// [`FactLoadErrorKind`], and records
+    /// [`crate::FactLoadError::audit_detail`] into [`Self::detail`] without
+    /// requiring every policy to repeat that mapping by hand.
     pub fn from_load_result<V>(
         fact_name: &'static str,
         key: impl Into<String>,
         result: &FactLoadResult<V>,
     ) -> Self {
         let (detail, error_kind) = match result {
-            FactLoadResult::Error(error) => (Some(error.to_string()), Some(error.kind())),
+            FactLoadResult::Error(error) => {
+                (Some(error.audit_detail().into_owned()), Some(error.kind()))
+            }
             FactLoadResult::Found(_) | FactLoadResult::Missing => (None, None),
         };
 
