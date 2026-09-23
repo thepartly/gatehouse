@@ -264,6 +264,7 @@ where
 /// is normal: the source enumerated more IDs but the policy stack denied
 /// every one in that page. Continue paging until `next_cursor` is `None`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct LookupAuthorizedPage<R> {
     /// Resources from this page that the full policy stack authorized,
     /// in source-defined order.

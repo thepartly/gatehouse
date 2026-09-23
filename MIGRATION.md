@@ -232,7 +232,7 @@ Replace reason-only `to_result(...)` conversion or blanket 403 responses with
 `into_result()` and classify `AccessError`:
 
 ```rust
-use gatehouse::{AccessError, AccessEvaluation, EvalTrace};
+use gatehouse::{AccessError, AccessEvaluation, EvaluationSession, PermissionChecker, PolicyDomain};
 
 fn status(evaluation: AccessEvaluation) -> u16 {
     match evaluation.into_result() {
@@ -241,10 +241,21 @@ fn status(evaluation: AccessEvaluation) -> u16 {
         Err(_) => 503,
     }
 }
-assert_eq!(status(AccessEvaluation::Indeterminate {
-    reason: "authorization input unavailable".into(),
-    trace: EvalTrace::new(),
-}), 503);
+
+// Decisions come only from a checker; they cannot be constructed directly.
+struct Unit;
+impl PolicyDomain for Unit {
+    type Subject = ();
+    type Action = ();
+    type Resource = ();
+    type Context = ();
+}
+async fn empty_checker_denies() {
+    let checker = PermissionChecker::<Unit>::new();
+    let session = EvaluationSession::empty();
+    let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
+    assert_eq!(status(evaluation), 403);
+}
 ```
 
 `AccessError` retains the full trace and exposes `fact_load_errors()` for
@@ -370,6 +381,28 @@ match on `AccessEvaluation`. Create a fresh session for retries and each
 reauthorization pass so cached failures or stale permissions are not reused.
 
 ---
+
+## Unreleased changes after 0.6.0-alpha.2
+
+- **Decisions are sealed.** `AccessEvaluation`, `AccessError`, `FilterError`,
+  and `LookupAuthorizedPage` can be matched but no longer constructed outside
+  Gatehouse. Add `..` to struct patterns on their variants, for example
+  `AccessError::Denied { reason, .. }`. Tests that built a decision by hand
+  should obtain one from a `PermissionChecker` instead.
+- **Grants name the deciding policy.** `granted_policy_type()`,
+  `assert_granted_by`, and the `Granted` reason now follow the grant through
+  `OrPolicy` and delegates to the policy that granted, as `forbidden_by`
+  already did for vetoes. An assertion such as `assert_granted_by("OrPolicy")`
+  or one naming a delegate now names the child. `grant_path()` returns the
+  whole chain, with the delegate first. `AndPolicy` and `NotPolicy` still
+  receive the credit themselves, because the whole combination decided. Give
+  them a meaningful name with `.named("...")`; the veto combinators accept
+  `.named` too.
+- **Backend error text stays out of audit output.** `FactProvenance::detail`
+  for an error wrapped with `FactLoadError::backend(err)` is now a fixed
+  placeholder. Use `FactLoadError::backend_with_message("safe text", err)` to
+  record a description while keeping `err` available through
+  `std::error::Error::source` for your own logs.
 
 # Historical: migrating from 0.4 to 0.5
 

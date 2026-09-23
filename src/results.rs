@@ -348,15 +348,15 @@ pub enum PolicyEvalResult {
 /// let result = example().await;
 ///
 /// match result {
-///     AccessEvaluation::Granted { policy_type, reason, trace } => {
+///     AccessEvaluation::Granted { policy_type, reason, trace, .. } => {
 ///         println!("Access granted by {}: {:?}", policy_type, reason);
 ///         println!("Full evaluation trace:\n{}", trace.format());
 ///     }
-///     AccessEvaluation::Denied { reason, trace } => {
+///     AccessEvaluation::Denied { reason, trace, .. } => {
 ///         println!("Access denied: {}", reason);
 ///         println!("Full evaluation trace:\n{}", trace.format());
 ///     }
-///     AccessEvaluation::Indeterminate { reason, trace } => {
+///     AccessEvaluation::Indeterminate { reason, trace, .. } => {
 ///         println!("Could not evaluate access: {}", reason);
 ///         println!("Full evaluation trace:\n{}", trace.format());
 ///     }
@@ -366,6 +366,41 @@ pub enum PolicyEvalResult {
 /// }
 /// # });
 /// ```
+///
+/// ### Only a checker produces decisions
+///
+/// Every variant is `#[non_exhaustive]`, so code outside this crate can
+/// match on an evaluation but cannot construct one. An `AccessEvaluation`,
+/// [`AccessError`], [`FilterError`], or [`crate::LookupAuthorizedPage`] in
+/// hand therefore came from a [`crate::PermissionChecker`]:
+///
+/// ```compile_fail
+/// use gatehouse::{AccessEvaluation, EvalTrace};
+/// let forged = AccessEvaluation::Granted {
+///     policy_type: "Forged".into(),
+///     reason: None,
+///     trace: EvalTrace::new(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use gatehouse::{AccessError, EvalTrace};
+/// let forged = AccessError::Denied {
+///     reason: "forged".into(),
+///     trace: EvalTrace::new(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// let forged = gatehouse::LookupAuthorizedPage::<u32> {
+///     resources: vec![1],
+///     next_cursor: None,
+/// };
+/// ```
+///
+/// ```compile_fail
+/// let forged = gatehouse::FilterError::<u32> { evaluations: Vec::new() };
+/// ```
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -373,6 +408,7 @@ pub enum PolicyEvalResult {
 #[must_use = "inspect the authorization decision or propagate it with into_result()?"]
 pub enum AccessEvaluation {
     /// Access was granted.
+    #[non_exhaustive]
     Granted {
         /// The policy that granted access. `Cow<'static, str>` for the
         /// same reason as on [`PolicyEvalResult`]: static names pass
@@ -384,6 +420,7 @@ pub enum AccessEvaluation {
         trace: EvalTrace,
     },
     /// Access was denied.
+    #[non_exhaustive]
     Denied {
         /// The complete evaluation trace showing all policy decisions
         trace: EvalTrace,
@@ -405,6 +442,7 @@ pub enum AccessEvaluation {
     /// [`Self::fact_load_errors`] to collect them and
     /// [`FactProvenance::error_kind`] to distinguish transient backend
     /// failures from permanent wiring bugs.
+    #[non_exhaustive]
     Indeterminate {
         /// The complete evaluation trace showing all policy decisions
         trace: EvalTrace,
@@ -419,6 +457,7 @@ pub enum AccessEvaluation {
 #[non_exhaustive]
 pub enum AccessError {
     /// Authorization completed and denied access.
+    #[non_exhaustive]
     Denied {
         /// Summary reason for the denial.
         reason: String,
@@ -426,6 +465,7 @@ pub enum AccessError {
         trace: EvalTrace,
     },
     /// Authorization could not be decided.
+    #[non_exhaustive]
     Indeterminate {
         /// Summary reason for the unresolved decision.
         reason: String,
@@ -469,6 +509,7 @@ impl std::error::Error for AccessError {}
 ///
 /// No partial authorized list is returned. The original items and every
 /// decision remain available in input order for inspection or recovery.
+#[non_exhaustive]
 pub struct FilterError<T> {
     /// All input items paired with their completed evaluations.
     pub evaluations: Vec<(T, AccessEvaluation)>,
@@ -573,15 +614,40 @@ impl AccessEvaluation {
         }
     }
 
-    /// Returns the granting policy's name when the evaluation was a grant.
+    /// Returns the name of the policy that decided a grant.
     ///
-    /// Useful for non-panicking inspection in tests and in production code
-    /// that branches on which policy made the decision.
+    /// This is the deciding policy, not necessarily the registered one: a
+    /// grant through [`crate::OrPolicy`] or a delegate names the child that
+    /// granted, mirroring [`Self::forbidden_by`]. Use [`Self::grant_path`] for
+    /// the chain of policies it was reached through.
     pub fn granted_policy_type(&self) -> Option<&str> {
         match self {
             Self::Granted { policy_type, .. } => Some(policy_type),
             Self::Denied { .. } | Self::Indeterminate { .. } => None,
         }
+    }
+
+    /// Returns the policy names from the registered policy down to the one
+    /// that decided a grant, outermost first. Empty for non-grants.
+    ///
+    /// [`Self::granted_policy_type`] is the last entry. The earlier entries
+    /// give its context: the delegate and combinators it was reached
+    /// through. Checker roots, including the child checker inside a
+    /// delegate, are omitted.
+    ///
+    /// A conjunction ([`crate::AndPolicy`]) or inversion
+    /// ([`crate::NotPolicy`]) decides as a whole, so the path ends there.
+    /// Name it with `named` to make that entry meaningful.
+    pub fn grant_path(&self) -> Vec<&str> {
+        let Self::Granted { trace, .. } = self else {
+            return Vec::new();
+        };
+        trace.root().map_or_else(Vec::new, |root| {
+            root.grant_path()
+                .into_iter()
+                .map(PolicyEvalResult::policy_type)
+                .collect()
+        })
     }
 
     /// Returns the summary denial reason when the evaluation was a denial.
@@ -1023,17 +1089,38 @@ impl AccessEvaluation {
     /// service error in application code.
     ///
     /// ```
-    /// use gatehouse::{AccessError, AccessEvaluation, EvalTrace};
-    /// let evaluation = AccessEvaluation::Indeterminate {
-    ///     reason: "relationship backend unavailable".into(),
-    ///     trace: EvalTrace::new(),
-    /// };
+    /// use gatehouse::*;
+    /// # struct Unit;
+    /// # impl PolicyDomain for Unit {
+    /// #     type Subject = ();
+    /// #     type Action = ();
+    /// #     type Resource = ();
+    /// #     type Context = ();
+    /// # }
+    /// struct BackendDown;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Policy<Unit> for BackendDown {
+    ///     async fn evaluate(&self, _ctx: &EvalCtx<'_, Unit>) -> GrantResult {
+    ///         GrantResult::indeterminate("BackendDown", "relationship backend unavailable")
+    ///     }
+    ///     fn policy_type(&self) -> std::borrow::Cow<'static, str> {
+    ///         "BackendDown".into()
+    ///     }
+    /// }
+    ///
+    /// # tokio_test::block_on(async {
+    /// let mut checker = PermissionChecker::<Unit>::new();
+    /// checker.add_policy(BackendDown);
+    /// let session = EvaluationSession::empty();
+    /// let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
     /// let status = match evaluation.into_result() {
     ///     Ok(()) => 200,
     ///     Err(AccessError::Denied { .. }) => 403,
     ///     Err(_) => 503,
     /// };
     /// assert_eq!(status, 503);
+    /// # });
     /// ```
     pub fn into_result(self) -> Result<(), AccessError> {
         match self {
@@ -1304,6 +1391,47 @@ impl PolicyEvalResult {
     /// carries authority.
     pub fn is_forbidden(&self) -> bool {
         self.decision() == Decision::Forbid
+    }
+
+    /// Returns the active grant spine, outermost first, without checker
+    /// roots: this node and, recursively, the child that carried the grant,
+    /// down to the node that decided it.
+    ///
+    /// Disjunctions (OR, delegation, and a checker's deny-overrides root)
+    /// grant through one child, so the search descends into the first
+    /// granting child. A conjunction or inversion decided as a whole, so it
+    /// ends the spine: naming one AND child would credit a guard with a grant
+    /// that every child was needed for. Nothing is collected for a non-grant.
+    pub(crate) fn grant_path(&self) -> Vec<&Self> {
+        let mut spine = Vec::new();
+        self.grant_spine(&mut spine);
+        spine.retain(|node| {
+            !matches!(
+                node,
+                Self::Combined {
+                    operation: CombineOp::DenyOverrides,
+                    ..
+                }
+            )
+        });
+        spine
+    }
+
+    fn grant_spine<'a>(&'a self, spine: &mut Vec<&'a Self>) {
+        if !self.is_granted() {
+            return;
+        }
+        spine.push(self);
+        if let Self::Combined {
+            operation: CombineOp::Or | CombineOp::Delegate | CombineOp::DenyOverrides,
+            children,
+            ..
+        } = self
+        {
+            if let Some(child) = children.iter().find(|child| child.is_granted()) {
+                child.grant_spine(spine);
+            }
+        }
     }
 
     pub(crate) fn forbidden_leaf(&self) -> Option<(&str, Option<&str>)> {

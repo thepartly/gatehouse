@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `.named(...)` on `AndPolicy`, `OrPolicy`, `NotPolicy`, `AllOfVeto`, and
+  `AnyOfVeto` replaces the fixed type name in audit trees, attribution, and
+  telemetry.
+- `AccessEvaluation::grant_path` lists the policies a grant was reached
+  through, from the registered policy to the one that decided.
+- `FactLoadError::backend_with_message` pairs an audit-safe message with the
+  source error; `FactLoadError::audit_detail` returns the text recorded in
+  provenance; `FactLoadError` now implements `Error::source`.
+
+### Changed
+
+- **Breaking:** `AccessEvaluation`, `AccessError`, `FilterError`, and
+  `LookupAuthorizedPage` cannot be constructed outside the crate, and struct
+  patterns on their variants need `..`. A decision in hand therefore came from
+  a checker.
+- **Breaking:** grants are credited to the policy that decided them.
+  `granted_policy_type`, `assert_granted_by`, and the `Granted` reason
+  follow the grant through `OrPolicy` and delegates to the granting child
+  instead of reporting `"OrPolicy"` or the delegate name. Conjunctions and
+  inversions are credited as a whole.
+- **Breaking:** `FactProvenance::from_load_result` no longer copies a backend
+  error's message into `detail`. Errors built with `FactLoadError::backend`
+  record a fixed placeholder; `backend_message` and `backend_with_message`
+  record their caller-authored message.
+- A `PolicyBuilder::build_veto` predicate that cannot be evaluated is
+  indeterminate rather than passing. Builder predicates cannot currently
+  produce that result.
+- The Actix example's collaborator rule uses the author's draft window, so a
+  collaborator can no longer edit published posts or drafts older than 30
+  days. The PostgreSQL example wraps database errors with
+  `backend_with_message`.
+
 ## [0.6.0-alpha.2] - 2026-09-20
 
 ### Added

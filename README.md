@@ -122,7 +122,7 @@ At application boundaries, use `bound.authorize(&resource).await?`, or `evaluati
 `AccessEvaluation`, `GrantResult`, and `VetoResult` are `#[must_use]`: discarding them warns by default and fails compilation under `#![deny(unused_must_use)]`. The batch methods `evaluate` and `evaluate_by` also warn when their awaited results are discarded. This catches accidental omissions; callers can still deliberately ignore results.
 
 ```rust
-use gatehouse::{AccessError, AccessEvaluation, EvalTrace};
+use gatehouse::{AccessError, AccessEvaluation, EvaluationSession, PermissionChecker, PolicyDomain};
 
 fn http_status(evaluation: AccessEvaluation) -> u16 {
     match evaluation.into_result() {
@@ -131,10 +131,21 @@ fn http_status(evaluation: AccessEvaluation) -> u16 {
         Err(_) => 503,
     }
 }
-assert_eq!(http_status(AccessEvaluation::Indeterminate {
-    reason: "authorization input unavailable".into(),
-    trace: EvalTrace::new(),
-}), 503);
+
+// Decisions come only from a checker; they cannot be constructed directly.
+struct Unit;
+impl PolicyDomain for Unit {
+    type Subject = ();
+    type Action = ();
+    type Resource = ();
+    type Context = ();
+}
+async fn empty_checker_denies() {
+    let checker = PermissionChecker::<Unit>::new();
+    let session = EvaluationSession::empty();
+    let evaluation = checker.bind(&session, &(), &(), &()).check(&()).await;
+    assert_eq!(http_status(evaluation), 403);
+}
 ```
 
 `PolicyEvalResult` is the audit tree, accessed through `GrantResult::trace`, `VetoResult::trace`, or the final `EvalTrace`. It is not a policy return type. Its public nodes support inspection and serialization; arbitrary raw trees cannot be converted into typed policy results.
@@ -337,7 +348,7 @@ If your product contract authorizes once at stream open, create a fresh session,
 
 When trace-level events are enabled, checker evaluation records spans for single-resource and batch evaluation, and each evaluated policy records a `trace!` event on the `gatehouse::security` target. Batch evaluation records aggregate item counts and nested `gatehouse.batch_policy` spans with per-policy counts.
 
-Reason strings are emitted verbatim. Keep credentials, tokens, raw PII, and other sensitive material out of policy reasons and fact provenance details. Enable the optional `serde` feature to serialize `AccessEvaluation`, `EvalTrace`, `PolicyEvalResult`, and fact provenance for audit logs.
+Reason strings are emitted verbatim. Keep credentials, tokens, raw PII, and other sensitive material out of policy reasons and fact provenance details. Backend errors wrapped with `FactLoadError::backend` are recorded as a fixed placeholder; use `FactLoadError::backend_with_message` to record a safe description and keep the original error on `source()` for your own logs. Enable the optional `serde` feature to serialize `AccessEvaluation`, `EvalTrace`, `PolicyEvalResult`, and fact provenance for audit logs.
 
 Security event fields:
 

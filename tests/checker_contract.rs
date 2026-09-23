@@ -2168,3 +2168,157 @@ async fn negated_malformed_batch_attributes_the_child() {
         );
     }
 }
+
+fn grant_when(name: &'static str, grants: fn(u8) -> bool) -> impl Policy<Domain> {
+    PolicyBuilder::<Domain>::new(name)
+        .when(move |_subject, _action, resource: &Resource, _context| grants(resource.id))
+        .build()
+}
+
+/// Checks that single and batch evaluation credit the same deciding policy.
+async fn assert_attribution(
+    checker: &PermissionChecker<Domain>,
+    cases: &[(u8, Option<&str>, &[&str])],
+) {
+    let session = EvaluationSession::empty();
+    let resources = cases
+        .iter()
+        .map(|&(id, _, _)| Resource { id })
+        .collect::<Vec<_>>();
+    let batch = bind(checker, &session).evaluate(resources.clone()).await;
+    for ((&(id, granted_by, path), resource), (_, batch_evaluation)) in
+        cases.iter().zip(&resources).zip(&batch)
+    {
+        let single = check_resource(checker, &session, resource).await;
+        for evaluation in [&single, batch_evaluation] {
+            assert_eq!(
+                evaluation.granted_policy_type(),
+                granted_by,
+                "resource {id}"
+            );
+            assert_eq!(evaluation.grant_path(), path, "resource {id}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn grants_are_credited_to_the_disjunct_that_decided() {
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(grant_when("Admins", |id| id == 1).or(grant_when("Owners", |id| id == 2)));
+
+    assert_attribution(
+        &checker,
+        &[
+            (1, Some("Admins"), &["OrPolicy", "Admins"]),
+            (2, Some("Owners"), &["OrPolicy", "Owners"]),
+            (3, None, &[]),
+        ],
+    )
+    .await;
+
+    let session = EvaluationSession::empty();
+    let evaluation = check_resource(&checker, &session, &Resource { id: 2 }).await;
+    let AccessEvaluation::Granted { reason, .. } = &evaluation else {
+        panic!("expected a grant: {evaluation:?}");
+    };
+    assert_eq!(
+        reason.as_deref(),
+        Some("Policy allowed access"),
+        "the reason comes from the deciding leaf, not the combinator"
+    );
+}
+
+#[tokio::test]
+async fn conjunctions_and_inversions_are_credited_as_a_whole() {
+    // Every AND child was needed, so crediting one of them would name a guard
+    // as the grantor. The conjunction is credited, under its given name.
+    let guard_and_rule =
+        grant_when("Guard", |id| id < 10).and(grant_when("Rule", |id| id % 2 == 0));
+
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(guard_and_rule);
+    assert_attribution(
+        &checker,
+        &[(2, Some("AndPolicy"), &["AndPolicy"]), (3, None, &[])],
+    )
+    .await;
+
+    let named = grant_when("Guard", |id| id < 10)
+        .and(grant_when("Rule", |id| id % 2 == 0))
+        .named("EvenBelowTen");
+    let inverted = grant_when("Banned", |id| id != 11)
+        .not()
+        .named("OnlyEleven");
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(
+        OrPolicy::try_new(vec![Arc::new(named), Arc::new(inverted)])
+            .unwrap()
+            .named("Access"),
+    );
+    assert_attribution(
+        &checker,
+        &[
+            (4, Some("EvenBelowTen"), &["Access", "EvenBelowTen"]),
+            (11, Some("OnlyEleven"), &["Access", "OnlyEleven"]),
+            (13, None, &[]),
+        ],
+    )
+    .await;
+
+    let session = EvaluationSession::empty();
+    let evaluation = check_resource(&checker, &session, &Resource { id: 4 }).await;
+    evaluation.assert_trace_contains("EvenBelowTen");
+    evaluation.assert_trace_contains("Access");
+}
+
+#[tokio::test]
+async fn delegated_grants_name_the_child_policy_and_keep_the_delegate_in_the_path() {
+    let mut child = PermissionChecker::<Domain>::new();
+    child.add_policy(grant_when("ChildOdd", |id| id % 2 == 1));
+    child.add_policy(grant_when("ChildFour", |id| id == 4));
+
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(grant_when("ParentZero", |id| id == 0));
+    checker.add_delegate(DelegatingPolicy::new(
+        "Tenant",
+        child,
+        |_subject: &Subject| Subject,
+        |_action: &Action| Action,
+        |_subject: &Subject, _action: &Action, resource: &Resource, _context: &Ctx| {
+            resource.clone()
+        },
+        |_subject: &Subject, _action: &Action, _context: &Ctx| Ctx,
+    ));
+
+    assert_attribution(
+        &checker,
+        &[
+            (0, Some("ParentZero"), &["ParentZero"]),
+            (3, Some("ChildOdd"), &["Tenant", "ChildOdd"]),
+            (4, Some("ChildFour"), &["Tenant", "ChildFour"]),
+            (6, None, &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn named_veto_combinators_appear_in_the_trace() {
+    let freeze = PolicyBuilder::<Domain>::new("Frozen")
+        .when(|_subject, _action, resource: &Resource, _context| resource.id == 1)
+        .build_veto()
+        .any_of(
+            PolicyBuilder::<Domain>::new("Archived")
+                .when(|_subject, _action, resource: &Resource, _context| resource.id == 2)
+                .build_veto(),
+        )
+        .named("ChangeFreeze");
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(PolicyBuilder::<Domain>::new("Anyone").allow_all());
+    checker.add_veto(freeze);
+
+    let session = EvaluationSession::empty();
+    let evaluation = check_resource(&checker, &session, &Resource { id: 2 }).await;
+    evaluation.assert_forbidden_by("Archived");
+    evaluation.assert_trace_contains("ChangeFreeze");
+}

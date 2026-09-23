@@ -331,7 +331,9 @@ fn collaborator_policy() -> Box<dyn Policy<BlogDomain>> {
 
     Box::new(
         AndPolicy::try_new(vec![is_view_or_edit, has_editor_relationship])
-            .expect("collaborator policy has a guard and a relationship check"),
+            .expect("collaborator policy has a guard and a relationship check")
+            // Named so a grant is credited to this rule rather than "AndPolicy".
+            .named("CollaboratorAccess"),
     )
 }
 
