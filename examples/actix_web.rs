@@ -15,7 +15,7 @@
 // Identity and roles come from unauthenticated demo headers. Run on loopback only.
 //
 // Try it with curl (the demo grants user 2222… an editor relationship on the
-// demo posts, so they can view drafts and edit without being the author):
+// demo posts, so they can view drafts and edit the same drafts the author can):
 //
 // ```bash
 // # The author lists their posts
@@ -282,33 +282,43 @@ fn admin_override_policy() -> Box<dyn Policy<BlogDomain>> {
         .build()
 }
 
-/// Editing rule for the author: edit your own unpublished, unlocked draft that
-/// is still inside the 30-day window.
-fn author_can_edit_policy() -> Box<dyn Policy<BlogDomain>> {
+/// The draft-editing window shared by every non-admin editor: the post is
+/// unpublished, unlocked, and less than 30 days old. Author and collaborator
+/// rules both call this, so a collaborator never gets a wider window than the
+/// author.
+fn is_editable_draft(post: &BlogPost, ctx: &RequestContext) -> bool {
     const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+    !post.locked
+        && post.published_at.is_none()
+        && ctx
+            .current_time
+            .duration_since(post.created_at)
+            .is_ok_and(|age| age < MAX_AGE)
+}
+
+/// Editing rule for the author: edit your own editable draft.
+fn author_can_edit_policy() -> Box<dyn Policy<BlogDomain>> {
     PolicyBuilder::<BlogDomain>::new("AuthorCanEdit")
         .when(|user, action, post, ctx| {
             matches!(action, Action::Edit)
                 && user.id == post.author_id
-                && !post.locked
-                && post.published_at.is_none()
-                && ctx
-                    .current_time
-                    .duration_since(post.created_at)
-                    .is_ok_and(|age| age < MAX_AGE)
+                && is_editable_draft(post, ctx)
         })
         .build()
 }
 
 /// The fact-backed rule: a registered collaborator (an "editor" relationship,
-/// loaded through the session) may view and edit the post, author or not. The
-/// guard restricts the relationship check to the View/Edit actions; publishing
+/// loaded through the session) may view the post, and may edit it under the
+/// same draft window as the author. The guard runs first, so the relationship
+/// is only loaded for requests the collaborator could be allowed; publishing
 /// stays role-gated below.
 fn collaborator_policy() -> Box<dyn Policy<BlogDomain>> {
     let is_view_or_edit: Arc<dyn Policy<BlogDomain>> = Arc::from(
         PolicyBuilder::<BlogDomain>::new("IsViewOrEdit")
-            .when(|_user, action, post, _ctx| {
-                matches!(action, Action::View) || (matches!(action, Action::Edit) && !post.locked)
+            .when(|_user, action, post, ctx| match action {
+                Action::View => true,
+                Action::Edit => is_editable_draft(post, ctx),
+                Action::Publish => false,
             })
             .build(),
     );
@@ -321,7 +331,9 @@ fn collaborator_policy() -> Box<dyn Policy<BlogDomain>> {
 
     Box::new(
         AndPolicy::try_new(vec![is_view_or_edit, has_editor_relationship])
-            .expect("collaborator policy has a guard and a relationship check"),
+            .expect("collaborator policy has a guard and a relationship check")
+            // Named so a grant is credited to this rule rather than "AndPolicy".
+            .named("CollaboratorAccess"),
     )
 }
 

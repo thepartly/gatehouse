@@ -1,5 +1,55 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `.named(...)` on `AndPolicy`, `OrPolicy`, `NotPolicy`, `AllOfVeto`, and
+  `AnyOfVeto` replaces the fixed type name in the combinator's audit-tree node,
+  attribution paths, and telemetry. A named `AndPolicy`, `NotPolicy`, or
+  `AllOfVeto` is also what `granted_policy_type` or `forbidden_by` reports.
+- `AccessEvaluation::grant_path` and `AccessEvaluation::forbidden_path` list
+  the policies a decision passed through, from the registered policy to the
+  one that decided.
+- `FactLoadError::backend_with_message` pairs an audit-safe message with the
+  source error, `FactLoadError::audit_detail` returns the text recorded in
+  provenance, and `FactLoadError` now implements `Error::source`.
+
+### Changed
+
+- **Breaking:** the variants of `AccessEvaluation` and `AccessError`, and the
+  `FilterError` and `LookupAuthorizedPage` structs, are `#[non_exhaustive]`.
+  They cannot be constructed outside the crate, and struct patterns on the
+  enum variants need `..`.
+- **Breaking:** grants and vetoes are credited to the policy that decided
+  them, by one rule. `OrPolicy`, `AnyOfVeto`, delegates, and custom
+  `GrantResult::any` results pass the decision up from their first deciding
+  child; `AndPolicy`, `NotPolicy`, and `AllOfVeto` decide as a whole and are
+  credited themselves. This changes `granted_policy_type`, `forbidden_by`,
+  `assert_granted_by`, `assert_forbidden_by`, the `Granted` reason, the
+  `Forbidden by ...` denial reason, the serialized `AccessEvaluation`
+  `policy_type`, and the checker span's `policy.type` field. Previously grants
+  named the registered policy (for example `"OrPolicy"` or a delegate) and
+  `forbidden_by` named the first child of an `AllOfVeto`.
+
+### Fixed
+
+- `PolicyBuilder::build_veto` treats a predicate that cannot be evaluated as
+  indeterminate rather than passing. This was latent: builder predicates
+  return `bool`.
+- The Actix example's collaborator rule uses the author's draft window, so a
+  collaborator can no longer edit published posts or drafts older than 30
+  days.
+
+### Security
+
+- **Breaking:** `FactProvenance::from_load_result` no longer copies a backend
+  error's message into `detail`, where it reached traces, logs, and serialized
+  audit output. Errors built with `FactLoadError::backend` record a fixed
+  placeholder; `backend_message` and `backend_with_message` record their
+  caller-authored message. The PostgreSQL example wraps database errors with
+  `backend_with_message`.
+
 ## [0.6.0-alpha.2] - 2026-09-20
 
 ### Added

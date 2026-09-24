@@ -2168,3 +2168,226 @@ async fn negated_malformed_batch_attributes_the_child() {
         );
     }
 }
+
+fn grant_when(name: &'static str, grants: fn(u8) -> bool) -> impl Policy<Domain> {
+    PolicyBuilder::<Domain>::new(name)
+        .when(move |_subject, _action, resource: &Resource, _context| grants(resource.id))
+        .build()
+}
+
+/// Checks that single and batch evaluation credit the same deciding policy.
+async fn assert_attribution(
+    checker: &PermissionChecker<Domain>,
+    cases: &[(u8, Option<&str>, &[&str])],
+) {
+    let session = EvaluationSession::empty();
+    let resources = cases
+        .iter()
+        .map(|&(id, _, _)| Resource { id })
+        .collect::<Vec<_>>();
+    let batch = bind(checker, &session).evaluate(resources.clone()).await;
+    assert_eq!(batch.len(), cases.len());
+    for ((&(id, granted_by, path), resource), (batch_resource, batch_evaluation)) in
+        cases.iter().zip(&resources).zip(&batch)
+    {
+        assert_eq!(batch_resource.id, id, "batch preserves input order");
+        let single = check_resource(checker, &session, resource).await;
+        for evaluation in [&single, batch_evaluation] {
+            assert_eq!(
+                evaluation.granted_policy_type(),
+                granted_by,
+                "resource {id}"
+            );
+            assert_eq!(evaluation.grant_path(), path, "resource {id}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn grants_are_credited_to_the_disjunct_that_decided() {
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(grant_when("Admins", |id| id == 1).or(grant_when("Owners", |id| id == 2)));
+
+    assert_attribution(
+        &checker,
+        &[
+            (1, Some("Admins"), &["OrPolicy", "Admins"]),
+            (2, Some("Owners"), &["OrPolicy", "Owners"]),
+            (3, None, &[]),
+        ],
+    )
+    .await;
+
+    let session = EvaluationSession::empty();
+    let evaluation = check_resource(&checker, &session, &Resource { id: 2 }).await;
+    let AccessEvaluation::Granted { reason, .. } = &evaluation else {
+        panic!("expected a grant: {evaluation:?}");
+    };
+    assert_eq!(
+        reason.as_deref(),
+        Some("Policy allowed access"),
+        "the reason comes from the deciding leaf, not the combinator"
+    );
+}
+
+#[tokio::test]
+async fn conjunctions_and_inversions_are_credited_as_a_whole() {
+    // Every AND child was needed, so crediting one of them would name a guard
+    // as the grantor. The conjunction is credited, under its given name.
+    let guard_and_rule =
+        grant_when("Guard", |id| id < 10).and(grant_when("Rule", |id| id % 2 == 0));
+
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(guard_and_rule);
+    assert_attribution(
+        &checker,
+        &[(2, Some("AndPolicy"), &["AndPolicy"]), (3, None, &[])],
+    )
+    .await;
+
+    let named = grant_when("Guard", |id| id < 10)
+        .and(grant_when("Rule", |id| id % 2 == 0))
+        .named("EvenBelowTen");
+    let inverted = grant_when("Banned", |id| id != 11)
+        .not()
+        .named("OnlyEleven");
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(
+        OrPolicy::try_new(vec![Arc::new(named), Arc::new(inverted)])
+            .unwrap()
+            .named("Access"),
+    );
+    assert_attribution(
+        &checker,
+        &[
+            (4, Some("EvenBelowTen"), &["Access", "EvenBelowTen"]),
+            (11, Some("OnlyEleven"), &["Access", "OnlyEleven"]),
+            (13, None, &[]),
+        ],
+    )
+    .await;
+
+    let session = EvaluationSession::empty();
+    let evaluation = check_resource(&checker, &session, &Resource { id: 4 }).await;
+    evaluation.assert_trace_contains("EvenBelowTen");
+    evaluation.assert_trace_contains("Access");
+}
+
+#[tokio::test]
+async fn delegated_grants_name_the_child_policy_and_keep_the_delegate_in_the_path() {
+    let mut child = PermissionChecker::<Domain>::new();
+    child.add_policy(grant_when("ChildOdd", |id| id % 2 == 1));
+    child.add_policy(grant_when("ChildFour", |id| id == 4));
+
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(grant_when("ParentZero", |id| id == 0));
+    checker.add_delegate(DelegatingPolicy::new(
+        "Tenant",
+        child,
+        |_subject: &Subject| Subject,
+        |_action: &Action| Action,
+        |_subject: &Subject, _action: &Action, resource: &Resource, _context: &Ctx| {
+            resource.clone()
+        },
+        |_subject: &Subject, _action: &Action, _context: &Ctx| Ctx,
+    ));
+
+    assert_attribution(
+        &checker,
+        &[
+            (0, Some("ParentZero"), &["ParentZero"]),
+            (3, Some("ChildOdd"), &["Tenant", "ChildOdd"]),
+            (4, Some("ChildFour"), &["Tenant", "ChildFour"]),
+            (6, None, &[]),
+        ],
+    )
+    .await;
+}
+
+fn forbid_when(name: &'static str, forbids: fn(u8) -> bool) -> impl VetoPolicy<Domain> {
+    PolicyBuilder::<Domain>::new(name)
+        .when(move |_subject, _action, resource: &Resource, _context| forbids(resource.id))
+        .build_veto()
+}
+
+/// Checks that single and batch evaluation credit the same deciding veto.
+async fn assert_veto_attribution(
+    checker: &PermissionChecker<Domain>,
+    cases: &[(u8, Option<&str>, &[&str])],
+) {
+    let session = EvaluationSession::empty();
+    let resources = cases
+        .iter()
+        .map(|&(id, _, _)| Resource { id })
+        .collect::<Vec<_>>();
+    let batch = bind(checker, &session).evaluate(resources.clone()).await;
+    assert_eq!(batch.len(), cases.len());
+    for ((&(id, forbidden_by, path), resource), (batch_resource, batch_evaluation)) in
+        cases.iter().zip(&resources).zip(&batch)
+    {
+        assert_eq!(batch_resource.id, id, "batch preserves input order");
+        let single = check_resource(checker, &session, resource).await;
+        for evaluation in [&single, batch_evaluation] {
+            assert_eq!(evaluation.forbidden_by(), forbidden_by, "resource {id}");
+            assert_eq!(evaluation.forbidden_path(), path, "resource {id}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vetoes_are_credited_like_grants() {
+    let mut child = PermissionChecker::<Domain>::new();
+    child.add_veto(forbid_when("ChildSeven", |id| id == 7));
+
+    let mut checker = PermissionChecker::<Domain>::new();
+    checker.add_policy(PolicyBuilder::<Domain>::new("Anyone").allow_all());
+    // Any-of forbids through one child, so that child is credited.
+    checker.add_veto(
+        forbid_when("Frozen", |id| id == 1)
+            .any_of(forbid_when("Archived", |id| id == 2))
+            .named("ChangeFreeze"),
+    );
+    // All-of forbids only when every child does, so it is credited itself.
+    checker.add_veto(
+        forbid_when("Large", |id| id >= 10)
+            .all_of(forbid_when("Odd", |id| id % 2 == 1))
+            .named("LargeOdd"),
+    );
+    checker.add_delegate(DelegatingPolicy::new(
+        "Tenant",
+        child,
+        |_subject: &Subject| Subject,
+        |_action: &Action| Action,
+        |_subject: &Subject, _action: &Action, resource: &Resource, _context: &Ctx| {
+            resource.clone()
+        },
+        |_subject: &Subject, _action: &Action, _context: &Ctx| Ctx,
+    ));
+
+    assert_veto_attribution(
+        &checker,
+        &[
+            (1, Some("Frozen"), &["ChangeFreeze", "Frozen"]),
+            (2, Some("Archived"), &["ChangeFreeze", "Archived"]),
+            (11, Some("LargeOdd"), &["LargeOdd"]),
+            (7, Some("ChildSeven"), &["Tenant", "ChildSeven"]),
+            // An all-of veto whose children disagree passes, and its matched
+            // child does not steal the attribution.
+            (9, None, &[]),
+            (12, None, &[]),
+        ],
+    )
+    .await;
+
+    let session = EvaluationSession::empty();
+    let all_of = check_resource(&checker, &session, &Resource { id: 11 }).await;
+    assert_eq!(all_of.denied_reason(), Some("Forbidden by LargeOdd"));
+    let any_of = check_resource(&checker, &session, &Resource { id: 2 }).await;
+    assert_eq!(
+        any_of.denied_reason(),
+        Some("Forbidden by Archived: Policy forbids access")
+    );
+    assert!(check_resource(&checker, &session, &Resource { id: 12 })
+        .await
+        .is_granted());
+}

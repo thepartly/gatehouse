@@ -1008,23 +1008,19 @@ fn evaluation_from_tree(tree: PolicyEvalResult) -> AccessEvaluation {
         },
     }
 }
+/// Names the node that decided a grant and its reason. See
+/// [`PolicyEvalResult::grant_nodes`] for how the decider is chosen.
 fn winning_grant(tree: &PolicyEvalResult) -> Option<(Cow<'static, str>, Option<String>)> {
-    match tree {
-        PolicyEvalResult::Combined { children, .. } => children
-            .iter()
-            .find(|child| child.is_granted())
-            .map(|child| {
-                let policy_type = match child {
-                    PolicyEvalResult::Granted { policy_type, .. }
-                    | PolicyEvalResult::NotApplicable { policy_type, .. }
-                    | PolicyEvalResult::Forbidden { policy_type, .. }
-                    | PolicyEvalResult::Indeterminate { policy_type, .. }
-                    | PolicyEvalResult::Combined { policy_type, .. } => policy_type.clone(),
-                };
-                (policy_type, child.reason())
-            }),
-        _ => None,
-    }
+    tree.grant_nodes().last().map(|node| {
+        let policy_type = match node {
+            PolicyEvalResult::Granted { policy_type, .. }
+            | PolicyEvalResult::NotApplicable { policy_type, .. }
+            | PolicyEvalResult::Forbidden { policy_type, .. }
+            | PolicyEvalResult::Indeterminate { policy_type, .. }
+            | PolicyEvalResult::Combined { policy_type, .. } => policy_type.clone(),
+        };
+        (policy_type, node.reason())
+    })
 }
 #[cfg(feature = "tracing")]
 fn emit_policy_event<D: PolicyDomain>(

@@ -82,7 +82,10 @@ impl PgRelationshipSource {
             .await
         {
             Ok(row) => FactLoadResult::Found(row.get("allowed")),
-            Err(error) => FactLoadResult::Error(FactLoadError::backend(error)),
+            Err(error) => FactLoadResult::Error(FactLoadError::backend_with_message(
+                "relationship point lookup failed",
+                error,
+            )),
         }
     }
 
@@ -104,7 +107,11 @@ impl PgRelationshipSource {
                 .map(|row| FactLoadResult::Found(row.get("allowed")))
                 .collect(),
             Err(error) => {
-                let error = FactLoadError::backend(error);
+                // The audit trace records only this message; the PostgreSQL
+                // error, which can quote row values, stays on `source()` for
+                // operational logs.
+                let error =
+                    FactLoadError::backend_with_message("relationship bulk lookup failed", error);
                 keys.iter()
                     .map(|_| FactLoadResult::Error(error.clone()))
                     .collect()

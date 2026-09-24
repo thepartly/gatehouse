@@ -218,17 +218,19 @@ async fn authorize_matches_check_preserves_evidence_and_evaluates_once() {
         match (&actual, &expected) {
             (Ok(()), Ok(())) => assert_eq!(id, 1),
             (
-                Err(AccessError::Denied { reason, trace }),
+                Err(AccessError::Denied { reason, trace, .. }),
                 Err(AccessError::Denied {
                     reason: expected_reason,
                     trace: expected_trace,
+                    ..
                 }),
             )
             | (
-                Err(AccessError::Indeterminate { reason, trace }),
+                Err(AccessError::Indeterminate { reason, trace, .. }),
                 Err(AccessError::Indeterminate {
                     reason: expected_reason,
                     trace: expected_trace,
+                    ..
                 }),
             ) => {
                 assert_eq!(reason, expected_reason);
@@ -634,19 +636,22 @@ async fn strict_errors_support_borrowed_non_debug_rows() {
         .to_string()
         .contains("could not determine authorization"));
 
+    // `FilterError` and `AccessEvaluation` are sealed, so the wrapped error
+    // comes from a second strict filter rather than a struct literal.
+    let Err(filter_error) = bind(&checker, &session)
+        .try_filter_by(
+            vec![Row {
+                resource: Resource { id: 3 },
+                label: &label,
+            }],
+            |row| &row.resource,
+        )
+        .await
+    else {
+        panic!("unavailable fact must fail the strict filter");
+    };
     let error: LookupAuthorizedError<Infallible, Infallible, Row<'_>> =
-        LookupAuthorizedError::Evaluation(gatehouse::FilterError {
-            evaluations: vec![(
-                Row {
-                    resource: Resource { id: 3 },
-                    label: &label,
-                },
-                AccessEvaluation::Indeterminate {
-                    reason: "offline".into(),
-                    trace: gatehouse::EvalTrace::new(),
-                },
-            )],
-        });
+        LookupAuthorizedError::Evaluation(filter_error);
     assert!(!format!("{error:?}").contains(&label));
     let error = as_standard_error(error);
     assert!(error.source().is_none());

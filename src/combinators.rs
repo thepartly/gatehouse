@@ -30,20 +30,20 @@ pub trait PolicyExt<D: PolicyDomain>: Policy<D> + Sized + 'static {
     /// Requires both policies to grant.
     fn and<P: Policy<D> + 'static>(self, other: P) -> AndPolicy<D> {
         AndPolicy {
+            name: Cow::Borrowed("AndPolicy"),
             policies: vec![Arc::new(self), Arc::new(other)],
         }
     }
     /// Grants if either policy grants.
     fn or<P: Policy<D> + 'static>(self, other: P) -> OrPolicy<D> {
         OrPolicy {
+            name: Cow::Borrowed("OrPolicy"),
             policies: vec![Arc::new(self), Arc::new(other)],
         }
     }
     /// Inverts a definite grant or abstention; uncertainty remains uncertain.
     fn not(self) -> NotPolicy<D> {
-        NotPolicy {
-            policy: Arc::new(self),
-        }
+        NotPolicy::new(self)
     }
     /// Boxes the policy.
     fn boxed(self) -> Box<dyn Policy<D>> {
@@ -54,14 +54,17 @@ impl<D: PolicyDomain, P: Policy<D> + Sized + 'static> PolicyExt<D> for P {}
 
 /// Requires every child policy to grant.
 pub struct AndPolicy<D: PolicyDomain> {
+    name: Cow<'static, str>,
     policies: Vec<Arc<dyn Policy<D>>>,
 }
 /// Grants when any child policy grants.
 pub struct OrPolicy<D: PolicyDomain> {
+    name: Cow<'static, str>,
     policies: Vec<Arc<dyn Policy<D>>>,
 }
 /// Inverts a grant policy, preserving uncertainty.
 pub struct NotPolicy<D: PolicyDomain> {
+    name: Cow<'static, str>,
     policy: Arc<dyn Policy<D>>,
 }
 
@@ -69,13 +72,43 @@ impl<D: PolicyDomain> NotPolicy<D> {
     /// Inverts the given grant policy, preserving indeterminate results.
     pub fn new<P: Policy<D> + 'static>(policy: P) -> Self {
         Self {
+            name: Cow::Borrowed("NotPolicy"),
             policy: Arc::new(policy),
         }
     }
 }
 
+/// Adds `named`, which replaces a combinator's default type name. The
+/// second argument documents what that name is credited with.
+macro_rules! named {
+    ($name:ident, $credit:literal) => {
+        impl<D: PolicyDomain> $name<D> {
+            /// Replaces this combinator's default type name (for example
+            #[doc = concat!("`\"", stringify!($name), "\"`)")]
+            /// in its audit-tree node, attribution paths, and telemetry, so
+            /// two combinators of the same type can be told apart.
+            ///
+            #[doc = $credit]
+            ///
+            /// Unlike [`crate::PermissionChecker::named`], which only labels a
+            /// checker's telemetry, this name is the policy's audit identity.
+            #[must_use]
+            pub fn named(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+                self.name = name.into();
+                self
+            }
+        }
+    };
+}
+named!(
+    NotPolicy,
+    "An inversion decides a grant as a whole, so this is the name \
+     [`crate::AccessEvaluation::granted_policy_type`] reports; name it after \
+     the rule it expresses."
+);
+
 macro_rules! constructor {
-    ($name:ident,$policy:ident) => {
+    ($name:ident, $policy:ident, $credit:literal) => {
         impl<D: PolicyDomain> $name<D> {
             /// Builds a combinator from a nonempty list.
             pub fn try_new(policies: Vec<Arc<dyn $policy<D>>>) -> Result<Self, EmptyPoliciesError> {
@@ -85,16 +118,32 @@ macro_rules! constructor {
                         " requires at least one policy"
                     )))
                 } else {
-                    Ok(Self { policies })
+                    Ok(Self {
+                        name: Cow::Borrowed(stringify!($name)),
+                        policies,
+                    })
                 }
             }
         }
+        named!($name, $credit);
     };
 }
-constructor!(AndPolicy, Policy);
-constructor!(OrPolicy, Policy);
+constructor!(
+    AndPolicy,
+    Policy,
+    "A conjunction decides a grant as a whole, so this is the name \
+     [`crate::AccessEvaluation::granted_policy_type`] reports; name it after the rule it expresses."
+);
+constructor!(
+    OrPolicy,
+    Policy,
+    "A disjunction grants through one child, which is what \
+     [`crate::AccessEvaluation::granted_policy_type`] reports; this name appears in \
+     [`crate::AccessEvaluation::grant_path`]."
+);
 
 async fn grant_children<D: PolicyDomain>(
+    name: Cow<'static, str>,
     policies: &[Arc<dyn Policy<D>>],
     ctx: &BatchEvalCtx<'_, D>,
     conjunction: bool,
@@ -164,9 +213,9 @@ async fn grant_children<D: PolicyDomain>(
         .into_iter()
         .map(|children| {
             if conjunction {
-                GrantResult::all("AndPolicy", children)
+                GrantResult::all(name.clone(), children)
             } else {
-                GrantResult::any("OrPolicy", children)
+                GrantResult::any(name.clone(), children)
             }
         })
         .collect()
@@ -187,9 +236,15 @@ macro_rules! grant_combinator {
                     &items,
                     self.policy_type(),
                 );
-                grant_children(&self.policies, &inner, $conjunction, true)
-                    .await
-                    .remove(0)
+                grant_children(
+                    self.name.clone(),
+                    &self.policies,
+                    &inner,
+                    $conjunction,
+                    true,
+                )
+                .await
+                .remove(0)
             }
             async fn evaluate_batch<'item>(
                 &self,
@@ -198,10 +253,10 @@ macro_rules! grant_combinator {
                 if ctx.items.is_empty() {
                     return Vec::new();
                 }
-                grant_children(&self.policies, ctx, $conjunction, false).await
+                grant_children(self.name.clone(), &self.policies, ctx, $conjunction, false).await
             }
             fn policy_type(&self) -> Cow<'static, str> {
-                Cow::Borrowed(stringify!($name))
+                self.name.clone()
             }
         }
     };
@@ -209,18 +264,13 @@ macro_rules! grant_combinator {
 grant_combinator!(AndPolicy, true);
 grant_combinator!(OrPolicy, false);
 
-fn invert(result: GrantResult) -> GrantResult {
+fn invert(name: Cow<'static, str>, result: GrantResult) -> GrantResult {
     let decision = match result.decision() {
         Decision::Grant => Decision::NotApplicable,
         Decision::NotApplicable => Decision::Grant,
         _ => Decision::Indeterminate,
     };
-    GrantResult(combined(
-        "NotPolicy",
-        CombineOp::Not,
-        vec![result.0],
-        decision,
-    ))
+    GrantResult(combined(name, CombineOp::Not, vec![result.0], decision))
 }
 #[async_trait]
 impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
@@ -234,7 +284,7 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
             self.policy.policy_type(),
         );
         let result = self.policy.evaluate(&inner).await;
-        invert(inner.finish(result))
+        invert(self.name.clone(), inner.finish(result))
     }
     async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<GrantResult> {
         let inner = BatchEvalCtx::new(
@@ -259,10 +309,13 @@ impl<D: PolicyDomain> Policy<D> for NotPolicy<D> {
                 })
                 .collect();
         }
-        results.into_iter().map(invert).collect()
+        results
+            .into_iter()
+            .map(|result| invert(self.name.clone(), result))
+            .collect()
     }
     fn policy_type(&self) -> Cow<'static, str> {
-        Cow::Borrowed("NotPolicy")
+        self.name.clone()
     }
 }
 
@@ -271,12 +324,14 @@ pub trait VetoPolicyExt<D: PolicyDomain>: VetoPolicy<D> + Sized + 'static {
     /// Forbids only if both children forbid. A definite pass defeats uncertainty.
     fn all_of<P: VetoPolicy<D> + 'static>(self, other: P) -> AllOfVeto<D> {
         AllOfVeto {
+            name: Cow::Borrowed("AllOfVeto"),
             policies: vec![Arc::new(self), Arc::new(other)],
         }
     }
     /// Forbids if either child forbids. A definite veto defeats uncertainty.
     fn any_of<P: VetoPolicy<D> + 'static>(self, other: P) -> AnyOfVeto<D> {
         AnyOfVeto {
+            name: Cow::Borrowed("AnyOfVeto"),
             policies: vec![Arc::new(self), Arc::new(other)],
         }
     }
@@ -288,16 +343,30 @@ pub trait VetoPolicyExt<D: PolicyDomain>: VetoPolicy<D> + Sized + 'static {
 impl<D: PolicyDomain, P: VetoPolicy<D> + Sized + 'static> VetoPolicyExt<D> for P {}
 /// Forbids when all veto children forbid.
 pub struct AllOfVeto<D: PolicyDomain> {
+    name: Cow<'static, str>,
     policies: Vec<Arc<dyn VetoPolicy<D>>>,
 }
 /// Forbids when any veto child forbids.
 pub struct AnyOfVeto<D: PolicyDomain> {
+    name: Cow<'static, str>,
     policies: Vec<Arc<dyn VetoPolicy<D>>>,
 }
-constructor!(AllOfVeto, VetoPolicy);
-constructor!(AnyOfVeto, VetoPolicy);
+constructor!(
+    AllOfVeto,
+    VetoPolicy,
+    "An all-of veto forbids only when every child does, so this is the name \
+     [`crate::AccessEvaluation::forbidden_by`] reports; name it after the rule it expresses."
+);
+constructor!(
+    AnyOfVeto,
+    VetoPolicy,
+    "An any-of veto forbids through one child, which is what \
+     [`crate::AccessEvaluation::forbidden_by`] reports; this name appears in \
+     [`crate::AccessEvaluation::forbidden_path`]."
+);
 
 async fn veto_children<D: PolicyDomain>(
+    name: Cow<'static, str>,
     policies: &[Arc<dyn VetoPolicy<D>>],
     ctx: &BatchEvalCtx<'_, D>,
     conjunction: bool,
@@ -385,11 +454,7 @@ async fn veto_children<D: PolicyDomain>(
                 Decision::NotApplicable
             };
             VetoResult(combined(
-                if conjunction {
-                    "AllOfVeto"
-                } else {
-                    "AnyOfVeto"
-                },
+                name.clone(),
                 if conjunction {
                     CombineOp::And
                 } else {
@@ -417,18 +482,24 @@ macro_rules! veto_combinator {
                     &items,
                     self.policy_type(),
                 );
-                veto_children(&self.policies, &inner, $conjunction, true)
-                    .await
-                    .remove(0)
+                veto_children(
+                    self.name.clone(),
+                    &self.policies,
+                    &inner,
+                    $conjunction,
+                    true,
+                )
+                .await
+                .remove(0)
             }
             async fn evaluate_batch<'item>(&self, ctx: &BatchEvalCtx<'item, D>) -> Vec<VetoResult> {
                 if ctx.items.is_empty() {
                     return Vec::new();
                 }
-                veto_children(&self.policies, ctx, $conjunction, false).await
+                veto_children(self.name.clone(), &self.policies, ctx, $conjunction, false).await
             }
             fn policy_type(&self) -> Cow<'static, str> {
-                Cow::Borrowed(stringify!($name))
+                self.name.clone()
             }
         }
     };

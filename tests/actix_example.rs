@@ -77,6 +77,30 @@ async fn edit_post_allows_collaborator_via_relationship() {
 }
 
 #[actix_web::test]
+async fn collaborator_edit_is_bounded_by_the_author_draft_window() {
+    // The collaborator holds an editor relationship on every demo post, so
+    // only the draft window can refuse these edits. A collaborator must never
+    // be able to edit a post its author cannot.
+    let app = init_actix_app!().await;
+    let old_draft = Uuid::parse_str("dddddddd-dddd-dddd-dddd-dddddddddddd").unwrap();
+
+    for post_id in [published_post_id(), locked_post_id(), old_draft] {
+        for user_id in [author_id(), collaborator_id()] {
+            let req = test::TestRequest::put()
+                .uri(&format!("/posts/{post_id}"))
+                .insert_header(("x-user-id", user_id.to_string()))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "user {user_id} editing post {post_id}"
+            );
+        }
+    }
+}
+
+#[actix_web::test]
 async fn edit_post_denies_non_author() {
     let app = init_actix_app!().await;
 

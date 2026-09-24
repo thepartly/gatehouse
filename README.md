@@ -117,12 +117,12 @@ flowchart LR
 
 The checker first resolves vetoes. A definite veto denies access even if another veto failed. Unresolved veto uncertainty blocks grants. Once vetoes pass, any grant authorizes; a failed grant policy does not defeat an independent grant. If nothing grants, uncertainty yields `AccessEvaluation::Indeterminate`; otherwise access is `Denied`. An empty checker denies access.
 
-At application boundaries, use `bound.authorize(&resource).await?`, or `evaluation.into_result()` when you already have a decision. Both return `Ok(())`, `AccessError::Denied { reason, trace }`, or `AccessError::Indeterminate { reason, trace }`. Map denial to a forbidden response and indeterminate to an appropriate service error. Both the evaluation and typed error expose `fact_load_errors()` with structured `FactProvenance::error_kind`. An error recorded on an otherwise successful decision need not be its cause; classify the final decision first.
+At application boundaries, use `bound.authorize(&resource).await?`, or `evaluation.into_result()` when you already have a decision. Both return `Ok(())`, `AccessError::Denied { reason, trace, .. }`, or `AccessError::Indeterminate { reason, trace, .. }`. Map denial to a forbidden response and indeterminate to an appropriate service error. Both the evaluation and typed error expose `fact_load_errors()` with structured `FactProvenance::error_kind`. An error recorded on an otherwise successful decision need not be its cause; classify the final decision first.
 
 `AccessEvaluation`, `GrantResult`, and `VetoResult` are `#[must_use]`: discarding them warns by default and fails compilation under `#![deny(unused_must_use)]`. The batch methods `evaluate` and `evaluate_by` also warn when their awaited results are discarded. This catches accidental omissions; callers can still deliberately ignore results.
 
 ```rust
-use gatehouse::{AccessError, AccessEvaluation, EvalTrace};
+use gatehouse::{AccessError, AccessEvaluation};
 
 fn http_status(evaluation: AccessEvaluation) -> u16 {
     match evaluation.into_result() {
@@ -131,10 +131,6 @@ fn http_status(evaluation: AccessEvaluation) -> u16 {
         Err(_) => 503,
     }
 }
-assert_eq!(http_status(AccessEvaluation::Indeterminate {
-    reason: "authorization input unavailable".into(),
-    trace: EvalTrace::new(),
-}), 503);
 ```
 
 `PolicyEvalResult` is the audit tree, accessed through `GrantResult::trace`, `VetoResult::trace`, or the final `EvalTrace`. It is not a policy return type. Its public nodes support inspection and serialization; arbitrary raw trees cannot be converted into typed policy results.
@@ -337,7 +333,7 @@ If your product contract authorizes once at stream open, create a fresh session,
 
 When trace-level events are enabled, checker evaluation records spans for single-resource and batch evaluation, and each evaluated policy records a `trace!` event on the `gatehouse::security` target. Batch evaluation records aggregate item counts and nested `gatehouse.batch_policy` spans with per-policy counts.
 
-Reason strings are emitted verbatim. Keep credentials, tokens, raw PII, and other sensitive material out of policy reasons and fact provenance details. Enable the optional `serde` feature to serialize `AccessEvaluation`, `EvalTrace`, `PolicyEvalResult`, and fact provenance for audit logs.
+Reason strings are emitted verbatim. Keep credentials, tokens, raw PII, and other sensitive material out of policy reasons and fact provenance details. Backend errors wrapped with `FactLoadError::backend` are recorded as a fixed placeholder; use `FactLoadError::backend_with_message` to record a safe description and keep the original error on `source()` for your own logs. Enable the optional `serde` feature to serialize `AccessEvaluation`, `EvalTrace`, `PolicyEvalResult`, and fact provenance for audit logs.
 
 Security event fields:
 

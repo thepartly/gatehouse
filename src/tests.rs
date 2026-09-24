@@ -3258,6 +3258,62 @@ mod core_tests {
     }
 
     #[test]
+    fn provenance_withholds_backend_error_text_not_written_for_audit() {
+        use std::error::Error as _;
+        const SECRET: &str = "DETAIL: Key (email)=(alice@example.com) already exists";
+
+        let raw = FactLoadError::backend(std::io::Error::other(SECRET));
+        let provenance = FactProvenance::from_load_result(
+            "membership",
+            "IsMember(42)",
+            &FactLoadResult::<bool>::Error(raw.clone()),
+        );
+        assert_eq!(provenance.error_kind, Some(FactLoadErrorKind::Backend));
+        assert_eq!(
+            provenance.detail.as_deref(),
+            Some(crate::facts::REDACTED_BACKEND_DETAIL)
+        );
+        assert!(!provenance.to_string().contains("alice"));
+        assert_eq!(
+            raw.to_string(),
+            SECRET,
+            "Display keeps the message for operators"
+        );
+
+        let wrapped = FactLoadError::backend_with_message(
+            "membership lookup failed",
+            std::io::Error::other(SECRET),
+        );
+        let provenance = FactProvenance::from_load_result(
+            "membership",
+            "IsMember(42)",
+            &FactLoadResult::<bool>::Error(wrapped.clone()),
+        );
+        assert_eq!(
+            provenance.detail.as_deref(),
+            Some("membership lookup failed")
+        );
+        assert_eq!(wrapped.to_string(), "membership lookup failed");
+        assert_eq!(
+            wrapped.source().map(|source| source.to_string()).as_deref(),
+            Some(SECRET),
+            "the backend error stays reachable for logging"
+        );
+
+        let message = FactLoadError::backend_message("database unavailable");
+        assert_eq!(message.audit_detail(), "database unavailable");
+        assert!(message.source().is_none());
+
+        let nested = FactLoadError::backend(FactLoadError::backend_message("shard offline"));
+        assert_eq!(nested.audit_detail(), "shard offline");
+        let nested_raw = FactLoadError::backend(raw);
+        assert_eq!(
+            nested_raw.audit_detail(),
+            crate::facts::REDACTED_BACKEND_DETAIL
+        );
+    }
+
+    #[test]
     fn provenance_from_load_result_leaves_non_errors_unclassified() {
         let found = FactLoadResult::Found(true);
         let missing = FactLoadResult::<bool>::Missing;
@@ -3920,7 +3976,9 @@ mod policy_builder_tests {
         let mut checker = PermissionChecker::new();
         checker.add_policy(allow_policy);
         checker.add_veto(
-            block_policy.all_of(PolicyBuilder::<TestDomain>::new("SecondBlock").forbid_all()),
+            block_policy
+                .all_of(PolicyBuilder::<TestDomain>::new("SecondBlock").forbid_all())
+                .named("BlockAliceEverywhere"),
         );
 
         let session = EvaluationSession::empty();
@@ -3938,8 +3996,14 @@ mod policy_builder_tests {
 
         assert_eq!(results.len(), 2);
         for (_resource, evaluation) in results {
-            evaluation.assert_forbidden_by("BlockAlicePolicy");
-            evaluation.assert_trace_contains("AllOfVeto");
+            // Both children had to forbid, so the all-of veto decided as a
+            // whole and is credited, not its first child.
+            evaluation.assert_forbidden_by("BlockAliceEverywhere");
+            assert_eq!(evaluation.forbidden_path(), ["BlockAliceEverywhere"]);
+            assert_eq!(
+                evaluation.denied_reason(),
+                Some("Forbidden by BlockAliceEverywhere")
+            );
         }
     }
 
@@ -5112,6 +5176,27 @@ mod policy_builder_tests {
             Some("Forbidden by GlobalFreeze: Policy forbids access"),
             "forbid_all keeps the veto reason text"
         );
+    }
+
+    #[test]
+    fn predicate_veto_adapter_maps_each_decision_without_failing_open() {
+        let forbid = crate::builder::predicate_veto_result(GrantResult::granted("Rule", None));
+        assert_eq!(forbid.decision(), Decision::Forbid);
+
+        let pass =
+            crate::builder::predicate_veto_result(GrantResult::not_applicable("Rule", "no match"));
+        assert_eq!(pass.decision(), Decision::NotApplicable);
+
+        let unknown = crate::builder::predicate_veto_result(GrantResult::indeterminate(
+            "Rule",
+            "fact failed",
+        ));
+        assert_eq!(
+            unknown.decision(),
+            Decision::Indeterminate,
+            "an unresolved predicate must block grants, not pass the veto"
+        );
+        assert_eq!(unknown.policy_type(), "Rule");
     }
 }
 

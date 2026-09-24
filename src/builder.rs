@@ -1,6 +1,6 @@
 use crate::{
-    BatchEvalCtx, EvalCtx, GrantResult, Policy, PolicyDomain, PolicyEvalResult, VetoPolicy,
-    VetoResult,
+    BatchEvalCtx, Decision, EvalCtx, GrantResult, Policy, PolicyDomain, PolicyEvalResult,
+    VetoPolicy, VetoResult,
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -607,8 +607,8 @@ impl<D: PolicyDomain> VetoPolicy<D> for PredicateVeto<D> {
         self.0.policy_type()
     }
 }
-fn predicate_veto_result(result: GrantResult) -> VetoResult {
-    let matched = result.is_granted();
+pub(crate) fn predicate_veto_result(result: GrantResult) -> VetoResult {
+    let decision = result.decision();
     let policy_type = match result.0 {
         PolicyEvalResult::Granted { policy_type, .. }
         | PolicyEvalResult::NotApplicable { policy_type, .. }
@@ -616,9 +616,12 @@ fn predicate_veto_result(result: GrantResult) -> VetoResult {
         | PolicyEvalResult::Indeterminate { policy_type, .. }
         | PolicyEvalResult::Combined { policy_type, .. } => policy_type,
     };
-    if matched {
-        VetoResult::forbid(policy_type, "Policy forbids access")
-    } else {
-        VetoResult::pass(policy_type, "Policy predicate did not match")
+    // Only a definite non-match passes. Any other non-grant is indeterminate,
+    // so the veto blocks grants instead of failing open. Builder predicates
+    // return `bool`, so that arm is currently unreachable.
+    match decision {
+        Decision::Grant => VetoResult::forbid(policy_type, "Policy forbids access"),
+        Decision::NotApplicable => VetoResult::pass(policy_type, "Policy predicate did not match"),
+        _ => VetoResult::indeterminate(policy_type, "Veto predicate could not be evaluated"),
     }
 }

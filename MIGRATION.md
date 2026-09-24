@@ -4,7 +4,8 @@ This guide describes the 0.6 prerelease API, including typed grant and veto
 capabilities. `0.6.0-alpha.1` is the first prerelease of that line; expect
 further breaking changes before 0.6.0. Rust 1.82 remains the minimum supported
 compiler. The historical 0.4 → 0.5 guide follows at the end and describes that
-older API only.
+older API only. Upgrading from 0.6.0-alpha.2? See
+[Unreleased changes after 0.6.0-alpha.2](#unreleased-changes-after-060-alpha2).
 
 ## Separate grants from vetoes
 
@@ -232,7 +233,7 @@ Replace reason-only `to_result(...)` conversion or blanket 403 responses with
 `into_result()` and classify `AccessError`:
 
 ```rust
-use gatehouse::{AccessError, AccessEvaluation, EvalTrace};
+use gatehouse::{AccessError, AccessEvaluation};
 
 fn status(evaluation: AccessEvaluation) -> u16 {
     match evaluation.into_result() {
@@ -241,10 +242,6 @@ fn status(evaluation: AccessEvaluation) -> u16 {
         Err(_) => 503,
     }
 }
-assert_eq!(status(AccessEvaluation::Indeterminate {
-    reason: "authorization input unavailable".into(),
-    trace: EvalTrace::new(),
-}), 503);
 ```
 
 `AccessError` retains the full trace and exposes `fact_load_errors()` for
@@ -346,7 +343,7 @@ Other source and behavior changes:
 - `FactProvenance` gains `error_kind`. Add `error_kind: None` to old struct
   literals, or prefer `from_load_result`. `new` produces unclassified evidence.
 - `RebacPolicy` returns indeterminate for failed loads. `Missing` and
-  `Found(false)` still abstain. Backend detail stays in provenance.
+  `Found(false)` still abstain. The failure's `error_kind` and audit-safe detail stay in provenance.
 - Wrong-length policy batches produce indeterminate results. Veto failures
   block grants; grant failures can be superseded by a later grant.
 - `NotPolicy` preserves uncertainty, including explicit failed-load evidence
@@ -368,6 +365,31 @@ Before adopting the prerelease, run custom policy and batch tests, inject fact
 backend failures into single and list endpoints, and check every wildcard
 match on `AccessEvaluation`. Create a fresh session for retries and each
 reauthorization pass so cached failures or stale permissions are not reused.
+
+## Unreleased changes after 0.6.0-alpha.2
+
+- **Decisions are sealed.** The variants of `AccessEvaluation` and
+  `AccessError`, and the `FilterError` and `LookupAuthorizedPage` structs,
+  can be read and matched but no longer constructed outside Gatehouse. Add
+  `..` to struct patterns on the enum variants, for example
+  `AccessError::Denied { reason, .. }`. Tests that built a decision by hand
+  should obtain one from a `PermissionChecker` instead.
+- **Decisions name the policy that decided them.** Grants and vetoes follow
+  the same rule. An `OrPolicy`, `AnyOfVeto`, or delegate passes the decision
+  up from one child, so `granted_policy_type()`, `forbidden_by()`,
+  `assert_granted_by`, `assert_forbidden_by`, and the summary reason now name
+  that child. An `AndPolicy`, `NotPolicy`, or `AllOfVeto` decides as a whole
+  and is named itself; previously `forbidden_by` named the first child of an
+  `AllOfVeto`. Update assertions such as `assert_granted_by("OrPolicy")`, or
+  ones naming a delegate, to name the deciding child. `grant_path()` and
+  `forbidden_path()` return the chain from the registered policy (for example
+  a delegate or `OrPolicy`) down to the decider. Give combinators a
+  meaningful name with `.named("...")`.
+- **Backend error text stays out of audit output.** `FactProvenance::detail`
+  for an error wrapped with `FactLoadError::backend(err)` is now a fixed
+  placeholder. Use `FactLoadError::backend_with_message("safe text", err)` to
+  record a description while keeping `err` available through
+  `std::error::Error::source` for your own logs.
 
 ---
 
