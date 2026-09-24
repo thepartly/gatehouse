@@ -191,6 +191,12 @@ impl GrantResult {
         ))
     }
     /// Combines grant results with OR semantics. An empty disjunction abstains.
+    ///
+    /// A granting disjunction passes the grant up from its first granting
+    /// child, so that child, not `policy_type`, is what
+    /// [`crate::AccessEvaluation::granted_policy_type`] reports. Use
+    /// [`Self::all`] or a single leaf result when this policy should be
+    /// credited itself.
     pub fn any(policy_type: impl Into<Cow<'static, str>>, children: Vec<Self>) -> Self {
         let decision = if children.iter().any(Self::is_granted) {
             Decision::Grant

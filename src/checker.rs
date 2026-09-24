@@ -1009,9 +1009,9 @@ fn evaluation_from_tree(tree: PolicyEvalResult) -> AccessEvaluation {
     }
 }
 /// Names the node that decided a grant and its reason. See
-/// [`PolicyEvalResult::grant_path`] for how the decider is chosen.
+/// [`PolicyEvalResult::grant_nodes`] for how the decider is chosen.
 fn winning_grant(tree: &PolicyEvalResult) -> Option<(Cow<'static, str>, Option<String>)> {
-    tree.grant_path().last().map(|node| {
+    tree.grant_nodes().last().map(|node| {
         let policy_type = match node {
             PolicyEvalResult::Granted { policy_type, .. }
             | PolicyEvalResult::NotApplicable { policy_type, .. }

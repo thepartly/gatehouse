@@ -296,7 +296,9 @@ pub enum PolicyEvalResult {
     /// Contains the policy type, the combining operation ([`CombineOp`]),
     /// a list of child evaluation results, and the aggregate decision.
     Combined {
-        /// The name of the combinator policy (e.g. `"AndPolicy"`).
+        /// The aggregate's name: a combinator's type name (e.g.
+        /// `"AndPolicy"`) or the name given with `named`, a delegate's name,
+        /// or the checker root's name.
         policy_type: Cow<'static, str>,
         /// The boolean operation used to combine child results.
         operation: CombineOp,
@@ -367,14 +369,17 @@ pub enum PolicyEvalResult {
 /// # });
 /// ```
 ///
-/// ### Only a checker produces decisions
+/// ### Decisions come only from evaluation
 ///
-/// Every variant is `#[non_exhaustive]`, so code outside this crate can
-/// match on an evaluation but cannot construct one. An `AccessEvaluation`,
-/// [`AccessError`], [`FilterError`], or [`crate::LookupAuthorizedPage`] in
-/// hand therefore came from a [`crate::PermissionChecker`]:
+/// The variants of `AccessEvaluation` and [`AccessError`], and the
+/// [`FilterError`] and [`crate::LookupAuthorizedPage`] structs, are
+/// `#[non_exhaustive]`. Code outside this crate can read and match them but
+/// cannot construct them, so each value was produced by a
+/// [`crate::PermissionChecker`] evaluating policies. This is a statement
+/// about provenance, not trust: the policies may be anything, and the owner
+/// of a value can still write to its public fields.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0639
 /// use gatehouse::{AccessEvaluation, EvalTrace};
 /// let forged = AccessEvaluation::Granted {
 ///     policy_type: "Forged".into(),
@@ -383,7 +388,7 @@ pub enum PolicyEvalResult {
 /// };
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0639
 /// use gatehouse::{AccessError, EvalTrace};
 /// let forged = AccessError::Denied {
 ///     reason: "forged".into(),
@@ -391,14 +396,14 @@ pub enum PolicyEvalResult {
 /// };
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0639
 /// let forged = gatehouse::LookupAuthorizedPage::<u32> {
 ///     resources: vec![1],
 ///     next_cursor: None,
 /// };
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0639
 /// let forged = gatehouse::FilterError::<u32> { evaluations: Vec::new() };
 /// ```
 #[derive(Debug, Clone)]
@@ -410,7 +415,8 @@ pub enum AccessEvaluation {
     /// Access was granted.
     #[non_exhaustive]
     Granted {
-        /// The policy that granted access. `Cow<'static, str>` for the
+        /// The policy that decided the grant; see
+        /// [`AccessEvaluation::granted_policy_type`]. `Cow<'static, str>` for the
         /// same reason as on [`PolicyEvalResult`]: static names pass
         /// through with zero allocation.
         policy_type: Cow<'static, str>,
@@ -561,6 +567,23 @@ fn leaf_not_applicable_matches(node: &PolicyEvalResult, expected: &str) -> bool 
     }
 }
 
+/// Names the decisive spine of a checker-produced trace. Only a checker's
+/// deny-overrides root is searched, so a hand-built trace attributes nothing.
+fn decisive_path<'a, I>(trace: &'a EvalTrace, nodes: fn(&'a PolicyEvalResult) -> I) -> Vec<&'a str>
+where
+    I: Iterator<Item = &'a PolicyEvalResult>,
+{
+    match trace.root() {
+        Some(
+            root @ PolicyEvalResult::Combined {
+                operation: CombineOp::DenyOverrides,
+                ..
+            },
+        ) => nodes(root).map(PolicyEvalResult::policy_type).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Collects every [`FactProvenance`] with [`FactOutcome::Error`] from a
 /// result tree (leaves and combinator children).
 fn collect_fact_load_errors<'a>(node: &'a PolicyEvalResult, out: &mut Vec<&'a FactProvenance>) {
@@ -618,8 +641,15 @@ impl AccessEvaluation {
     ///
     /// This is the deciding policy, not necessarily the registered one: a
     /// grant through [`crate::OrPolicy`] or a delegate names the child that
-    /// granted, mirroring [`Self::forbidden_by`]. Use [`Self::grant_path`] for
-    /// the chain of policies it was reached through.
+    /// granted, while [`crate::AndPolicy`] and [`crate::NotPolicy`] are named
+    /// themselves. [`Self::forbidden_by`] follows the same rule for vetoes.
+    /// Use [`Self::grant_path`] for the chain the grant passed through; its
+    /// first entry is the registered policy.
+    ///
+    /// Policy names are labels chosen by whoever built the policy. They are
+    /// not unique, and a child checker behind a delegate can use the same
+    /// name as a parent policy, so branch on names only where you control
+    /// every policy that could produce them.
     pub fn granted_policy_type(&self) -> Option<&str> {
         match self {
             Self::Granted { policy_type, .. } => Some(policy_type),
@@ -630,24 +660,17 @@ impl AccessEvaluation {
     /// Returns the policy names from the registered policy down to the one
     /// that decided a grant, outermost first. Empty for non-grants.
     ///
-    /// [`Self::granted_policy_type`] is the last entry. The earlier entries
-    /// give its context: the delegate and combinators it was reached
-    /// through. Checker roots, including the child checker inside a
-    /// delegate, are omitted.
-    ///
-    /// A conjunction ([`crate::AndPolicy`]) or inversion
-    /// ([`crate::NotPolicy`]) decides as a whole, so the path ends there.
-    /// Name it with `named` to make that entry meaningful.
+    /// The first entry is the policy registered with the checker, the last is
+    /// [`Self::granted_policy_type`], and any between are the delegates and
+    /// combinators the grant passed through. Checker roots, including the
+    /// child checker inside a delegate, are omitted. The path ends at a
+    /// conjunction ([`crate::AndPolicy`]) or inversion
+    /// ([`crate::NotPolicy`]), which decides as a whole.
     pub fn grant_path(&self) -> Vec<&str> {
-        let Self::Granted { trace, .. } = self else {
-            return Vec::new();
-        };
-        trace.root().map_or_else(Vec::new, |root| {
-            root.grant_path()
-                .into_iter()
-                .map(PolicyEvalResult::policy_type)
-                .collect()
-        })
+        match self {
+            Self::Granted { trace, .. } => decisive_path(trace, PolicyEvalResult::grant_nodes),
+            Self::Denied { .. } | Self::Indeterminate { .. } => Vec::new(),
+        }
     }
 
     /// Returns the summary denial reason when the evaluation was a denial.
@@ -681,23 +704,27 @@ impl AccessEvaluation {
     /// hold) from "no grant matched" — for example to map the former to a
     /// distinct HTTP status or audit event. Returns `None` for grants and
     /// for ordinary denials.
+    ///
+    /// This names the policy that decided the veto. A veto through
+    /// [`crate::AnyOfVeto`] or a delegate names the child that forbade;
+    /// [`crate::AllOfVeto`] forbids only when every child does, so it is
+    /// named itself. Use [`Self::forbidden_path`] for the full chain.
     pub fn forbidden_by(&self) -> Option<&str> {
-        let Self::Denied { trace, .. } = self else {
+        self.forbidden_path().last().copied()
+    }
+
+    /// Returns the policy names from the registered veto down to the one
+    /// that decided it, outermost first. Empty unless a veto caused the
+    /// denial.
+    ///
+    /// Mirrors [`Self::grant_path`]; [`Self::forbidden_by`] is the last entry.
+    pub fn forbidden_path(&self) -> Vec<&str> {
+        match self {
             // Grants have no veto; an indeterminate evaluation means no
             // forbid was observed (an observed forbid produces `Denied`).
-            return None;
-        };
-        let Some(PolicyEvalResult::Combined {
-            operation: CombineOp::DenyOverrides,
-            children,
-            ..
-        }) = trace.root()
-        else {
-            return None;
-        };
-        children
-            .iter()
-            .find_map(|child| child.forbidden_leaf().map(|(policy_type, _)| policy_type))
+            Self::Denied { trace, .. } => decisive_path(trace, PolicyEvalResult::forbid_nodes),
+            Self::Granted { .. } | Self::Indeterminate { .. } => Vec::new(),
+        }
     }
 
     /// Returns every fact provenance entry with [`FactOutcome::Error`]
@@ -710,8 +737,9 @@ impl AccessEvaluation {
     /// not-applicable leaves; this helper walks the whole tree so callers
     /// do not need to destructure combinators by hand.
     ///
-    /// Use this when you need the backend error detail (via
-    /// [`FactProvenance::detail`]) rather than a simple boolean — see
+    /// Use this when you need the error classification (via
+    /// [`FactProvenance::error_kind`]) and audit-safe detail rather than a
+    /// simple boolean — see
     /// [`Self::denied_due_to_fact_load_error`] for the yes/no form.
     pub fn fact_load_errors(&self) -> Vec<&FactProvenance> {
         let mut errors = Vec::new();
@@ -1393,19 +1421,28 @@ impl PolicyEvalResult {
         self.decision() == Decision::Forbid
     }
 
-    /// Returns the active grant spine, outermost first, without checker
-    /// roots: this node and, recursively, the child that carried the grant,
-    /// down to the node that decided it.
+    /// Walks the nodes that carried a definite `decision`, outermost first,
+    /// skipping checker roots.
     ///
-    /// Disjunctions (OR, delegation, and a checker's deny-overrides root)
-    /// grant through one child, so the search descends into the first
-    /// granting child. A conjunction or inversion decided as a whole, so it
-    /// ends the spine: naming one AND child would credit a guard with a grant
-    /// that every child was needed for. Nothing is collected for a non-grant.
-    pub(crate) fn grant_path(&self) -> Vec<&Self> {
-        let mut spine = Vec::new();
-        self.grant_spine(&mut spine);
-        spine.retain(|node| {
+    /// OR, delegation, and checker-root nodes pass a decision up from one
+    /// child, so the walk continues into the first child with that decision.
+    /// Any other aggregate (AND, NOT, all-of veto) reached its decision as a
+    /// whole and ends the walk: naming one of its children would credit a
+    /// guard with an outcome that every child was needed for. The walk is
+    /// empty when this node's decision differs.
+    fn decisive_nodes(&self, decision: Decision) -> impl Iterator<Item = &Self> + '_ {
+        std::iter::successors(
+            (self.decision() == decision).then_some(self),
+            move |node| match node {
+                Self::Combined {
+                    operation: CombineOp::Or | CombineOp::Delegate | CombineOp::DenyOverrides,
+                    children,
+                    ..
+                } => children.iter().find(|child| child.decision() == decision),
+                _ => None,
+            },
+        )
+        .filter(|node| {
             !matches!(
                 node,
                 Self::Combined {
@@ -1413,42 +1450,24 @@ impl PolicyEvalResult {
                     ..
                 }
             )
-        });
-        spine
+        })
     }
 
-    fn grant_spine<'a>(&'a self, spine: &mut Vec<&'a Self>) {
-        if !self.is_granted() {
-            return;
-        }
-        spine.push(self);
-        if let Self::Combined {
-            operation: CombineOp::Or | CombineOp::Delegate | CombineOp::DenyOverrides,
-            children,
-            ..
-        } = self
-        {
-            if let Some(child) = children.iter().find(|child| child.is_granted()) {
-                child.grant_spine(spine);
-            }
-        }
+    /// The grant spine: see [`Self::decisive_nodes`].
+    pub(crate) fn grant_nodes(&self) -> impl Iterator<Item = &Self> + '_ {
+        self.decisive_nodes(Decision::Grant)
     }
 
+    /// The veto spine: see [`Self::decisive_nodes`].
+    pub(crate) fn forbid_nodes(&self) -> impl Iterator<Item = &Self> + '_ {
+        self.decisive_nodes(Decision::Forbid)
+    }
+
+    /// Names the node that decided a veto, with its reason when it is a leaf.
     pub(crate) fn forbidden_leaf(&self) -> Option<(&str, Option<&str>)> {
-        match self {
-            Self::Forbidden {
-                policy_type,
-                reason,
-                ..
-            } => Some((policy_type.as_ref(), Some(reason.as_str()))),
-            Self::Combined {
-                children,
-                decision: Decision::Forbid,
-                ..
-            } => children.iter().find_map(Self::forbidden_leaf),
-            Self::Combined { .. } => None,
-            Self::Granted { .. } | Self::NotApplicable { .. } | Self::Indeterminate { .. } => None,
-        }
+        self.forbid_nodes()
+            .last()
+            .map(|node| (node.policy_type(), node.reason_str()))
     }
 
     /// Attributes uncertainty along the active indeterminate spine.

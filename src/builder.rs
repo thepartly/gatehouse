@@ -616,9 +616,9 @@ pub(crate) fn predicate_veto_result(result: GrantResult) -> VetoResult {
         | PolicyEvalResult::Indeterminate { policy_type, .. }
         | PolicyEvalResult::Combined { policy_type, .. } => policy_type,
     };
-    // Only a definite non-match passes. Anything else that is not a match
-    // (today unreachable, since builder predicates are pure) must block
-    // grants rather than let the veto fail open.
+    // Only a definite non-match passes. Any other non-grant is indeterminate,
+    // so the veto blocks grants instead of failing open. Builder predicates
+    // return `bool`, so that arm is currently unreachable.
     match decision {
         Decision::Grant => VetoResult::forbid(policy_type, "Policy forbids access"),
         Decision::NotApplicable => VetoResult::pass(policy_type, "Policy predicate did not match"),

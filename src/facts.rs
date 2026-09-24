@@ -69,6 +69,10 @@ pub(crate) const REDACTED_BACKEND_DETAIL: &str =
     "backend error (message withheld from audit output)";
 
 /// Error raised while loading a fact.
+///
+/// [`fmt::Display`] and [`fmt::Debug`] include a wrapped backend error's own
+/// text, so they are for operational logs only. [`Self::audit_detail`] is the
+/// audit-safe form that Gatehouse records in traces.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum FactLoadError {
@@ -133,10 +137,10 @@ pub enum FactLoadErrorKind {
 impl FactLoadError {
     /// Wraps a backend error.
     ///
-    /// The error's own message is kept for [`fmt::Display`] and
-    /// [`std::error::Error::source`], but is withheld from audit output:
-    /// [`Self::audit_detail`] and [`crate::FactProvenance::detail`] record a
-    /// fixed placeholder. Database and client errors can quote row values or
+    /// The error is wrapped transparently: this error's [`fmt::Display`]
+    /// shows its message and [`std::error::Error::source`] forwards its
+    /// cause. Audit output withholds the message: [`Self::audit_detail`] and
+    /// [`crate::FactProvenance::detail`] record a fixed placeholder. Database and client errors can quote row values or
     /// connection details, and traces are routinely logged and serialized.
     /// Use [`Self::backend_with_message`] to record a safe description.
     pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
@@ -157,8 +161,8 @@ impl FactLoadError {
     /// Wraps a backend error behind a caller-authored message.
     ///
     /// `message` is what audit output records and what [`fmt::Display`]
-    /// shows. `source` stays reachable through [`std::error::Error::source`]
-    /// for operational logging, and is never copied into the trace.
+    /// shows. `source` is returned by [`std::error::Error::source`] for
+    /// operational logging and is never copied into the trace.
     pub fn backend_with_message(
         message: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -173,14 +177,20 @@ impl FactLoadError {
     ///
     /// Gatehouse-raised errors describe themselves. A backend error built with
     /// [`Self::backend_message`] or [`Self::backend_with_message`] records its
-    /// caller-authored message; any other backend error records a fixed
-    /// placeholder instead of its own message.
+    /// caller-authored message, as does a `FactLoadError` wrapped in
+    /// another; any other backend error records a fixed placeholder instead
+    /// of its own message.
     pub fn audit_detail(&self) -> Cow<'_, str> {
         match self {
-            Self::Backend(error) => match error.downcast_ref::<MessageError>() {
-                Some(message) => Cow::Borrowed(message.message.as_str()),
-                None => Cow::Borrowed(REDACTED_BACKEND_DETAIL),
-            },
+            Self::Backend(error) => {
+                if let Some(message) = error.downcast_ref::<MessageError>() {
+                    Cow::Borrowed(message.message.as_str())
+                } else if let Some(inner) = error.downcast_ref::<FactLoadError>() {
+                    inner.audit_detail()
+                } else {
+                    Cow::Borrowed(REDACTED_BACKEND_DETAIL)
+                }
+            }
             _ => Cow::Owned(self.to_string()),
         }
     }

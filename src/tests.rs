@@ -3303,6 +3303,14 @@ mod core_tests {
         let message = FactLoadError::backend_message("database unavailable");
         assert_eq!(message.audit_detail(), "database unavailable");
         assert!(message.source().is_none());
+
+        let nested = FactLoadError::backend(FactLoadError::backend_message("shard offline"));
+        assert_eq!(nested.audit_detail(), "shard offline");
+        let nested_raw = FactLoadError::backend(raw);
+        assert_eq!(
+            nested_raw.audit_detail(),
+            crate::facts::REDACTED_BACKEND_DETAIL
+        );
     }
 
     #[test]
@@ -3968,7 +3976,9 @@ mod policy_builder_tests {
         let mut checker = PermissionChecker::new();
         checker.add_policy(allow_policy);
         checker.add_veto(
-            block_policy.all_of(PolicyBuilder::<TestDomain>::new("SecondBlock").forbid_all()),
+            block_policy
+                .all_of(PolicyBuilder::<TestDomain>::new("SecondBlock").forbid_all())
+                .named("BlockAliceEverywhere"),
         );
 
         let session = EvaluationSession::empty();
@@ -3986,8 +3996,14 @@ mod policy_builder_tests {
 
         assert_eq!(results.len(), 2);
         for (_resource, evaluation) in results {
-            evaluation.assert_forbidden_by("BlockAlicePolicy");
-            evaluation.assert_trace_contains("AllOfVeto");
+            // Both children had to forbid, so the all-of veto decided as a
+            // whole and is credited, not its first child.
+            evaluation.assert_forbidden_by("BlockAliceEverywhere");
+            assert_eq!(evaluation.forbidden_path(), ["BlockAliceEverywhere"]);
+            assert_eq!(
+                evaluation.denied_reason(),
+                Some("Forbidden by BlockAliceEverywhere")
+            );
         }
     }
 

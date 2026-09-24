@@ -78,18 +78,20 @@ impl<D: PolicyDomain> NotPolicy<D> {
     }
 }
 
-/// Adds `named`, which replaces a combinator's default type name in audit
-/// trees, attribution, and telemetry.
+/// Adds `named`, which replaces a combinator's default type name. The
+/// second argument documents what that name is credited with.
 macro_rules! named {
-    ($name:ident) => {
+    ($name:ident, $credit:literal) => {
         impl<D: PolicyDomain> $name<D> {
-            /// Names this combinator for audit output.
+            /// Replaces this combinator's default type name (for example
+            #[doc = concat!("`\"", stringify!($name), "\"`)")]
+            /// in its audit-tree node, attribution paths, and telemetry, so
+            /// two combinators of the same type can be told apart.
             ///
-            /// By default a combinator reports its type name (for example
-            /// `"AndPolicy"`), which cannot tell two combinators apart. A
-            /// conjunction decides a grant as a whole, so it is the policy
-            /// [`crate::AccessEvaluation::granted_policy_type`] reports; give
-            /// it the name of the rule it expresses.
+            #[doc = $credit]
+            ///
+            /// Unlike [`crate::PermissionChecker::named`], which only labels a
+            /// checker's telemetry, this name is the policy's audit identity.
             #[must_use]
             pub fn named(mut self, name: impl Into<Cow<'static, str>>) -> Self {
                 self.name = name.into();
@@ -98,10 +100,15 @@ macro_rules! named {
         }
     };
 }
-named!(NotPolicy);
+named!(
+    NotPolicy,
+    "An inversion decides a grant as a whole, so this is the name \
+     [`crate::AccessEvaluation::granted_policy_type`] reports; name it after \
+     the rule it expresses."
+);
 
 macro_rules! constructor {
-    ($name:ident,$policy:ident) => {
+    ($name:ident, $policy:ident, $credit:literal) => {
         impl<D: PolicyDomain> $name<D> {
             /// Builds a combinator from a nonempty list.
             pub fn try_new(policies: Vec<Arc<dyn $policy<D>>>) -> Result<Self, EmptyPoliciesError> {
@@ -118,11 +125,22 @@ macro_rules! constructor {
                 }
             }
         }
-        named!($name);
+        named!($name, $credit);
     };
 }
-constructor!(AndPolicy, Policy);
-constructor!(OrPolicy, Policy);
+constructor!(
+    AndPolicy,
+    Policy,
+    "A conjunction decides a grant as a whole, so this is the name \
+     [`crate::AccessEvaluation::granted_policy_type`] reports; name it after the rule it expresses."
+);
+constructor!(
+    OrPolicy,
+    Policy,
+    "A disjunction grants through one child, which is what \
+     [`crate::AccessEvaluation::granted_policy_type`] reports; this name appears in \
+     [`crate::AccessEvaluation::grant_path`]."
+);
 
 async fn grant_children<D: PolicyDomain>(
     name: Cow<'static, str>,
@@ -333,8 +351,19 @@ pub struct AnyOfVeto<D: PolicyDomain> {
     name: Cow<'static, str>,
     policies: Vec<Arc<dyn VetoPolicy<D>>>,
 }
-constructor!(AllOfVeto, VetoPolicy);
-constructor!(AnyOfVeto, VetoPolicy);
+constructor!(
+    AllOfVeto,
+    VetoPolicy,
+    "An all-of veto forbids only when every child does, so this is the name \
+     [`crate::AccessEvaluation::forbidden_by`] reports; name it after the rule it expresses."
+);
+constructor!(
+    AnyOfVeto,
+    VetoPolicy,
+    "An any-of veto forbids through one child, which is what \
+     [`crate::AccessEvaluation::forbidden_by`] reports; this name appears in \
+     [`crate::AccessEvaluation::forbidden_path`]."
+);
 
 async fn veto_children<D: PolicyDomain>(
     name: Cow<'static, str>,

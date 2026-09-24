@@ -2186,9 +2186,11 @@ async fn assert_attribution(
         .map(|&(id, _, _)| Resource { id })
         .collect::<Vec<_>>();
     let batch = bind(checker, &session).evaluate(resources.clone()).await;
-    for ((&(id, granted_by, path), resource), (_, batch_evaluation)) in
+    assert_eq!(batch.len(), cases.len());
+    for ((&(id, granted_by, path), resource), (batch_resource, batch_evaluation)) in
         cases.iter().zip(&resources).zip(&batch)
     {
+        assert_eq!(batch_resource.id, id, "batch preserves input order");
         let single = check_resource(checker, &session, resource).await;
         for evaluation in [&single, batch_evaluation] {
             assert_eq!(
@@ -2302,23 +2304,90 @@ async fn delegated_grants_name_the_child_policy_and_keep_the_delegate_in_the_pat
     .await;
 }
 
-#[tokio::test]
-async fn named_veto_combinators_appear_in_the_trace() {
-    let freeze = PolicyBuilder::<Domain>::new("Frozen")
-        .when(|_subject, _action, resource: &Resource, _context| resource.id == 1)
+fn forbid_when(name: &'static str, forbids: fn(u8) -> bool) -> impl VetoPolicy<Domain> {
+    PolicyBuilder::<Domain>::new(name)
+        .when(move |_subject, _action, resource: &Resource, _context| forbids(resource.id))
         .build_veto()
-        .any_of(
-            PolicyBuilder::<Domain>::new("Archived")
-                .when(|_subject, _action, resource: &Resource, _context| resource.id == 2)
-                .build_veto(),
-        )
-        .named("ChangeFreeze");
+}
+
+/// Checks that single and batch evaluation credit the same deciding veto.
+async fn assert_veto_attribution(
+    checker: &PermissionChecker<Domain>,
+    cases: &[(u8, Option<&str>, &[&str])],
+) {
+    let session = EvaluationSession::empty();
+    let resources = cases
+        .iter()
+        .map(|&(id, _, _)| Resource { id })
+        .collect::<Vec<_>>();
+    let batch = bind(checker, &session).evaluate(resources.clone()).await;
+    assert_eq!(batch.len(), cases.len());
+    for ((&(id, forbidden_by, path), resource), (batch_resource, batch_evaluation)) in
+        cases.iter().zip(&resources).zip(&batch)
+    {
+        assert_eq!(batch_resource.id, id, "batch preserves input order");
+        let single = check_resource(checker, &session, resource).await;
+        for evaluation in [&single, batch_evaluation] {
+            assert_eq!(evaluation.forbidden_by(), forbidden_by, "resource {id}");
+            assert_eq!(evaluation.forbidden_path(), path, "resource {id}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vetoes_are_credited_like_grants() {
+    let mut child = PermissionChecker::<Domain>::new();
+    child.add_veto(forbid_when("ChildSeven", |id| id == 7));
+
     let mut checker = PermissionChecker::<Domain>::new();
     checker.add_policy(PolicyBuilder::<Domain>::new("Anyone").allow_all());
-    checker.add_veto(freeze);
+    // Any-of forbids through one child, so that child is credited.
+    checker.add_veto(
+        forbid_when("Frozen", |id| id == 1)
+            .any_of(forbid_when("Archived", |id| id == 2))
+            .named("ChangeFreeze"),
+    );
+    // All-of forbids only when every child does, so it is credited itself.
+    checker.add_veto(
+        forbid_when("Large", |id| id >= 10)
+            .all_of(forbid_when("Odd", |id| id % 2 == 1))
+            .named("LargeOdd"),
+    );
+    checker.add_delegate(DelegatingPolicy::new(
+        "Tenant",
+        child,
+        |_subject: &Subject| Subject,
+        |_action: &Action| Action,
+        |_subject: &Subject, _action: &Action, resource: &Resource, _context: &Ctx| {
+            resource.clone()
+        },
+        |_subject: &Subject, _action: &Action, _context: &Ctx| Ctx,
+    ));
+
+    assert_veto_attribution(
+        &checker,
+        &[
+            (1, Some("Frozen"), &["ChangeFreeze", "Frozen"]),
+            (2, Some("Archived"), &["ChangeFreeze", "Archived"]),
+            (11, Some("LargeOdd"), &["LargeOdd"]),
+            (7, Some("ChildSeven"), &["Tenant", "ChildSeven"]),
+            // An all-of veto whose children disagree passes, and its matched
+            // child does not steal the attribution.
+            (9, None, &[]),
+            (12, None, &[]),
+        ],
+    )
+    .await;
 
     let session = EvaluationSession::empty();
-    let evaluation = check_resource(&checker, &session, &Resource { id: 2 }).await;
-    evaluation.assert_forbidden_by("Archived");
-    evaluation.assert_trace_contains("ChangeFreeze");
+    let all_of = check_resource(&checker, &session, &Resource { id: 11 }).await;
+    assert_eq!(all_of.denied_reason(), Some("Forbidden by LargeOdd"));
+    let any_of = check_resource(&checker, &session, &Resource { id: 2 }).await;
+    assert_eq!(
+        any_of.denied_reason(),
+        Some("Forbidden by Archived: Policy forbids access")
+    );
+    assert!(check_resource(&checker, &session, &Resource { id: 12 })
+        .await
+        .is_granted());
 }
