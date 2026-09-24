@@ -27,7 +27,7 @@ Create a binary crate with `cargo new gatehouse-quickstart`, then add these depe
 
 ```toml
 [dependencies]
-gatehouse = "=0.6.0-alpha.2"
+gatehouse = "=0.6.0-alpha.3"
 tokio = { version = "1", features = ["macros", "rt"] }
 ```
 
