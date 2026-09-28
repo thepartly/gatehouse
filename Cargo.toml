@@ -1,6 +1,6 @@
 [package]
 name = "gatehouse"
-version = "0.6.0-alpha.2"
+version = "0.6.0-alpha.3"
 edition = "2021"
 # 1.82 is the supported compiler floor, verified by the MSRV job in CI.
 # Nothing in the crate currently requires a newer compiler; the stable

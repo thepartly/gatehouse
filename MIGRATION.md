@@ -1,11 +1,11 @@
-# Migrating from 0.5.1 to 0.6.0-alpha.2
+# Migrating from 0.5.1 to 0.6.0-alpha.3
 
 This guide describes the 0.6 prerelease API, including typed grant and veto
 capabilities. `0.6.0-alpha.1` is the first prerelease of that line; expect
 further breaking changes before 0.6.0. Rust 1.82 remains the minimum supported
 compiler. The historical 0.4 → 0.5 guide follows at the end and describes that
 older API only. Upgrading from 0.6.0-alpha.2? See
-[Unreleased changes after 0.6.0-alpha.2](#unreleased-changes-after-060-alpha2).
+[Changes in 0.6.0-alpha.3](#changes-in-060-alpha3).
 
 ## Separate grants from vetoes
 
@@ -366,7 +366,7 @@ backend failures into single and list endpoints, and check every wildcard
 match on `AccessEvaluation`. Create a fresh session for retries and each
 reauthorization pass so cached failures or stale permissions are not reused.
 
-## Unreleased changes after 0.6.0-alpha.2
+## Changes in 0.6.0-alpha.3
 
 - **Decisions are sealed.** The variants of `AccessEvaluation` and
   `AccessError`, and the `FilterError` and `LookupAuthorizedPage` structs,
