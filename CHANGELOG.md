@@ -1,54 +1,75 @@
 # Changelog
 
-## [0.6.0-alpha.3] - 2026-09-24
+## [0.6.0-alpha.3] - 2026-09-28
+
+This prerelease settles what Gatehouse's audit output promises. Decisions now
+name the policy that decided them, decision types can no longer be built
+outside the crate, and backend error messages no longer reach audit output.
+All three are breaking; see
+[MIGRATION.md](https://github.com/thepartly/gatehouse/blob/v0.6.0-alpha.3/MIGRATION.md#changes-in-060-alpha3) for upgrade steps.
+
+### Changed
+
+- **Breaking:** grants and vetoes are credited to the policy that decided
+  them, under one rule. `OrPolicy`, `AnyOfVeto`, delegates, and custom
+  `GrantResult::any` results pass the decision up from their first deciding
+  child. `AndPolicy`, `NotPolicy`, and `AllOfVeto` decide as a whole and are
+  credited themselves. Previously a grant named the registered policy (for
+  example `"OrPolicy"` or the delegate), and `forbidden_by` named the first
+  child of an `AllOfVeto` even though every child had to forbid. Affected
+  outputs:
+  - `granted_policy_type`, `forbidden_by`, `assert_granted_by`, and
+    `assert_forbidden_by`;
+  - the `Granted` reason and the `Forbidden by ...` denial reason;
+  - the serialized `AccessEvaluation` `policy_type`;
+  - the `policy.type` field recorded on the evaluation span. Per-policy
+    `gatehouse::security` events still name the registered policy.
+- **Breaking:** the variants of `AccessEvaluation` and `AccessError`, and the
+  `FilterError` and `LookupAuthorizedPage` structs, are `#[non_exhaustive]`.
+  Code outside the crate can read and match them but not construct them, so
+  every such value comes from a checker evaluation, and fields can be added
+  later without another breaking change. Struct patterns on the enum variants
+  need `..`.
 
 ### Added
 
 - `.named(...)` on `AndPolicy`, `OrPolicy`, `NotPolicy`, `AllOfVeto`, and
-  `AnyOfVeto` replaces the fixed type name in the combinator's audit-tree node,
-  attribution paths, and telemetry. A named `AndPolicy`, `NotPolicy`, or
-  `AllOfVeto` is also what `granted_policy_type` or `forbidden_by` reports.
+  `AnyOfVeto` replaces the fixed type name in the combinator's audit-tree
+  node, attribution paths, and telemetry. A named `AndPolicy`, `NotPolicy`, or
+  `AllOfVeto` is what `granted_policy_type` or `forbidden_by` reports.
 - `AccessEvaluation::grant_path` and `AccessEvaluation::forbidden_path` list
   the policies a decision passed through, from the registered policy to the
-  one that decided.
-- `FactLoadError::backend_with_message` pairs an audit-safe message with the
-  source error, `FactLoadError::audit_detail` returns the text recorded in
-  provenance, and `FactLoadError` now implements `Error::source`.
-
-### Changed
-
-- **Breaking:** the variants of `AccessEvaluation` and `AccessError`, and the
-  `FilterError` and `LookupAuthorizedPage` structs, are `#[non_exhaustive]`.
-  They cannot be constructed outside the crate, and struct patterns on the
-  enum variants need `..`.
-- **Breaking:** grants and vetoes are credited to the policy that decided
-  them, by one rule. `OrPolicy`, `AnyOfVeto`, delegates, and custom
-  `GrantResult::any` results pass the decision up from their first deciding
-  child; `AndPolicy`, `NotPolicy`, and `AllOfVeto` decide as a whole and are
-  credited themselves. This changes `granted_policy_type`, `forbidden_by`,
-  `assert_granted_by`, `assert_forbidden_by`, the `Granted` reason, the
-  `Forbidden by ...` denial reason, the serialized `AccessEvaluation`
-  `policy_type`, and the checker span's `policy.type` field. Previously grants
-  named the registered policy (for example `"OrPolicy"` or a delegate) and
-  `forbidden_by` named the first child of an `AllOfVeto`.
+  one that decided. Use them to recover the delegate or combinator name that
+  attribution no longer reports.
+- `FactLoadError::backend_with_message(message, source)` records an
+  audit-safe message and keeps the source error for logging.
+  `FactLoadError::audit_detail` returns the text recorded in provenance, and
+  `FactLoadError` implements `Error::source`.
 
 ### Fixed
 
 - `PolicyBuilder::build_veto` treats a predicate that cannot be evaluated as
-  indeterminate rather than passing. This was latent: builder predicates
-  return `bool`.
-- The Actix example's collaborator rule uses the author's draft window, so a
-  collaborator can no longer edit published posts or drafts older than 30
-  days.
+  indeterminate, blocking grants, rather than passing. This was latent:
+  builder predicates return `bool`.
+- The Actix example's collaborator rule now uses the author's draft window.
+  Before, a collaborator could edit published posts and drafts older than 30
+  days, which the author is refused.
 
 ### Security
 
 - **Breaking:** `FactProvenance::from_load_result` no longer copies a backend
   error's message into `detail`, where it reached traces, logs, and serialized
-  audit output. Errors built with `FactLoadError::backend` record a fixed
-  placeholder; `backend_message` and `backend_with_message` record their
-  caller-authored message. The PostgreSQL example wraps database errors with
-  `backend_with_message`.
+  audit output; database errors can quote row values. An error built with
+  `FactLoadError::backend` now records the placeholder
+  `backend error (message withheld from audit output)`. Errors built with
+  `backend_message` or `backend_with_message` record their caller-authored
+  message, including through a nested `FactLoadError`. The PostgreSQL example
+  now uses `backend_with_message`.
+
+### Development
+
+- The diff-scoped mutation gate also covers `src/results.rs` (attribution)
+  and `src/facts.rs` (redaction).
 
 ## [0.6.0-alpha.2] - 2026-09-20
 
