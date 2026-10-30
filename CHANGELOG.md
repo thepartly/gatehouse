@@ -2,26 +2,49 @@
 
 ## [0.6.0] - 2026-10-30
 
-0.6.0 makes authorization outcomes explicit and typed. It is the stable release of the 0.6.0-alpha.1 to alpha.3 prereleases and has the same API as 0.6.0-alpha.3; the prerelease sections below record each change in detail. See [MIGRATION.md](https://github.com/thepartly/gatehouse/blob/v0.6.0/MIGRATION.md) to upgrade from 0.5.1. Rust 1.82 remains the minimum supported version.
+0.6.0 makes authorization outcomes explicit and typed: grants and vetoes are separate capabilities, an outage is reported as indeterminate rather than as a denial, and audit output names the policy that decided without leaking backend errors. To upgrade from 0.5.1, follow [MIGRATION.md](https://github.com/thepartly/gatehouse/blob/v0.6.0/MIGRATION.md). Rust 1.82 remains the minimum supported version.
 
-### Highlights since 0.5.1
+### Breaking changes
 
-- **Typed grants and vetoes.** `Policy` returns `GrantResult`; veto rules implement `VetoPolicy` and return `VetoResult`, each with its own combinators. A grant policy cannot veto and a veto policy cannot grant. Register vetoes with `add_veto` and delegates with `add_delegate`.
-- **Indeterminate outcomes.** Fact-load failures and malformed batches produce `AccessEvaluation::Indeterminate` instead of ordinary denials. Definite vetoes win, unresolved vetoes block grants, and `into_result` keeps a denial and an outage apart in `AccessError`.
-- **Strict list APIs.** `try_filter`, `try_filter_by` and `try_lookup_page` fail on indeterminate items. Lossy collection is explicit: `filter_lossy`, `filter_by_lossy` and `lookup_page_lossy`.
-- **Recorded facts.** Evaluation contexts record the facts each policy consults, with structured failure kinds in provenance.
-- **Safer builders.** Repeated predicates accumulate with AND, an empty builder is a compile-time error, and `allow_all` / `forbid_all` name unconditional policies.
-- **Audit output you can rely on.** Decisions name the policy that decided them, with `grant_path` and `forbidden_path` showing the route. Decision types can only come from a checker. Backend error messages are withheld from audit output; `FactLoadError::backend_with_message` records a safe message and keeps the source error.
-- **Optional instrumentation.** `tracing` is a default feature. Disabling it removes instrumentation without changing decisions or audit data.
+- **Grants and vetoes are separate types.** `Policy::evaluate` and `evaluate_batch` return `GrantResult` and `Vec<GrantResult>`. Veto rules implement `VetoPolicy` and return `VetoResult`; register them with `PermissionChecker::add_veto` or build them with `PolicyBuilder::build_veto`. `Effect`, `Policy::effect`, `add_forbid_policy` and `PolicyBuilder::forbid` are removed.
+- **Separate combinators.** Grant combinators accept only grant policies, and vetoes compose with `AllOfVeto`, `AnyOfVeto` and `VetoPolicyExt`. `DelegatingPolicy` no longer implements `Policy`; register it with `add_delegate`.
+- **Outages are indeterminate.** Fact-load failures and malformed policy batches produce `AccessEvaluation::Indeterminate` instead of a denial, and the audit `Decision` has four values. Definite vetoes win, unresolved vetoes block grants, and an independent grant can still succeed past a failing grant policy. `RebacPolicy` still abstains on `Found(false)` and `Missing`.
+- **`PolicyEvalResult` is audit-only.** It cannot be returned as, or converted into, a policy result. `Combined` has `decision` instead of `outcome`, plus `provenance`.
+- **Builder predicates accumulate.** Repeated `subjects`, `actions`, `resources`, `context` and `when` calls combine with AND instead of replacing each other. `build` and `build_veto` need at least one predicate; use `allow_all` or `forbid_all` for a policy that applies to every request.
+- **Decisions name the deciding policy.** `OrPolicy`, `AnyOfVeto`, delegates and `GrantResult::any` credit their first deciding child; `AndPolicy`, `NotPolicy` and `AllOfVeto` credit themselves. This changes `granted_policy_type`, `forbidden_by`, `assert_granted_by`, `assert_forbidden_by`, the `Granted` and `Forbidden by ...` reasons, the serialized `policy_type`, and the evaluation span's `policy.type`.
+- **Decision types are `#[non_exhaustive]`.** `AccessEvaluation`, `AccessError`, `FilterError` and `LookupAuthorizedPage` can be read and matched (struct patterns need `..`) but not constructed outside the crate.
+- **Backend error text stays out of audit output.** An error built with `FactLoadError::backend` records a fixed placeholder in provenance; use `backend_message` or `backend_with_message` to record a message you write.
+- **Stricter bounds and constructors.** `FactKey` requires `Debug` and provides `render()`. `RelationshipQuery` requires `Debug` on IDs and relations and `Display` on relations. `EvalCtx` and `BatchEvalCtx` are built with constructors and their fields are private; raw access is through `session()`.
+
+### Added
+
+- `try_filter`, `try_filter_by` and `try_lookup_page`, list APIs that exclude denials and fail on indeterminate items, keeping the original items and decisions in the error.
+- `filter_lossy`, `filter_by_lossy` and `lookup_page_lossy`, which name the omit-on-uncertainty behaviour.
+- `AccessEvaluation::into_result` and `AccessError`, which keep a denial and an indeterminate outcome apart with their reasons, traces and fact errors, and `BoundEvaluator::authorize` for enforcement with `?`.
+- Recording contexts (`EvalCtx::fact` and `facts`, `BatchEvalCtx::facts_by` and `fact`, `record`, `finish`) that attach consulted facts to the audit trail, and `FactLoadErrorKind` with `FactLoadError::kind` for structured failure classes.
+- `PolicyBuilder::allow_all` and `forbid_all`, and typed builder states so only a builder with a predicate can be built.
+- `.named(...)` on combinators, `AccessEvaluation::grant_path` and `forbidden_path`, and `FactLoadError::backend_with_message`, `audit_detail` and `Error::source`.
+- A default-enabled `tracing` feature. Disabling it removes instrumentation without changing decisions or audit data. Indeterminate evaluations have their own telemetry outcome.
+- Unused-result warnings on `AccessEvaluation`, `GrantResult`, `VetoResult` and awaited evaluations.
+- A runnable quick start in the README.
+
+### Changed
+
+- `NotPolicy` preserves uncertainty and cannot invert a veto policy.
+- ReBAC reasons no longer interpolate backend text.
+- A lookup page larger than its requested limit fails with `LookupPageTooLarge` before hydration or authorization.
+- Builder predicates run in the order subject, action, context, resource, then `when`, and shared predicates run once per batch.
+- Sequential fact loading is linear in the number of keys and keeps completed facts when cancelled.
 
 ### Deprecated
 
-- `AccessEvaluation::denied_due_to_fact_load_error`.
-- `filter`, `filter_by` and `lookup_page`, which remain as aliases of their `_lossy` counterparts.
+- `AccessEvaluation::denied_due_to_fact_load_error`, planned for removal in 0.7. Use `is_indeterminate()` or `into_result()`, and `fact_load_errors()` for diagnostics.
+- `filter`, `filter_by` and `lookup_page`, which remain aliases of their `_lossy` counterparts.
 
-### Since 0.6.0-alpha.3
+### Fixed
 
-- No API or behaviour changes. A development-only dependency, `ctutils`, was updated for RUSTSEC-2026-0385.
+- `PolicyBuilder::build_veto` treats a predicate that cannot be evaluated as indeterminate instead of passing.
+- `EvaluationSession::shared_empty()` no longer retains fact state or cache entries.
 
 ## [0.6.0-alpha.3] - 2026-09-28
 
