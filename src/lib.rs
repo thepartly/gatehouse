@@ -175,7 +175,7 @@
 //! when the request session loads a `Found(true)` relationship fact. A
 //! `Found(false)` or `Missing` fact is an ordinary non-grant; missing
 //! sources, backend errors, and fact-source contract violations fail closed
-//! as [`PolicyEvalResult::Indeterminate`] — never a grant, and structurally
+//! as an indeterminate [`GrantResult`] — never a grant, and structurally
 //! distinguishable from a policy denial.
 //!
 //! # Long-Lived Streams
@@ -293,3 +293,11 @@ pub use session::{EvaluationSession, FactRegistry, FactRegistryBuilder};
 // permutation tests both live in `src/session/core.rs` and are unaffected.
 #[cfg(all(test, not(loom)))]
 mod tests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../MIGRATION.md")]
+struct MigrationDoctests;

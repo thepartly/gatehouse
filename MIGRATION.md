@@ -1,12 +1,32 @@
 # Migrating from 0.5.1 to 0.6.0
 
-This guide covers the 0.6 API, including typed grant and veto capabilities.
-Rust 1.82 remains the minimum supported compiler. The historical 0.4 → 0.5
-guide follows at the end and describes that older API only.
+Fix the compile errors first; the compiler finds every one. Then work
+through the changes that compile unchanged but alter authorization results,
+audit output or telemetry. Rust 1.82 remains the minimum supported compiler.
+The historical 0.4 → 0.5 guide follows at the end and describes that older
+API only.
+
+Three changes compile unchanged and alter results. Read these before you
+deploy:
+
+- [Preserve outages at application boundaries](#preserve-outages-at-application-boundaries):
+  an outage is now `Indeterminate`, and an existing `_ =>` arm on
+  `AccessEvaluation` receives it.
+- [Record consulted facts](#record-consulted-facts): a policy that reads the
+  raw session with `ctx.session()` still fails open during an outage.
+- [PolicyBuilder predicates accumulate](#policybuilder-predicates-accumulate):
+  a repeated builder setter now narrows the policy, so a veto fires less
+  often.
+
+[Mechanical search hints](#mechanical-search-hints) lists searches that find
+the call sites for each change.
 
 Upgrading from a 0.6.0 prerelease? 0.6.0 has the same API as 0.6.0-alpha.3.
-From alpha.2, see [Changes in 0.6.0-alpha.3](#changes-in-060-alpha3). From
-alpha.1, also see [PolicyBuilder predicates accumulate](#policybuilder-predicates-accumulate)
+From alpha.2, read [Decisions name the policy that decided them](#decisions-name-the-policy-that-decided-them),
+[Decisions are sealed](#decisions-are-sealed) and
+[Backend error text stays out of audit output](#backend-error-text-stays-out-of-audit-output).
+From alpha.1, also read
+[PolicyBuilder predicates accumulate](#policybuilder-predicates-accumulate)
 and [Explicit lossy collection names](#explicit-lossy-collection-names).
 
 ## Separate grants from vetoes
@@ -27,10 +47,9 @@ For predicates, replace `.forbid().build()` with `.build_veto()`:
 ```rust
 use gatehouse::*;
 
-struct Account { suspended: bool }
 struct Accounts;
 impl PolicyDomain for Accounts {
-    type Subject = Account;
+    type Subject = bool; // whether the account is suspended
     type Action = ();
     type Resource = ();
     type Context = ();
@@ -40,16 +59,9 @@ let mut checker = PermissionChecker::<Accounts>::new();
 checker.add_policy(PolicyBuilder::<Accounts>::new("Member").allow_all());
 checker.add_veto(
     PolicyBuilder::<Accounts>::new("Suspended")
-        .subjects(|account| account.suspended)
+        .subjects(|suspended| *suspended)
         .build_veto(),
 );
-# tokio_test::block_on(async {
-let session = EvaluationSession::empty();
-let evaluation = checker
-    .bind(&session, &Account { suspended: true }, &(), &())
-    .check(&()).await;
-evaluation.assert_forbidden_by("Suspended");
-# });
 ```
 
 For a custom rule that previously both granted and vetoed, split it into
@@ -246,6 +258,25 @@ fn status(evaluation: AccessEvaluation) -> u16 {
 }
 ```
 
+`AccessEvaluation` was already `#[non_exhaustive]`, so a `match` outside
+the crate has a wildcard arm, and that arm now silently receives
+`Indeterminate`. A `_ =>` that denies reports an outage as a policy decision,
+with a 403 where a 503 belongs. Handle the outcome explicitly, or use
+`into_result()` as above:
+
+```rust
+use gatehouse::AccessEvaluation;
+
+fn status(evaluation: &AccessEvaluation) -> u16 {
+    match evaluation {
+        AccessEvaluation::Granted { .. } => 200,
+        AccessEvaluation::Denied { .. } => 403,
+        AccessEvaluation::Indeterminate { .. } => 503,
+        _ => 503,
+    }
+}
+```
+
 `AccessError` retains the full trace and exposes `fact_load_errors()` for
 structured classification. Applications can implement `From<AccessError>`
 for their own error type and then use `check(...).await.into_result()?`.
@@ -275,11 +306,30 @@ with a fresh session after recovery. Previously returned pages cannot be
 retracted, so an endpoint requiring an atomic multi-page response must collect
 all pages before sending it.
 
-The explicit `filter_lossy`, `filter_by_lossy`, and `lookup_page_lossy` methods are deliberately
-lossy: they exclude both denials and indeterminate items. The old `to_result`
-also merges both outcomes into one reason-only error callback.
-`denied_due_to_fact_load_error()` is deprecated; it detects any error in the
-trace, which may be irrelevant to the final decision.
+A `LookupSource` that returns more IDs than the requested `limit` fails
+with `LookupAuthorizedError::LookupPageTooLarge { limit, actual }` before
+hydration or authorization; 0.5.1 authorized the whole page. Make the source
+honour `limit`. The error's third type parameter, `Resource`, defaults to
+`()`, so a signature that names `LookupAuthorizedError<L, H>` still compiles;
+a `match` on it needs arms for the `Evaluation` and `LookupPageTooLarge`
+variants, or a wildcard.
+
+`AccessEvaluation`, `GrantResult`, `VetoResult` and awaited
+`BoundEvaluator::evaluate` results are `#[must_use]`, and the old list names
+and `denied_due_to_fact_load_error()` are deprecated, so a build that denies
+warnings fails until each is addressed. `denied_due_to_fact_load_error()`
+detects any error in the trace, which may be irrelevant to the final decision;
+use `is_indeterminate()` or `into_result()`, and `fact_load_errors()` for
+diagnostics. It is planned for removal in 0.7.
+
+## Explicit lossy collection names
+
+`filter`, `filter_by`, and `lookup_page` are deprecated forwarding aliases;
+their behavior is unchanged, so they still omit indeterminate items along
+with denials. Use the `try_` methods above to surface outages. If dropping
+indeterminate items is intentional, migrate to `filter_lossy`,
+`filter_by_lossy`, and `lookup_page_lossy`. Lossy lookup still returns
+lookup, hydration, and adapter-contract errors.
 
 ## Record consulted facts
 
@@ -319,6 +369,36 @@ impl Policy<Documents> for Member {
 }
 ```
 
+**`ctx.session` is not a safe rename.** The raw session is now read with
+`ctx.session()`, and the mechanical rename compiles. Only facts loaded through
+`ctx.fact`, `ctx.facts`, `ctx.facts_by` and `RebacPolicy` turn a failed load
+into `Indeterminate`; a policy that reads the session directly keeps the
+0.5.1 behaviour. There, a failed load looks like an abstention, so
+`member.and(blocked.not())` grants when the `blocked` lookup fails, and a
+veto whose data source failed lets the grant through. Load through the
+context, or map `FactLoadResult::Error` yourself:
+
+```rust,ignore
+// Compiles after the rename, and still fails open.
+match ctx.session().get(Blocked(*ctx.subject)).await {
+    FactLoadResult::Found(true) => ctx.grant("blocked"),
+    _ => ctx.not_applicable("not blocked"),
+}
+
+// Fails closed: the recorded failure makes the result Indeterminate.
+match ctx.fact(Blocked(*ctx.subject)).await {
+    FactLoadResult::Found(true) => ctx.grant("blocked"),
+    _ => ctx.not_applicable("not blocked"),
+}
+
+// Also fails closed, when the load must stay on the session.
+match ctx.session().get(Suspended(*ctx.subject)).await {
+    FactLoadResult::Found(true) => ctx.forbid("suspended"),
+    FactLoadResult::Found(false) | FactLoadResult::Missing => ctx.pass("active"),
+    FactLoadResult::Error(_) => ctx.veto_indeterminate("suspension lookup failed"),
+}
+```
+
 A recorded failure upgrades abstention or veto pass to `Indeterminate`.
 This also applies to explicit `*_with_facts` constructors when the result's
 own provenance contains `FactOutcome::Error`; the reason and facts are retained.
@@ -334,7 +414,7 @@ settled aggregate uncertain again.
 When invoking a policy directly, call `ctx.finish(result)` or
 `batch_ctx.finish(results)`. Construct contexts with `EvalCtx::new` /
 `BatchEvalCtx::new`; their recorders and session fields are private.
-`ctx.session()` remains an explicit non-recording escape hatch. Use
+`ctx.session()` is an explicit non-recording escape hatch. Use
 `ctx.record(FactProvenance::from_load_result(...))` for externally loaded facts.
 
 Other source and behavior changes:
@@ -355,43 +435,122 @@ Other source and behavior changes:
 - Serialized audit nodes gain `decision` and aggregate `provenance` fields;
   update consumers that previously expected `Combined.outcome`.
 
+## Decisions name the policy that decided them
+
+Grants and vetoes follow one rule. An `OrPolicy`, `AnyOfVeto`, or delegate
+passes the decision up from its first deciding child, so
+`granted_policy_type()`, `forbidden_by()`, `assert_granted_by`,
+`assert_forbidden_by`, and the summary reason name that child. An
+`AndPolicy`, `NotPolicy`, or `AllOfVeto` decides as a whole and is named
+itself; 0.5.1 named the first child of an `AllOfVeto`.
+
+A grant through `a.or(b)` used to report `OrPolicy` and now reports `a` or
+`b`, with that policy's reason. This also changes the `Granted` display, the
+serialized `policy_type`, and the evaluation span's `policy.type`. Update
+assertions such as `assert_granted_by("OrPolicy")`, or ones naming a
+delegate, to name the deciding child, and any dashboard that groups by
+`policy.type`. Per-policy `gatehouse::security` events still name the
+registered policy.
+
+`grant_path()` and `forbidden_path()` return the chain from the registered
+policy (for example a delegate or `OrPolicy`) down to the decider. Give a
+combinator a stable name with `.named("...")`.
+
+## Decisions are sealed
+
+The variants of `AccessEvaluation` and `AccessError`, and the `FilterError`
+and `LookupAuthorizedPage` structs, can be read and matched but not
+constructed outside Gatehouse. Add `..` to struct patterns on the enum
+variants, for example `AccessError::Denied { reason, .. }`. Tests that built
+a decision by hand should obtain one from a `PermissionChecker` instead.
+
+## Backend error text stays out of audit output
+
+Backend errors, such as database errors, can quote row values. For an error
+wrapped with `FactLoadError::backend(err)`, `FactProvenance::detail` is a
+fixed placeholder (`backend error (message withheld from audit output)`) in
+provenance, traces, logs and serialized output, and `RebacPolicy` reasons
+name the failure class instead of quoting the error. To record a
+description, use `FactLoadError::backend_with_message("safe text", err)`.
+`err` stays available through `std::error::Error::source` for your own logs.
+
 ## Optional instrumentation
 
-`tracing` is a default-enabled Cargo feature. Set `default-features = false`
-to remove tracing instrumentation and its dependency. Decisions, returned
-`EvalTrace`, and fact provenance remain available and have the same semantics;
-telemetry spans, security events, and contract warnings are absent. `serde`
-is independent and can be enabled without tracing.
+`tracing` is a default-enabled Cargo feature. In 0.5.1 it was always
+compiled in, so a dependency declared with `default-features = false` now
+loses its spans, security events and contract warnings unless it also
+enables `tracing`. Decisions, the returned `EvalTrace`, and fact provenance
+are unaffected and have the same semantics. `serde` is independent and can be
+enabled without tracing.
 
-Before adopting the prerelease, run custom policy and batch tests, inject fact
-backend failures into single and list endpoints, and check every wildcard
-match on `AccessEvaluation`. Create a fresh session for retries and each
-reauthorization pass so cached failures or stale permissions are not reused.
+Outages are reported differently from denials:
 
-## Changes in 0.6.0-alpha.3
+| Telemetry | 0.5.1 | 0.6.0 |
+| --- | --- | --- |
+| Evaluation span `outcome` | `denied` | `indeterminate` |
+| Security event `event.outcome` | `failure` | `unknown` |
+| Batch span `denied_count` | included outages | excludes outages |
+| Batch span `indeterminate_count` | absent | outages |
 
-- **Decisions are sealed.** The variants of `AccessEvaluation` and
-  `AccessError`, and the `FilterError` and `LookupAuthorizedPage` structs,
-  can be read and matched but no longer constructed outside Gatehouse. Add
-  `..` to struct patterns on the enum variants, for example
-  `AccessError::Denied { reason, .. }`. Tests that built a decision by hand
-  should obtain one from a `PermissionChecker` instead.
-- **Decisions name the policy that decided them.** Grants and vetoes follow
-  the same rule. An `OrPolicy`, `AnyOfVeto`, or delegate passes the decision
-  up from one child, so `granted_policy_type()`, `forbidden_by()`,
-  `assert_granted_by`, `assert_forbidden_by`, and the summary reason now name
-  that child. An `AndPolicy`, `NotPolicy`, or `AllOfVeto` decides as a whole
-  and is named itself; previously `forbidden_by` named the first child of an
-  `AllOfVeto`. Update assertions such as `assert_granted_by("OrPolicy")`, or
-  ones naming a delegate, to name the deciding child. `grant_path()` and
-  `forbidden_path()` return the chain from the registered policy (for example
-  a delegate or `OrPolicy`) down to the decider. Give combinators a
-  meaningful name with `.named("...")`.
-- **Backend error text stays out of audit output.** `FactProvenance::detail`
-  for an error wrapped with `FactLoadError::backend(err)` is now a fixed
-  placeholder. Use `FactLoadError::backend_with_message("safe text", err)` to
-  record a description while keeping `err` available through
-  `std::error::Error::source` for your own logs.
+`policy.effect` is `allow` or `deny`. Alerts and dashboards that count
+denials or failures stop seeing outages; add a rule for the new values.
+
+## Before you deploy
+
+Run custom policy and batch tests, inject fact backend failures into single
+and list endpoints, and check every wildcard match on `AccessEvaluation`.
+Create a fresh session for retries and each reauthorization pass so cached
+failures or stale permissions are not reused.
+
+## Mechanical search hints
+
+Each search lists call sites to review, with the action to take:
+
+```shell
+# Removed: use build_veto and add_veto (Separate grants from vetoes).
+rg 'add_forbid_policy|\.forbid\(\)|Effect::|fn effect'
+
+# Policies can no longer return it: return GrantResult or VetoResult.
+rg 'PolicyEvalResult'
+
+# Builders that repeat a setter, and empty builders (PolicyBuilder section).
+rg '\.(subjects|actions|resources|context|when)\('
+rg 'new(_owned|_static)?\([^)]*\)\s*\.\s*build(_veto)?\(\)'
+
+# Raw session reads fail open: load with ctx.fact, ctx.facts or ctx.facts_by.
+rg 'ctx\.session\b'
+
+# Reason-only conversion merges outages and denials: use into_result().
+rg '\bto_result\('
+
+# Deprecated: use is_indeterminate() or into_result().
+rg 'denied_due_to_fact_load_error'
+
+# Deprecated, lossy: use try_filter, try_filter_by, try_lookup_page,
+# or the _lossy name when dropping outages is intended.
+rg '\.(filter|filter_by|lookup_page)\('
+
+# Outage tests: assert_denied now fails on Indeterminate.
+rg 'assert_denied'
+
+# Wildcard arms now receive Indeterminate: add an explicit arm.
+rg -U '(?s)AccessEvaluation::.{0,400}?_ =>' --glob '*.rs'
+
+# Lookup errors: handle Evaluation and LookupPageTooLarge.
+rg 'LookupAuthorizedError'
+
+# tracing is now a default feature: re-enable it if you rely on telemetry.
+rg 'gatehouse.*default-features\s*=\s*false' --glob 'Cargo.toml'
+
+# Struct literals need error_kind: use FactProvenance::from_load_result.
+rg 'FactProvenance \{'
+
+# Message withheld from audit output: use backend_with_message if it is safe.
+rg 'FactLoadError::backend\('
+
+# Helpers that return a builder after adding a predicate.
+rg 'PolicyBuilder<[^>]*>\s*\{'
+```
 
 ---
 
@@ -444,13 +603,9 @@ impl Policy<User, ReadAction, Document, RequestContext> for OwnerPolicy {
 
 Now define a domain marker once:
 
-```rust
+```rust,ignore
 use gatehouse::PolicyDomain;
 
-# struct User;
-# struct ReadAction;
-# struct Document;
-# struct RequestContext;
 struct Documents;
 
 impl PolicyDomain for Documents {
@@ -787,7 +942,7 @@ match evaluation {
 
 The new optional `serde` feature derives `Serialize` for decision and trace types (`AccessEvaluation`, `EvalTrace`, `PolicyEvalResult`, `FactProvenance`, and related value enums) for audit logging pipelines.
 
-## Mechanical search hints
+## Mechanical search hints (0.4 to 0.5)
 
 These searches catch most migration work:
 
@@ -800,7 +955,3 @@ rg "evaluate_in_session|filter_authorized|lookup_authorized|\\.check\\(&"
 rg "AbacPolicy|Effect::Deny"
 rg "AccessEvaluation::|PolicyEvalResult::|FactLoadResult::|LookupAuthorizedError::"
 ```
-
-## Explicit lossy collection names
-
-`filter`, `filter_by`, and `lookup_page` are deprecated forwarding aliases; their behavior is unchanged. Use `try_filter`, `try_filter_by`, and `try_lookup_page` to surface authorization outages. If dropping indeterminate resources is intentional, migrate to `filter_lossy`, `filter_by_lossy`, and `lookup_page_lossy`. Lossy lookup still returns lookup, hydration, and adapter-contract errors.
