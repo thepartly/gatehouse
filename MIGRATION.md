@@ -1,11 +1,13 @@
-# Migrating from 0.5.1 to 0.6.0-alpha.3
+# Migrating from 0.5.1 to 0.6.0
 
-This guide describes the 0.6 prerelease API, including typed grant and veto
-capabilities. `0.6.0-alpha.1` is the first prerelease of that line; expect
-further breaking changes before 0.6.0. Rust 1.82 remains the minimum supported
-compiler. The historical 0.4 → 0.5 guide follows at the end and describes that
-older API only. Upgrading from 0.6.0-alpha.2? See
-[Changes in 0.6.0-alpha.3](#changes-in-060-alpha3).
+This guide covers the 0.6 API, including typed grant and veto capabilities.
+Rust 1.82 remains the minimum supported compiler. The historical 0.4 → 0.5
+guide follows at the end and describes that older API only.
+
+Upgrading from a 0.6.0 prerelease? 0.6.0 has the same API as 0.6.0-alpha.3.
+From alpha.2, see [Changes in 0.6.0-alpha.3](#changes-in-060-alpha3). From
+alpha.1, also see [PolicyBuilder predicates accumulate](#policybuilder-predicates-accumulate)
+and [Explicit lossy collection names](#explicit-lossy-collection-names).
 
 ## Separate grants from vetoes
 

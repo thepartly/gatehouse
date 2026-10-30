@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.0] - 2026-10-30
+
+0.6.0 makes authorization outcomes explicit and typed. It is the stable release of the 0.6.0-alpha.1 to alpha.3 prereleases and has the same API as 0.6.0-alpha.3; the prerelease sections below record each change in detail. See [MIGRATION.md](https://github.com/thepartly/gatehouse/blob/v0.6.0/MIGRATION.md) to upgrade from 0.5.1. Rust 1.82 remains the minimum supported version.
+
+### Highlights since 0.5.1
+
+- **Typed grants and vetoes.** `Policy` returns `GrantResult`; veto rules implement `VetoPolicy` and return `VetoResult`, each with its own combinators. A grant policy cannot veto and a veto policy cannot grant. Register vetoes with `add_veto` and delegates with `add_delegate`.
+- **Indeterminate outcomes.** Fact-load failures and malformed batches produce `AccessEvaluation::Indeterminate` instead of ordinary denials. Definite vetoes win, unresolved vetoes block grants, and `into_result` keeps a denial and an outage apart in `AccessError`.
+- **Strict list APIs.** `try_filter`, `try_filter_by` and `try_lookup_page` fail on indeterminate items. Lossy collection is explicit: `filter_lossy`, `filter_by_lossy` and `lookup_page_lossy`.
+- **Recorded facts.** Evaluation contexts record the facts each policy consults, with structured failure kinds in provenance.
+- **Safer builders.** Repeated predicates accumulate with AND, an empty builder is a compile-time error, and `allow_all` / `forbid_all` name unconditional policies.
+- **Audit output you can rely on.** Decisions name the policy that decided them, with `grant_path` and `forbidden_path` showing the route. Decision types can only come from a checker. Backend error messages are withheld from audit output; `FactLoadError::backend_with_message` records a safe message and keeps the source error.
+- **Optional instrumentation.** `tracing` is a default feature. Disabling it removes instrumentation without changing decisions or audit data.
+
+### Deprecated
+
+- `AccessEvaluation::denied_due_to_fact_load_error`.
+- `filter`, `filter_by` and `lookup_page`, which remain as aliases of their `_lossy` counterparts.
+
+### Since 0.6.0-alpha.3
+
+- No API or behaviour changes. A development-only dependency, `ctutils`, was updated for RUSTSEC-2026-0385.
+
 ## [0.6.0-alpha.3] - 2026-09-28
 
 This prerelease settles what Gatehouse's audit output promises. Decisions now
