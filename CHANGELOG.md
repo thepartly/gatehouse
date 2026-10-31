@@ -1,5 +1,108 @@
 # Changelog
 
+## [0.6.0] - 2026-10-30
+
+Gatehouse is an in-process authorization library for Rust. You write policies as Rust code, register them on a `PermissionChecker`, and ask whether a subject may perform an action on a resource. There is no policy language, server or sidecar, and Gatehouse does not store your users, roles or relationships: it asks for them per request, through code you provide.
+
+0.6.0 changes what an answer can be. Grants and vetoes are separate types, a failure to load the data a decision needs is reported as `Indeterminate` instead of as a denial, and audit output names the policy that decided without exposing backend error text. It is a breaking release: follow [MIGRATION.md](https://github.com/thepartly/gatehouse/blob/v0.6.0/MIGRATION.md) to upgrade from 0.5.1, and read [Upgrading from 0.5.1](#upgrading-from-051) below before deploying. Rust 1.82 remains the minimum supported version. If you are on a 0.6.0 prerelease, 0.6.0 has the same API as 0.6.0-alpha.3.
+
+### At a glance
+
+- **Deny overrides, default deny.** Vetoes (`VetoPolicy`, registered with `add_veto`) run before grants (`Policy`, registered with `add_policy`). A definite veto denies; otherwise any grant allows; no grant means deny. The types stop a grant policy from vetoing and a veto policy from granting.
+- **Three outcomes.** `AccessEvaluation` is `Granted`, `Denied` or `Indeterminate`. `Indeterminate` means a policy that mattered could not be evaluated, usually because a fact backend failed, and it never grants. `BoundEvaluator::authorize` and `into_result()` keep the distinction in `AccessError`, so a handler can return 403 for a denial and 503 for an outage.
+- **Request-scoped facts.** Policies read backend data with `ctx.fact(...)`. An `EvaluationSession` batches loads through your `FactSource`, deduplicates and caches them for the request, and records each fact a decision consulted.
+- **Strict list endpoints.** `try_filter`, `try_filter_by` and `try_lookup_page` return only authorized items and fail, with every original item and decision attached, if any item is indeterminate.
+- **Audit trail.** Every decision carries a trace naming the policy that decided and the facts it consulted. The `serde` feature serializes it, and the default `tracing` feature emits spans and security events.
+
+```rust
+let mut checker = PermissionChecker::<Documents>::new();
+checker.add_policy(
+    PolicyBuilder::<Documents>::new("Owner")
+        .when(|user, _action, document, _context| user.id == document.owner_id)
+        .build(),
+);
+checker.add_veto(
+    PolicyBuilder::<Documents>::new("Suspended")
+        .subjects(|user| user.suspended)
+        .build_veto(),
+);
+
+let session = EvaluationSession::empty();
+let bound = checker.bind(&session, &user, &Read, &());
+match bound.authorize(&document).await {
+    Ok(()) => { /* allowed */ }
+    Err(AccessError::Denied { .. }) => { /* 403 */ }
+    Err(_) => { /* 503: authorization could not be decided */ }
+}
+let visible = bound.try_filter(documents).await?;
+```
+
+Start with the [README quick start](https://github.com/thepartly/gatehouse/blob/v0.6.0/README.md#quick-start), then the [examples](https://github.com/thepartly/gatehouse/tree/v0.6.0/examples). API documentation is on [docs.rs](https://docs.rs/gatehouse/0.6.0).
+
+### Upgrading from 0.5.1
+
+Fix the compile errors first, then review the behaviour changes below: they compile unchanged and alter authorization results, audit output or telemetry. Two of them close paths that granted access during a backend outage, so expect 5xx responses where an outage used to produce a 200.
+
+#### Behaviour changes the compiler will not report
+
+- **Outages are `Indeterminate`, not `Denied`.** A failed fact load, or a custom `evaluate_batch` that returns the wrong number of results, now produces `AccessEvaluation::Indeterminate`. `AccessEvaluation` was already `#[non_exhaustive]`, so an existing `match` has a wildcard arm and still compiles; that arm now receives outages. Add an `Indeterminate` arm, or use `authorize` or `into_result()` and map `AccessError::Indeterminate` to a 5xx. `to_result` still sends both outcomes to one error, `assert_denied()` now panics on an indeterminate evaluation (use `assert_indeterminate()`), and serialized output gains an indeterminate variant. A definite veto still wins over an outage, an unresolved veto blocks every grant, and an independent grant still succeeds when another grant policy failed. `RebacPolicy` still abstains on `Found(false)` and `Missing`.
+- **Two outage paths now fail closed.** In 0.5.1 a failed load inside a policy looked like an abstention, so `member.and(blocked.not())` granted access when the `blocked` lookup failed, and a forbid policy whose data source failed let the grant through. Both are now `Indeterminate`. This applies to facts loaded through `ctx.fact`, `ctx.facts`, `ctx.facts_by` and `RebacPolicy`. A policy that reads the raw session keeps the 0.5.1 behaviour: the mechanical rename from `ctx.session` to `ctx.session()` preserves both paths, so load with `ctx.fact(...)` instead, or return `ctx.indeterminate(...)` (grants) or `ctx.veto_indeterminate(...)` (vetoes) on `FactLoadResult::Error`.
+- **Builder predicates combine with AND.** Repeated `subjects`, `actions`, `resources`, `context` and `when` calls used to keep only the last predicate; now all must match. A grant can only get narrower, but a veto fires less often, so a veto built with a repeated setter can permit requests it used to block. Keep only the final call to preserve the old behaviour, and express alternatives with `PolicyExt::or` (grants) or `VetoPolicyExt::any_of` (vetoes). Scalar evaluation also runs context predicates before resource predicates, and an empty batch runs no predicates.
+- **Decisions name the deciding policy.** `OrPolicy`, `AnyOfVeto` and delegates credit their first deciding child; `AndPolicy`, `NotPolicy` and `AllOfVeto` credit themselves. A grant through `a.or(b)` used to report `OrPolicy` and now reports `a` or `b`, with that policy's reason. This changes `granted_policy_type`, `assert_granted_by`, the `Granted` display, the serialized `policy_type` and the evaluation span's `policy.type`. Per-policy `gatehouse::security` events still name the registered policy. Give a combinator a stable name with `.named(...)`, and use `grant_path()` and `forbidden_path()` for the full route.
+- **Backend error text stays out of audit output.** An error built with `FactLoadError::backend` records the placeholder `backend error (message withheld from audit output)` in provenance, traces and serialized output, and `RebacPolicy` reasons name the failure class instead of quoting the error. Use `backend_message` or `backend_with_message(message, source)` to record text you wrote; the source error stays available through `Error::source`.
+- **Outage telemetry differs.** An outage sets the evaluation span's `outcome` to `indeterminate` (it was `denied`) and a security event's `event.outcome` to `unknown` (it was `failure`). Batch spans gain `indeterminate_count`, and `denied_count` no longer includes outages. `policy.effect` is `allow` or `deny`. Alerts that count denials or failures will stop seeing outages.
+- **`default-features = false` now removes `tracing`.** In 0.5.1 `tracing` was always compiled in. It is now a default feature, so a dependency declared with `default-features = false` loses spans, security events and contract warnings unless it also enables `tracing`. Decisions, traces and provenance are unaffected.
+- **Oversized lookup pages are rejected.** A `LookupSource` that returns more IDs than the requested limit now fails with `LookupPageTooLarge` before hydration or authorization, instead of authorizing the whole page.
+- **The old list names still drop outages silently.** `filter`, `filter_by` and `lookup_page` behave as before, omitting indeterminate items along with denials, but are deprecated. Move to the `try_` methods, or to `filter_lossy`, `filter_by_lossy` and `lookup_page_lossy` where dropping them is intended.
+
+#### Changes that fail to compile
+
+- **Grants and vetoes are separate types.** `Policy::evaluate` and `evaluate_batch` return `GrantResult` and `Vec<GrantResult>`. `Effect`, `Policy::effect`, `add_forbid_policy` and `PolicyBuilder::forbid` are removed: replace `.forbid().build()` with `.build_veto()` and register it with `add_veto`. Hand-written vetoes implement `VetoPolicy` and return `VetoResult`, and a custom policy that both granted and vetoed must be split in two.
+- **Combinators and delegation.** `AndPolicy`, `OrPolicy` and `NotPolicy` accept grant policies only; compose vetoes with `AllOfVeto`, `AnyOfVeto` and `VetoPolicyExt`. `DelegatingPolicy` no longer implements `Policy`; register it with `add_delegate`, which installs its grants and vetoes together.
+- **Builder.** `build` and `build_veto` need at least one predicate; write `allow_all()` or `forbid_all()` for a policy that applies to every request. A helper that returns a builder after adding a predicate returns `PolicyBuilder<D, Conditional>`.
+- **Audit types.** `PolicyEvalResult` can no longer be returned from a policy or converted into a policy result. `Combined` has `decision` instead of `outcome`, plus `provenance`, and there is a new `Decision` enum with an indeterminate value. `FactProvenance` gains `error_kind`; prefer `FactProvenance::from_load_result` to struct literals.
+- **Contexts.** `EvalCtx` and `BatchEvalCtx` are built with `EvalCtx::new` and `BatchEvalCtx::new`, and the raw session is read with `session()`. When you call a policy directly, pass its result through `ctx.finish(...)`.
+- **Decisions are sealed.** The variants of `AccessEvaluation` and `AccessError`, and the `FilterError` and `LookupAuthorizedPage` structs, can be read and matched but not constructed outside the crate. Struct patterns on the variants need `..`; tests should get a decision from a `PermissionChecker`.
+- **Bounds.** `FactKey` requires `Debug` and provides `render()`. `RelationshipQuery` requires `Debug` on IDs and relations and `Display` on relations.
+- **Lookup errors.** `LookupAuthorizedError` has a third type parameter, `Resource`, defaulting to `()`, and new `Evaluation` and `LookupPageTooLarge` variants.
+- **New warnings.** `AccessEvaluation`, `GrantResult`, `VetoResult` and awaited evaluations are `#[must_use]`, and the old list names are deprecated, so builds that deny warnings need these addressed.
+
+### Added
+
+- `BoundEvaluator::authorize` and `AccessEvaluation::into_result`, which return `Result<(), AccessError>` and keep a denial and an indeterminate outcome apart, each with its reason, trace and fact errors.
+- `try_filter`, `try_filter_by` and `try_lookup_page`, and `filter_lossy`, `filter_by_lossy` and `lookup_page_lossy`.
+- Recording contexts (`EvalCtx::fact` and `facts`, `BatchEvalCtx::facts_by` and `fact`, `record`, `finish`) that attach consulted facts to the audit trail, and `FactLoadErrorKind` with `FactLoadError::kind`.
+- `PolicyBuilder::allow_all` and `forbid_all`, and `AccessEvaluation::grant_path`, `forbidden_path` and `is_indeterminate`.
+- `.named(...)` on `AndPolicy`, `OrPolicy`, `NotPolicy`, `AllOfVeto` and `AnyOfVeto`.
+- `FactLoadError::backend_with_message` and `audit_detail`, and `Error::source` on `FactLoadError`.
+- A runnable quick start in the README, checked in CI against the packaged crate.
+
+### Changed
+
+- Loading facts in chunks is linear in the number of keys; it was quadratic.
+
+### Deprecated
+
+- `AccessEvaluation::denied_due_to_fact_load_error`, planned for removal in 0.7. Use `is_indeterminate()` or `into_result()`, and `fact_load_errors()` for diagnostics.
+- `filter`, `filter_by` and `lookup_page`, which remain aliases of their `_lossy` counterparts.
+
+### Fixed
+
+- `EvaluationSession::shared_empty()` no longer retains fact state or cache entries when facts are read from it by mistake.
+
+### Security
+
+- A `NotPolicy` over a failed lookup, and a veto whose data source failed, granted access during an outage in 0.5.1. Both now fail closed when facts are loaded through the recording contexts.
+- Backend error messages, which can quote row values, no longer reach traces, logs or serialized audit output.
+
+### Verification
+
+- The library is `#![forbid(unsafe_code)]`. Its runtime dependencies are `async-trait` and `futures-channel`, plus `tracing` (default) and `serde` (optional).
+- Decision semantics are covered by property tests, compile-fail tests for the grant and veto boundary, and loom tests for concurrent fact loading. Pull requests run mutation testing over the evaluator, combinators, decision attribution and audit redaction.
+- CI checks Rust 1.82, runs the examples and the README quick start, and runs the PostgreSQL example against a live database. Releases publish from CI through crates.io Trusted Publishing after `cargo audit` passes.
+
+Design background: [#58](https://github.com/thepartly/gatehouse/issues/58), [#61](https://github.com/thepartly/gatehouse/issues/61), [#62](https://github.com/thepartly/gatehouse/issues/62), [#63](https://github.com/thepartly/gatehouse/issues/63), [#67](https://github.com/thepartly/gatehouse/issues/67). Full diff: [v0.5.1...v0.6.0](https://github.com/thepartly/gatehouse/compare/v0.5.1...v0.6.0).
+
 ## [0.6.0-alpha.3] - 2026-09-28
 
 This prerelease settles what Gatehouse's audit output promises. Decisions now

@@ -24,7 +24,7 @@ if arguments.packaged:
     crate = tomllib.loads((repository / "Cargo.toml").read_text())["package"]
     arguments.gatehouse_path = pathlib.Path(metadata["target_directory"]) / "package" / f"gatehouse-{crate['version']}"
 fixture = repository / "tests/consumer/quickstart"
-quickstart = (repository / "README.md").read_text().split("## Quick Start", 1)[1]
+quickstart = (repository / "README.md").read_text().split("## Quick start", 1)[1]
 program = quickstart.split("```rust\n", 1)[1].split("```", 1)[0]
 assert program == (fixture / "src/main.rs").read_text(), "README program differs from consumer"
 dependencies = quickstart.split("```toml\n", 1)[1].split("```", 1)[0]

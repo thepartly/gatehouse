@@ -7,5 +7,5 @@ publish = false
 [workspace]
 
 [dependencies]
-gatehouse = { version = "=0.6.0-alpha.3", path = "../../.." }
+gatehouse = { version = "=0.6.0", path = "../../.." }
 tokio = { version = "1", features = ["macros", "rt"] }
