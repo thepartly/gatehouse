@@ -186,6 +186,8 @@ let page = bound
 
 A `LookupSource` must enumerate a superset of every resource that any policy could grant for the bound subject, action and context. Lookup narrows candidates; it does not replace the policies. If evaluation is indeterminate, the error retains the hydrated resources and returns no next cursor: retry the same cursor with a fresh session after recovery. A page with more IDs than the requested limit is rejected with `LookupPageTooLarge`.
 
+For search endpoints that narrow rows in the database first, [`examples/scoped_search.rs`](examples/scoped_search.rs) runs `try_filter` over the narrowed page as a second check, so a scope that returns too much is filtered out and an indeterminate decision fails the request. It evaluates each distinct parent resource once rather than once per row.
+
 `filter_lossy`, `filter_by_lossy` and `lookup_page_lossy` deliberately omit indeterminate items along with denials. The older `filter`, `filter_by` and `lookup_page` names behave the same way and are deprecated.
 
 ### Long-lived streams
